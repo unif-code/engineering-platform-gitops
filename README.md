@@ -1,0 +1,35 @@
+# engineering-platform-gitops
+
+本仓库是 `engineering-platform` DEV 环境唯一的 GitOps Desired State 入口。Flux 只从受保护的 `main` 分支读取 `clusters/dev/`，所有集群变更必须通过 Pull Request 审核后合并。
+
+## 目录
+
+```text
+clusters/dev/     # DEV 环境的 Flux 入口与依赖顺序
+infrastructure/   # Cluster Foundation、存储、证书、数据库与 Observability
+apps/             # engineering-platform frontend/backend 工作负载
+pcs/              # Platform Compatibility Set Candidate 与实际 digest
+runbook/          # 人工命令、输出摘录、恢复演练与 Gate 证据
+```
+
+## 变更规则
+
+- `main` 禁止 direct push 和 force push；所有变更通过 PR，至少一名 Reviewer 批准。
+- 禁止在 Git 中保存 Secret 值、私钥、Token、kubeconfig 或密码库导出内容。
+- 禁止使用 `latest`、浮动 tag 或启动时自动升级；Chart、Manifest 和 Image 必须按 PCS Candidate 固定版本，部署后的 Image 必须回填 digest。
+- 带外 `kubectl apply`、手工 Patch 或临时扩缩容不会成为 Desired State，Flux 会在下一次 Reconcile 将其纠正。bootstrap 阶段确需带外执行的命令必须逐条记录在 `runbook/`。
+- 每个 Flux `Kustomization`/`HelmRelease` 必须显式声明 Reconcile ServiceAccount；Controller 禁止跨 Namespace 引用。
+
+## DEV-001 治理例外
+
+> **ACTIVE：仅限 V0.1 DEV。** MinIO 与被保护的数据位于同一台服务器，整机故障会同时丢失源数据和备份。该拓扑只验证 S3/Versioning/Object Lock、备份和恢复机制，不满足 Cluster 外故障域要求。最迟必须在 **V0.5 Production Candidate 验收前**切换为真实 Cluster 外 S3-compatible Repository；PROD 永不适用。
+
+来源：`engineering-platform/docs/architecture/deviations.md#dev-001v01-dev-备份与审计归档与集群同机`。
+
+## 本地校验
+
+```bash
+./scripts/validate.sh
+```
+
+运行态证据只有在对应 `runbook/` 已回填真实命令输出、PCS digest 与验收结果后才成立；清单可渲染不等于环境已部署。
