@@ -24,8 +24,10 @@ runbook/          # 人工命令、输出摘录、恢复演练与 Gate 证据
 
 > **ACTIVE：仅限 V0.1 DEV。** MinIO 与被保护的数据位于同一台服务器，整机故障会同时丢失源数据和备份。该拓扑只验证 S3/Versioning/Object Lock、备份和恢复机制，不满足 Cluster 外故障域要求。最迟必须在 **V0.5 Production Candidate 验收前**切换为真实 Cluster 外 S3-compatible Repository；PROD 永不适用。
 
-- DEV-001 canonical source：`engineering-platform/docs/decisions/DEV-001-same-host-backup.md`。
-- DEV-002 canonical source：`engineering-platform/docs/decisions/DEV-002-single-user-kubernetes-profile.md`。
+- 基础设施与运维架构：`engineering-platform-docs/architecture/09-infrastructure-operations.md`。
+- DEV-001 canonical source：`engineering-platform-docs/architecture/deviations.md`。
+- DEV-002 canonical source：`engineering-platform-docs/architecture/deviations.md`。
+- 架构基线清单：`engineering-platform-docs/architecture/baseline-manifest.json`。
 
 DEV-002 使用完整功能的单用户 Kubernetes Profile：83Gi 稳态 PVC、103Gi 恢复态 PVC、130Gi 平台规划峰值，保留 7 天备份和 3.8GiB 主机 Swap；Pod 使用 `NoSwap`。local-path 的 PVC/ResourceQuota 是申请合同而非文件系统硬 quota；根盘达到 80% 告警，达到 90% 时停止新发布、PVC 变更和恢复演练。
 

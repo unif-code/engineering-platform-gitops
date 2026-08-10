@@ -4,6 +4,12 @@
 环境：`DEV` / `NON_HA`  
 基线：`2026-08-10.1`
 
+基础设施与运维架构：`engineering-platform-docs/architecture/09-infrastructure-operations.md`
+
+架构参数：`engineering-platform-docs/architecture/appendix-parameters.md`
+
+治理例外（DEV-001 / DEV-002）：`engineering-platform-docs/architecture/deviations.md`
+
 容量 Profile：`DEV-002` / `SINGLE_USER_MINIMAL`
 目标平台：`linux/amd64`（必须由 `runbook/00-server-baseline.md` 的 `uname -m=x86_64` 回执确认）
 

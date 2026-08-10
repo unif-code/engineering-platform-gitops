@@ -1,8 +1,8 @@
 # DEV 运维证据索引
 
-> **DEV-001 ACTIVE（仅 V0.1 DEV）**：MinIO 与被保护数据位于同一台服务器，整机故障会同时丢失源数据和备份。本拓扑只验证备份/恢复机制，不满足 Cluster 外故障域要求；最迟在 **V0.5 Production Candidate** 前关闭，PROD 永不适用。
+> **DEV-001 ACTIVE（仅 V0.1 DEV）**：MinIO 与被保护数据位于同一台服务器，整机故障会同时丢失源数据和备份。本拓扑只验证备份/恢复机制，不满足 Cluster 外故障域要求；最迟在 **V0.5 Production Candidate** 前关闭，PROD 永不适用。canonical 记录位于 `engineering-platform-docs/architecture/deviations.md`。
 
-> **DEV-002 ACTIVE（仅单用户 DEV）**：完整功能与 7 天保留不变；平台稳态实际磁盘目标不超过 100Gi、恢复峰值不超过 130Gi，根盘 80% 告警、90% Stop Gate。canonical 记录位于 `engineering-platform/docs/decisions/`。
+> **DEV-002 ACTIVE（仅单用户 DEV）**：完整功能与 7 天保留不变；平台稳态实际磁盘目标不超过 100Gi、恢复峰值不超过 130Gi，根盘 80% 告警、90% Stop Gate。canonical 记录位于 `engineering-platform-docs/architecture/deviations.md`。
 
 所有标记为【运维】的命令只能由获准人员在目标服务器执行。执行前记录 Git commit，执行后保留 UTC 时间、完整命令、关键 stdout/stderr、退出码与判定；Secret 值、Token、私钥、kubeconfig 不得写入本目录。
 
