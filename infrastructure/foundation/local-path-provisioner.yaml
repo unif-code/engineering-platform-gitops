@@ -137,11 +137,11 @@ spec:
           name: local-path-provisioner
           resources:
             limits:
-              cpu: 200m
-              memory: 128Mi
+              cpu: 100m
+              memory: 96Mi
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 20m
+              memory: 32Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -202,6 +202,13 @@ data:
         - image: registry.k8s.io/e2e-test-images/busybox@sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb
           imagePullPolicy: IfNotPresent
           name: helper-pod
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -41,11 +41,11 @@ spec:
   primaryUpdateStrategy: unsupervised
   resources:
     limits:
-      cpu: '4'
-      memory: 8Gi
+      cpu: '2'
+      memory: 4Gi
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: 250m
+      memory: 512Mi
   storage:
     size: 20Gi
     storageClass: stateful-rwo-lowlatency

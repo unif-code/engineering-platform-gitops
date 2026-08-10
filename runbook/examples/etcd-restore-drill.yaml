@@ -28,11 +28,11 @@ spec:
           name: status
           resources:
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 200m
+              memory: 128Mi
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 10m
+              memory: 32Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -76,11 +76,11 @@ spec:
           name: download
           resources:
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 200m
+              memory: 128Mi
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 10m
+              memory: 32Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -110,11 +110,11 @@ spec:
           name: restore
           resources:
             limits:
-              cpu: '1'
-              memory: 512Mi
+              cpu: 500m
+              memory: 256Mi
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 64Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

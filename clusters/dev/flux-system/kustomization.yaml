@@ -60,11 +60,11 @@ patches:
               - name: manager
                 resources:
                   limits:
-                    cpu: 400m
-                    memory: 512Mi
-                  requests:
-                    cpu: 100m
+                    cpu: 200m
                     memory: 256Mi
+                  requests:
+                    cpu: 25m
+                    memory: 96Mi
     target:
       kind: Deployment
       name: source-controller
@@ -80,11 +80,11 @@ patches:
               - name: manager
                 resources:
                   limits:
-                    cpu: '1'
-                    memory: 1Gi
-                  requests:
-                    cpu: 250m
+                    cpu: 500m
                     memory: 512Mi
+                  requests:
+                    cpu: 50m
+                    memory: 128Mi
     target:
       kind: Deployment
       name: kustomize-controller
@@ -100,11 +100,11 @@ patches:
               - name: manager
                 resources:
                   limits:
-                    cpu: 400m
+                    cpu: 500m
                     memory: 512Mi
                   requests:
-                    cpu: 100m
-                    memory: 256Mi
+                    cpu: 50m
+                    memory: 128Mi
     target:
       kind: Deployment
       name: helm-controller
@@ -120,11 +120,11 @@ patches:
               - name: manager
                 resources:
                   limits:
-                    cpu: 200m
-                    memory: 256Mi
-                  requests:
-                    cpu: 50m
+                    cpu: 100m
                     memory: 128Mi
+                  requests:
+                    cpu: 10m
+                    memory: 64Mi
     target:
       kind: Deployment
       name: notification-controller

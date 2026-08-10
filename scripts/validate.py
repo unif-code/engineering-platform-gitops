@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Tuple, Union
 
@@ -302,6 +303,373 @@ def validate_single_user_storage() -> None:
             fail(f'{alert} 必须使用阈值 {threshold}')
 
 
+def cpu_millicores(quantity: str) -> int:
+    if quantity.endswith('m'):
+        return int(quantity[:-1])
+    return int(Decimal(quantity) * 1000)
+
+
+def memory_mib(quantity: str) -> int:
+    if quantity.endswith('Mi'):
+        return int(quantity[:-2])
+    if quantity.endswith('Gi'):
+        return int(Decimal(quantity[:-2]) * 1024)
+    fail(f'不支持的内存 quantity：{quantity}')
+
+
+def validate_single_user_resources() -> Tuple[int, int]:
+    total_cpu_millicores = 0
+    total_memory_mib = 0
+
+    def check_resources(
+        label: str,
+        resources: dict[str, Any],
+        request_cpu: str,
+        request_memory: str,
+        limit_cpu: str,
+        limit_memory: str,
+        steady: bool,
+    ) -> None:
+        nonlocal total_cpu_millicores, total_memory_mib
+        expected = {
+            'limits': {'cpu': limit_cpu, 'memory': limit_memory},
+            'requests': {'cpu': request_cpu, 'memory': request_memory},
+        }
+        if resources != expected:
+            fail(f'{label} resources 期望 {expected!r}，实测 {resources!r}')
+        if steady:
+            total_cpu_millicores += cpu_millicores(request_cpu)
+            total_memory_mib += memory_mib(request_memory)
+
+    flux_kustomization = next(
+        load_documents(ROOT / 'clusters/dev/flux-system/kustomization.yaml')
+    )
+    flux_contracts = (
+        ('source-controller', '25m', '96Mi', '200m', '256Mi'),
+        ('kustomize-controller', '50m', '128Mi', '500m', '512Mi'),
+        ('helm-controller', '50m', '128Mi', '500m', '512Mi'),
+        ('notification-controller', '10m', '64Mi', '100m', '128Mi'),
+    )
+    patches = flux_kustomization.get('patches', [])
+    for controller, request_cpu, request_memory, limit_cpu, limit_memory in flux_contracts:
+        resources = None
+        for patch_entry in patches:
+            target = patch_entry.get('target', {})
+            if target.get('kind') != 'Deployment' or target.get('name') != controller:
+                continue
+            patch_document = yaml.safe_load(patch_entry.get('patch', ''))
+            if not isinstance(patch_document, dict) or 'spec' not in patch_document:
+                continue
+            resources = value_at(
+                patch_document,
+                (
+                    'spec',
+                    'template',
+                    'spec',
+                    'containers',
+                    ('name', 'manager'),
+                    'resources',
+                ),
+            )
+            break
+        if resources is None:
+            fail(f'Flux 缺少 {controller} resources patch')
+        check_resources(
+            f'Flux {controller}',
+            resources,
+            request_cpu,
+            request_memory,
+            limit_cpu,
+            limit_memory,
+            True,
+        )
+
+    contracts = (
+        (
+            'local-path-provisioner',
+            'infrastructure/foundation/local-path-provisioner.yaml',
+            'Deployment',
+            'local-path-provisioner',
+            ('spec', 'template', 'spec', 'containers', ('name', 'local-path-provisioner'), 'resources'),
+            '20m', '32Mi', '100m', '96Mi', True,
+        ),
+        (
+            'cert-manager controller',
+            'infrastructure/cert-manager/controller/release.yaml',
+            'HelmRelease',
+            'cert-manager',
+            ('spec', 'values', 'resources'),
+            '30m', '64Mi', '300m', '256Mi', True,
+        ),
+        (
+            'cert-manager cainjector',
+            'infrastructure/cert-manager/controller/release.yaml',
+            'HelmRelease',
+            'cert-manager',
+            ('spec', 'values', 'cainjector', 'resources'),
+            '30m', '64Mi', '300m', '256Mi', True,
+        ),
+        (
+            'cert-manager webhook',
+            'infrastructure/cert-manager/controller/release.yaml',
+            'HelmRelease',
+            'cert-manager',
+            ('spec', 'values', 'webhook', 'resources'),
+            '20m', '64Mi', '200m', '128Mi', True,
+        ),
+        (
+            'cert-manager startupapicheck',
+            'infrastructure/cert-manager/controller/release.yaml',
+            'HelmRelease',
+            'cert-manager',
+            ('spec', 'values', 'startupapicheck', 'resources'),
+            '10m', '32Mi', '100m', '64Mi', False,
+        ),
+        (
+            'MinIO server',
+            'infrastructure/minio/deployment.yaml',
+            'Deployment',
+            'minio',
+            ('spec', 'template', 'spec', 'containers', ('name', 'minio'), 'resources'),
+            '100m', '256Mi', '1', '2Gi', True,
+        ),
+        (
+            'MinIO bootstrap',
+            'infrastructure/minio/bootstrap-job.yaml',
+            'Job',
+            'minio-bootstrap-v1',
+            ('spec', 'template', 'spec', 'containers', ('name', 'mc'), 'resources'),
+            '10m', '32Mi', '100m', '128Mi', False,
+        ),
+        (
+            'CloudNativePG operator',
+            'infrastructure/cnpg/controller/cnpg-release.yaml',
+            'HelmRelease',
+            'cloudnative-pg',
+            ('spec', 'values', 'resources'),
+            '50m', '128Mi', '300m', '256Mi', True,
+        ),
+        (
+            'Barman operator',
+            'infrastructure/cnpg/controller/barman-release.yaml',
+            'HelmRelease',
+            'plugin-barman-cloud',
+            ('spec', 'values', 'resources'),
+            '50m', '128Mi', '300m', '256Mi', True,
+        ),
+        (
+            'PostgreSQL primary',
+            'infrastructure/cnpg/database/cluster.yaml',
+            'Cluster',
+            'platform',
+            ('spec', 'resources'),
+            '250m', '512Mi', '2', '4Gi', True,
+        ),
+        (
+            'Barman instance sidecar',
+            'infrastructure/cnpg/database/object-store.yaml',
+            'ObjectStore',
+            'platform-backup',
+            ('spec', 'instanceSidecarConfiguration', 'resources'),
+            '50m', '64Mi', '500m', '256Mi', True,
+        ),
+        (
+            'Alertmanager',
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'alertmanager', 'alertmanagerSpec', 'resources'),
+            '20m', '64Mi', '200m', '256Mi', True,
+        ),
+        (
+            'Grafana',
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'grafana', 'resources'),
+            '50m', '128Mi', '500m', '512Mi', True,
+        ),
+        (
+            'kube-state-metrics',
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'kube-state-metrics', 'resources'),
+            '20m', '64Mi', '200m', '128Mi', True,
+        ),
+        (
+            'Prometheus',
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'prometheus', 'prometheusSpec', 'resources'),
+            '200m', '512Mi', '1', '2Gi', True,
+        ),
+        (
+            'node-exporter',
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'prometheus-node-exporter', 'resources'),
+            '20m', '32Mi', '100m', '64Mi', True,
+        ),
+        (
+            'Prometheus Operator',
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'prometheusOperator', 'resources'),
+            '50m', '128Mi', '300m', '256Mi', True,
+        ),
+        (
+            'etcd backup upload',
+            'infrastructure/etcd-backup/cronjob.yaml',
+            'CronJob',
+            'etcd-backup',
+            ('spec', 'jobTemplate', 'spec', 'template', 'spec', 'containers', ('name', 'upload'), 'resources'),
+            '10m', '32Mi', '200m', '128Mi', False,
+        ),
+        (
+            'etcd backup snapshot',
+            'infrastructure/etcd-backup/cronjob.yaml',
+            'CronJob',
+            'etcd-backup',
+            ('spec', 'jobTemplate', 'spec', 'template', 'spec', 'initContainers', ('name', 'snapshot'), 'resources'),
+            '50m', '64Mi', '500m', '256Mi', False,
+        ),
+        (
+            'etcd backup validate',
+            'infrastructure/etcd-backup/cronjob.yaml',
+            'CronJob',
+            'etcd-backup',
+            ('spec', 'jobTemplate', 'spec', 'template', 'spec', 'initContainers', ('name', 'validate'), 'resources'),
+            '10m', '32Mi', '200m', '128Mi', False,
+        ),
+        (
+            'PostgreSQL restore',
+            'runbook/examples/postgres-restore.yaml',
+            'Cluster',
+            'platform-restore',
+            ('spec', 'resources'),
+            '250m', '512Mi', '2', '4Gi', False,
+        ),
+        (
+            'Barman restore sidecar',
+            'runbook/examples/postgres-restore.yaml',
+            'ObjectStore',
+            'platform-restore-source',
+            ('spec', 'instanceSidecarConfiguration', 'resources'),
+            '50m', '64Mi', '500m', '256Mi', False,
+        ),
+        (
+            'etcd restore download',
+            'runbook/examples/etcd-restore-drill.yaml',
+            'Job',
+            'etcd-restore-drill',
+            ('spec', 'template', 'spec', 'initContainers', ('name', 'download'), 'resources'),
+            '10m', '32Mi', '200m', '128Mi', False,
+        ),
+        (
+            'etcd restore',
+            'runbook/examples/etcd-restore-drill.yaml',
+            'Job',
+            'etcd-restore-drill',
+            ('spec', 'template', 'spec', 'initContainers', ('name', 'restore'), 'resources'),
+            '50m', '64Mi', '500m', '256Mi', False,
+        ),
+        (
+            'etcd restore status',
+            'runbook/examples/etcd-restore-drill.yaml',
+            'Job',
+            'etcd-restore-drill',
+            ('spec', 'template', 'spec', 'containers', ('name', 'status'), 'resources'),
+            '10m', '32Mi', '200m', '128Mi', False,
+        ),
+        (
+            'MinIO lock verify',
+            'runbook/examples/minio-lock-verify.yaml',
+            'Job',
+            'minio-lock-verify',
+            ('spec', 'template', 'spec', 'containers', ('name', 'verify'), 'resources'),
+            '10m', '32Mi', '100m', '128Mi', False,
+        ),
+    )
+
+    for (
+        label,
+        relative_path,
+        kind,
+        name,
+        path,
+        request_cpu,
+        request_memory,
+        limit_cpu,
+        limit_memory,
+        steady,
+    ) in contracts:
+        document = document_by_identity(ROOT / relative_path, kind, name)
+        resources = value_at(document, path)
+        check_resources(
+            label,
+            resources,
+            request_cpu,
+            request_memory,
+            limit_cpu,
+            limit_memory,
+            steady,
+        )
+
+    local_path_config = document_by_identity(
+        ROOT / 'infrastructure/foundation/local-path-provisioner.yaml',
+        'ConfigMap',
+        'local-path-config',
+    )
+    helper_pod = yaml.safe_load(
+        value_at(local_path_config, ('data', 'helperPod.yaml'))
+    )
+    helper_resources = value_at(
+        helper_pod,
+        ('spec', 'containers', ('name', 'helper-pod'), 'resources'),
+    )
+    check_resources(
+        'local-path helper Pod',
+        helper_resources,
+        '10m',
+        '16Mi',
+        '100m',
+        '64Mi',
+        False,
+    )
+
+    expect_value(
+        'infrastructure/cnpg/database/object-store.yaml',
+        'ObjectStore',
+        'platform-backup',
+        ('spec', 'configuration', 'data', 'jobs'),
+        1,
+    )
+    expect_value(
+        'infrastructure/cnpg/database/object-store.yaml',
+        'ObjectStore',
+        'platform-backup',
+        ('spec', 'configuration', 'wal', 'maxParallel'),
+        1,
+    )
+    expect_value(
+        'runbook/examples/postgres-restore.yaml',
+        'ObjectStore',
+        'platform-restore-source',
+        ('spec', 'configuration', 'wal', 'maxParallel'),
+        1,
+    )
+
+    if total_cpu_millicores > 2000:
+        fail(f'DEV-002 稳态 CPU requests 超预算：{total_cpu_millicores}m')
+    if total_memory_mib > 6144:
+        fail(f'DEV-002 稳态内存 requests 超预算：{total_memory_mib}Mi')
+    return total_cpu_millicores, total_memory_mib
+
+
 def resource_id(document: dict[str, Any]) -> tuple[str, str, str, str] | None:
     api_version = document.get('apiVersion')
     kind = document.get('kind')
@@ -431,6 +799,7 @@ def main() -> None:
     validate_kustomize_builds()
     validate_documents()
     validate_single_user_storage()
+    validate_single_user_resources()
     print('GitOps manifests validated successfully.')
 
 

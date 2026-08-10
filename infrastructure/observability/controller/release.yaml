@@ -34,11 +34,11 @@ spec:
         replicas: 1
         resources:
           limits:
-            cpu: 500m
-            memory: 512Mi
-          requests:
-            cpu: 100m
+            cpu: 200m
             memory: 256Mi
+          requests:
+            cpu: 20m
+            memory: 64Mi
         storage:
           volumeClaimTemplate:
             spec:
@@ -65,19 +65,19 @@ spec:
       replicas: 1
       resources:
         limits:
-          cpu: '1'
-          memory: 1Gi
-        requests:
-          cpu: 100m
-          memory: 256Mi
-    kube-state-metrics:
-      resources:
-        limits:
-          cpu: 300m
-          memory: 256Mi
+          cpu: 500m
+          memory: 512Mi
         requests:
           cpu: 50m
           memory: 128Mi
+    kube-state-metrics:
+      resources:
+        limits:
+          cpu: 200m
+          memory: 128Mi
+        requests:
+          cpu: 20m
+          memory: 64Mi
     prometheus:
       prometheusSpec:
         podMonitorNamespaceSelector: {}
@@ -85,11 +85,11 @@ spec:
         replicas: 1
         resources:
           limits:
-            cpu: '2'
-            memory: 4Gi
-          requests:
-            cpu: 500m
+            cpu: '1'
             memory: 2Gi
+          requests:
+            cpu: 200m
+            memory: 512Mi
         retention: 7d
         retentionSize: 8GB
         serviceMonitorNamespaceSelector: {}
@@ -106,16 +106,16 @@ spec:
     prometheus-node-exporter:
       resources:
         limits:
-          cpu: 200m
-          memory: 128Mi
-        requests:
-          cpu: 50m
+          cpu: 100m
           memory: 64Mi
+        requests:
+          cpu: 20m
+          memory: 32Mi
     prometheusOperator:
       resources:
         limits:
-          cpu: 500m
-          memory: 512Mi
-        requests:
-          cpu: 100m
+          cpu: 300m
           memory: 256Mi
+        requests:
+          cpu: 50m
+          memory: 128Mi

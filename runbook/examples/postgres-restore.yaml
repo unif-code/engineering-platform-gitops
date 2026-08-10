@@ -21,7 +21,16 @@ spec:
         key: ACCESS_SECRET_KEY
         name: pg-backup-minio
     wal:
-      maxParallel: 2
+      maxParallel: 1
+  instanceSidecarConfiguration:
+    logLevel: info
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -51,11 +60,11 @@ spec:
   instances: 1
   resources:
     limits:
-      cpu: '4'
-      memory: 8Gi
+      cpu: '2'
+      memory: 4Gi
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: 250m
+      memory: 512Mi
   storage:
     size: 20Gi
     storageClass: stateful-rwo-lowlatency

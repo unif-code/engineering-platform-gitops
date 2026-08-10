@@ -37,11 +37,11 @@ spec:
     replicaCount: 1
     resources:
       limits:
-        cpu: 500m
-        memory: 512Mi
-      requests:
-        cpu: 100m
+        cpu: 300m
         memory: 256Mi
+      requests:
+        cpu: 50m
+        memory: 128Mi
     sidecarImage:
       tag: v0.13.0
     updateStrategy:

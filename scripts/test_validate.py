@@ -8,6 +8,7 @@ import yaml
 
 from validate import (
     document_by_identity,
+    validate_single_user_resources,
     validate_single_user_storage,
     value_at,
 )
@@ -74,6 +75,9 @@ class ProfileValidationTest(unittest.TestCase):
 
 
 class RepositoryProfileContractTest(unittest.TestCase):
+    def test_single_user_resource_contract(self) -> None:
+        self.assertEqual(validate_single_user_resources(), (1095, 2656))
+
     def test_single_user_storage_contract(self) -> None:
         validate_single_user_storage()
 

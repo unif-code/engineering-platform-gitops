@@ -10,7 +10,7 @@ spec:
   configuration:
     data:
       compression: lz4
-      jobs: 2
+      jobs: 1
     destinationPath: s3://postgres-backup/platform/
     endpointCA:
       key: ca.crt
@@ -25,14 +25,14 @@ spec:
         name: pg-backup-minio
     wal:
       compression: lz4
-      maxParallel: 2
+      maxParallel: 1
   instanceSidecarConfiguration:
     logLevel: info
     resources:
       limits:
-        cpu: '1'
-        memory: 512Mi
+        cpu: 500m
+        memory: 256Mi
       requests:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 50m
+        memory: 64Mi
   retentionPolicy: 7d

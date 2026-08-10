@@ -36,19 +36,19 @@ spec:
         enabled: false
     resources:
       limits:
-        cpu: 400m
+        cpu: 300m
         memory: 256Mi
       requests:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 30m
+        memory: 64Mi
     cainjector:
       resources:
         limits:
-          cpu: 400m
+          cpu: 300m
           memory: 256Mi
         requests:
-          cpu: 100m
-          memory: 128Mi
+          cpu: 30m
+          memory: 64Mi
     startupapicheck:
       resources:
         limits:
@@ -63,5 +63,5 @@ spec:
           cpu: 200m
           memory: 128Mi
         requests:
-          cpu: 50m
+          cpu: 20m
           memory: 64Mi
