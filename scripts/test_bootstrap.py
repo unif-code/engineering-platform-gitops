@@ -1690,6 +1690,14 @@ esac
                   ;;
               esac
             fi
+            case "$temporary" in
+              *"${FAKE_PHASE_RACE_MKTEMP_MATCH:-not-a-real-match}"*) phase_matched=1 ;;
+              *) phase_matched=0 ;;
+            esac
+            if [ "${FAKE_PHASE_RACE_PHASE:-}" = post-mktemp ] && [ "$phase_matched" = 1 ]; then
+              : >"$FAKE_PHASE_RACE_OWNER_MARKER"
+              printf 'race-trigger %s %s\n' "$FAKE_PHASE_RACE_PHASE" "$FAKE_PHASE_RACE_COMPONENT" >>"$FAKE_COMMAND_LOG"
+            fi
             ''',
         )
         self.write_executable(
@@ -1703,7 +1711,12 @@ esac
                 printf 'concurrent\n' >"$last"
               fi
             fi
-            exec /bin/mv "$@"
+            eval "last=\${${#}}"
+            /bin/mv "$@" || exit
+            if [ "${FAKE_PHASE_RACE_PHASE:-}" = pre-publish ] && [ "$last" = "${FAKE_PHASE_RACE_AFTER_MV:-}" ]; then
+              : >"$FAKE_PHASE_RACE_OWNER_MARKER"
+              printf 'race-trigger %s %s\n' "$FAKE_PHASE_RACE_PHASE" "$FAKE_PHASE_RACE_COMPONENT" >>"$FAKE_COMMAND_LOG"
+            fi
             ''',
         )
         self.write_executable(
@@ -1719,7 +1732,11 @@ esac
             '''
             #!/bin/sh
             [ "$1" != "-xzf" ] || printf 'tar-write %s\n' "$*" >>"$FAKE_COMMAND_LOG"
-            exec /usr/bin/tar "$@"
+            /usr/bin/tar "$@" || exit
+            if [ "$1" = -xzf ] && [ "${FAKE_PHASE_RACE_PHASE:-}" = pre-tar ] && [ "${2##*/}" = "${FAKE_PHASE_RACE_AFTER_TAR:-}" ]; then
+              : >"$FAKE_PHASE_RACE_OWNER_MARKER"
+              printf 'race-trigger %s %s\n' "$FAKE_PHASE_RACE_PHASE" "$FAKE_PHASE_RACE_COMPONENT" >>"$FAKE_COMMAND_LOG"
+            fi
             ''',
         )
         self.write_executable(
@@ -1746,8 +1763,13 @@ esac
               is-enabled) [ -f "$FAKE_SERVICE_ENABLED" ] ;;
               is-active) [ -f "$FAKE_SERVICE_ACTIVE" ] && printf 'active\n' ;;
               show)
+                [ "$*" = "show --all --property=LoadState --property=FragmentPath --property=DropInPaths containerd.service" ] || exit 64
                 [ "${FAKE_SYSTEMCTL_SHOW_FAIL:-0}" != 1 ] || exit 1
                 [ "${FAKE_SYSTEMCTL_SHOW_EMPTY:-0}" != 1 ] || exit 0
+                if [ "${FAKE_SYSTEMCTL_SHOW_CUSTOM:-0}" = 1 ]; then
+                  printf '%s\n' "$FAKE_SYSTEMCTL_SHOW_OUTPUT"
+                  exit 0
+                fi
                 if [ -f "$FAKE_SERVICE_UNIT_LOADED" ]; then
                   load_state=${FAKE_LOAD_STATE:-loaded}
                   fragment_path=$FAKE_FRAGMENT_PATH
@@ -2031,6 +2053,46 @@ esac
             with self.subTest(variable=variable, value=value):
                 environment, host, _, _ = self.make_environment()
                 environment[variable] = value
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertTrue(
+                    all(
+                        not path.exists()
+                        for path in self.managed_targets(host).values()
+                    )
+                )
+
+    def test_check_rejects_malformed_systemd_property_output(self) -> None:
+        """捕获缺失、重复或非 allowlist systemctl property 被宽松接受的缺陷。"""
+        cases = {
+            'missing-load-state': 'FragmentPath=\nDropInPaths=',
+            'missing-fragment-path': 'LoadState=not-found\nDropInPaths=',
+            'missing-drop-in-paths': 'LoadState=not-found\nFragmentPath=',
+            'duplicate-load-state': (
+                'LoadState=not-found\nLoadState=not-found\n'
+                'FragmentPath=\nDropInPaths='
+            ),
+            'extra-property': (
+                'LoadState=not-found\nFragmentPath=\nDropInPaths=\n'
+                'UnitFileState=disabled'
+            ),
+            'non-property-line': (
+                'LoadState=not-found\nFragmentPath=\nDropInPaths=\n'
+                'unexpected output'
+            ),
+        }
+        for case, output in cases.items():
+            with self.subTest(case=case):
+                environment, host, _, _ = self.make_environment()
+                environment.update(
+                    {
+                        'FAKE_SYSTEMCTL_SHOW_CUSTOM': '1',
+                        'FAKE_SYSTEMCTL_SHOW_OUTPUT': output,
+                    }
+                )
 
                 result = self.run_stage(environment, '--check')
 
@@ -2366,6 +2428,101 @@ esac
         self.assert_extract_parent_race_stops_before_writes(
             match='.crictl.extract.', parent_path='usr/local/bin'
         )
+
+    def assert_phase_parent_race_stops_followup_writes(
+        self, *, phase: str, component: str
+    ) -> None:
+        environment, host, command_log, _ = self.make_environment()
+        parent_path = (
+            'opt/cni/bin' if component == 'cni' else 'usr/local/bin'
+        )
+        parent = host / parent_path
+        marker = host.parent / f'{phase}-{component}-owner.marker'
+        environment.update(
+            {
+                'FAKE_PHASE_RACE_PHASE': phase,
+                'FAKE_PHASE_RACE_COMPONENT': component,
+                'FAKE_PHASE_RACE_OWNER_MARKER': str(marker),
+                'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH': str(parent),
+                'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER': str(marker),
+            }
+        )
+        if phase == 'post-mktemp':
+            environment['FAKE_PHASE_RACE_MKTEMP_MATCH'] = (
+                f'.{component}.extract.'
+            )
+        elif phase == 'pre-tar':
+            environment['FAKE_PHASE_RACE_AFTER_TAR'] = (
+                'containerd-2.3.1-linux-amd64.tar.gz'
+                if component == 'cni'
+                else 'cni-plugins-linux-amd64-v1.9.1.tgz'
+            )
+        else:
+            environment['FAKE_PHASE_RACE_AFTER_MV'] = str(
+                host / (
+                    'usr/local/sbin/runc'
+                    if component == 'cni'
+                    else 'opt/cni/bin/portmap'
+                )
+            )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        reason_phase = {
+            'post-mktemp': 'state-raced',
+            'pre-tar': 'pre-tar-raced',
+            'pre-publish': 'pre-publish-raced',
+        }[phase]
+        self.assertIn(
+            f'REASON={component}-extract-{reason_phase}', result.stdout
+        )
+        trigger = f'race-trigger {phase} {component}\n'
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertEqual(commands.count(trigger), 1, commands)
+        followup = commands.split(trigger, 1)[1]
+        for forbidden in ('tar-write ', 'install ', 'mv '):
+            self.assertNotIn(forbidden, followup)
+        targets = self.managed_targets(host)
+        unpublished = (
+            targets.values()
+            if phase != 'pre-publish'
+            else (
+                (
+                    targets['bridge'], targets['host-local'],
+                    targets['loopback'], targets['portmap'], targets['crictl'],
+                    targets['config'], targets['unit'],
+                )
+                if component == 'cni'
+                else (targets['crictl'], targets['config'], targets['unit'])
+            )
+        )
+        self.assertTrue(all(not path.exists() for path in unpublished))
+
+    def test_apply_post_mktemp_parent_gate_is_load_bearing(self) -> None:
+        """捕获绕过 CNI/crictl post-mktemp owner Gate 后继续写入的 mutation。"""
+        for component in ('cni', 'crictl'):
+            with self.subTest(component=component):
+                self.assert_phase_parent_race_stops_followup_writes(
+                    phase='post-mktemp', component=component
+                )
+
+    def test_apply_pre_tar_parent_gate_is_load_bearing(self) -> None:
+        """捕获绕过 CNI/crictl pre-tar owner Gate 后继续解压的 mutation。"""
+        for component in ('cni', 'crictl'):
+            with self.subTest(component=component):
+                self.assert_phase_parent_race_stops_followup_writes(
+                    phase='pre-tar', component=component
+                )
+
+    def test_apply_pre_publish_parent_gate_is_load_bearing(self) -> None:
+        """捕获绕过 CNI/crictl pre-publish owner Gate 后继续发布的 mutation。"""
+        for component in ('cni', 'crictl'):
+            with self.subTest(component=component):
+                self.assert_phase_parent_race_stops_followup_writes(
+                    phase='pre-publish', component=component
+                )
 
     def test_health_rejects_version_and_plugin_drift(self) -> None:
         """捕获宽松接受 containerd/runc/crictl 版本或 CRI/overlayfs plugin 漂移的缺陷。"""
