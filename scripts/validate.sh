@@ -13,4 +13,7 @@ python3 -c 'import yaml' >/dev/null 2>&1 || {
   exit 1
 }
 
+PYTHONPATH="$repo_root/scripts" python3 -m unittest discover \
+  -s "$repo_root/scripts" \
+  -p 'test_*.py'
 python3 "$repo_root/scripts/validate.py"

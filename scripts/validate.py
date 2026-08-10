@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Tuple, Union
 
 import yaml
 
@@ -95,6 +95,54 @@ def load_documents(path: Path) -> Iterable[dict[str, Any]]:
                 yield document
     except yaml.YAMLError as error:
         fail(f'{path.relative_to(ROOT)} YAML 解析失败：{error}')
+
+
+PathToken = Union[str, Tuple[str, str]]
+
+
+def document_by_identity(path: Path, kind: str, name: str) -> dict[str, Any]:
+    for document in load_documents(path):
+        metadata = document.get('metadata', {})
+        if document.get('kind') == kind and metadata.get('name') == name:
+            return document
+    fail(f'{path.relative_to(ROOT)} 缺少 {kind}/{name}')
+
+
+def value_at(value: Any, path: Tuple[PathToken, ...]) -> Any:
+    current = value
+    for token in path:
+        if isinstance(token, tuple):
+            key, expected = token
+            if not isinstance(current, list):
+                fail(f'路径 selector {key}={expected} 的父值不是 list')
+            current = next(
+                (
+                    item
+                    for item in current
+                    if isinstance(item, dict) and item.get(key) == expected
+                ),
+                None,
+            )
+            if current is None:
+                fail(f'路径缺少 selector {key}={expected}')
+        else:
+            if not isinstance(current, dict) or token not in current:
+                fail(f'路径缺少 key {token}')
+            current = current[token]
+    return current
+
+
+def expect_value(
+    relative_path: str,
+    kind: str,
+    name: str,
+    path: Tuple[PathToken, ...],
+    expected: Any,
+) -> None:
+    document = document_by_identity(ROOT / relative_path, kind, name)
+    actual = value_at(document, path)
+    if actual != expected:
+        fail(f'{relative_path} 期望 {expected!r}，实测 {actual!r}')
 
 
 def resource_id(document: dict[str, Any]) -> tuple[str, str, str, str] | None:
