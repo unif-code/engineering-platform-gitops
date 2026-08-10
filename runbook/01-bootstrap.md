@@ -43,10 +43,26 @@ GitOps commit / PR：
 - `/root/dev-infra-evidence` 中的全部证据。
 - 身份未核验的宿主机 `3001` 进程；在取得 executable、cwd 与启动来源证据前不得结束或删除。
 
+### 清退执行记录
+
+第一次执行：
+
+| 字段 | 回执 |
+| --- | --- |
+| 证据文件 | `/root/dev-infra-evidence/03-legacy-runtime-cleanup-20260810T025142Z.txt` |
+| SHA-256 | `e758df7f2af5ce2ea43e10ef3aa75f18e7d936808ffa363ecda9bee6556c83af` |
+| Exit code | `100`（未完成） |
+| 已执行 | 15 个容器已关闭并删除；Caddy、Docker 与旧 containerd service 已 disable/stop |
+| 未执行 | APT package purge、数据目录删除、bridge 删除及最终验证均未开始 |
+| 根因 | Docker 相关 package 被 APT hold；`apt-get purge -y` 拒绝变更 held package |
+| 续跑约束 | 仅解除 7 个明确清退目标的 hold；允许 purge held package；禁止执行 `apt autoremove` |
+
+APT 报告的可自动移除项包含 `iptables`、`nftables`、`libnetfilter-conntrack3` 等后续 Kubernetes/Cilium 仍可能使用的宿主机网络组件，因此本阶段必须保留。
+
 清退完成回执：
 
 ```text
-待运维回填清退证据文件与 SHA-256。
+待运维回填续跑证据文件、SHA-256 与 exit code 0。
 ```
 
 ## containerd 与内核前置
