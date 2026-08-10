@@ -79,10 +79,29 @@ APT 报告的可自动移除项包含 `iptables`、`nftables`、`libnetfilter-co
 - cwd：`/data/workflow/apps/server`。
 - cgroup：`/user.slice/user-0.slice/session-397.scope`，未发现 system service 归属证据。
 
+### 宿主机 Workflow/Node 审计
+
+| 字段 | 回执 |
+| --- | --- |
+| 证据文件 | `/root/dev-infra-evidence/05-host-workflow-audit-20260810T030918Z.txt` |
+| SHA-256 | `3f3432d0e3a5fdef9da4f292e0329d598e7554f8af0e7ded2f2728b9dbdb4933` |
+| 监听进程 | `*:3001`；PID `1034757`；用户 `uniflow`；executable `/usr/local/lib/node-v24.18.0/bin/node`；cwd `/data/workflow/apps/server` |
+| 父进程链 | 两层 Node `MainThread` → `sh` → `npm exec tsx` → `bash`；整条链均属于 `uniflow`，cwd 均为 `/data/workflow/apps/server` |
+| 会话归属 | 全部进程位于 `/user.slice/user-0.slice/session-397.scope`；对应旧 root SSH session `397`，RemoteHost `10.96.125.33`，状态 `closing` |
+| 持久化检查 | root/uniflow crontab 均不存在；未发现用户 systemd unit、已安装 Workflow systemd unit、PM2、forever 或 Supervisor |
+| 账号 | `uniflow` 为 UID/GID `1000`，仅属于 `uniflow` 与旧 `docker` 组；未登录且未启用 lingering；home 占用 `76K` |
+| 应用数据 | `/data/workflow` 位于根文件系统，归 `uniflow` 所有；旧 Git 项目及依赖合计约 `2.2G`，包含应用 `.env`、`.git`、构建产物与 `node_modules` |
+| Node runtime | `/usr/local/lib/node-v24.18.0` 为非 dpkg 管理的手工安装，约 `203M`；`node`、`npm`、`npx`、`corepack`、`pnpm`、`pnpx` 的 `/usr/local/bin` 链接均指向该目录 |
+| 其余监听 | 除 DNS、NTP、SSH 与 `3001` 外，无其他旧应用监听端口 |
+
+审计已确认 `3001` 为旧 Workflow 应用的孤立进程链，不属于当前 SSH 会话，也没有发现宿主机持久化启动入口。用户已批准清除旧安装及数据；下一维护动作可永久删除该进程链、`/data/workflow`、手工 Node runtime、`uniflow` 账号/home，以及清空后的旧 `docker` 组。
+
+执行清退前仍须以进程 UID、cwd、executable、cgroup 与证据 SHA-256 做 fail-closed 复核；任一身份漂移必须停止，不得扩大删除范围。不得执行 `apt autoremove`，且必须保留 `/root/dev-infra-evidence` 与基础系统服务。
+
 清退完成回执：
 
 ```text
-Docker/Caddy/旧 containerd 清退完成；宿主机 workflow/Node 应用仍 PENDING。
+Docker/Caddy/旧 containerd 清退完成；宿主机 workflow/Node 已核验，清退仍 PENDING。
 ```
 
 ## containerd 与内核前置
