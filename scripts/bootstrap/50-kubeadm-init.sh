@@ -3,6 +3,13 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
+if [[ -n "${APT_CONFIG+x}" || -n "${KUBECONFIG+x}" ||
+      -n "${DPKG_ADMINDIR+x}" || -n "${DPKG_ROOT+x}" ||
+      -n "${DPKG_FORCE+x}" || -n "${DPKG_FRONTEND_LOCKED+x}" ]]; then
+  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
+  exit 10
+fi
+
 if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
   if [[ "$EUID" -eq 0 ]]; then
     printf 'RESULT=STOP_TEST_MODE\nREASON=test-mode-is-for-unprivileged-tests-only\n' >&2
@@ -35,6 +42,9 @@ readonly SERVICE_CIDR=172.20.0.0/16
 readonly POD_CIDR=172.21.0.0/16
 readonly CONFIG_SHA256=e37b38f198bd7279ae3d203a990a4c2d40e1b2a8b59796475b814f09445103c6
 readonly CONFIG_FILE="${repo_root}/bootstrap/kubeadm/init.yaml"
+readonly KERNEL_TRANSCRIPT=$'PHASE=prepare-kernel\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kernel-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=30-install-containerd\nSHA256=NONE'
+readonly CONTAINERD_TRANSCRIPT=$'PHASE=containerd\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=containerd-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=40-install-kubernetes\nSHA256=NONE'
+readonly KUBERNETES_TRANSCRIPT=$'PHASE=install-kubernetes\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kubernetes-packages-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=50-kubeadm-init.sh --check\nSHA256=NONE'
 
 host_path() {
   local absolute=$1
@@ -74,94 +84,270 @@ safe_test_gate() {
 }
 
 run_stage_gate() {
-  /bin/bash "$1" --check >/dev/null 2>&1
+  local script=$1 expected=$2 captured
+  captured=$(
+    set +e
+    /bin/bash "$script" --check 2>/dev/null
+    printf '__EXIT_CODE__=%s\n' "$?"
+  )
+  [[ "$captured" == "${expected}"$'\n__EXIT_CODE__=0' ]]
 }
 
 initialization_state_gate() {
-  local admin_conf manifest_dir etcd_member listener first_manifest
-  admin_conf=$(host_path /etc/kubernetes/admin.conf)
-  manifest_dir=$(host_path /etc/kubernetes/manifests)
-  etcd_member=$(host_path /var/lib/etcd/member)
-  for marker in "$admin_conf" "$etcd_member"; do
-    if [[ -e "$marker" || -L "$marker" ]]; then
-      complete STOP_ALREADY_INITIALIZED initialized-or-partial-marker-present "$EXIT_UNKNOWN_STATE" NONE
+  local root listener first_entry
+  for root in "$(host_path /etc/kubernetes)" "$(host_path /var/lib/etcd)"; do
+    if [[ ! -e "$root" && ! -L "$root" ]]; then
+      continue
     fi
+    if [[ -L "$root" || ! -d "$root" || "$(path_mode "$root")" != 755 ]] || ! owned_by_expected "$root"; then
+      complete STOP_ALREADY_INITIALIZED initialized-state-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
+    fi
+    first_entry=$(find "$root" -mindepth 1 -print -quit 2>/dev/null) ||
+      complete STOP_ALREADY_INITIALIZED initialized-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
+    [[ -z "$first_entry" ]] || complete STOP_ALREADY_INITIALIZED initialized-or-partial-state-present "$EXIT_UNKNOWN_STATE" NONE
   done
-  if [[ -e "$manifest_dir" || -L "$manifest_dir" ]]; then
-    if [[ -L "$manifest_dir" || ! -d "$manifest_dir" ]]; then
-      complete STOP_ALREADY_INITIALIZED static-manifest-path-present "$EXIT_UNKNOWN_STATE" NONE
-    fi
-    first_manifest=$(find "$manifest_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) ||
-      complete STOP_ALREADY_INITIALIZED static-manifest-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
-    [[ -z "$first_manifest" ]] || complete STOP_ALREADY_INITIALIZED static-manifest-present "$EXIT_UNKNOWN_STATE" NONE
-  fi
   listener=$(ss -H -ltn 'sport = :6443' 2>/dev/null) ||
     complete STOP_PRECONDITION apiserver-listener-state-unreadable "$EXIT_PRECONDITION" NONE
   [[ -z "$listener" ]] || complete STOP_ALREADY_INITIALIZED apiserver-port-listener-present "$EXIT_UNKNOWN_STATE" NONE
 }
 
+kubelet_pre_init_inputs_gate() {
+  local kubelet_root default_file root_mode first_entry sensitive_path
+  kubelet_root=$(host_path /var/lib/kubelet)
+  default_file=$(host_path /etc/default/kubelet)
+  if [[ -e "$kubelet_root" || -L "$kubelet_root" ]]; then
+    if [[ ! -d "$kubelet_root" || -L "$kubelet_root" ]] || ! owned_by_expected "$kubelet_root"; then
+      complete STOP_ALREADY_INITIALIZED kubelet-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
+    fi
+    root_mode=$(path_mode "$kubelet_root") || complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable "$EXIT_UNKNOWN_STATE" NONE
+    [[ "$root_mode" == 700 || "$root_mode" == 750 || "$root_mode" == 755 ]] ||
+      complete STOP_ALREADY_INITIALIZED kubelet-root-mode-unsafe "$EXIT_UNKNOWN_STATE" NONE
+    first_entry=$(find "$kubelet_root" -mindepth 1 -print -quit 2>/dev/null) ||
+      complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable "$EXIT_UNKNOWN_STATE" NONE
+    [[ -z "$first_entry" ]] ||
+      complete STOP_ALREADY_INITIALIZED kubelet-generated-state-present "$EXIT_UNKNOWN_STATE" NONE
+  fi
+  for sensitive_path in \
+    "${kubelet_root}/kubeadm-flags.env" \
+    "${kubelet_root}/config.yaml" \
+    "${kubelet_root}/instance-config.yaml" \
+    "${kubelet_root}/pki"; do
+    if [[ -e "$sensitive_path" || -L "$sensitive_path" ]]; then
+      complete STOP_ALREADY_INITIALIZED kubelet-generated-or-identity-state-present "$EXIT_UNKNOWN_STATE" NONE
+    fi
+  done
+  if [[ ! -e "$default_file" && ! -L "$default_file" ]]; then
+    return
+  fi
+  if [[ ! -f "$default_file" || -L "$default_file" || "$(path_mode "$default_file")" != 644 ]] || ! owned_by_expected "$default_file" || [[ -s "$default_file" ]]; then
+    complete STOP_ALREADY_INITIALIZED kubelet-operator-override-present "$EXIT_UNKNOWN_STATE" NONE
+  fi
+}
+
+managed_kubernetes_clients_gate() {
+  local package logical target shadow ownership verification
+  for package in kubeadm kubectl; do
+    shadow=$(host_path "/usr/sbin/${package}")
+    if [[ -e "$shadow" || -L "$shadow" ]]; then
+      complete STOP_UNKNOWN_STATE kubernetes-client-shadow-present "$EXIT_UNKNOWN_STATE" NONE
+    fi
+    logical="/usr/bin/${package}"
+    target=$(host_path "$logical")
+    if [[ ! -f "$target" || -L "$target" || ! -x "$target" || "$(path_mode "$target")" != 755 ]] || ! owned_by_expected "$target"; then
+      complete STOP_UNKNOWN_STATE kubernetes-client-metadata-drift "$EXIT_UNKNOWN_STATE" NONE
+    fi
+    ownership=$(dpkg-query -S "$logical" 2>/dev/null) ||
+      complete STOP_UNKNOWN_STATE kubernetes-client-owner-unreadable "$EXIT_UNKNOWN_STATE" NONE
+    [[ "$ownership" == "${package}: ${logical}" ]] ||
+      complete STOP_UNKNOWN_STATE kubernetes-client-package-owner-drift "$EXIT_UNKNOWN_STATE" NONE
+    verification=$(dpkg --verify "$package" 2>/dev/null) ||
+      complete STOP_UNKNOWN_STATE kubernetes-client-package-verification-failed "$EXIT_UNKNOWN_STATE" NONE
+    [[ -z "$verification" ]] ||
+      complete STOP_UNKNOWN_STATE kubernetes-client-package-content-drift "$EXIT_UNKNOWN_STATE" NONE
+  done
+}
+
+config_file_is_safe() {
+  local target=$1 expected_mode=$2 digest
+  [[ -f "$target" && ! -L "$target" && "$(path_mode "$target")" == "$expected_mode" ]] || return 1
+  owned_by_expected "$target" || return 1
+  digest=$(sha256_file "$target") || return 1
+  [[ "$digest" == "$CONFIG_SHA256" ]]
+}
+
+host_and_dependency_gates() {
+  local actual_hostname os_release os_id os_version cgroup_path cgroup_fs
+  local address_output swap_file swap_output swap_lines swap_name swap_bytes
+  local route_output cidr_output
+  local -a cidr_arguments
+
+  actual_hostname=$(hostname 2>/dev/null) || complete STOP_PRECONDITION hostname-unreadable "$EXIT_PRECONDITION" NONE
+  [[ "$actual_hostname" == "$EXPECTED_HOSTNAME" ]] || complete STOP_PRECONDITION hostname-mismatch "$EXIT_PRECONDITION" NONE
+  os_release=$(host_path /etc/os-release)
+  [[ -f "$os_release" && ! -L "$os_release" ]] || complete STOP_PRECONDITION os-release-unsafe "$EXIT_PRECONDITION" NONE
+  os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
+  os_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' "$os_release")
+  [[ "$os_id" == ubuntu && "$os_version" == 24.04* ]] || complete STOP_PRECONDITION os-mismatch "$EXIT_PRECONDITION" NONE
+  [[ "$(uname -m 2>/dev/null)" == x86_64 ]] || complete STOP_PRECONDITION architecture-mismatch "$EXIT_PRECONDITION" NONE
+
+  cgroup_path=$(host_path /sys/fs/cgroup)
+  [[ -d "$cgroup_path" && ! -L "$cgroup_path" ]] || complete STOP_PRECONDITION cgroup-path-unsafe "$EXIT_PRECONDITION" NONE
+  cgroup_fs=$(stat -fc %T "$cgroup_path" 2>/dev/null) || complete STOP_PRECONDITION cgroup-state-unreadable "$EXIT_PRECONDITION" NONE
+  [[ "$cgroup_fs" == cgroup2fs ]] || complete STOP_PRECONDITION cgroup-v2-required "$EXIT_PRECONDITION" NONE
+
+  address_output=$(ip -o -4 address show up 2>/dev/null) || complete STOP_PRECONDITION address-unreadable "$EXIT_PRECONDITION" NONE
+  printf '%s\n' "$address_output" | awk -v ip="$EXPECTED_NODE_IP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}' ||
+    complete STOP_PRECONDITION node-ip-not-bound-up "$EXIT_PRECONDITION" NONE
+
+  swap_file=$(host_path /swap.img)
+  [[ -f "$swap_file" && ! -L "$swap_file" ]] || complete STOP_PRECONDITION swap-file-missing "$EXIT_PRECONDITION" NONE
+  swap_output=$(swapon --show --noheadings --bytes --output NAME,SIZE 2>/dev/null) || complete STOP_PRECONDITION swap-unreadable "$EXIT_PRECONDITION" NONE
+  swap_lines=$(printf '%s\n' "$swap_output" | awk 'NF {count++} END {print count+0}')
+  swap_name=$(printf '%s\n' "$swap_output" | awk 'NF {print $1}')
+  swap_bytes=$(printf '%s\n' "$swap_output" | awk 'NF {print $2}')
+  [[ "$swap_lines" == 1 && "$swap_name" == /swap.img && "$swap_bytes" =~ ^[0-9]+$ ]] ||
+    complete STOP_PRECONDITION swap-layout-mismatch "$EXIT_PRECONDITION" NONE
+  (( swap_bytes >= 4000000000 && swap_bytes <= 4400000000 )) ||
+    complete STOP_PRECONDITION swap-size-mismatch "$EXIT_PRECONDITION" NONE
+
+  run_stage_gate "$kernel_script" "$KERNEL_TRANSCRIPT" || complete STOP_PRECONDITION kernel-gate-failed "$EXIT_PRECONDITION" NONE
+  run_stage_gate "$containerd_script" "$CONTAINERD_TRANSCRIPT" || complete STOP_PRECONDITION containerd-gate-failed "$EXIT_PRECONDITION" NONE
+  run_stage_gate "$kubernetes_script" "$KUBERNETES_TRANSCRIPT" || complete STOP_PRECONDITION kubernetes-gate-failed "$EXIT_PRECONDITION" NONE
+
+  route_output=$(ip -o -4 route show table all 2>/dev/null) || complete STOP_PRECONDITION route-unreadable "$EXIT_PRECONDITION" NONE
+  cidr_arguments=(--service-cidr "$SERVICE_CIDR" --pod-cidr "$POD_CIDR")
+  while IFS= read -r address; do
+    [[ -n "$address" ]] && cidr_arguments+=(--address "$address")
+  done < <(printf '%s\n' "$address_output" | awk '{print $4}')
+  while IFS= read -r route; do
+    [[ -n "$route" ]] && cidr_arguments+=(--route "$route")
+  done < <(printf '%s\n' "$route_output" | awk '$1 != "default" && $1 ~ /\// {print $1}')
+  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
+    cidr_output=$("$cidr_script" "${cidr_arguments[@]}" 2>/dev/null) || complete STOP_PRECONDITION cidr-gate-failed "$EXIT_PRECONDITION" NONE
+  else
+    cidr_output=$(python3 "$cidr_script" "${cidr_arguments[@]}" 2>/dev/null) || complete STOP_PRECONDITION cidr-gate-failed "$EXIT_PRECONDITION" NONE
+  fi
+  [[ "$cidr_output" == $'RESULT=PASS_CIDRS\nREASON=no-server-local-overlap\nSCOPE=SERVER_LOCAL_SCOPE_ONLY' ]] ||
+    complete STOP_PRECONDITION cidr-gate-output-invalid "$EXIT_PRECONDITION" NONE
+}
+
+config_snapshot_dir=
+config_snapshot=
+
+# trap 间接调用；仅清理受验证的私有 snapshot 目录。
+# shellcheck disable=SC2329
+cleanup_config_snapshot() {
+  local parent
+  [[ -n "$config_snapshot_dir" ]] || return 0
+  parent=$(host_path /var/tmp)
+  [[ "$config_snapshot_dir" == "${parent}/.kubeadm-config."* ]] || return 0
+  [[ -d "$config_snapshot_dir" && ! -L "$config_snapshot_dir" && "$(path_mode "$config_snapshot_dir")" == 700 ]] || return 0
+  owned_by_expected "$config_snapshot_dir" || return 0
+  rm -r -- "$config_snapshot_dir"
+}
+
+create_config_snapshot() {
+  local parent mode
+  parent=$(host_path /var/tmp)
+  [[ -d "$parent" && ! -L "$parent" && -k "$parent" ]] || return "$EXIT_UNKNOWN_STATE"
+  mode=$(path_mode "$parent") || return "$EXIT_UNKNOWN_STATE"
+  [[ "$mode" == 1777 || "$mode" == 777 ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$parent" || return "$EXIT_UNKNOWN_STATE"
+  config_snapshot_dir=$(mktemp -d "${parent}/.kubeadm-config.XXXXXX") || return "$EXIT_APPLY_FAILED"
+  [[ "$(path_mode "$config_snapshot_dir")" == 700 ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$config_snapshot_dir" || return "$EXIT_UNKNOWN_STATE"
+  config_snapshot="${config_snapshot_dir}/init.yaml"
+  install -m 0600 "$config_source" "$config_snapshot" || return "$EXIT_APPLY_FAILED"
+  sync "$config_snapshot" || return "$EXIT_APPLY_FAILED"
+  config_file_is_safe "$config_source" 644 || return "$EXIT_UNKNOWN_STATE"
+  config_file_is_safe "$config_snapshot" 600 || return "$EXIT_UNKNOWN_STATE"
+}
+
+pre_init_gates() {
+  initialization_state_gate
+  kubelet_pre_init_inputs_gate
+  managed_kubernetes_clients_gate
+  config_file_is_safe "$config_source" 644 || complete STOP_PRECONDITION kubeadm-config-contract-drift "$EXIT_PRECONDITION" NONE
+  if [[ -n "$config_snapshot" ]]; then
+    config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+  fi
+  host_and_dependency_gates
+}
+
+control_plane_json_is_exact() {
+  python3 -c '
+import json
+import sys
+
+expected = ["etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"]
+try:
+    document = json.load(sys.stdin)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if not isinstance(document, dict) or set(document) != {"containers"}:
+    raise SystemExit(1)
+containers = document["containers"]
+if not isinstance(containers, list) or len(containers) != 4:
+    raise SystemExit(1)
+names = []
+for container in containers:
+    if not isinstance(container, dict):
+        raise SystemExit(1)
+    metadata = container.get("metadata")
+    labels = container.get("labels")
+    if not isinstance(metadata, dict) or not isinstance(labels, dict):
+        raise SystemExit(1)
+    name = metadata.get("name")
+    if not isinstance(name, str) or container.get("state") != "CONTAINER_RUNNING":
+        raise SystemExit(1)
+    if labels.get("io.kubernetes.pod.namespace") != "kube-system":
+        raise SystemExit(1)
+    names.append(name)
+if sorted(names) != expected:
+    raise SystemExit(1)
+' >/dev/null 2>&1
+}
+
+kubectl_query_is_empty() {
+  local captured
+  captured=$(
+    set +e
+    "$kubectl_binary" --kubeconfig "$admin_conf" --namespace kube-system "$@" 2>/dev/null
+    printf '__EXIT_CODE__=%s\n' "$?"
+  )
+  [[ "$captured" == '__EXIT_CODE__=0' ]]
+}
+
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk date find grep hostname id ip kubeadm openssl python3 sed sha256sum sort ss stat swapon systemctl tr uname; do
+for required_command in awk date dpkg dpkg-query find grep hostname id install ip mktemp openssl python3 rm sed sha256sum sort ss stat swapon sync systemctl tr uname; do
   if [[ "$required_command" == sha256sum ]] && command -v shasum >/dev/null 2>&1; then
     continue
   fi
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 
-admin_conf=$(host_path /etc/kubernetes/admin.conf)
-etcd_member=$(host_path /var/lib/etcd/member)
-initialization_state_gate
-
-actual_hostname=$(hostname 2>/dev/null) || complete STOP_PRECONDITION hostname-unreadable "$EXIT_PRECONDITION" NONE
-[[ "$actual_hostname" == "$EXPECTED_HOSTNAME" ]] || complete STOP_PRECONDITION hostname-mismatch "$EXIT_PRECONDITION" NONE
-os_release=$(host_path /etc/os-release)
-[[ -f "$os_release" && ! -L "$os_release" ]] || complete STOP_PRECONDITION os-release-unsafe "$EXIT_PRECONDITION" NONE
-os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
-os_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' "$os_release")
-[[ "$os_id" == ubuntu && "$os_version" == 24.04* ]] || complete STOP_PRECONDITION os-mismatch "$EXIT_PRECONDITION" NONE
-[[ "$(uname -m 2>/dev/null)" == x86_64 ]] || complete STOP_PRECONDITION architecture-mismatch "$EXIT_PRECONDITION" NONE
-address_output=$(ip -o -4 address show up 2>/dev/null) || complete STOP_PRECONDITION address-unreadable "$EXIT_PRECONDITION" NONE
-printf '%s\n' "$address_output" | awk -v ip="$EXPECTED_NODE_IP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}' || complete STOP_PRECONDITION node-ip-not-bound-up "$EXIT_PRECONDITION" NONE
-swap_file=$(host_path /swap.img)
-[[ -f "$swap_file" && ! -L "$swap_file" ]] || complete STOP_PRECONDITION swap-file-missing "$EXIT_PRECONDITION" NONE
-swap_output=$(swapon --show --noheadings --bytes --output NAME,SIZE 2>/dev/null) || complete STOP_PRECONDITION swap-unreadable "$EXIT_PRECONDITION" NONE
-[[ "$(printf '%s\n' "$swap_output" | awk 'NF {count++} END {print count+0}')" == 1 ]] || complete STOP_PRECONDITION swap-layout-mismatch "$EXIT_PRECONDITION" NONE
-[[ "$(printf '%s\n' "$swap_output" | awk 'NF {print $1}')" == /swap.img ]] || complete STOP_PRECONDITION swap-layout-mismatch "$EXIT_PRECONDITION" NONE
-
-config_digest=$(sha256_file "$CONFIG_FILE") || complete STOP_PRECONDITION kubeadm-config-unreadable "$EXIT_PRECONDITION" NONE
-[[ "$config_digest" == "$CONFIG_SHA256" ]] || complete STOP_PRECONDITION kubeadm-config-digest-mismatch "$EXIT_PRECONDITION" NONE
-
 kernel_script="${script_dir}/20-prepare-kernel.sh"
 containerd_script="${script_dir}/30-install-containerd.sh"
 kubernetes_script="${script_dir}/40-install-kubernetes.sh"
 cidr_script="${script_dir}/check_cidrs.py"
+config_source=$CONFIG_FILE
+kubeadm_binary=$(host_path /usr/bin/kubeadm)
+kubectl_binary=$(host_path /usr/bin/kubectl)
 if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
   kernel_script=${BOOTSTRAP_TEST_KERNEL_SCRIPT:-$kernel_script}
   containerd_script=${BOOTSTRAP_TEST_CONTAINERD_SCRIPT:-$containerd_script}
   kubernetes_script=${BOOTSTRAP_TEST_KUBERNETES_SCRIPT:-$kubernetes_script}
   cidr_script=${BOOTSTRAP_TEST_CIDR_SCRIPT:-$cidr_script}
+  config_source=${BOOTSTRAP_TEST_CONFIG_FILE:-$config_source}
   for gate in "$kernel_script" "$containerd_script" "$kubernetes_script" "$cidr_script"; do
     safe_test_gate "$gate" || complete STOP_PRECONDITION test-gate-unsafe "$EXIT_PRECONDITION" NONE
   done
+  [[ "$config_source" == /* && -O "$config_source" && ! -L "$config_source" ]] ||
+    complete STOP_PRECONDITION test-config-unsafe "$EXIT_PRECONDITION" NONE
 fi
-run_stage_gate "$kernel_script" || complete STOP_PRECONDITION kernel-gate-failed "$EXIT_PRECONDITION" NONE
-run_stage_gate "$containerd_script" || complete STOP_PRECONDITION containerd-gate-failed "$EXIT_PRECONDITION" NONE
-run_stage_gate "$kubernetes_script" || complete STOP_PRECONDITION kubernetes-gate-failed "$EXIT_PRECONDITION" NONE
 
-route_output=$(ip -o -4 route show table all 2>/dev/null) || complete STOP_PRECONDITION route-unreadable "$EXIT_PRECONDITION" NONE
-declare -a cidr_arguments=(--service-cidr "$SERVICE_CIDR" --pod-cidr "$POD_CIDR")
-while IFS= read -r address; do
-  [[ -n "$address" ]] && cidr_arguments+=(--address "$address")
-done < <(printf '%s\n' "$address_output" | awk '{print $4}')
-while IFS= read -r route; do
-  [[ -n "$route" ]] && cidr_arguments+=(--route "$route")
-done < <(printf '%s\n' "$route_output" | awk '$1 != "default" {print $1}')
-if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
-  "$cidr_script" "${cidr_arguments[@]}" >/dev/null 2>&1 || complete STOP_PRECONDITION cidr-gate-failed "$EXIT_PRECONDITION" NONE
-else
-  python3 "$cidr_script" "${cidr_arguments[@]}" >/dev/null 2>&1 || complete STOP_PRECONDITION cidr-gate-failed "$EXIT_PRECONDITION" NONE
-fi
+pre_init_gates
 
 # MODE 由公共 parse_mode helper 赋值。
 # shellcheck disable=SC2153
@@ -169,18 +355,33 @@ if [[ "$MODE" == CHECK ]]; then
   complete PASS_KUBEADM_CHECK apply-required 0 '50-kubeadm-init.sh --apply'
 fi
 
-if ! kubeadm config validate --config "$CONFIG_FILE" >/dev/null 2>&1; then
+trap cleanup_config_snapshot EXIT
+snapshot_result=0
+create_config_snapshot || snapshot_result=$?
+(( snapshot_result == 0 )) || {
+  (( snapshot_result == EXIT_UNKNOWN_STATE )) && complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-unsafe "$EXIT_UNKNOWN_STATE" NONE
+  complete STOP_APPLY_FAILED kubeadm-config-snapshot-create-failed "$EXIT_APPLY_FAILED" NONE
+}
+
+config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+if ! "$kubeadm_binary" config validate --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-config-validation-failed "$EXIT_APPLY_FAILED" NONE
 fi
-if ! kubeadm init phase preflight --config "$CONFIG_FILE" >/dev/null 2>&1; then
+pre_init_gates
+config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+if ! "$kubeadm_binary" init phase preflight --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-phase-preflight-failed "$EXIT_APPLY_FAILED" NONE
 fi
-initialization_state_gate
-evidence_dir=$(host_path /root/dev-infra-evidence)
-open_evidence 12-kubeadm "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
-if ! kubeadm init --config "$CONFIG_FILE" >/dev/null 2>&1; then
+pre_init_gates
+config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+if ! "$kubeadm_binary" init --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-init-failed "$EXIT_APPLY_FAILED" NONE
 fi
+config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+managed_kubernetes_clients_gate
+
+admin_conf=$(host_path /etc/kubernetes/admin.conf)
+etcd_member=$(host_path /var/lib/etcd/member)
 
 if [[ ! -f "$admin_conf" || -L "$admin_conf" || "$(path_mode "$admin_conf")" != 600 ]] || ! owned_by_expected "$admin_conf"; then
   complete STOP_VERIFY_FAILED admin-conf-metadata-drift "$EXIT_VERIFY_FAILED" NONE
@@ -198,8 +399,36 @@ done
 [[ -d "$etcd_member" && ! -L "$etcd_member" ]] || complete STOP_VERIFY_FAILED etcd-member-missing "$EXIT_VERIFY_FAILED" NONE
 [[ "$(systemctl is-active kubelet.service 2>/dev/null)" == active ]] || complete STOP_VERIFY_FAILED kubelet-inactive "$EXIT_VERIFY_FAILED" NONE
 
+crictl_binary=$(host_path /usr/local/bin/crictl)
+for binary in "$crictl_binary" "$kubectl_binary"; do
+  [[ -f "$binary" && ! -L "$binary" && -x "$binary" && "$(path_mode "$binary")" == 755 ]] ||
+    complete STOP_VERIFY_FAILED post-init-client-unsafe "$EXIT_VERIFY_FAILED" NONE
+  owned_by_expected "$binary" || complete STOP_VERIFY_FAILED post-init-client-owner-drift "$EXIT_VERIFY_FAILED" NONE
+done
+runtime_endpoint=unix:///run/containerd/containerd.sock
+set +e
+control_plane_output=$("$crictl_binary" \
+  --runtime-endpoint "$runtime_endpoint" \
+  --image-endpoint "$runtime_endpoint" \
+  ps --state Running --output json 2>/dev/null)
+crictl_exit=$?
+set -e
+(( crictl_exit == 0 )) || complete STOP_VERIFY_FAILED control-plane-runtime-query-failed "$EXIT_VERIFY_FAILED" NONE
+if ! printf '%s' "$control_plane_output" | control_plane_json_is_exact; then
+  complete STOP_VERIFY_FAILED control-plane-runtime-set-drift "$EXIT_VERIFY_FAILED" NONE
+fi
+
+kubectl_query_is_empty get daemonset kube-proxy --ignore-not-found --output=name ||
+  complete STOP_VERIFY_FAILED kube-proxy-daemonset-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
+kubectl_query_is_empty get pods --selector k8s-app=kube-proxy --output=name ||
+  complete STOP_VERIFY_FAILED kube-proxy-pods-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
+kubectl_query_is_empty get configmap kube-proxy --ignore-not-found --output=name ||
+  complete STOP_VERIFY_FAILED kube-proxy-configmap-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
+
 certificate=$(host_path /etc/kubernetes/pki/apiserver.crt)
 [[ -f "$certificate" && ! -L "$certificate" ]] || complete STOP_VERIFY_FAILED apiserver-certificate-missing "$EXIT_VERIFY_FAILED" NONE
+openssl x509 -checkend 0 -noout -in "$certificate" >/dev/null 2>&1 ||
+  complete STOP_VERIFY_FAILED apiserver-certificate-expired "$EXIT_VERIFY_FAILED" NONE
 certificate_output=$(openssl x509 -in "$certificate" -noout -subject -ext subjectAltName -enddate 2>/dev/null) || complete STOP_VERIFY_FAILED apiserver-certificate-unreadable "$EXIT_VERIFY_FAILED" NONE
 certificate_subject=$(printf '%s\n' "$certificate_output" | sed -n 's/^subject=//p')
 certificate_expiry=$(printf '%s\n' "$certificate_output" | sed -n 's/^notAfter=//p')
@@ -207,12 +436,17 @@ certificate_expiry=$(printf '%s\n' "$certificate_output" | sed -n 's/^notAfter=/
 [[ -n "$certificate_expiry" && "$certificate_expiry" != *$'\n'* ]] || complete STOP_VERIFY_FAILED certificate-expiry-invalid "$EXIT_VERIFY_FAILED" NONE
 grep -Fq 'IP Address:10.93.1.27' <<<"$certificate_output" || complete STOP_VERIFY_FAILED certificate-san-missing "$EXIT_VERIFY_FAILED" NONE
 
+evidence_dir=$(host_path /root/dev-infra-evidence)
+open_evidence 12-kubeadm "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
+
 log_evidence CONFIG_SHA256="$CONFIG_SHA256"
 log_evidence NODE="$EXPECTED_HOSTNAME"
 log_evidence CONTROL_PLANE_ENDPOINT=10.93.1.27:6443
 log_evidence ADMIN_CONF_PRESENT=true
 log_evidence ADMIN_CONF_MODE=600
 log_evidence STATIC_COMPONENTS=kube-apiserver,kube-controller-manager,kube-scheduler,etcd
+log_evidence RUNTIME_COMPONENTS=kube-apiserver,kube-controller-manager,kube-scheduler,etcd
+log_evidence KUBE_PROXY_OBJECTS=absent
 log_evidence KUBELET_ACTIVE=active
 log_evidence "CERTIFICATE_SUBJECT=${certificate_subject}"
 log_evidence CERTIFICATE_SAN_IP=10.93.1.27

@@ -3,6 +3,13 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
+if [[ -n "${APT_CONFIG+x}" || -n "${KUBECONFIG+x}" || -n "${GNUPGHOME+x}" ||
+      -n "${DPKG_ADMINDIR+x}" || -n "${DPKG_ROOT+x}" ||
+      -n "${DPKG_FORCE+x}" || -n "${DPKG_FRONTEND_LOCKED+x}" ]]; then
+  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
+  exit 10
+fi
+
 if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
   if [[ "$EUID" -eq 0 ]]; then
     printf 'RESULT=STOP_TEST_MODE\nREASON=test-mode-is-for-unprivileged-tests-only\n' >&2
@@ -31,6 +38,7 @@ readonly PHASE=install-kubernetes
 readonly REPOSITORY_URL='https://pkgs.k8s.io/core:/stable:/v1.36/deb/'
 readonly RELEASE_KEY_URL="${REPOSITORY_URL}Release.key"
 readonly RELEASE_KEY_SHA256=7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d
+readonly RELEASE_KEYRING_SHA256=5c463ffcfcb24088da4b049ac7b2c7b61dd9d6a7fa4f24e74eb0a533c53bfa17
 readonly RELEASE_KEY_FINGERPRINT=DE15B14486CD377B9E876E1A234654DA9A296436
 readonly SOURCE_CONTENT='deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /'
 readonly -a PACKAGES=(kubeadm kubectl kubelet kubernetes-cni)
@@ -76,6 +84,83 @@ managed_parent_safe() {
   [[ -d "$1" && ! -L "$1" && "$(path_mode "$1")" == 755 ]] && owned_by_expected "$1"
 }
 
+managed_directory_state() {
+  local target=$1
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    printf 'MISSING\n'
+    return
+  fi
+  if [[ -L "$target" || ! -d "$target" || "$(path_mode "$target")" != 755 ]] || ! owned_by_expected "$target"; then
+    printf 'UNKNOWN\n'
+    return
+  fi
+  printf 'COMPLIANT\n'
+}
+
+cni_path_chain_safe() {
+  local opt_root cni_root bin_root opt_state cni_state bin_state
+  opt_root=$(host_path /opt)
+  cni_root=$(host_path /opt/cni)
+  bin_root=$(host_path /opt/cni/bin)
+  opt_state=$(managed_directory_state "$opt_root") || return 1
+  cni_state=$(managed_directory_state "$cni_root") || return 1
+  bin_state=$(managed_directory_state "$bin_root") || return 1
+  [[ "$opt_state" == COMPLIANT ]] || return 1
+  [[ "$cni_state" == MISSING || "$cni_state" == COMPLIANT ]] || return 1
+  [[ "$bin_state" == MISSING || "$bin_state" == COMPLIANT ]] || return 1
+}
+
+kubelet_mutable_inputs_are_pristine() {
+  local kubelet_root default_file root_mode first_entry sensitive_path
+  kubelet_root=$(host_path /var/lib/kubelet)
+  default_file=$(host_path /etc/default/kubelet)
+  if [[ -e "$kubelet_root" || -L "$kubelet_root" ]]; then
+    [[ -d "$kubelet_root" && ! -L "$kubelet_root" ]] || return 1
+    owned_by_expected "$kubelet_root" || return 1
+    root_mode=$(path_mode "$kubelet_root") || return 1
+    [[ "$root_mode" == 700 || "$root_mode" == 750 || "$root_mode" == 755 ]] || return 1
+    first_entry=$(find "$kubelet_root" -mindepth 1 -print -quit 2>/dev/null) || return 1
+    [[ -z "$first_entry" ]] || return 1
+  fi
+  for sensitive_path in \
+    "${kubelet_root}/kubeadm-flags.env" \
+    "${kubelet_root}/config.yaml" \
+    "${kubelet_root}/instance-config.yaml" \
+    "${kubelet_root}/pki"; do
+    [[ ! -e "$sensitive_path" && ! -L "$sensitive_path" ]] || return 1
+  done
+  if [[ ! -e "$default_file" && ! -L "$default_file" ]]; then
+    return 0
+  fi
+  [[ -f "$default_file" && ! -L "$default_file" && "$(path_mode "$default_file")" == 644 ]] || return 1
+  owned_by_expected "$default_file" || return 1
+  [[ "$(path_size "$default_file")" == 0 ]]
+}
+
+kubernetes_shadow_paths_absent() {
+  local binary_name shadow
+  for binary_name in kubeadm kubectl kubelet; do
+    shadow=$(host_path "/usr/sbin/${binary_name}")
+    [[ ! -e "$shadow" && ! -L "$shadow" ]] || return 1
+  done
+}
+
+managed_kubernetes_binaries_are_exact() {
+  local package logical target ownership verification
+  for package in kubeadm kubectl kubelet; do
+    logical="/usr/bin/${package}"
+    target=$(host_path "$logical")
+    [[ -f "$target" && ! -L "$target" && -x "$target" && "$(path_mode "$target")" == 755 ]] || return 1
+    owned_by_expected "$target" || return 1
+    ownership=$(dpkg-query -S "$logical" 2>/dev/null) || return 1
+    [[ "$ownership" == "${package}: ${logical}" ]] || return 1
+  done
+  for package in "${PACKAGES[@]}"; do
+    verification=$(dpkg --verify "$package" 2>/dev/null) || return 1
+    [[ -z "$verification" ]] || return 1
+  done
+}
+
 download_parent_safe() {
   local mode
   mode=$(path_mode "$1") || return 1
@@ -113,6 +198,14 @@ package_size() {
 package_filename() {
   local package=$1
   printf 'amd64/%s_%s_amd64.deb\n' "$package" "$(package_version "$package")"
+}
+
+package_depends() {
+  case "$1" in
+    kubelet) printf 'iptables (>= 1.4.21),kubernetes-cni (>= 1.2.0),mount,util-linux,libc6\n' ;;
+    kubeadm|kubectl|kubernetes-cni) printf 'NONE\n' ;;
+    *) return 1 ;;
+  esac
 }
 
 cni_manifest() {
@@ -162,12 +255,31 @@ source_state() {
 }
 
 keyring_fingerprint() {
-  gpg --batch --no-options --no-autostart --show-keys --with-colons --fingerprint "$1" 2>/dev/null |
-    awk -F: '$1 == "fpr" {print $10}'
+  local target=$1 homedir=$2
+  gpg --batch --no-options --no-autostart --homedir "$homedir" \
+    --show-keys --with-colons --fingerprint "$target" 2>/dev/null |
+    awk -F: '
+      $1 == "pub" {pubs++; awaiting_primary=1; next}
+      $1 == "sub" {subkeys++; awaiting_primary=0; next}
+      $1 == "fpr" {
+        fingerprints++
+        if (awaiting_primary == 1) {
+          primary=$10
+          awaiting_primary=0
+        } else {
+          unexpected_fingerprint=1
+        }
+      }
+      END {
+        if (pubs != 1 || subkeys != 0 || fingerprints != 1 ||
+            unexpected_fingerprint == 1 || primary == "") exit 1
+        print primary
+      }
+    '
 }
 
 keyring_state() {
-  local target=$1 fingerprints
+  local target=$1 actual_digest
   if [[ ! -e "$target" && ! -L "$target" ]]; then
     printf 'MISSING\n'
     return
@@ -176,11 +288,11 @@ keyring_state() {
     printf 'UNKNOWN\n'
     return
   fi
-  fingerprints=$(keyring_fingerprint "$target") || {
+  actual_digest=$(sha256_file "$target") || {
     printf 'UNKNOWN\n'
     return
   }
-  if [[ "$fingerprints" == "$RELEASE_KEY_FINGERPRINT" ]]; then
+  if [[ "$actual_digest" == "$RELEASE_KEYRING_SHA256" ]]; then
     printf 'COMPLIANT\n'
   else
     printf 'UNKNOWN\n'
@@ -229,33 +341,170 @@ installed_record() {
   dpkg-query -W -f='${Status}\t${Version}\t${Architecture}\n' "$1" 2>/dev/null
 }
 
+base_dependencies_are_exact() {
+  local dependency record status version architecture extra
+  for dependency in "${BASE_DEPENDENCIES[@]}"; do
+    record=$(dpkg-query -W -f='${Status}\t${Version}\t${Architecture}\n' "$dependency" 2>/dev/null) || return 1
+    IFS=$'\t' read -r status version architecture extra <<<"$record"
+    [[ "$status" == 'install ok installed' && -n "$version" && "$architecture" == amd64 && -z "$extra" ]] || return 1
+    if [[ "$dependency" == iptables ]]; then
+      dpkg --compare-versions "$version" ge 1.4.21 || return 1
+    fi
+  done
+}
+
 candidate_is_exact() {
-  local package=$1 expected output candidate repo_count
+  local package=$1 apt_config=$2 expected output candidate repo_count
   expected=$(package_version "$package")
-  output=$(apt-cache policy "$package" 2>/dev/null) || return 1
+  output=$(APT_CONFIG="$apt_config" apt-cache policy "$package" 2>/dev/null) || return 1
   candidate=$(awk '/^[[:space:]]*Candidate:/ {print $2; count++} END {exit count != 1}' <<<"$output") || return 1
   [[ "$candidate" == "$expected" ]] || return 1
   repo_count=$(grep -Fc "${REPOSITORY_URL%/}" <<<"$output")
   [[ "$repo_count" == 1 ]]
 }
 
+bound_packages_index() {
+  local apt_config=$1 lists_dir output line_count line
+  local identifier uri suite component architecture filename extra mode
+  lists_dir="${apt_workspace}/lists"
+  # APT 自己展开 indextargets 的占位符，shell 不应展开。
+  # shellcheck disable=SC2016
+  output=$(APT_CONFIG="$apt_config" apt-get indextargets --format '$(IDENTIFIER)|$(URI)|$(SUITE)|$(COMPONENT)|$(ARCHITECTURE)|$(FILENAME)' 2>/dev/null) || return 1
+  line_count=$(awk 'NF {count++} END {print count+0}' <<<"$output") || return 1
+  [[ "$line_count" == 1 ]] || return 1
+  line=$(awk 'NF {print}' <<<"$output") || return 1
+  IFS='|' read -r identifier uri suite component architecture filename extra <<<"$line"
+  [[ -z "$extra" && "$identifier" == Packages && "$uri" == "${REPOSITORY_URL}Packages" ]] || return 1
+  [[ "$suite" == / && -z "$component" && "$architecture" == amd64 ]] || return 1
+  [[ "${filename%/*}" == "$lists_dir" && -f "$filename" && ! -L "$filename" ]] || return 1
+  mode=$(path_mode "$filename") || return 1
+  [[ "$mode" == 600 || "$mode" == 644 ]] || return 1
+  owned_by_expected "$filename" || return 1
+  printf '%s\n' "$filename"
+}
+
 signed_index_record() {
-  local package=$1 version output
+  local package=$1 index_file=$2 version
   version=$(package_version "$package")
-  output=$(apt-cache show --no-all-versions "${package}=${version}" 2>/dev/null) || return 1
-  awk '
-    /^Package: / {package=$2; packages++}
-    /^Version: / {version=$2; versions++}
-    /^Architecture: / {architecture=$2; architectures++}
-    /^Filename: / {filename=$2; filenames++}
-    /^Size: / {size=$2; sizes++}
-    /^SHA256: / {sha256=$2; digests++}
-    END {
-      if (packages != 1 || versions != 1 || architectures != 1 ||
-          filenames != 1 || sizes != 1 || digests != 1) exit 1
-      print package "\t" version "\t" architecture "\t" filename "\t" size "\t" sha256
+  awk -v expected_package="$package" -v expected_version="$version" '
+    BEGIN {RS=""; FS="\n"}
+    {
+      split("", count)
+      split("", value)
+      for (i=1; i<=NF; i++) {
+        separator=index($i, ": ")
+        if (separator == 0) continue
+        field=substr($i, 1, separator-1)
+        field_value=substr($i, separator+2)
+        if (field == "Package" || field == "Version" || field == "Architecture" ||
+            field == "Filename" || field == "Size" || field == "SHA256" ||
+            field == "Depends" || field == "Pre-Depends" || field == "Recommends" ||
+            field == "Suggests" || field == "Conflicts" || field == "Breaks" ||
+            field == "Replaces" || field == "Provides") {
+          count[field]++
+          value[field]=field_value
+        }
+      }
+      if (value["Package"] == expected_package && value["Version"] == expected_version &&
+          value["Architecture"] == "amd64") {
+        matches++
+        valid=(count["Package"] == 1 && count["Version"] == 1 &&
+               count["Architecture"] == 1 && count["Filename"] == 1 &&
+               count["Size"] == 1 && count["SHA256"] == 1 &&
+               count["Depends"] <= 1 && count["Pre-Depends"] <= 1 &&
+               count["Recommends"] <= 1 && count["Suggests"] <= 1 &&
+               count["Conflicts"] <= 1 && count["Breaks"] <= 1 &&
+               count["Replaces"] <= 1 && count["Provides"] <= 1)
+        selected_valid=valid
+        selected_package=value["Package"]
+        selected_version=value["Version"]
+        selected_architecture=value["Architecture"]
+        selected_filename=value["Filename"]
+        selected_size=value["Size"]
+        selected_sha256=value["SHA256"]
+        selected_depends=value["Depends"]
+        relationship_count=count["Pre-Depends"]
+        relationship_count+=count["Recommends"]
+        relationship_count+=count["Suggests"]
+        relationship_count+=count["Conflicts"]
+        relationship_count+=count["Breaks"]
+        relationship_count+=count["Replaces"]
+        relationship_count+=count["Provides"]
+      }
     }
-  ' <<<"$output"
+    END {
+      if (matches != 1 || selected_valid != 1) exit 1
+      if (selected_depends == "") selected_depends="NONE"
+      print selected_package "\t" selected_version "\t" selected_architecture "\t" \
+        selected_filename "\t" selected_size "\t" selected_sha256 "\t" \
+        selected_depends "\t" relationship_count
+    }
+  ' "$index_file"
+}
+
+simulation_transaction_is_exact() {
+  awk '
+    function expected_version(package) {
+      if (package == "kubeadm" || package == "kubectl" || package == "kubelet") {
+        return "1.36.3-1.1"
+      }
+      if (package == "kubernetes-cni") return "1.9.1-1.1"
+      return ""
+    }
+    $1 == "Inst" || $1 == "Conf" {
+      action=$1
+      package=$2
+      version_field=$3
+      if (version_field !~ /^\(/ || $NF != "[amd64])") exit 1
+      sub(/^\(/, "", version_field)
+      sub(/\)$/, "", version_field)
+      expected=expected_version(package)
+      if (expected == "" || version_field != expected ||
+          ++seen[action, package] != 1) exit 1
+      action_count[action]++
+      next
+    }
+    $1 == "Remv" || $1 == "Purg" {exit 1}
+    END {
+      if (action_count["Inst"] != 4 || action_count["Conf"] != 4) exit 1
+      split("kubeadm kubectl kubelet kubernetes-cni", packages, " ")
+      for (i=1; i<=4; i++) {
+        if (seen["Inst", packages[i]] != 1 ||
+            seen["Conf", packages[i]] != 1) exit 1
+      }
+    }
+  '
+}
+
+downloaded_debs_are_exact() {
+  local package deb expected_digest actual_digest
+  download_directory_exact "$download_dir" "${deb_basenames[@]}" || return 1
+  for package in "${PACKAGES[@]}"; do
+    deb="${download_dir}/${package}_$(package_version "$package")_amd64.deb"
+    [[ -f "$deb" && ! -L "$deb" ]] || return 1
+    owned_by_expected "$deb" || return 1
+    [[ "$(path_size "$deb")" == "$(package_size "$package")" ]] || return 1
+    expected_digest=$(package_sha256 "$package") || return 1
+    actual_digest=$(sha256_file "$deb") || return 1
+    [[ "$actual_digest" == "$expected_digest" ]] || return 1
+  done
+}
+
+deb_dependency_contract_is_exact() {
+  local deb=$1 package=$2 field value expected_depends
+  expected_depends=$(package_depends "$package") || return 1
+  for field in Depends Pre-Depends Recommends Suggests Conflicts Breaks Replaces Provides; do
+    value=$(dpkg-deb -f "$deb" "$field" 2>/dev/null) || return 1
+    if [[ "$field" == Depends ]]; then
+      if [[ "$expected_depends" == NONE ]]; then
+        [[ -z "$value" ]] || return 1
+      else
+        [[ "$value" == "$expected_depends" ]] || return 1
+      fi
+    else
+      [[ -z "$value" ]] || return 1
+    fi
+  done
 }
 
 cni_directory_state() {
@@ -304,23 +553,188 @@ cni_directory_state() {
   printf 'COMPLIANT\n'
 }
 
-target_holds() {
-  apt-mark showhold 2>/dev/null |
-    awk '$1 == "kubeadm" || $1 == "kubectl" || $1 == "kubelet" || $1 == "kubernetes-cni" {print}' |
-    sort
+HOLDS_RAW=
+
+load_hold_state() {
+  HOLDS_RAW=$(dpkg-query -W -f='${Package}\t${Architecture}\t${db:Status-Want}\n' 2>/dev/null) || return 1
+}
+
+all_holds_from_loaded_state() {
+  awk -F '\t' '
+    NF == 0 {next}
+    NF != 3 || $1 !~ /^[a-z0-9][a-z0-9+.-]*$/ ||
+      $2 !~ /^[a-z0-9][a-z0-9-]*$/ ||
+      ($3 != "unknown" && $3 != "install" && $3 != "hold" &&
+       $3 != "deinstall" && $3 != "purge") {exit 1}
+    {key=$1 SUBSEP $2; if (seen[key]++) exit 1}
+    $3 == "hold" {if ($2 == "amd64") print $1; else print $1 ":" $2}
+  ' <<<"$HOLDS_RAW" | sort
 }
 
 verify_installed_state() {
+  verify_package_selection_and_holds || return "$?"
+  kubernetes_shadow_paths_absent || return 1
+  managed_kubernetes_binaries_are_exact || return 1
+  [[ "$(cni_directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]] || return 1
+  kubelet_pre_init_state_is_expected || return 1
+  kubelet_mutable_inputs_are_pristine
+}
+
+verify_package_selection_and_holds() {
   local package expected record holds
   for package in "${PACKAGES[@]}"; do
     expected=$(package_version "$package")
     record=$(installed_record "$package") || return 1
-    [[ "$record" == $'install ok installed\t'"${expected}"$'\tamd64' ]] || return 1
-    candidate_is_exact "$package" || return 1
+    [[ "$record" == $'hold ok installed\t'"${expected}"$'\tamd64' ]] || return 1
   done
-  holds=$(target_holds)
+  load_hold_state || return 2
+  holds=$(all_holds_from_loaded_state) || return 1
   [[ "$holds" == $'kubeadm\nkubectl\nkubelet\nkubernetes-cni' ]] || return 1
-  [[ "$(cni_directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]]
+}
+
+kubelet_pre_init_state_is_expected() {
+  local output fragment dropin fragment_file dropin_file unit_file ownership
+  output=$(systemctl show kubelet.service \
+    --property=LoadState \
+    --property=UnitFileState \
+    --property=ActiveState \
+    --property=SubState \
+    --property=FragmentPath \
+    --property=DropInPaths 2>/dev/null) || return 1
+  awk -F= '
+    NF != 2 {exit 1}
+    $1 != "LoadState" && $1 != "UnitFileState" && $1 != "ActiveState" &&
+      $1 != "SubState" && $1 != "FragmentPath" && $1 != "DropInPaths" {exit 1}
+    {if (seen[$1]++) exit 1; value[$1]=$2; field_count++}
+    END {
+      fragment_ok=(value["FragmentPath"] == "/usr/lib/systemd/system/kubelet.service" ||
+                   value["FragmentPath"] == "/lib/systemd/system/kubelet.service")
+      dropin_ok=(value["DropInPaths"] == "/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf" ||
+                 value["DropInPaths"] == "/lib/systemd/system/kubelet.service.d/10-kubeadm.conf")
+      state_ok=((value["ActiveState"] == "activating" &&
+                 value["SubState"] == "auto-restart") ||
+                (value["ActiveState"] == "active" &&
+                 value["SubState"] == "running"))
+      if (field_count != 6 || value["LoadState"] != "loaded" ||
+          value["UnitFileState"] != "enabled" || !fragment_ok || !dropin_ok ||
+          !state_ok) exit 1
+    }
+  ' <<<"$output" || return 1
+  fragment=$(awk -F= '$1 == "FragmentPath" {print $2}' <<<"$output") || return 1
+  dropin=$(awk -F= '$1 == "DropInPaths" {print $2}' <<<"$output") || return 1
+  fragment_file=$(host_path "$fragment")
+  dropin_file=$(host_path "$dropin")
+  for unit_file in "$fragment_file" "$dropin_file"; do
+    [[ -f "$unit_file" && ! -L "$unit_file" && "$(path_mode "$unit_file")" == 644 ]] || return 1
+    owned_by_expected "$unit_file" || return 1
+  done
+  ownership=$(dpkg-query -S "$fragment" 2>/dev/null) || return 1
+  [[ "$ownership" == "kubelet: ${fragment}" ]] || return 1
+  ownership=$(dpkg-query -S "$dropin" 2>/dev/null) || return 1
+  [[ "$ownership" == "kubeadm: ${dropin}" ]] || return 1
+}
+
+apt_workspace=
+apt_config=
+gpg_workspace=
+
+# trap 在 APT workspace 创建后间接调用该清理函数。
+# shellcheck disable=SC2329
+cleanup_apt_workspace() {
+  local download_parent
+  [[ -n "$apt_workspace" ]] || return 0
+  download_parent=$(host_path /var/tmp)
+  [[ "$apt_workspace" == "${download_parent}/.kubernetes-apt."* ]] || return 0
+  [[ -d "$apt_workspace" && ! -L "$apt_workspace" ]] || return 0
+  rm -r -- "$apt_workspace"
+}
+
+# trap 在 GnuPG workspace 创建后间接调用该清理函数。
+# shellcheck disable=SC2329
+cleanup_gpg_workspace() {
+  local parent
+  [[ -n "$gpg_workspace" ]] || return 0
+  parent=$(host_path /var/tmp)
+  [[ "$gpg_workspace" == "${parent}/.kubernetes-gpg."* ]] || return 0
+  [[ -d "$gpg_workspace" && ! -L "$gpg_workspace" && "$(path_mode "$gpg_workspace")" == 700 ]] || return 0
+  owned_by_expected "$gpg_workspace" || return 0
+  rm -r -- "$gpg_workspace"
+}
+
+# trap 间接调用。
+# shellcheck disable=SC2329
+cleanup_temporary_workspaces() {
+  cleanup_apt_workspace || true
+  cleanup_gpg_workspace || true
+}
+
+create_gpg_workspace() {
+  local parent
+  parent=$(host_path /var/tmp)
+  download_parent_safe "$parent" || return "$EXIT_UNKNOWN_STATE"
+  gpg_workspace=$(mktemp -d "${parent}/.kubernetes-gpg.XXXXXX") || return "$EXIT_APPLY_FAILED"
+  [[ "$(path_mode "$gpg_workspace")" == 700 ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$gpg_workspace" || return "$EXIT_UNKNOWN_STATE"
+}
+
+create_apt_workspace() {
+  local download_parent status_source lists_dir archives_dir state_dir
+  download_parent=$(host_path /var/tmp)
+  download_parent_safe "$download_parent" || return "$EXIT_UNKNOWN_STATE"
+  status_source=$(host_path /var/lib/dpkg/status)
+  [[ -f "$status_source" && ! -L "$status_source" ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$status_source" || return "$EXIT_UNKNOWN_STATE"
+  apt_workspace=$(mktemp -d "${download_parent}/.kubernetes-apt.XXXXXX") || return "$EXIT_APPLY_FAILED"
+  [[ "$(path_mode "$apt_workspace")" == 700 ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$apt_workspace" || return "$EXIT_UNKNOWN_STATE"
+  lists_dir="${apt_workspace}/lists"
+  archives_dir="${apt_workspace}/archives"
+  state_dir="${apt_workspace}/state"
+  mkdir -m 0700 -- "$lists_dir" "$archives_dir" "$state_dir" || return "$EXIT_APPLY_FAILED"
+  apt_config="${apt_workspace}/apt.conf"
+  if ! printf '%s\n' \
+    'Dir::Etc::main "-";' \
+    'Dir::Etc::parts "-";' \
+    "Dir::Etc::sourcelist \"${source_target}\";" \
+    'Dir::Etc::sourceparts "-";' \
+    "Dir::State::lists \"${lists_dir}\";" \
+    "Dir::State::status \"${status_source}\";" \
+    "Dir::State::extended_states \"${state_dir}/extended_states\";" \
+    "Dir::Cache::archives \"${archives_dir}\";" \
+    'Dir::Cache::pkgcache "";' \
+    'Dir::Cache::srcpkgcache "";' \
+    'Acquire::Languages "none";' \
+    'Acquire::GzipIndexes "false";' \
+    'APT::Get::List-Cleanup "0";' >"$apt_config"; then
+    return "$EXIT_APPLY_FAILED"
+  fi
+  chmod 0600 "$apt_config" || return "$EXIT_APPLY_FAILED"
+}
+
+effective_apt_configuration_is_safe() {
+  local dump=$1 status_source directive expected key_count exact_count
+  status_source=$(host_path /var/lib/dpkg/status)
+  while IFS='|' read -r directive expected; do
+    key_count=$(awk -v key="$directive" '$1 == key {count++} END {print count+0}' <<<"$dump") || return 1
+    exact_count=$(grep -Fxc "$expected" <<<"$dump") || true
+    [[ "$key_count" == 1 && "$exact_count" == 1 ]] || return 1
+  done <<EOF
+Dir::Etc::main|Dir::Etc::main "-";
+Dir::Etc::parts|Dir::Etc::parts "-";
+Dir::Etc::sourcelist|Dir::Etc::sourcelist "${source_target}";
+Dir::Etc::sourceparts|Dir::Etc::sourceparts "-";
+Dir::State::lists|Dir::State::lists "${apt_workspace}/lists";
+Dir::State::status|Dir::State::status "${status_source}";
+Dir::State::extended_states|Dir::State::extended_states "${apt_workspace}/state/extended_states";
+Dir::Cache::archives|Dir::Cache::archives "${apt_workspace}/archives";
+Dir::Cache::pkgcache|Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache|Dir::Cache::srcpkgcache "";
+EOF
+  if grep -Eiq '^(DPkg::(Pre-Invoke|Post-Invoke|Pre-Install-Pkgs)|APT::Update::[^[:space:]]*Invoke[^[:space:]]*)(::|[[:space:]])' <<<"$dump"; then
+    return 1
+  fi
+  [[ -f "$apt_config" && ! -L "$apt_config" && "$(path_mode "$apt_config")" == 600 ]] || return 1
+  owned_by_expected "$apt_config"
 }
 
 download_directory_exact() {
@@ -338,21 +752,23 @@ download_directory_exact() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in apt-cache apt-get apt-mark awk cat chmod curl date dpkg-deb dpkg-query find gpg grep id install ln mktemp rm sed sort stat sync tr wc; do
+for required_command in apt-cache apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln mkdir mktemp rm sed sort stat sync systemctl tr wc; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   complete STOP_PRECONDITION missing-command-sha256 "$EXIT_PRECONDITION" NONE
 fi
 
-for dependency in "${BASE_DEPENDENCIES[@]}"; do
-  dependency_state=$(dpkg-query -W -f='${Status}\n' "$dependency" 2>/dev/null) || complete STOP_UNKNOWN_STATE "base-dependency-missing-${dependency}" "$EXIT_UNKNOWN_STATE" NONE
-  [[ "$dependency_state" == 'install ok installed' ]] || complete STOP_UNKNOWN_STATE "base-dependency-drift-${dependency}" "$EXIT_UNKNOWN_STATE" NONE
-done
+cni_path_chain_safe || complete STOP_UNKNOWN_STATE cni-path-chain-unsafe "$EXIT_UNKNOWN_STATE" NONE
+kubernetes_shadow_paths_absent || complete STOP_UNKNOWN_STATE kubernetes-binary-shadow-present "$EXIT_UNKNOWN_STATE" NONE
+kubelet_mutable_inputs_are_pristine || complete STOP_UNKNOWN_STATE kubelet-pre-init-inputs-not-pristine "$EXIT_UNKNOWN_STATE" NONE
+
+base_dependencies_are_exact || complete STOP_UNKNOWN_STATE base-dependency-contract-drift "$EXIT_UNKNOWN_STATE" NONE
 if dpkg-query -W -f='${Status}\t${Version}\t${Architecture}\n' cri-tools >/dev/null 2>&1; then
   complete STOP_UNKNOWN_STATE cri-tools-package-forbidden "$EXIT_UNKNOWN_STATE" NONE
 fi
-if apt-mark showhold 2>/dev/null | grep -Fxq cri-tools; then
+load_hold_state || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
+if grep -Fxq cri-tools <<<"$HOLDS_RAW"; then
   complete STOP_UNKNOWN_STATE cri-tools-hold-forbidden "$EXIT_UNKNOWN_STATE" NONE
 fi
 
@@ -377,33 +793,42 @@ keyring_contract=$(keyring_state "$keyring_target")
 [[ "$source_contract" == "$keyring_contract" ]] || complete STOP_UNKNOWN_STATE partial-repository-contract "$EXIT_UNKNOWN_STATE" NONE
 
 installed_count=0
+held_selection_count=0
 for package in "${PACKAGES[@]}"; do
   if record=$(installed_record "$package"); then
     expected=$(package_version "$package")
-    [[ "$record" == $'install ok installed\t'"${expected}"$'\tamd64' ]] || complete STOP_UNKNOWN_STATE "installed-package-drift-${package}" "$EXIT_UNKNOWN_STATE" NONE
+    if [[ "$record" == $'hold ok installed\t'"${expected}"$'\tamd64' ]]; then
+      ((held_selection_count += 1))
+    elif [[ "$record" != $'install ok installed\t'"${expected}"$'\tamd64' ]]; then
+      complete STOP_UNKNOWN_STATE "installed-package-drift-${package}" "$EXIT_UNKNOWN_STATE" NONE
+    fi
     ((installed_count += 1))
   fi
 done
 (( installed_count == 0 || installed_count == ${#PACKAGES[@]} )) || complete STOP_UNKNOWN_STATE partial-kubernetes-installation "$EXIT_UNKNOWN_STATE" NONE
-holds=$(target_holds)
+holds=$(all_holds_from_loaded_state) || complete STOP_UNKNOWN_STATE package-hold-state-invalid "$EXIT_UNKNOWN_STATE" NONE
 hold_count=$(awk 'NF {count++} END {print count+0}' <<<"$holds")
-(( hold_count == 0 || hold_count == ${#PACKAGES[@]} )) || complete STOP_UNKNOWN_STATE partial-kubernetes-hold "$EXIT_UNKNOWN_STATE" NONE
+if (( hold_count != 0 )) && [[ "$holds" != $'kubeadm\nkubectl\nkubelet\nkubernetes-cni' ]]; then
+  complete STOP_UNKNOWN_STATE package-hold-set-unknown "$EXIT_UNKNOWN_STATE" NONE
+fi
 if (( installed_count == 0 && hold_count != 0 )); then
   complete STOP_UNKNOWN_STATE orphan-kubernetes-hold "$EXIT_UNKNOWN_STATE" NONE
+fi
+if (( installed_count != 0 )) &&
+  { (( hold_count == 0 && held_selection_count != 0 )) ||
+    (( hold_count == ${#PACKAGES[@]} && held_selection_count != ${#PACKAGES[@]} )); }; then
+  complete STOP_UNKNOWN_STATE package-selection-state-drift "$EXIT_UNKNOWN_STATE" NONE
 fi
 cni_state=$(cni_directory_state "$(host_path /opt/cni/bin)")
 if (( installed_count == 0 )); then
   [[ "$cni_state" == MISSING ]] || complete STOP_UNKNOWN_STATE preexisting-cni-directory "$EXIT_UNKNOWN_STATE" NONE
 else
   [[ "$source_contract" == COMPLIANT && "$hold_count" == "${#PACKAGES[@]}" && "$cni_state" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE partial-kubernetes-contract "$EXIT_UNKNOWN_STATE" NONE
-  verify_installed_state || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
+  verification_result=0
+  verify_installed_state || verification_result=$?
+  (( verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
+  (( verification_result == 0 )) || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
   complete ALREADY_COMPLIANT kubernetes-packages-ready 0 '50-kubeadm-init.sh --check'
-fi
-
-if [[ "$source_contract" == COMPLIANT ]]; then
-  for package in "${PACKAGES[@]}"; do
-    candidate_is_exact "$package" || complete STOP_UNKNOWN_STATE "candidate-drift-${package}" "$EXIT_UNKNOWN_STATE" NONE
-  done
 fi
 
 # MODE 由公共 parse_mode helper 赋值。
@@ -413,6 +838,13 @@ if [[ "$MODE" == CHECK ]]; then
 fi
 
 if [[ "$source_contract" == MISSING ]]; then
+  workspace_result=0
+  create_gpg_workspace || workspace_result=$?
+  (( workspace_result == 0 )) || {
+    (( workspace_result == EXIT_UNKNOWN_STATE )) && complete STOP_UNKNOWN_STATE gpg-workspace-unsafe "$EXIT_UNKNOWN_STATE" NONE
+    complete STOP_APPLY_FAILED gpg-workspace-create-failed "$EXIT_APPLY_FAILED" NONE
+  }
+  trap cleanup_temporary_workspaces EXIT
   armored_key=$(mktemp "${keyring_target}.armored.XXXXXX") || complete STOP_APPLY_FAILED key-download-temp-failed "$EXIT_APPLY_FAILED" NONE
   decoded_key=$(mktemp "${keyring_target}.decoded.XXXXXX") || complete STOP_APPLY_FAILED key-decode-temp-failed "$EXIT_APPLY_FAILED" NONE
   if ! curl --fail --location --proto '=https' --tlsv1.2 --output "$armored_key" "$RELEASE_KEY_URL" >/dev/null 2>&1; then
@@ -424,15 +856,20 @@ if [[ "$source_contract" == MISSING ]]; then
     rm -f -- "$armored_key" "$decoded_key"
     complete STOP_SUPPLY_CHAIN_MISMATCH release-key-digest-mismatch "$EXIT_SUPPLY_CHAIN" NONE
   }
-  armored_fingerprints=$(keyring_fingerprint "$armored_key") || true
+  armored_fingerprints=$(keyring_fingerprint "$armored_key" "$gpg_workspace") || true
   [[ "$armored_fingerprints" == "$RELEASE_KEY_FINGERPRINT" ]] || {
     rm -f -- "$armored_key" "$decoded_key"
     complete STOP_SUPPLY_CHAIN_MISMATCH release-key-fingerprint-mismatch "$EXIT_SUPPLY_CHAIN" NONE
   }
-  if ! gpg --batch --no-options --no-autostart --yes --dearmor --output "$decoded_key" "$armored_key" >/dev/null 2>&1; then
+  if ! gpg --batch --no-options --no-autostart --homedir "$gpg_workspace" --yes --dearmor --output "$decoded_key" "$armored_key" >/dev/null 2>&1; then
     rm -f -- "$armored_key" "$decoded_key"
     complete STOP_APPLY_FAILED release-key-dearmor-failed "$EXIT_APPLY_FAILED" NONE
   fi
+  decoded_digest=$(sha256_file "$decoded_key") || true
+  [[ "$decoded_digest" == "$RELEASE_KEYRING_SHA256" ]] || {
+    rm -f -- "$armored_key" "$decoded_key"
+    complete STOP_SUPPLY_CHAIN_MISMATCH release-keyring-digest-mismatch "$EXIT_SUPPLY_CHAIN" NONE
+  }
   publish_result=0
   publish_new_file "$decoded_key" "$keyring_target" 0644 || publish_result=$?
   rm -f -- "$armored_key" "$decoded_key"
@@ -449,9 +886,19 @@ if [[ "$source_contract" == MISSING ]]; then
 fi
 
 [[ "$(keyring_state "$keyring_target")" == COMPLIANT && "$(source_state "$source_target")" == COMPLIANT ]] || complete STOP_VERIFY_FAILED repository-contract-verification-failed "$EXIT_VERIFY_FAILED" NONE
-apt-get -o APT::Update::Error-Mode=any update >/dev/null 2>&1 || complete STOP_APPLY_FAILED apt-update-failed "$EXIT_APPLY_FAILED" NONE
+workspace_result=0
+create_apt_workspace || workspace_result=$?
+(( workspace_result == 0 )) || {
+  (( workspace_result == EXIT_UNKNOWN_STATE )) && complete STOP_UNKNOWN_STATE apt-workspace-unsafe "$EXIT_UNKNOWN_STATE" NONE
+  complete STOP_APPLY_FAILED apt-workspace-create-failed "$EXIT_APPLY_FAILED" NONE
+}
+trap cleanup_temporary_workspaces EXIT
+effective_apt_config=$(APT_CONFIG="$apt_config" apt-config dump 2>/dev/null) || complete STOP_UNKNOWN_STATE effective-apt-config-unreadable "$EXIT_UNKNOWN_STATE" NONE
+effective_apt_configuration_is_safe "$effective_apt_config" || complete STOP_UNKNOWN_STATE effective-apt-config-unsafe "$EXIT_UNKNOWN_STATE" NONE
+APT_CONFIG="$apt_config" apt-get -o APT::Update::Error-Mode=any update >/dev/null 2>&1 || complete STOP_APPLY_FAILED apt-update-failed "$EXIT_APPLY_FAILED" NONE
+packages_index=$(bound_packages_index "$apt_config") || complete STOP_SUPPLY_CHAIN_MISMATCH packages-index-provenance-invalid "$EXIT_SUPPLY_CHAIN" NONE
 for package in "${PACKAGES[@]}"; do
-  candidate_is_exact "$package" || complete STOP_UNKNOWN_STATE "candidate-drift-${package}" "$EXIT_UNKNOWN_STATE" NONE
+  candidate_is_exact "$package" "$apt_config" || complete STOP_UNKNOWN_STATE "candidate-drift-${package}" "$EXIT_UNKNOWN_STATE" NONE
 done
 
 download_parent=$(host_path /var/tmp)
@@ -467,15 +914,17 @@ for package in "${PACKAGES[@]}"; do
   expected_filename=$(package_filename "$package")
   expected_size=$(package_size "$package")
   expected_digest=$(package_sha256 "$package")
-  IFS=$'\t' read -r index_package index_version index_architecture index_filename index_size index_digest < <(signed_index_record "$package") || {
+  expected_depends=$(package_depends "$package")
+  index_record=$(signed_index_record "$package" "$packages_index") || {
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "signed-index-metadata-invalid-${package}" "$EXIT_SUPPLY_CHAIN" NONE
   }
-  [[ "$index_package" == "$package" && "$index_version" == "$version" && "$index_architecture" == amd64 && "$index_filename" == "$expected_filename" && "$index_size" == "$expected_size" && "$index_digest" == "$expected_digest" ]] || {
+  IFS=$'\t' read -r index_package index_version index_architecture index_filename index_size index_digest index_depends index_relationship_count <<<"$index_record"
+  [[ "$index_package" == "$package" && "$index_version" == "$version" && "$index_architecture" == amd64 && "$index_filename" == "$expected_filename" && "$index_size" == "$expected_size" && "$index_digest" == "$expected_digest" && "$index_depends" == "$expected_depends" && "$index_relationship_count" == 0 ]] || {
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "signed-index-metadata-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
   }
-  (cd "$download_dir" && apt-get download "${package}=${version}" >/dev/null 2>&1) || {
+  (cd "$download_dir" && APT_CONFIG="$apt_config" apt-get download "${package}=${version}" >/dev/null 2>&1) || {
     rm -r -- "$download_dir"
     complete STOP_APPLY_FAILED "package-download-failed-${package}" "$EXIT_APPLY_FAILED" NONE
   }
@@ -506,6 +955,10 @@ for package in "${PACKAGES[@]}"; do
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "deb-metadata-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
   }
+  deb_dependency_contract_is_exact "$deb" "$package" || {
+    rm -r -- "$download_dir"
+    complete STOP_SUPPLY_CHAIN_MISMATCH "deb-dependency-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
+  }
   actual_digest=$(sha256_file "$deb") || {
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "deb-digest-unreadable-${package}" "$EXIT_SUPPLY_CHAIN" NONE
@@ -517,21 +970,66 @@ for package in "${PACKAGES[@]}"; do
   debs+=("$deb")
 done
 
-evidence_dir=$(host_path /root/dev-infra-evidence)
-open_evidence 11-kubernetes "$evidence_dir" || {
+simulation_output=$(LC_ALL=C APT_CONFIG="$apt_config" apt-get -s install --no-install-recommends --no-download "${debs[@]}" 2>&1) || {
   rm -r -- "$download_dir"
-  complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
+  complete STOP_APPLY_FAILED local-deb-simulation-failed "$EXIT_APPLY_FAILED" NONE
 }
-apt-get install -y --no-install-recommends --no-download "${debs[@]}" >/dev/null 2>&1 || {
+simulation_transaction_is_exact <<<"$simulation_output" || {
+  rm -r -- "$download_dir"
+  complete STOP_SUPPLY_CHAIN_MISMATCH local-deb-transaction-drift "$EXIT_SUPPLY_CHAIN" NONE
+}
+download_directory_exact "${apt_workspace}/archives" || {
+  rm -r -- "$download_dir"
+  complete STOP_SUPPLY_CHAIN_MISMATCH apt-archives-cache-raced "$EXIT_SUPPLY_CHAIN" NONE
+}
+cni_path_chain_safe || {
+  rm -r -- "$download_dir"
+  complete STOP_UNKNOWN_STATE cni-path-chain-raced "$EXIT_UNKNOWN_STATE" NONE
+}
+kubernetes_shadow_paths_absent || {
+  rm -r -- "$download_dir"
+  complete STOP_UNKNOWN_STATE kubernetes-binary-shadow-raced "$EXIT_UNKNOWN_STATE" NONE
+}
+kubelet_mutable_inputs_are_pristine || {
+  rm -r -- "$download_dir"
+  complete STOP_UNKNOWN_STATE kubelet-pre-init-inputs-raced "$EXIT_UNKNOWN_STATE" NONE
+}
+base_dependencies_are_exact || {
+  rm -r -- "$download_dir"
+  complete STOP_UNKNOWN_STATE base-dependency-contract-raced "$EXIT_UNKNOWN_STATE" NONE
+}
+downloaded_debs_are_exact || {
+  rm -r -- "$download_dir"
+  complete STOP_SUPPLY_CHAIN_MISMATCH downloaded-deb-raced "$EXIT_SUPPLY_CHAIN" NONE
+}
+APT_CONFIG="$apt_config" apt-get install -y --no-install-recommends --no-download "${debs[@]}" >/dev/null 2>&1 || {
   rm -r -- "$download_dir"
   complete STOP_APPLY_FAILED local-deb-install-failed "$EXIT_APPLY_FAILED" NONE
 }
+APT_CONFIG="$apt_config" apt-mark hold "${PACKAGES[@]}" >/dev/null 2>&1 || complete STOP_APPLY_FAILED package-hold-failed "$EXIT_APPLY_FAILED" NONE
+hold_verification_result=0
+verify_package_selection_and_holds || hold_verification_result=$?
+(( hold_verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
+(( hold_verification_result == 0 )) || complete STOP_VERIFY_FAILED package-hold-verification-failed "$EXIT_VERIFY_FAILED" NONE
+cni_path_chain_safe || {
+  rm -r -- "$download_dir"
+  complete STOP_UNKNOWN_STATE cni-path-chain-post-install-unsafe "$EXIT_UNKNOWN_STATE" NONE
+}
+[[ "$(cni_directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]] || {
+  rm -r -- "$download_dir"
+  complete STOP_VERIFY_FAILED cni-package-payload-invalid "$EXIT_VERIFY_FAILED" NONE
+}
 rm -r -- "$download_dir"
-apt-mark hold "${PACKAGES[@]}" >/dev/null 2>&1 || complete STOP_APPLY_FAILED package-hold-failed "$EXIT_APPLY_FAILED" NONE
-verify_installed_state || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
+verification_result=0
+verify_installed_state || verification_result=$?
+(( verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
+(( verification_result == 0 )) || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
 if dpkg-query -W -f='${Status}\n' cri-tools >/dev/null 2>&1; then
   complete STOP_VERIFY_FAILED cri-tools-package-installed "$EXIT_VERIFY_FAILED" NONE
 fi
+
+evidence_dir=$(host_path /root/dev-infra-evidence)
+open_evidence 11-kubernetes "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
 
 log_evidence REPOSITORY_MINOR=v1.36
 log_evidence RELEASE_KEY_SHA256="$RELEASE_KEY_SHA256"

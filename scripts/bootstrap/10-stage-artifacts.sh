@@ -60,22 +60,22 @@ approved_record() {
 
   case "$name" in
     containerd)
-      printf '%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' /usr/local/bin
+      printf '%s\t%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' 628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054 /usr/local/bin
       ;;
     runc)
-      printf '%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' /usr/local/sbin/runc
+      printf '%s\t%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' 3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c /usr/local/sbin/runc
       ;;
     crictl)
-      printf '%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' /usr/local/bin/crictl
+      printf '%s\t%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' 83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3 /usr/local/bin/crictl
       ;;
     helm)
-      printf '%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' /usr/local/bin/helm
+      printf '%s\t%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' 0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36 /usr/local/bin/helm
       ;;
     gateway-api)
-      printf '%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 'kubernetes://gateway-api/standard'
+      printf '%s\t%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73 'kubernetes://gateway-api/standard'
       ;;
     cilium-chart)
-      printf '%s\t%s\t%s\n' 1.20.0 'https://helm.cilium.io/cilium-1.20.0.tgz' 'kubernetes://kube-system/cilium'
+      printf '%s\t%s\t%s\t%s\n' 1.20.0 'https://helm.cilium.io/cilium-1.20.0.tgz' c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883 'kubernetes://kube-system/cilium'
       ;;
     *)
       return 1
@@ -229,8 +229,8 @@ while IFS=$'\t' read -r name version url digest target extra; do
   if array_contains "$base" "${basenames[@]-}"; then
     complete STOP_SUPPLY_CHAIN_MISMATCH lock-basename-duplicate "$EXIT_SUPPLY_CHAIN"
   fi
-  IFS=$'\t' read -r expected_version expected_url expected_target <<<"$expected_record"
-  [[ "$version" == "$expected_version" && "$url" == "$expected_url" && "$target" == "$expected_target" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-schema-drift "$EXIT_SUPPLY_CHAIN"
+  IFS=$'\t' read -r expected_version expected_url expected_digest expected_target <<<"$expected_record"
+  [[ "$version" == "$expected_version" && "$url" == "$expected_url" && "$digest" == "$expected_digest" && "$target" == "$expected_target" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-schema-drift "$EXIT_SUPPLY_CHAIN"
   names+=("$name")
   urls+=("$url")
   digests+=("$digest")
