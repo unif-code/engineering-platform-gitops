@@ -7,6 +7,8 @@ metadata:
   namespace: flux-system
 data:
   availability: NON_HA
+  capacityDecision: DEV-002
+  capacityProfile: SINGLE_USER_MINIMAL
   environment: DEV
   storageBinding: minio-gen-1
   storageDeviation: DEV-001

@@ -20,11 +20,14 @@ runbook/          # 人工命令、输出摘录、恢复演练与 Gate 证据
 - 带外 `kubectl apply`、手工 Patch 或临时扩缩容不会成为 Desired State，Flux 会在下一次 Reconcile 将其纠正。bootstrap 阶段确需带外执行的命令必须逐条记录在 `runbook/`。
 - 每个 Flux `Kustomization`/`HelmRelease` 必须显式声明 Reconcile ServiceAccount；Controller 禁止跨 Namespace 引用。
 
-## DEV-001 治理例外
+## Architecture Decisions
 
 > **ACTIVE：仅限 V0.1 DEV。** MinIO 与被保护的数据位于同一台服务器，整机故障会同时丢失源数据和备份。该拓扑只验证 S3/Versioning/Object Lock、备份和恢复机制，不满足 Cluster 外故障域要求。最迟必须在 **V0.5 Production Candidate 验收前**切换为真实 Cluster 外 S3-compatible Repository；PROD 永不适用。
 
-来源：`engineering-platform/docs/architecture/deviations.md#dev-001v01-dev-备份与审计归档与集群同机`。
+- DEV-001 canonical source：`engineering-platform/docs/decisions/DEV-001-same-host-backup.md`。
+- DEV-002 canonical source：`engineering-platform/docs/decisions/DEV-002-single-user-kubernetes-profile.md`。
+
+DEV-002 使用完整功能的单用户 Kubernetes Profile：83Gi 稳态 PVC、103Gi 恢复态 PVC、130Gi 平台规划峰值，保留 7 天备份和 3.8GiB 主机 Swap；Pod 使用 `NoSwap`。local-path 的 PVC/ResourceQuota 是申请合同而非文件系统硬 quota；根盘达到 80% 告警，达到 90% 时停止新发布、PVC 变更和恢复演练。
 
 ## 本地校验
 

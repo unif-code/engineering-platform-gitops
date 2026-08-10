@@ -1,6 +1,6 @@
 # Gateway 应用 Smoke
 
-> Task 7 两个 owner 提供真实镜像 digest 且 Task 8 应用清单合并前，本 runbook 保持 `BLOCKED`。
+> frontend/backend 两个 owner 提供真实镜像 digest 且应用 Desired State 合并前，本 runbook 保持 `BLOCKED`。
 
 GitOps commit / PR：
 frontend digest：
@@ -23,4 +23,6 @@ Hostname：`platform.dev.local`
 - [ ] 只存在 Gateway 北向入口，没有 NodePort/额外 Ingress。
 - [ ] Gateway TLS 证书 SAN、Serial、有效期与 Secret 一致。
 - [ ] Deployment 实际 Image ID 与 GitOps digest 一致。
+- [ ] frontend 起始 resources 为 `10m/64Mi` requests、`250m/256Mi` limits；backend 为 `100m/256Mi` requests、`1 CPU/1Gi` limits。
+- [ ] Alembic migration Job 为 `100m/256Mi` requests、`1 CPU/1Gi` limits，并在成功后才放行应用 Reconcile。
 - [ ] PASS

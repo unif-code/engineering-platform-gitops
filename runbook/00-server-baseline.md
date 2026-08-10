@@ -3,15 +3,15 @@
 执行人：`root`（人工回执；实名待补）
 执行时间（含时区）：`2026-08-10T00:42:03Z`（`2026-08-10 08:42:03 Asia/Shanghai`）
 服务器标识：`retail-test-workflow`（`10.93.1.27/24`，VMware VM）
-对应 GitOps 提交：`d8ad31a`
+对应 GitOps 提交：基线回执 `d0cb7fd`；单用户 Profile `9589d93`、`f615400`、`ea98777`
 
 | 检查 | 命令 | 判定 | 实测 |
 | --- | --- | --- | --- |
 | CPU | `nproc` | ≥16 | 16，通过 |
 | 内存 | `free -g` | total ≥62 | 62 GiB，通过 |
-| 磁盘 | `lsblk`、`df -hT` | 系统盘 ≥200G；独立数据盘/目录 ≥500G | 单块 500G `/dev/sda`；根 LV 497G、可用 438G；无独立数据盘/目录，不通过 |
+| 磁盘 | `lsblk`、`df -hT` | DEV-002：当前可用空间 - 130Gi ≥ 300Gi | 单块 500G `/dev/sda`；根 LV 497G、可用 438G；`438 - 130 = 308Gi`，通过单用户 Profile |
 | 架构 | `uname -m` | x86_64 | x86_64，通过 |
-| Swap | `swapon --show` | 输出为空（`swapoff -a` 并注释 fstab） | `/swap.img` 3.8 GiB 已启用，不通过 |
+| Swap | `swapon --show` | DEV-002：保留现有 3.8GiB；kubelet `failSwapOn=false` + `NoSwap` | `/swap.img` 3.8 GiB 已启用；主机基线通过，kubelet 配置待 bootstrap 验证 |
 | 发行版 | `cat /etc/os-release` | systemd 主流发行版 | Ubuntu 24.04.4 LTS；systemd 255 running，通过 |
 | 时间同步 | `timedatectl` | NTP 同步 active | Chrony active，时钟已同步，通过 |
 | cgroup | `stat -fc %T /sys/fs/cgroup` | cgroup v2 | `cgroup2fs`，通过 |
@@ -59,15 +59,19 @@ cilium: not installed
 
 ## 结论
 
-- [ ] 全部通过，可以继续 bootstrap。
-- [x] 存在不达标项，已停止并请求决策。
+- [x] CPU、内存、架构、磁盘容量、Swap、OS、NTP、cgroup v2 与 `ip_forward` 已按 DEV-002 通过。
+- [ ] bootstrap 前置条件全部关闭。
+- [x] DNS、bridge netfilter 与 containerd 共存仍为 Stop Gate，未执行安装。
 
-不达标项 / 待决策：
+已关闭的容量决策：
 
-1. 当前只有一块承载系统和现有 Docker 数据的 500G 磁盘，根文件系统可用 438G；不满足“独立数据盘/目录 ≥500G”。需增加独立磁盘并确认挂载点，或批准带风险说明的架构偏差。
-2. `/swap.img` 仍启用。需确认允许永久禁用，并在执行后核验 `/etc/fstab`。
-3. `dev-cp.unif.internal` 尚未解析。需确认是否将其固定映射到 `10.93.1.27`，以及由 DNS 还是 `/etc/hosts` 提供。
-4. 服务器存在活跃 Docker 工作负载和共用的 containerd.io 2.2.5。升级到规划版本 2.3.1、生成配置和重启 containerd 可能中断现有服务；需明确采用专用新主机，或批准维护窗口及共存方案。
-5. `br_netfilter` 未加载，bridge netfilter sysctl 尚不存在；获得继续授权后可在 bootstrap 阶段修复并复核。
+1. 不增加独立 500Gi 数据盘；使用共享根盘和 DEV-002 的 130Gi 峰值包络，按实测为其他程序保留约 308Gi。
+2. 不执行 `swapoff`；保留现有 `/swap.img`，Pod 通过 kubelet `NoSwap` 保持不使用 Swap。
 
-根据实施计划 Task 2 Step 1 的 Stop Gate，上述决策关闭前不得执行 containerd/Kubernetes 安装。
+未关闭项 / 待决策：
+
+1. `dev-cp.unif.internal` 尚未解析。需确认是否固定映射到 `10.93.1.27`，以及由 DNS 还是 `/etc/hosts` 提供。
+2. 服务器存在活跃 Docker 工作负载和共用的 containerd.io 2.2.5。升级到规划版本 2.3.1、生成配置和重启 containerd 可能中断现有服务；必须先完成只读共存审计，再由用户选择维护窗口、独立 CRI 或 DEV-only 版本偏差。
+3. `br_netfilter` 未加载，bridge netfilter sysctl 尚不存在；只在获得继续授权后的 bootstrap 阶段修复并复核。
+
+根据单用户 Profile 实施计划 Task 8，下一步只能先做【运维】只读 containerd 共存审计；收到完整回执前不得执行 containerd/Kubernetes 安装或升级。
