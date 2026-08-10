@@ -1,8 +1,8 @@
 # DEV 单节点 Bootstrap Fail-Closed Design
 
-状态：已完成对话式设计确认，等待书面审阅
+状态：已完成对话式设计确认；2026-08-10 已批准 CNI 单一 package ownership 修订
 
-工作分支：`feat/bootstrap-fail-closed-v01`
+工作分支：`main`（用户已批准后续工作直接提交；禁止 force push）
 
 目标主机：`retail-test-workflow` / Ubuntu 24.04.4 LTS / `linux/amd64`
 
@@ -14,10 +14,10 @@
 在不触碰 `engineering-platform` 前端仓和 backend 仓的前提下，为单节点 DEV 主机建立一组可审计、可分阶段执行、默认拒绝危险状态的 bootstrap 工具。第一阶段从已完成的旧运行时清退证据开始，完成以下闭环：
 
 1. 验证主机身份、网络、内核与旧运行时清退证据。
-2. 从官方来源获取并固定 containerd 及全部配套制品。
+2. 从官方来源获取并固定 containerd 配套制品与 Kubernetes 签名 package 闭包。
 3. 配置 Kubernetes 所需内核模块与 sysctl。
-4. 安装并验证 containerd、runc、CNI plugins 和 crictl。
-5. 安装并锁定 Kubernetes `v1.36.3` 的 kubelet、kubeadm 和 kubectl。
+4. 安装并验证 containerd、runc 和 crictl。
+5. 通过官方签名 APT repository 安装并锁定 Kubernetes `v1.36.3` 的 kubelet、kubeadm、kubectl 与 package-owned CNI plugins。
 6. 使用固定 IP 初始化无 kube-proxy 的单节点 control plane。
 7. 安装 Gateway API Standard CRD `v1.6.1` 与 Cilium `1.20.0`。
 8. 验证节点 `Ready`、Cilium 健康且集群不存在 kube-proxy。
@@ -35,20 +35,20 @@
 - Secret 创建或读取 Secret 值。
 - 自动重置已有 Kubernetes 集群。
 - 自动回滚、自动清理未知状态或 `apt autoremove`。
-- 对 `main` 的直接提交或 push。
+- force push、历史重写或未经验证的远端发布。
 
 ## 3. 已确认决策
 
 | 主题 | 决策 |
 | --- | --- |
-| Git 工作方式 | 所有设计、脚本、测试与文档仅进入 `feat/bootstrap-fail-closed-v01`；`main` 保持不变 |
+| Git 工作方式 | bootstrap 前半段 feature 已 fast-forward 至 `main@98a1f3f`；后续工作按用户批准直接进入 `main`，每个提交独立验证，普通 push，禁止 force |
 | 现有仓库内容 | 全部保留，不删除、不重命名；未来组件标记为 `STAGED` 或 `BLOCKED` |
 | 激活方式 | 注释仅用于说明；真正的停止机制是从活动 Kustomize/Flux 引用链断开 |
 | containerd 来源 | 官方 GitHub release 的 `containerd-2.3.1-linux-amd64.tar.gz` |
 | containerd artifact SHA-256 | `628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054` |
 | containerd 配置 | config version 4、CRI v1、overlayfs、runc v2、`SystemdCgroup = true` |
 | runc | `v1.3.6` 官方 `linux/amd64` artifact |
-| CNI plugins | `v1.9.1` 官方 `linux/amd64` artifact |
+| CNI plugins | `kubernetes-cni=1.9.1-1.1`，只由官方 v1.36 签名 APT package 安装并持有文件 ownership；`.deb` SHA-256 `4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93` |
 | crictl | `v1.36.0` 官方 `linux/amd64` artifact；固定显式 containerd endpoint |
 | Kubernetes | `v1.36.3`，只接受官方 `pkgs.k8s.io` v1.36 APT repository 的精确 package 版本 |
 | Helm CLI | `v3.21.0` 官方 `linux/amd64` artifact；只用于固定 Cilium chart 的安装与核验 |
@@ -160,11 +160,11 @@ name<TAB>version<TAB>url<TAB>sha256<TAB>target
 3. `sha256` 必须是 64 位小写十六进制；下载完成后先校验再解包。
 4. tar archive 在解包前检查绝对路径、`..` 穿越、异常 symlink 和预期文件清单。
 5. 所有文件先放入 `/root/dev-infra-artifacts/pcs-2026-08-10.1`，目录权限为 `0700`。
-6. 安装阶段禁止联网，只消费已验证的本地 staged artifacts。
-7. Kubernetes APT repository 必须使用独立 `signed-by` keyring；package candidate 和实际 `.deb` metadata 必须精确匹配 `v1.36.3`，安装后立即 `apt-mark hold`。
+6. release artifact 安装阶段禁止联网，只消费已验证的本地 staged artifacts。唯一例外是 `40-install-kubernetes.sh --apply` 的 APT 获取子阶段：它可以获取已批准 key、签名 index 与精确 `.deb`；验证完成后，package 安装必须使用隔离目录中的本地文件并显式禁止补下载。
+7. Kubernetes APT repository 必须使用独立 `signed-by` keyring。`Release.key` armored SHA-256 固定为 `7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d`，唯一 primary fingerprint 固定为 `DE15B14486CD377B9E876E1A234654DA9A296436`。package candidate、签名 Packages stanza、下载 `.deb` 的 size/SHA-256 与 `dpkg-deb` metadata 必须逐项精确匹配；安装后四个 package 立即 `apt-mark hold`。
 8. 下载或 APT metadata 中出现同版本不同 digest 时，结果是 `STOP_SUPPLY_CHAIN_MISMATCH`，不得自动接受新值。
 
-锁清单精确覆盖七项：containerd archive、runc、CNI plugins、crictl、Helm CLI、Gateway API Standard manifest 和 Cilium chart。containerd systemd unit 作为仓库内审阅文件交付，安装时记录 Git blob 与文件 SHA-256，不属于网络下载制品。Kubernetes package 的签名 repository metadata、package version 与下载后的 `.deb` SHA-256 同样进入 evidence。
+release artifact 锁清单精确覆盖六项：containerd archive、runc、crictl、Helm CLI、Gateway API Standard manifest 和 Cilium chart。CNI archive 不再进入 staging 或 Task 5，避免 unmanaged 文件随后被 `dpkg` 接管。containerd systemd unit 作为仓库内审阅文件交付，安装时记录 Git blob 与文件 SHA-256，不属于网络下载制品。Kubernetes 的签名 repository metadata、四个 package 的版本与下载 `.deb` SHA-256 同样进入 evidence。
 
 ## 7. 阶段数据流
 
@@ -188,7 +188,7 @@ name<TAB>version<TAB>url<TAB>sha256<TAB>target
 
 ### 7.2 `10-stage-artifacts.sh`
 
-`--check` 只验证网络、allowlist、staging 目录和磁盘空间；`--apply` 下载并验证全部制品。该阶段不写 `/usr/local`、`/etc`、`/opt/cni`、APT source 或 systemd。
+`--check` 只验证网络、allowlist、staging 目录和磁盘空间；`--apply` 下载并验证六项 release artifact。该阶段不写 `/usr/local`、`/etc`、`/opt/cni`、APT source 或 systemd。
 
 通过结果为 `PASS_ARTIFACTS_STAGED`。精确 artifact 已存在时返回 `ALREADY_COMPLIANT`；同名文件摘要不同则停止，不覆盖。
 
@@ -215,18 +215,26 @@ net.ipv4.ip_forward=1
 
 - containerd binaries：`/usr/local/bin`
 - runc：`/usr/local/sbin/runc`
-- CNI plugins：`/opt/cni/bin`
 - crictl：`/usr/local/bin/crictl`
 - systemd unit：`/usr/local/lib/systemd/system/containerd.service`
 - config：`/etc/containerd/config.toml`
 - root：`/var/lib/containerd`
 - state/socket：`/run/containerd` 与 `/run/containerd/containerd.sock`
 
-任何未知 containerd/runc/crictl binary、非空旧 data root、未知 service unit 或未知 config 都是停止条件。安装后验证 binary version、config version 4、CRI plugin、overlayfs、runc v2、`SystemdCgroup=true`、service active/enabled 与 socket 权限；`crictl info` 必须显式使用 `unix:///run/containerd/containerd.sock`，要求 `RuntimeReady=true`，Cilium 安装前允许 `NetworkReady=false`。
+Task 5 不创建或管理 `/opt/cni/bin`；该路径由 Task 6 的 `kubernetes-cni` package 独占 ownership。任何未知 containerd/runc/crictl binary、非空旧 data root、未知 service unit 或未知 config 都是停止条件。安装后验证 binary version、config version 4、CRI plugin、overlayfs、runc v2、`SystemdCgroup=true`、service active/enabled 与 socket 权限；`crictl info` 必须显式使用 `unix:///run/containerd/containerd.sock`，要求 `RuntimeReady=true`，CNI/Cilium 安装前允许 `NetworkReady=false`。
 
 ### 7.5 `40-install-kubernetes.sh`
 
-只配置官方 v1.36 APT repository，安装精确版本的 kubelet、kubeadm、kubectl 及其明确依赖，然后 hold。检测到其他 Kubernetes minor repository、浮动 candidate、未知 package hold 或已安装不同版本时停止。
+只配置官方 v1.36 APT repository，安装并 hold 以下唯一 package 集：
+
+- `kubeadm=1.36.3-1.1`，amd64 `.deb` SHA-256 `7225b4b7928de8bb9b7a69b75524c2df1a6f78fcbb40724f7e5b49926119c2af`。
+- `kubectl=1.36.3-1.1`，amd64 `.deb` SHA-256 `22c1bbcecfdee50ad013ab7ab9e90ea9d3aaa01d3ac38ac578534976f856c330`。
+- `kubelet=1.36.3-1.1`，amd64 `.deb` SHA-256 `99c77d7c814ac0b0f1f346c11074160fbbab8243c27ba4236f84f2e536c8eaca`。
+- `kubernetes-cni=1.9.1-1.1`，amd64 `.deb` SHA-256 `4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93`。
+
+`kubernetes-cni` 是 `/opt/cni/bin` 的唯一安装者；批准 `.deb` 的完整 payload 已与 upstream `cni-plugins-linux-amd64-v1.9.1.tgz` 逐文件比对且字节一致。Task 6 在 mutation 前要求该路径不存在或处于精确 package-owned 状态，安装后验证 package file set、内容、owner 与 mode。禁止安装 `cri-tools` package，继续使用 Task 5 的 `/usr/local/bin/crictl`。`iptables`、`mount`、`util-linux` 与 `libc6` 必须在 mutation 前已由 Ubuntu 基线满足；缺失时停止，不允许安装阶段隐式下载。
+
+检测到其他 Kubernetes minor repository、legacy source、重复 `.list`/Deb822 `.sources`、浮动 candidate、未知 package hold、部分安装或已安装不同版本时停止。APT update 使用 fail-on-any-error；下载目录只允许四个普通 `.deb`。最终本地安装显式禁止下载，不能由 APT 补入第五个 package。
 
 kubelet 在 kubeadm init 前可能处于等待配置的 restart 状态；脚本只接受官方预期状态，不把它误判为完整失败。
 
@@ -272,7 +280,7 @@ Helm install 使用 `--atomic`、固定 namespace 与超时；禁止在线 repo 
 
 最终只读验证：
 
-- containerd、runc、CNI、kubelet、kubeadm、kubectl 精确版本。
+- containerd、runc、package-owned CNI、kubelet、kubeadm、kubectl 精确版本与 ownership。
 - containerd CRI v1 健康且 systemd cgroup 生效。
 - API endpoint 为 `10.93.1.27:6443`。
 - control plane static Pods 健康。
@@ -363,6 +371,6 @@ NEXT=<允许的下一阶段或 NONE>
 - `./scripts/validate.sh` 继续通过。
 - ShellCheck 无 error。
 - bootstrap 全部单元与合同测试通过。
-- `main` SHA 未变化；所有提交仅存在于 `feat/bootstrap-fail-closed-v01`。
+- 所有提交经独立验证后线性进入用户批准的 `main`；远端发布使用普通 push，禁止 force 或历史重写。
 - 没有任何服务器命令在未先展示完整命令并取得用户回执的情况下执行。
 - 仓库实现完成不等于服务器 bootstrap 完成；后者必须以各阶段 evidence 和最终 `90-verify.sh` 回执为准。

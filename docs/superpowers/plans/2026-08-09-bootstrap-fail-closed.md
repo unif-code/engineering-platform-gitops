@@ -11,12 +11,12 @@
 ## Global Constraints
 
 - 只修改 `engineering-platform-gitops`；不得修改 frontend 或 backend 仓。
-- 所有实现仅进入 `feat/bootstrap-fail-closed-v01`；`main` 只包含已独立发布的治理提交。
+- bootstrap 前半段已于 `98a1f3f` fast-forward 至 `main`；后续任务按用户批准直接在 `main` 以线性、独立验证提交推进，禁止 force push。
 - 所有修改型入口默认 `--check`，只有显式 `--apply` 才写系统；不存在自动串联全部阶段的入口。
 - 任一未知、漂移、部分安装或供应链不一致状态必须返回 `STOP_*`，不得自动 reset、清理、覆盖或降级。
 - 禁止 `apt autoremove`、`kubeadm reset`、`rm -rf`、`curl | sh`、force、`--insecure` 与 TLS 校验关闭参数。
 - evidence 只允许写 `/root/dev-infra-evidence`，编号固定为 07～14，权限 `0600`，文件名唯一且永不覆盖；不得记录 Secret、Token、私钥、完整 kubeconfig 或环境变量转储。
-- Artifact staging 目录固定为 `/root/dev-infra-artifacts/pcs-2026-08-10.1`，权限 `0700`；安装阶段不得联网。
+- Artifact staging 目录固定为 `/root/dev-infra-artifacts/pcs-2026-08-10.1`，权限 `0700`；release artifact 安装不得联网。Task 6 的 APT 获取子阶段是唯一例外，完成签名 metadata 与 digest 验证后必须从本地隔离目录以 no-download 方式安装。
 - 主机固定为 Ubuntu 24.04、`linux/amd64`、hostname `retail-test-workflow`、Node IP `10.93.1.27`。
 - Service CIDR 为 `172.20.0.0/16`，Pod CIDR 为 `172.21.0.0/16`；必须与本机所有地址、所有 IPv4 路由和彼此不重叠。
 - 保留 `/swap.img`；kubelet 使用 `failSwapOn=false` 与 `memorySwap.swapBehavior=NoSwap`。
@@ -118,12 +118,11 @@ Expected: FAIL，原因是 bootstrap 合同校验尚不存在。
 
 - [ ] **Step 3: 写入已由官方 release metadata 核对的 lock**
 
-lock 精确包含以下七项，不允许占位符：
+lock 精确包含以下六项，不允许占位符；CNI 改由 Task 6 的签名 APT package 独占 ownership：
 
 ```text
 containerd	2.3.1	https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz	628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054	/usr/local/bin
 runc	1.3.6	https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64	3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c	/usr/local/sbin/runc
-cni-plugins	1.9.1	https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz	b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303	/opt/cni/bin
 crictl	1.36.0	https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz	83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3	/usr/local/bin/crictl
 helm	3.21.0	https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz	0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36	/usr/local/bin/helm
 gateway-api	1.6.1	https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml	24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73	kubernetes://gateway-api/standard
@@ -210,7 +209,7 @@ git commit -m "feat(bootstrap): add fail-closed host preflight"
 
 - [ ] **Step 1: 写 staging RED 测试**
 
-覆盖非官方 host、HTTP URL、摘要错误、同名漂移文件、containerd/CNI/Helm archive 的绝对路径或 `..`、逃逸 symlink、预期成员缺失、CHECK 调用修改命令，以及全部文件精确存在时 `ALREADY_COMPLIANT`。fake downloader 只复制本地 fixture，不访问网络。
+覆盖非官方 host、HTTP URL、摘要错误、同名漂移文件、containerd/Helm archive 的绝对路径或 `..`、逃逸 symlink、预期成员缺失、CHECK 调用修改命令，以及六项文件精确存在时 `ALREADY_COMPLIANT`。测试还必须拒绝重新加入 `cni-plugins` artifact，避免恢复双重 ownership。fake downloader 只复制本地 fixture，不访问网络。
 
 - [ ] **Step 2: 运行并确认 RED**
 
@@ -241,8 +240,8 @@ git commit -m "feat(bootstrap): stage verified release artifacts"
 - Modify: `scripts/test_bootstrap.py`
 
 **Interfaces:**
-- Consumes: staged containerd、runc、CNI、crictl artifacts 与仓库内 config/unit。
-- Produces: 两个受管 kernel 文件、containerd binaries、runc、CNI、crictl、systemd unit、config、active/enabled service 与 CRI socket。
+- Consumes: staged containerd、runc、crictl artifacts 与仓库内 config/unit。
+- Produces: 两个受管 kernel 文件、containerd binaries、runc、crictl、systemd unit、config、active/enabled service 与 CRI socket；不创建或管理 `/opt/cni/bin`。
 
 - [ ] **Step 1: 写 kernel RED 测试**
 
@@ -258,7 +257,7 @@ git commit -m "feat(bootstrap): stage verified release artifacts"
 
 - [ ] **Step 4: 实现 containerd 阶段并转绿**
 
-APPLY 先将 archive 解到同 filesystem 临时目录，逐个校验预期可执行文件，再以 `install` 安装；CNI 与 crictl 同理。config 与 unit 只允许 MISSING 或精确 COMPLIANT，data root 只允许不存在或空目录。完成后 daemon-reload、enable/start，并用 `containerd --version`、`runc --version`、`crictl version`、`ctr plugins ls`、显式 endpoint 的 `crictl info` allowlisted 字段验证 config v4、CRI v1、RuntimeReady、overlayfs、runc v2 与 systemd cgroup。
+APPLY 先将 containerd/crictl archive 解到同 filesystem 临时目录，逐个校验预期可执行文件，再以 `install` 安装；runc 使用已验证的单文件 artifact。config 与 unit 只允许 MISSING 或精确 COMPLIANT，data root 只允许不存在或空目录。完成后 daemon-reload、enable/start，并用 `containerd --version`、`runc --version`、`crictl version`、`ctr plugins ls`、显式 endpoint 的 `crictl info` allowlisted 字段验证 config v4、CRI v1、RuntimeReady、overlayfs、runc v2 与 systemd cgroup；CNI 缺失时允许 `NetworkReady=false`。
 
 - [ ] **Step 5: 验证并提交**
 
@@ -279,16 +278,16 @@ git commit -m "feat(bootstrap): prepare kernel and install containerd"
 - Modify: `scripts/test_bootstrap.py`
 
 **Interfaces:**
-- Produces: official v1.36 signed-by APT source、精确 `kubelet/kubeadm/kubectl=1.36.3-1.1`、hold 状态与无 kube-proxy control plane。
+- Produces: official v1.36 signed-by APT source、精确四包 `kubelet/kubeadm/kubectl=1.36.3-1.1` 与 `kubernetes-cni=1.9.1-1.1`、四包 hold、package-owned `/opt/cni/bin` 与无 kube-proxy control plane。
 - Consumes: Task 5 healthy containerd 与 `bootstrap/kubeadm/init.yaml`。
 
 - [ ] **Step 1: 写 Kubernetes package RED 测试**
 
-覆盖其他 minor source、未知 keyring/source、candidate 不是 `1.36.3-1.1`、已安装不同版本、未知 hold、下载后 `dpkg-deb -f` metadata 不匹配和 CHECK 写操作。fixture 中 amd64 官方 SHA-256 固定验证为 kubeadm `7225b4…c2af`、kubectl `22c1bb…c330`、kubelet `99c77d…eaca`。
+覆盖其他 minor/legacy/重复 `.list` 或 Deb822 `.sources`、未知 keyring/source、Release.key digest/fingerprint 漂移、candidate 漂移、已安装不同或部分 package、未知/部分 hold、预存未知 `/opt/cni/bin`、下载目录额外文件、下载后 `dpkg-deb -f` metadata 不匹配、signed Packages 与批准 digest 不一致、APT update 部分失败和 CHECK 写操作。fixture 使用以下完整 amd64 官方 SHA-256 字面量，不从 fake metadata 动态生成 expected：kubeadm `7225b4b7928de8bb9b7a69b75524c2df1a6f78fcbb40724f7e5b49926119c2af`、kubectl `22c1bbcecfdee50ad013ab7ab9e90ea9d3aaa01d3ac38ac578534976f856c330`、kubelet `99c77d7c814ac0b0f1f346c11074160fbbab8243c27ba4236f84f2e536c8eaca`、kubernetes-cni `4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93`。
 
 - [ ] **Step 2: 实现 package 阶段并转绿**
 
-APPLY 独立安装 keyring/source，`apt-get update` 后先 `apt-get download` 三个精确版本，逐包核验 metadata 和 signed Packages 中 SHA-256，再 `apt-get install` 本地 `.deb`，最后 hold 并验证版本。不得接受浮动 candidate。
+APPLY 先下载 Release.key 到私有临时文件，核验 armored SHA-256 `7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d` 与唯一 primary fingerprint `DE15B14486CD377B9E876E1A234654DA9A296436`，再原子发布 exact keyring/source。`apt-get update` 必须设置 `APT::Update::Error-Mode=any`；从已验证签名 index 下载四个精确版本到空隔离目录，逐包核验唯一 Packages stanza、size/SHA-256 和 `dpkg-deb` package/version/architecture。`kubernetes-cni` payload 必须是唯一批准的完整 `/opt/cni/bin` set；禁止安装 `cri-tools`。最终仅从四个已验证本地 `.deb` 以 no-download 方式安装，Ubuntu 基线依赖缺失即停止，随后 hold 四包并逐项验证版本、ownership、内容、owner 与 mode。不得接受浮动 candidate或让 APT 补下载依赖。
 
 - [ ] **Step 3: 写 kubeadm RED 测试**
 
@@ -387,11 +386,11 @@ git commit -m "docs(runbook): wire staged bootstrap workflow"
 
 - [ ] **Step 5: 交付前检查**
 
-确认 `git merge-base --is-ancestor origin/main HEAD` 与 `git merge-base --is-ancestor origin/feat/bootstrap-fail-closed-v01 HEAD` 都返回 0；普通 push feature 分支，不 force。仓库交付完成后只提供首个服务器阶段的完整 `00-preflight.sh --check` 命令并停止，等待回执。
+确认 `git merge-base --is-ancestor origin/main HEAD` 返回 0；在最新远端引用上普通 push `main`，不 force。仓库交付完成后只提供首个服务器阶段的完整 `00-preflight.sh --check` 命令并停止，等待回执。
 
 ## Self-Review
 
-- Spec coverage：活动根隔离、七项固定制品、CIDR、host preflight、artifact staging、kernel、containerd/crictl、Kubernetes packages、kubeadm、Gateway/Cilium、最终验证、evidence 与服务器人工 Gate 均有对应任务。
+- Spec coverage：活动根隔离、六项 release artifacts、四项签名 Kubernetes packages、CIDR、host preflight、artifact staging、kernel、containerd/crictl、package-owned CNI、kubeadm、Gateway/Cilium、最终验证、evidence 与服务器人工 Gate 均有对应任务。
 - Placeholder scan：计划不含待补内容、猜测 digest 或浮动版本；运行态未知值明确由脚本读取并形成 evidence，而非静态占位。
 - Interface consistency：所有阶段共用 Task 3 的模式、evidence 与退出码；`validate_active_root` 和 `validate_bootstrap_contracts` 都接受可替换 `root` 以便真实 fixture 测试。
 - Mutation coverage：每个修改型阶段至少覆盖未知既有状态、CHECK 禁止写、精确幂等、摘要/版本漂移和敏感信息 canary；删除关键 Gate、放宽版本或接回 staged 入口都会使测试失败。
