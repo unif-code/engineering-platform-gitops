@@ -8,6 +8,7 @@
 - 基础设施、GitOps、Kubernetes 与运维目标契约以 `engineering-platform-docs/architecture/09-infrastructure-operations.md` 为准。
 - 版本、容量、端口与阶段参数以 `engineering-platform-docs/architecture/appendix-parameters.md` 为准。
 - DEV-001 与 DEV-002 的 canonical source 是 `engineering-platform-docs/architecture/deviations.md`。
+- 治理例外先登记后引用：任何 `DEV-xxx` 编号必须先存在于 `engineering-platform-docs/architecture/deviations.md` 的登记条目，才可在本仓 runbook、文档、清单或注释中引用；铸造新编号的一方负责在同一工作批次内完成 docs 仓登记。
 - 架构基线号与文档摘要以 `engineering-platform-docs/architecture/baseline-manifest.json` 为准。
 
 ## 变更与验证
