@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -12,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMON = ROOT / 'scripts/bootstrap/lib/common.sh'
 CIDR_CHECK = ROOT / 'scripts/bootstrap/check_cidrs.py'
 PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
+STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -328,6 +332,376 @@ class PreflightTest(BootstrapTestCase):
         self.assertIn('SERVER_LOCAL_SCOPE_ONLY', result.stdout)
         self.assertNotIn(canary, result.stdout + result.stderr)
         self.assertNotIn(canary, self.evidence_text(host))
+
+
+class ArtifactStageTest(BootstrapTestCase):
+    def write_executable(self, path: Path, source: str) -> None:
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def make_environment(
+        self,
+        artifact: bytes,
+        *,
+        name: str = 'runc',
+        version: str = '1.3.6',
+        url: str = 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64',
+        digest: str | None = None,
+        target: str = '/usr/local/sbin/runc',
+        records: list[tuple[str, str, str, bytes, str]] | None = None,
+    ) -> tuple[dict[str, str], Path, Path, Path]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        fake_bin = directory / 'bin'
+        evidence = host / 'root/dev-infra-evidence'
+        evidence.mkdir(parents=True)
+        fake_bin.mkdir()
+        fixture = directory / 'download.fixture'
+        fixture.write_bytes(artifact)
+        lock = directory / 'artifacts.lock.tsv'
+        if records is None:
+            records = [(name, version, url, artifact, target)]
+        lock.write_text(
+            ''.join(
+                '\t'.join(
+                    [
+                        record_name,
+                        record_version,
+                        record_url,
+                        (
+                            digest
+                            if len(records) == 1 and record_name == name and digest
+                            else hashlib.sha256(record_artifact).hexdigest()
+                        ),
+                        record_target,
+                    ]
+                )
+                + '\n'
+                for record_name, record_version, record_url, record_artifact, record_target in records
+            ),
+            encoding='utf-8',
+        )
+        curl_log = directory / 'curl.log'
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'curl',
+            '''
+            #!/bin/sh
+            printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
+            output=
+            fail=false
+            location=false
+            protocol=false
+            tls=false
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --fail)
+                  fail=true
+                  shift
+                  ;;
+                --location)
+                  location=true
+                  shift
+                  ;;
+                --proto)
+                  [ "$2" = '=https' ] || exit 64
+                  protocol=true
+                  shift 2
+                  ;;
+                --tlsv1.2)
+                  tls=true
+                  shift
+                  ;;
+                --output)
+                  output=$2
+                  shift 2
+                  ;;
+                *)
+                  shift
+                  ;;
+              esac
+            done
+            [ "$fail" = true ] && [ "$location" = true ] && \
+              [ "$protocol" = true ] && [ "$tls" = true ] && [ -n "$output" ] || exit 64
+            /bin/cp "$FAKE_DOWNLOAD_SOURCE" "$output"
+            ''',
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_LOCK_FILE': str(lock),
+                'FAKE_CURL_LOG': str(curl_log),
+                'FAKE_DOWNLOAD_SOURCE': str(fixture),
+            }
+        )
+        return environment, host, lock, curl_log
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', str(STAGE_ARTIFACTS), mode], env=environment
+        )
+
+    def staged_path(self, host: Path, basename: str) -> Path:
+        return (
+            host
+            / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+            / basename
+        )
+
+    def archive_bytes(self, members: list[tuple[str, bytes | str]]) -> bytes:
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            for name, content in members:
+                member = tarfile.TarInfo(name)
+                if isinstance(content, str):
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = content
+                    member.size = 0
+                    archive.addfile(member)
+                else:
+                    member.size = len(content)
+                    archive.addfile(member, io.BytesIO(content))
+        return stream.getvalue()
+
+    def test_check_does_not_create_staging_directory(self) -> None:
+        environment, _, _, curl_log = self.make_environment(b'runc fixture\n')
+        host = Path(environment['BOOTSTRAP_TEST_ROOT'])
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_ARTIFACTS_CHECK', result.stdout)
+        self.assertFalse((host / 'root/dev-infra-artifacts').exists())
+        self.assertFalse(curl_log.exists())
+
+    def test_apply_stages_verified_artifact(self) -> None:
+        artifact = b'runc fixture\n'
+        environment, host, _, _ = self.make_environment(artifact)
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_ARTIFACTS_STAGED', result.stdout)
+        staged = self.staged_path(host, 'runc.amd64')
+        self.assertEqual(staged.read_bytes(), artifact)
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+
+    def test_apply_rejects_download_digest_mismatch(self) -> None:
+        environment, host, _, _ = self.make_environment(
+            b'runc fixture\n', digest='0' * 64
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertFalse(self.staged_path(host, 'runc.amd64').exists())
+
+    def test_check_refuses_existing_same_name_with_different_digest(self) -> None:
+        environment, host, _, _ = self.make_environment(b'approved\n')
+        staged = self.staged_path(host, 'runc.amd64')
+        staged.parent.mkdir(parents=True, mode=0o700)
+        staged.write_bytes(b'unknown\n')
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertEqual(staged.read_bytes(), b'unknown\n')
+
+    def test_check_rejects_non_official_url_before_curl(self) -> None:
+        environment, _, _, curl_log = self.make_environment(
+            b'payload\n', url='https://example.com/v1.3.6/runc.amd64'
+        )
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertFalse(curl_log.exists())
+
+    def test_check_rejects_http_url_before_curl(self) -> None:
+        environment, _, _, curl_log = self.make_environment(
+            b'payload\n', url='http://github.com/opencontainers/runc/runc.amd64'
+        )
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertFalse(curl_log.exists())
+
+    def test_apply_rejects_archive_path_traversal(self) -> None:
+        artifact = self.archive_bytes([('../escape', b'escape\n')])
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='containerd',
+            version='2.3.1',
+            url='https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+            target='/usr/local/bin',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+        self.assertFalse(
+            self.staged_path(host, 'containerd-2.3.1-linux-amd64.tar.gz').exists()
+        )
+
+    def test_apply_rejects_cni_archive_absolute_member(self) -> None:
+        artifact = self.archive_bytes([('/escape', b'escape\n')])
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='cni-plugins',
+            version='1.9.1',
+            url='https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+            target='/opt/cni/bin',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+        self.assertFalse(self.staged_path(host, 'cni-plugins-linux-amd64-v1.9.1.tgz').exists())
+
+    def test_apply_rejects_helm_archive_path_traversal(self) -> None:
+        artifact = self.archive_bytes([('linux-amd64/../../escape', b'escape\n')])
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='helm',
+            version='3.21.0',
+            url='https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+            target='/usr/local/bin/helm',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+        self.assertFalse(self.staged_path(host, 'helm-v3.21.0-linux-amd64.tar.gz').exists())
+
+    def test_apply_rejects_archive_symlink_escaping_member_root(self) -> None:
+        artifact = self.archive_bytes(
+            [('bin/containerd', b'binary\n'), ('bin/escape', '../../outside')]
+        )
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='containerd',
+            version='2.3.1',
+            url='https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+            target='/usr/local/bin',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+        self.assertFalse(
+            self.staged_path(host, 'containerd-2.3.1-linux-amd64.tar.gz').exists()
+        )
+
+    def test_apply_rejects_archive_missing_required_member(self) -> None:
+        artifact = self.archive_bytes([('linux-amd64/README.md', b'missing helm\n')])
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='helm',
+            version='3.21.0',
+            url='https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+            target='/usr/local/bin/helm',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+        self.assertFalse(self.staged_path(host, 'helm-v3.21.0-linux-amd64.tar.gz').exists())
+
+    def test_apply_stages_archives_with_required_members(self) -> None:
+        fixtures = [
+            (
+                'containerd',
+                '2.3.1',
+                'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+                '/usr/local/bin',
+                [('bin/containerd', b'containerd\n'), ('bin/ctr', b'ctr\n'), ('bin/containerd-shim-runc-v2', b'shim\n')],
+            ),
+            (
+                'cni-plugins',
+                '1.9.1',
+                'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+                '/opt/cni/bin',
+                [('bridge', b'bridge\n'), ('host-local', b'host-local\n'), ('loopback', b'loopback\n')],
+            ),
+            (
+                'helm',
+                '3.21.0',
+                'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+                '/usr/local/bin/helm',
+                [('linux-amd64/helm', b'helm\n')],
+            ),
+        ]
+        for name, version, url, target, members in fixtures:
+            with self.subTest(name=name):
+                artifact = self.archive_bytes(members)
+                environment, host, _, _ = self.make_environment(
+                    artifact,
+                    name=name,
+                    version=version,
+                    url=url,
+                    target=target,
+                )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('RESULT=PASS_ARTIFACTS_STAGED', result.stdout)
+                self.assertEqual(self.staged_path(host, Path(url).name).read_bytes(), artifact)
+
+    def test_check_reports_exact_existing_artifact_as_compliant(self) -> None:
+        artifact = b'approved\n'
+        environment, host, _, curl_log = self.make_environment(artifact)
+        staged = self.staged_path(host, 'runc.amd64')
+        staged.parent.mkdir(parents=True, mode=0o700)
+        staged.write_bytes(artifact)
+        staged.chmod(0o600)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertFalse(curl_log.exists())
+
+    def test_apply_reports_already_compliant_only_when_all_locked_artifacts_match(self) -> None:
+        records = [
+            ('containerd', '2.3.1', 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz', b'containerd\n', '/usr/local/bin'),
+            ('runc', '1.3.6', 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64', b'runc\n', '/usr/local/sbin/runc'),
+            ('cni-plugins', '1.9.1', 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz', b'cni\n', '/opt/cni/bin'),
+            ('helm', '3.21.0', 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz', b'helm\n', '/usr/local/bin/helm'),
+            ('gateway-api', '1.6.1', 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml', b'gateway\n', 'kubernetes://gateway-api/standard'),
+            ('cilium-chart', '1.20.0', 'https://helm.cilium.io/cilium-1.20.0.tgz', b'cilium\n', 'kubernetes://kube-system/cilium'),
+        ]
+        environment, host, _, curl_log = self.make_environment(
+            b'ignored\n', records=records
+        )
+        for _, _, url, artifact, _ in records:
+            staged = self.staged_path(host, Path(url).name)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(artifact)
+            staged.chmod(0o600)
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertFalse(curl_log.exists())
 
 
 if __name__ == '__main__':

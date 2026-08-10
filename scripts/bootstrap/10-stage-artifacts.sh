@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+umask 077
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd "${script_dir}/../.." && pwd -P)
+# shellcheck disable=SC1091
+source "${script_dir}/lib/common.sh"
+
+readonly ARTIFACT_SET=pcs-2026-08-10.1
+readonly MINIMUM_AVAILABLE_KIB=1048576
+
+host_path() {
+  local absolute=$1
+  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
+    printf '%s%s\n' "${BOOTSTRAP_TEST_ROOT:?}" "$absolute"
+  else
+    printf '%s\n' "$absolute"
+  fi
+}
+
+complete() {
+  local result=$1
+  local reason=$2
+  local code=$3
+  printf 'RESULT=%s\nREASON=%s\n' "$result" "$reason"
+  exit "$code"
+}
+
+is_official_url() {
+  local url=$1
+  local host
+
+  if [[ ! "$url" =~ ^https://([^/:?#]+)(/[^?#]*)?$ ]]; then
+    return 1
+  fi
+  host=${BASH_REMATCH[1]}
+  case "$host" in
+    github.com|get.helm.sh|helm.cilium.io)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+artifact_basename() {
+  local url=$1
+  local path=${url#https://*/}
+  local base=${path##*/}
+  [[ -n "$base" && "$base" != . && "$base" != .. && "$base" != *$'\n'* ]] || return 1
+  printf '%s\n' "$base"
+}
+
+safe_archive_member() {
+  local member=$1
+  [[ -n "$member" && "$member" != /* && "$member" != *$'\n'* ]] || return 1
+  case "/${member}/" in
+    */../*) return 1 ;;
+  esac
+}
+
+safe_symlink_target() {
+  local target=$1
+  [[ -n "$target" && "$target" != /* && "$target" != *$'\n'* ]] || return 1
+  case "/${target}/" in
+    */../*) return 1 ;;
+  esac
+}
+
+require_archive_member() {
+  local listing=$1
+  local expected=$2
+  grep -Fqx -- "$expected" <<<"$listing"
+}
+
+validate_archive() {
+  local name=$1
+  local archive=$2
+  local listing
+  local verbose_listing
+  local member
+  local line
+  local link_target
+
+  listing=$(tar -tzf "$archive" 2>/dev/null) || return 1
+  while IFS= read -r member; do
+    safe_archive_member "$member" || return 1
+  done <<<"$listing"
+
+  verbose_listing=$(tar -tvzf "$archive" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    if [[ "$line" == l* ]]; then
+      [[ "$line" == *' -> '* ]] || return 1
+      link_target=${line##* -> }
+      safe_symlink_target "$link_target" || return 1
+    fi
+  done <<<"$verbose_listing"
+
+  case "$name" in
+    containerd)
+      require_archive_member "$listing" bin/containerd || return 1
+      require_archive_member "$listing" bin/ctr || return 1
+      require_archive_member "$listing" bin/containerd-shim-runc-v2 || return 1
+      ;;
+    cni-plugins)
+      require_archive_member "$listing" bridge || return 1
+      require_archive_member "$listing" host-local || return 1
+      require_archive_member "$listing" loopback || return 1
+      ;;
+    helm)
+      require_archive_member "$listing" linux-amd64/helm || return 1
+      ;;
+  esac
+}
+
+artifact_state() {
+  local target=$1
+  local expected_digest=$2
+  local actual_digest
+
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    printf 'MISSING\n'
+    return 0
+  fi
+  if [[ -L "$target" || ! -f "$target" ]]; then
+    printf 'DRIFT\n'
+    return 0
+  fi
+  actual_digest=$(sha256_file "$target") || return "$?"
+  if [[ "$actual_digest" == "$expected_digest" ]]; then
+    printf 'COMPLIANT\n'
+  else
+    printf 'DRIFT\n'
+  fi
+}
+
+parse_mode "$@" || exit "$?"
+
+for required_command in curl df grep mktemp mv rm tar; do
+  require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION"
+done
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  complete STOP_PRECONDITION missing-command-sha256 "$EXIT_PRECONDITION"
+fi
+require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION"
+
+lock_file=${BOOTSTRAP_TEST_LOCK_FILE:-"${repo_root}/bootstrap/artifacts.lock.tsv"}
+[[ -f "$lock_file" && ! -L "$lock_file" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-file-missing-or-unsafe "$EXIT_SUPPLY_CHAIN"
+
+artifact_root=$(host_path /root/dev-infra-artifacts)
+artifact_dir="${artifact_root}/${ARTIFACT_SET}"
+artifact_parent=$(dirname "$artifact_root")
+[[ -d "$artifact_parent" && ! -L "$artifact_parent" ]] || complete STOP_UNKNOWN_STATE artifact-parent-missing-or-unsafe "$EXIT_UNKNOWN_STATE"
+
+available_kib=$(df -Pk "$artifact_parent" 2>/dev/null | awk 'NR == 2 {print $4}') || complete STOP_PRECONDITION disk-space-unreadable "$EXIT_PRECONDITION"
+[[ "$available_kib" =~ ^[0-9]+$ ]] || complete STOP_PRECONDITION disk-space-invalid "$EXIT_PRECONDITION"
+(( available_kib >= MINIMUM_AVAILABLE_KIB )) || complete STOP_PRECONDITION disk-space-below-1-gib "$EXIT_PRECONDITION"
+
+declare -a names=() versions=() urls=() digests=() targets=() basenames=()
+while IFS=$'\t' read -r name version url digest target extra; do
+  [[ -z "$name" && -z "$version" && -z "$url" && -z "$digest" && -z "$target" && -z "$extra" ]] && continue
+  [[ -n "$name" && -n "$version" && -n "$target" && -z "$extra" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-record-invalid "$EXIT_SUPPLY_CHAIN"
+  is_official_url "$url" || complete STOP_SUPPLY_CHAIN_MISMATCH url-not-official-https "$EXIT_SUPPLY_CHAIN"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-digest-invalid "$EXIT_SUPPLY_CHAIN"
+  base=$(artifact_basename "$url") || complete STOP_SUPPLY_CHAIN_MISMATCH url-basename-invalid "$EXIT_SUPPLY_CHAIN"
+  names+=("$name")
+  versions+=("$version")
+  urls+=("$url")
+  digests+=("$digest")
+  targets+=("$target")
+  basenames+=("$base")
+done <"$lock_file"
+
+(( ${#names[@]} > 0 )) || complete STOP_SUPPLY_CHAIN_MISMATCH lock-file-empty "$EXIT_SUPPLY_CHAIN"
+
+if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
+  [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || complete STOP_UNKNOWN_STATE artifact-directory-unsafe "$EXIT_UNKNOWN_STATE"
+fi
+
+all_compliant=true
+for index in "${!names[@]}"; do
+  target_path="${artifact_dir}/${basenames[index]}"
+  state=$(artifact_state "$target_path" "${digests[index]}") || complete STOP_UNKNOWN_STATE artifact-state-unreadable "$EXIT_UNKNOWN_STATE"
+  case "$state" in
+    COMPLIANT)
+      ;;
+    MISSING)
+      all_compliant=false
+      ;;
+    DRIFT)
+      complete STOP_SUPPLY_CHAIN_MISMATCH "artifact-digest-drift-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"
+      ;;
+    *)
+      complete STOP_UNKNOWN_STATE artifact-state-invalid "$EXIT_UNKNOWN_STATE"
+      ;;
+  esac
+done
+
+if [[ "$all_compliant" == true ]]; then
+  printf 'RESULT=ALREADY_COMPLIANT\n'
+  exit 0
+fi
+
+if [[ "$MODE" == CHECK ]]; then
+  printf 'RESULT=PASS_ARTIFACTS_CHECK\n'
+  exit 0
+fi
+
+if [[ -e "$artifact_root" || -L "$artifact_root" ]]; then
+  [[ -d "$artifact_root" && ! -L "$artifact_root" ]] || complete STOP_UNKNOWN_STATE artifact-root-unsafe "$EXIT_UNKNOWN_STATE"
+else
+  mkdir -p -- "$artifact_root" || complete STOP_APPLY_FAILED artifact-root-create-failed "$EXIT_APPLY_FAILED"
+  chmod 700 "$artifact_root" || complete STOP_APPLY_FAILED artifact-root-mode-failed "$EXIT_APPLY_FAILED"
+fi
+if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
+  [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || complete STOP_UNKNOWN_STATE artifact-directory-unsafe "$EXIT_UNKNOWN_STATE"
+else
+  mkdir -- "$artifact_dir" || complete STOP_APPLY_FAILED artifact-directory-create-failed "$EXIT_APPLY_FAILED"
+  chmod 700 "$artifact_dir" || complete STOP_APPLY_FAILED artifact-directory-mode-failed "$EXIT_APPLY_FAILED"
+fi
+
+for index in "${!names[@]}"; do
+  target_path="${artifact_dir}/${basenames[index]}"
+  state=$(artifact_state "$target_path" "${digests[index]}") || complete STOP_UNKNOWN_STATE artifact-state-unreadable "$EXIT_UNKNOWN_STATE"
+  [[ "$state" == MISSING ]] || complete STOP_UNKNOWN_STATE "artifact-state-changed-${basenames[index]}" "$EXIT_UNKNOWN_STATE"
+
+  temporary=$(mktemp "${artifact_dir}/.${basenames[index]}.tmp.XXXXXX") || complete STOP_APPLY_FAILED artifact-temp-create-failed "$EXIT_APPLY_FAILED"
+  if ! curl --fail --location --proto '=https' --tlsv1.2 --output "$temporary" "${urls[index]}"; then
+    rm -f -- "$temporary"
+    complete STOP_APPLY_FAILED "download-failed-${basenames[index]}" "$EXIT_APPLY_FAILED"
+  fi
+  actual_digest=$(sha256_file "$temporary") || {
+    rm -f -- "$temporary"
+    complete STOP_APPLY_FAILED "download-digest-unreadable-${basenames[index]}" "$EXIT_APPLY_FAILED"
+  }
+  if [[ "$actual_digest" != "${digests[index]}" ]]; then
+    rm -f -- "$temporary"
+    complete STOP_SUPPLY_CHAIN_MISMATCH "download-digest-mismatch-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"
+  fi
+  case "${names[index]}" in
+    containerd|cni-plugins|helm)
+      if ! validate_archive "${names[index]}" "$temporary"; then
+        rm -f -- "$temporary"
+        complete STOP_ARCHIVE_UNSAFE "archive-validation-failed-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"
+      fi
+      ;;
+  esac
+  if ! mv -n "$temporary" "$target_path" || [[ -e "$temporary" || -L "$temporary" ]]; then
+    rm -f -- "$temporary"
+    complete STOP_UNKNOWN_STATE "artifact-target-appeared-${basenames[index]}" "$EXIT_UNKNOWN_STATE"
+  fi
+  rm -f -- "$temporary"
+  size=$(wc -c <"$target_path") || complete STOP_VERIFY_FAILED "artifact-size-unreadable-${basenames[index]}" "$EXIT_VERIFY_FAILED"
+  printf 'URL=%s\nFILE=%s\nSIZE=%s\nSHA256=%s\n' "${urls[index]}" "${basenames[index]}" "$size" "$actual_digest"
+done
+
+printf 'RESULT=PASS_ARTIFACTS_STAGED\n'
