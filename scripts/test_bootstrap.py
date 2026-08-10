@@ -1676,8 +1676,19 @@ esac
             #!/bin/sh
             temporary=$(/usr/bin/mktemp "$@") || exit
             printf '%s\n' "$temporary"
-            if [ -n "${FAKE_MKTEMP_RACE_PARENT:-}" ]; then
-              chmod 0700 "$FAKE_MKTEMP_RACE_PARENT"
+            case "$temporary" in
+              *"${FAKE_MKTEMP_RACE_MATCH:-}"*) matched=1 ;;
+              *) matched=0 ;;
+            esac
+            if [ -n "${FAKE_MKTEMP_RACE_PARENT:-}" ] && [ "$matched" = 1 ]; then
+              case "${FAKE_MKTEMP_RACE_ACTION:-mode}" in
+                mode) chmod 0700 "$FAKE_MKTEMP_RACE_PARENT" ;;
+                owner) : >"$FAKE_MKTEMP_RACE_OWNER_MARKER" ;;
+                type)
+                  /bin/mv "$FAKE_MKTEMP_RACE_PARENT" "$FAKE_MKTEMP_RACE_PARENT.raced"
+                  ln -s /tmp "$FAKE_MKTEMP_RACE_PARENT"
+                  ;;
+              esac
             fi
             ''',
         )
@@ -1735,9 +1746,18 @@ esac
               is-enabled) [ -f "$FAKE_SERVICE_ENABLED" ] ;;
               is-active) [ -f "$FAKE_SERVICE_ACTIVE" ] && printf 'active\n' ;;
               show)
-                [ -f "$FAKE_SERVICE_UNIT_LOADED" ] || exit 1
-                printf 'FragmentPath=%s\nDropInPaths=%s\n' \
-                  "$FAKE_FRAGMENT_PATH" "${FAKE_DROP_IN_PATHS:-}"
+                [ "${FAKE_SYSTEMCTL_SHOW_FAIL:-0}" != 1 ] || exit 1
+                [ "${FAKE_SYSTEMCTL_SHOW_EMPTY:-0}" != 1 ] || exit 0
+                if [ -f "$FAKE_SERVICE_UNIT_LOADED" ]; then
+                  load_state=${FAKE_LOAD_STATE:-loaded}
+                  fragment_path=$FAKE_FRAGMENT_PATH
+                else
+                  load_state=${FAKE_LOAD_STATE:-not-found}
+                  fragment_path=${FAKE_NONLOADED_FRAGMENT_PATH:-}
+                fi
+                [ "${FAKE_LOAD_STATE_EMPTY:-0}" != 1 ] || load_state=
+                printf 'LoadState=%s\nFragmentPath=%s\nDropInPaths=%s\n' \
+                  "$load_state" "$fragment_path" "${FAKE_DROP_IN_PATHS:-}"
                 ;;
               daemon-reload)
                 [ ! -f "$FAKE_UNIT_TARGET" ] || : >"$FAKE_SERVICE_UNIT_LOADED"
@@ -1919,6 +1939,30 @@ esac
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
 
+    def test_check_rejects_untrusted_run_parent(self) -> None:
+        """捕获未验证 `/run` 类型、symlink、0755 mode 或 owner 的缺陷。"""
+        for drift in ('file', 'symlink', 'mode', 'owner'):
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                run_parent = host / 'run'
+                if drift in ('file', 'symlink'):
+                    run_parent.rmdir()
+                    if drift == 'file':
+                        run_parent.write_bytes(b'unknown\n')
+                    else:
+                        run_parent.symlink_to('/tmp')
+                elif drift == 'mode':
+                    run_parent.chmod(0o700)
+                else:
+                    environment['BOOTSTRAP_TEST_OWNER_DRIFT_PATH'] = str(
+                        run_parent
+                    )
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
     def test_check_rejects_orphan_socket_before_install(self) -> None:
         """捕获 targets/service 尚缺时把孤立 socket entry 当作 fresh state 的缺陷。"""
         for drift in ('socket', 'file', 'symlink'):
@@ -1959,6 +2003,45 @@ esac
 
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_accepts_load_state_not_found_as_clean_fresh_host(self) -> None:
+        """捕获用 systemctl show exit0 误判 LoadState=not-found 为已加载 unit 的缺陷。"""
+        environment, _, command_log, _ = self.make_environment()
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CONTAINERD_CHECK', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn('systemctl show ', commands)
+        for forbidden in ('daemon-reload', ' enable ', ' start ', ' restart '):
+            self.assertNotIn(forbidden, commands)
+
+    def test_check_rejects_unknown_empty_or_failed_unit_state(self) -> None:
+        """捕获接受非 not-found/loaded、空输出或 show command failure 的缺陷。"""
+        cases = (
+            ('FAKE_LOAD_STATE', 'bad-setting'),
+            ('FAKE_LOAD_STATE', 'error'),
+            ('FAKE_LOAD_STATE', 'masked'),
+            ('FAKE_LOAD_STATE_EMPTY', '1'),
+            ('FAKE_SYSTEMCTL_SHOW_EMPTY', '1'),
+            ('FAKE_SYSTEMCTL_SHOW_FAIL', '1'),
+        )
+        for variable, value in cases:
+            with self.subTest(variable=variable, value=value):
+                environment, host, _, _ = self.make_environment()
+                environment[variable] = value
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertTrue(
+                    all(
+                        not path.exists()
+                        for path in self.managed_targets(host).values()
+                    )
+                )
 
     def test_check_allows_managed_runtime_data_after_successful_apply(self) -> None:
         """捕获首次启动填充 data root 后把精确安装误判为未知状态的缺陷。"""
@@ -2237,6 +2320,51 @@ esac
         self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
         self.assertTrue(
             all(not path.exists() for path in self.managed_targets(host).values())
+        )
+
+    def assert_extract_parent_race_stops_before_writes(
+        self, *, match: str, parent_path: str
+    ) -> None:
+        for drift in ('mode', 'owner', 'type'):
+            with self.subTest(match=match, drift=drift):
+                environment, host, command_log, _ = self.make_environment()
+                parent = host / parent_path
+                marker = host.parent / f'{match.strip(".")}-{drift}.marker'
+                environment.update(
+                    {
+                        'FAKE_MKTEMP_RACE_PARENT': str(parent),
+                        'FAKE_MKTEMP_RACE_MATCH': match,
+                        'FAKE_MKTEMP_RACE_ACTION': drift,
+                        'FAKE_MKTEMP_RACE_OWNER_MARKER': str(marker),
+                        'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH': str(parent),
+                        'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER': str(marker),
+                    }
+                )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                for forbidden in ('tar-write ', 'install ', 'mv '):
+                    self.assertNotIn(forbidden, commands)
+                self.assertTrue(
+                    all(
+                        not path.exists()
+                        for path in self.managed_targets(host).values()
+                    )
+                )
+
+    def test_apply_revalidates_cni_parent_after_its_mktemp(self) -> None:
+        """捕获 CNI mktemp 后 parent mode/owner/type 漂移仍 tar 或发布的缺陷。"""
+        self.assert_extract_parent_race_stops_before_writes(
+            match='.cni.extract.', parent_path='opt/cni/bin'
+        )
+
+    def test_apply_revalidates_crictl_parent_after_its_mktemp(self) -> None:
+        """捕获 crictl mktemp 后 parent mode/owner/type 漂移仍 tar 或发布的缺陷。"""
+        self.assert_extract_parent_race_stops_before_writes(
+            match='.crictl.extract.', parent_path='usr/local/bin'
         )
 
     def test_health_rejects_version_and_plugin_drift(self) -> None:

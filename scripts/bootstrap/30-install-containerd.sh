@@ -69,6 +69,9 @@ owned_by_expected() {
     if [[ "${BOOTSTRAP_TEST_OWNER_DRIFT_PATH:-}" == "$path" ]]; then
       expected_uid=$((expected_uid + 1))
     fi
+    if [[ "${BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH:-}" == "$path" && -e "${BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER:-}" ]]; then
+      expected_uid=$((expected_uid + 1))
+    fi
   fi
   [[ "$(path_owner "$path")" == "${expected_uid}:${expected_gid}" ]]
 }
@@ -255,6 +258,15 @@ runtime_directory_state() {
   fi
 }
 
+private_extract_directory() {
+  local directory=$1
+  local parent=$2
+  [[ "${directory%/*}" == "$parent" ]] || return 1
+  [[ "$(directory_state "$parent")" == COMPLIANT ]] || return 1
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  [[ "$(path_mode "$directory")" == 700 ]] && owned_by_expected "$directory"
+}
+
 atomic_publish() {
   local source=$1
   local target=$2
@@ -342,16 +354,56 @@ print("CRI_RUNTIME_READY=true")
   [[ "$marker" == CRI_RUNTIME_READY=true ]]
 }
 
+unit_contract_state() {
+  local unit_target=$1
+  local properties line
+  local load_state='' fragment_path='' drop_in_paths=''
+  local load_seen=0 fragment_seen=0 drop_in_seen=0
+  properties=$(systemctl show --all \
+    --property=LoadState \
+    --property=FragmentPath \
+    --property=DropInPaths \
+    containerd.service 2>/dev/null) || {
+      printf 'UNKNOWN\n'
+      return 0
+    }
+  while IFS= read -r line; do
+    case "$line" in
+      LoadState=*)
+        (( load_seen == 0 )) || { printf 'UNKNOWN\n'; return 0; }
+        load_state=${line#LoadState=}
+        load_seen=1
+        ;;
+      FragmentPath=*)
+        (( fragment_seen == 0 )) || { printf 'UNKNOWN\n'; return 0; }
+        fragment_path=${line#FragmentPath=}
+        fragment_seen=1
+        ;;
+      DropInPaths=*)
+        (( drop_in_seen == 0 )) || { printf 'UNKNOWN\n'; return 0; }
+        drop_in_paths=${line#DropInPaths=}
+        drop_in_seen=1
+        ;;
+      *) printf 'UNKNOWN\n'; return 0 ;;
+    esac
+  done <<<"$properties"
+  if (( load_seen != 1 || fragment_seen != 1 || drop_in_seen != 1 )); then
+    printf 'UNKNOWN\n'
+  elif [[ "$load_state" == not-found && -z "$fragment_path" && -z "$drop_in_paths" ]]; then
+    printf 'MISSING\n'
+  elif [[ "$load_state" == loaded && "$fragment_path" == "$unit_target" && -z "$drop_in_paths" ]]; then
+    printf 'COMPLIANT\n'
+  else
+    printf 'UNKNOWN\n'
+  fi
+}
+
 service_contract_compliant() {
   local unit_target=$1
   local socket_target=$2
   local data_root=$3
-  local properties data_result=0
-  properties=$(systemctl show \
-    --property=FragmentPath \
-    --property=DropInPaths \
-    containerd.service 2>/dev/null) || return 1
-  [[ "$properties" == $'FragmentPath='"${unit_target}"$'\nDropInPaths=' ]] || return 1
+  local data_result=0
+  [[ "$(unit_contract_state "$unit_target")" == COMPLIANT ]] || return 1
   [[ "$(runtime_directory_state "${socket_target%/*}")" == COMPLIANT ]] || return 1
   [[ -S "$socket_target" && ! -L "$socket_target" ]] || return 1
   [[ "$(path_mode "$socket_target")" == 660 ]] && owned_by_expected "$socket_target" || return 1
@@ -435,8 +487,10 @@ for absolute in "${directory_paths[@]}"; do
   esac
 done
 data_root=$(host_path /var/lib/containerd)
+run_parent=$(host_path /run)
 run_dir=$(host_path /run/containerd)
 socket_target=$(host_path /run/containerd/containerd.sock)
+[[ "$(directory_state "$run_parent")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE run-parent-unsafe "$EXIT_UNKNOWN_STATE" NONE
 [[ "$(runtime_directory_state "$run_dir")" != UNKNOWN ]] || complete STOP_UNKNOWN_STATE containerd-run-directory-unsafe "$EXIT_UNKNOWN_STATE" NONE
 
 containerd_target=$(host_path /usr/local/bin/containerd)
@@ -485,10 +539,8 @@ fi
 if (( compliant_count != ${#targets[@]} )) && [[ -e "$socket_target" || -L "$socket_target" ]]; then
   complete STOP_UNKNOWN_STATE orphan-containerd-socket "$EXIT_UNKNOWN_STATE" NONE
 fi
-if (( compliant_count != ${#targets[@]} )) && systemctl show \
-  --property=FragmentPath \
-  --property=DropInPaths \
-  containerd.service >/dev/null 2>&1; then
+unit_state=$(unit_contract_state "$unit_target")
+if (( compliant_count != ${#targets[@]} )) && [[ "$unit_state" != MISSING ]]; then
   complete STOP_UNKNOWN_STATE partial-containerd-unit-state "$EXIT_UNKNOWN_STATE" NONE
 fi
 data_root_result=0
@@ -525,20 +577,27 @@ for directory in "${missing_directories[@]-}"; do
 done
 
 [[ "$(directory_state "$(host_path /usr/local/bin)")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE containerd-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
-containerd_extract=$(mktemp -d "$(host_path /usr/local/bin)/.containerd.extract.XXXXXX") || complete STOP_APPLY_FAILED containerd-extract-create-failed "$EXIT_APPLY_FAILED" NONE
-[[ "$(directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE cni-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
-cni_extract=$(mktemp -d "$(host_path /opt/cni/bin)/.cni.extract.XXXXXX") || { rm -r -- "$containerd_extract"; complete STOP_APPLY_FAILED cni-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
-[[ "$(directory_state "$(host_path /usr/local/bin)")" == COMPLIANT ]] || { rm -r -- "$containerd_extract" "$cni_extract"; complete STOP_UNKNOWN_STATE crictl-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE; }
-crictl_extract=$(mktemp -d "$(host_path /usr/local/bin)/.crictl.extract.XXXXXX") || { rm -r -- "$containerd_extract" "$cni_extract"; complete STOP_APPLY_FAILED crictl-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
-chmod 0700 "$containerd_extract" "$cni_extract" "$crictl_extract" || { rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"; complete STOP_APPLY_FAILED extract-directory-mode-failed "$EXIT_APPLY_FAILED" NONE; }
+bin_parent=$(host_path /usr/local/bin)
+cni_parent=$(host_path /opt/cni/bin)
+containerd_extract=$(mktemp -d "${bin_parent}/.containerd.extract.XXXXXX") || complete STOP_APPLY_FAILED containerd-extract-create-failed "$EXIT_APPLY_FAILED" NONE
+private_extract_directory "$containerd_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE containerd-extract-state-raced "$EXIT_UNKNOWN_STATE" NONE
+[[ "$(directory_state "$cni_parent")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE cni-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
+cni_extract=$(mktemp -d "${cni_parent}/.cni.extract.XXXXXX") || { rm -r -- "$containerd_extract"; complete STOP_APPLY_FAILED cni-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
+private_extract_directory "$cni_extract" "$cni_parent" || complete STOP_UNKNOWN_STATE cni-extract-state-raced "$EXIT_UNKNOWN_STATE" NONE
+[[ "$(directory_state "$bin_parent")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE crictl-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
+crictl_extract=$(mktemp -d "${bin_parent}/.crictl.extract.XXXXXX") || { rm -r -- "$containerd_extract" "$cni_extract"; complete STOP_APPLY_FAILED crictl-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
+private_extract_directory "$crictl_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE crictl-extract-state-raced "$EXIT_UNKNOWN_STATE" NONE
+private_extract_directory "$containerd_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE containerd-extract-pre-tar-raced "$EXIT_UNKNOWN_STATE" NONE
 if ! tar -xzf "$containerd_artifact" -C "$containerd_extract" -- bin/containerd bin/ctr bin/containerd-shim-runc-v2; then
   rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
   complete STOP_ARCHIVE_UNSAFE containerd-extract-failed "$EXIT_SUPPLY_CHAIN" NONE
 fi
+private_extract_directory "$cni_extract" "$cni_parent" || complete STOP_UNKNOWN_STATE cni-extract-pre-tar-raced "$EXIT_UNKNOWN_STATE" NONE
 if ! tar -xzf "$cni_artifact" -C "$cni_extract" -- bridge host-local loopback portmap; then
   rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
   complete STOP_ARCHIVE_UNSAFE cni-extract-failed "$EXIT_SUPPLY_CHAIN" NONE
 fi
+private_extract_directory "$crictl_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE crictl-extract-pre-tar-raced "$EXIT_UNKNOWN_STATE" NONE
 if ! tar -xzf "$crictl_artifact" -C "$crictl_extract" -- crictl; then
   rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
   complete STOP_ARCHIVE_UNSAFE crictl-extract-failed "$EXIT_SUPPLY_CHAIN" NONE
@@ -556,6 +615,11 @@ for index in "${!sources[@]}"; do
   if (( index < 9 )); then
     [[ -x "$source_path" || "$source_path" == "$runc_artifact" ]] || { rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"; complete STOP_ARCHIVE_UNSAFE extracted-member-not-executable "$EXIT_SUPPLY_CHAIN" NONE; }
   fi
+  case "$source_path" in
+    "$containerd_extract"/*) private_extract_directory "$containerd_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE containerd-extract-pre-publish-raced "$EXIT_UNKNOWN_STATE" NONE ;;
+    "$cni_extract"/*) private_extract_directory "$cni_extract" "$cni_parent" || complete STOP_UNKNOWN_STATE cni-extract-pre-publish-raced "$EXIT_UNKNOWN_STATE" NONE ;;
+    "$crictl_extract"/*) private_extract_directory "$crictl_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE crictl-extract-pre-publish-raced "$EXIT_UNKNOWN_STATE" NONE ;;
+  esac
   publish_result=0
   atomic_publish "$source_path" "${targets[index]}" "${target_modes[index]}" || publish_result=$?
   if (( publish_result != 0 )); then
