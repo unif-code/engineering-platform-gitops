@@ -1,12 +1,3 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  labels:
-    app.kubernetes.io/part-of: engineering-platform
-    platform.unif.internal/availability: non-ha
-    platform.unif.internal/environment: dev-restore-drill
-  name: platform-restore
----
 apiVersion: barmancloud.cnpg.io/v1
 kind: ObjectStore
 metadata:
@@ -14,7 +5,7 @@ metadata:
     app.kubernetes.io/name: platform-postgres-restore
     app.kubernetes.io/part-of: engineering-platform
   name: platform-restore-source
-  namespace: platform-restore
+  namespace: platform
 spec:
   configuration:
     destinationPath: s3://postgres-backup/platform/
@@ -41,7 +32,7 @@ metadata:
     app.kubernetes.io/version: '18.4'
     platform.unif.internal/availability: non-ha
   name: platform-restore
-  namespace: platform-restore
+  namespace: platform
 spec:
   bootstrap:
     recovery:
@@ -66,5 +57,5 @@ spec:
       cpu: 500m
       memory: 1Gi
   storage:
-    size: 100Gi
+    size: 20Gi
     storageClass: stateful-rwo-lowlatency

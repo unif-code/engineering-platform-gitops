@@ -3,4 +3,5 @@ kind: Kustomization
 resources:
   - environment.yaml
   - local-path-provisioner.yaml
+  - resource-quotas.yaml
   - storage-class.yaml

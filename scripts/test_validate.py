@@ -6,7 +6,11 @@ from pathlib import Path
 
 import yaml
 
-from validate import document_by_identity, value_at
+from validate import (
+    document_by_identity,
+    validate_single_user_storage,
+    value_at,
+)
 
 
 class ProfileValidationTest(unittest.TestCase):
@@ -67,6 +71,11 @@ class ProfileValidationTest(unittest.TestCase):
             )
 
             self.assertEqual(cpu, '100m')
+
+
+class RepositoryProfileContractTest(unittest.TestCase):
+    def test_single_user_storage_contract(self) -> None:
+        validate_single_user_storage()
 
 
 if __name__ == '__main__':

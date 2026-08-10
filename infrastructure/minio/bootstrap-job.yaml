@@ -38,6 +38,9 @@ spec:
               mc version enable dev/postgres-backup
               mc version enable dev/etcd-backup
               mc version enable dev/audit-worm
+              mc quota set dev/postgres-backup --size 30Gi
+              mc quota set dev/etcd-backup --size 5Gi
+              mc quota set dev/audit-worm --size 5Gi
               mc retention set --default GOVERNANCE 7d dev/postgres-backup
               mc anonymous set none dev/postgres-backup
               mc anonymous set none dev/etcd-backup

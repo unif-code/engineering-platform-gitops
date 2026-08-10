@@ -42,3 +42,23 @@ spec:
           for: 2m
           labels:
             severity: critical
+        - alert: NodeRootFilesystemUsageHigh
+          annotations:
+            description: '根文件系统使用率已达到 80%，必须复核 DEV-002 容量预算。'
+            summary: DEV 根文件系统容量告警
+          expr: >-
+            100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}) >= 80
+          for: 10m
+          labels:
+            severity: warning
+        - alert: NodeRootFilesystemUsageCritical
+          annotations:
+            description: '根文件系统使用率已达到 90%；停止新发布、PVC 变更和恢复演练。'
+            summary: DEV 根文件系统触发 Stop Gate
+          expr: >-
+            100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}) >= 90
+          for: 5m
+          labels:
+            severity: critical

@@ -145,6 +145,163 @@ def expect_value(
         fail(f'{relative_path} 期望 {expected!r}，实测 {actual!r}')
 
 
+def validate_single_user_storage() -> None:
+    contracts = (
+        (
+            'infrastructure/minio/pvc.yaml',
+            'PersistentVolumeClaim',
+            'minio-data',
+            ('spec', 'resources', 'requests', 'storage'),
+            '50Gi',
+        ),
+        (
+            'infrastructure/cnpg/database/cluster.yaml',
+            'Cluster',
+            'platform',
+            ('spec', 'storage', 'size'),
+            '20Gi',
+        ),
+        (
+            'runbook/examples/postgres-restore.yaml',
+            'Cluster',
+            'platform-restore',
+            ('metadata', 'namespace'),
+            'platform',
+        ),
+        (
+            'runbook/examples/postgres-restore.yaml',
+            'Cluster',
+            'platform-restore',
+            ('spec', 'storage', 'size'),
+            '20Gi',
+        ),
+        (
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            (
+                'spec',
+                'values',
+                'alertmanager',
+                'alertmanagerSpec',
+                'storage',
+                'volumeClaimTemplate',
+                'spec',
+                'resources',
+                'requests',
+                'storage',
+            ),
+            '1Gi',
+        ),
+        (
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'grafana', 'persistence', 'size'),
+            '2Gi',
+        ),
+        (
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            (
+                'spec',
+                'values',
+                'prometheus',
+                'prometheusSpec',
+                'storageSpec',
+                'volumeClaimTemplate',
+                'spec',
+                'resources',
+                'requests',
+                'storage',
+            ),
+            '10Gi',
+        ),
+        (
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'prometheus', 'prometheusSpec', 'retention'),
+            '7d',
+        ),
+        (
+            'infrastructure/observability/controller/release.yaml',
+            'HelmRelease',
+            'kube-prometheus-stack',
+            ('spec', 'values', 'prometheus', 'prometheusSpec', 'retentionSize'),
+            '8GB',
+        ),
+    )
+    for relative_path, kind, name, path, expected in contracts:
+        expect_value(relative_path, kind, name, path, expected)
+
+    quota_documents = load_documents(
+        ROOT / 'infrastructure/foundation/resource-quotas.yaml'
+    )
+    quotas = {
+        document.get('metadata', {}).get('namespace'): document
+        for document in quota_documents
+        if document.get('kind') == 'ResourceQuota'
+    }
+    expected_quotas = {
+        'minio': ('1', '50Gi'),
+        'monitoring': ('3', '13Gi'),
+        'platform': ('2', '45Gi'),
+    }
+    for namespace, (claim_count, storage) in expected_quotas.items():
+        document = quotas.get(namespace)
+        if document is None:
+            fail(f'resource-quotas.yaml 缺少 namespace {namespace}')
+        hard = value_at(document, ('spec', 'hard'))
+        if hard.get('persistentvolumeclaims') != claim_count:
+            fail(f'{namespace} PVC 数量额度必须为 {claim_count}')
+        if hard.get('requests.storage') != storage:
+            fail(f'{namespace} PVC 存储额度必须为 {storage}')
+
+    bootstrap = document_by_identity(
+        ROOT / 'infrastructure/minio/bootstrap-job.yaml',
+        'Job',
+        'minio-bootstrap-v1',
+    )
+    args = value_at(
+        bootstrap,
+        ('spec', 'template', 'spec', 'containers', ('name', 'mc'), 'args'),
+    )
+    script = '\n'.join(args)
+    quota_commands = (
+        'mc quota set dev/postgres-backup --size 30Gi',
+        'mc quota set dev/etcd-backup --size 5Gi',
+        'mc quota set dev/audit-worm --size 5Gi',
+    )
+    for command in quota_commands:
+        if script.splitlines().count(command) != 1:
+            fail(f'MinIO bootstrap 必须且只能执行一次：{command}')
+
+    rules_document = document_by_identity(
+        ROOT / 'infrastructure/observability/config/alerts.yaml',
+        'PrometheusRule',
+        'dev-infra-alerts',
+    )
+    rules = value_at(
+        rules_document,
+        ('spec', 'groups', ('name', 'dev-infrastructure'), 'rules'),
+    )
+    alerts = {
+        rule.get('alert'): rule for rule in rules if isinstance(rule, dict)
+    }
+    expected_expressions = {
+        'NodeRootFilesystemUsageHigh': '>= 80',
+        'NodeRootFilesystemUsageCritical': '>= 90',
+    }
+    for alert, threshold in expected_expressions.items():
+        rule = alerts.get(alert)
+        if rule is None:
+            fail(f'alerts.yaml 缺少 {alert}')
+        if threshold not in str(rule.get('expr', '')):
+            fail(f'{alert} 必须使用阈值 {threshold}')
+
+
 def resource_id(document: dict[str, Any]) -> tuple[str, str, str, str] | None:
     api_version = document.get('apiVersion')
     kind = document.get('kind')
@@ -273,6 +430,7 @@ def validate_documents() -> None:
 def main() -> None:
     validate_kustomize_builds()
     validate_documents()
+    validate_single_user_storage()
     print('GitOps manifests validated successfully.')
 
 

@@ -47,5 +47,5 @@ spec:
       cpu: 500m
       memory: 1Gi
   storage:
-    size: 100Gi
+    size: 20Gi
     storageClass: stateful-rwo-lowlatency
