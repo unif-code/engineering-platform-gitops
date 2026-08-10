@@ -59,10 +59,30 @@ GitOps commit / PR：
 
 APT 报告的可自动移除项包含 `iptables`、`nftables`、`libnetfilter-conntrack3` 等后续 Kubernetes/Cilium 仍可能使用的宿主机网络组件，因此本阶段必须保留。
 
+第二次执行：
+
+| 字段 | 回执 |
+| --- | --- |
+| 证据文件 | `/root/dev-infra-evidence/04-legacy-runtime-cleanup-resume-20260810T025913Z.txt` |
+| SHA-256 | `166d8a71b5c459356f6c668770d9e8565ced5ef3a3ebe21372333f50a42b4aed` |
+| Exit code | `0`（成功） |
+| Package | Caddy、Docker Engine/CLI/plugins/rootless extras 与 containerd.io 均已 purge；目标 package hold 已清空 |
+| 数据 | `/var/lib/docker`、`/var/lib/containerd`、`/etc/{docker,containerd,caddy}`、`/opt/containerd`、`/data/coze-loop` 均已删除 |
+| 网络 | `docker0`、`br-28cd7b020fce` 与旧端口 `80`、`2019`、`3306`、`8082`、`8888` 均已清退 |
+| 主机健康 | SSH、chrony、systemd-networkd、systemd-resolved active；`ens160` up；Swap `3.8Gi` 保留 |
+| 清退后容量 | 根文件系统使用 `11G/489G`，可用 `458G`，使用率 `3%`；内存可用 `61Gi` |
+
+旧 Docker/Caddy/runtime 清退已关闭；没有执行 `apt autoremove`。宿主机仍有以下旧应用待单独审计和清退：
+
+- `uniflow` 用户的 Node 进程监听 `*:3001`。
+- executable：`/usr/local/lib/node-v24.18.0/bin/node`。
+- cwd：`/data/workflow/apps/server`。
+- cgroup：`/user.slice/user-0.slice/session-397.scope`，未发现 system service 归属证据。
+
 清退完成回执：
 
 ```text
-待运维回填续跑证据文件、SHA-256 与 exit code 0。
+Docker/Caddy/旧 containerd 清退完成；宿主机 workflow/Node 应用仍 PENDING。
 ```
 
 ## containerd 与内核前置
