@@ -356,11 +356,26 @@ class ArtifactStageTest(BootstrapTestCase):
         evidence = host / 'root/dev-infra-evidence'
         evidence.mkdir(parents=True)
         fake_bin.mkdir()
-        fixture = directory / 'download.fixture'
-        fixture.write_bytes(artifact)
         lock = directory / 'artifacts.lock.tsv'
         if records is None:
-            records = [(name, version, url, artifact, target)]
+            records = self.approved_records()
+            records = [
+                (
+                    name,
+                    version,
+                    url,
+                    artifact,
+                    target,
+                )
+                if record_name == name
+                else record
+                for record in records
+                for record_name, *_ in [record]
+            ]
+        fixtures = directory / 'download-fixtures'
+        fixtures.mkdir()
+        for _, _, record_url, record_artifact, _ in records:
+            (fixtures / Path(record_url).name).write_bytes(record_artifact)
         lock.write_text(
             ''.join(
                 '\t'.join(
@@ -370,7 +385,7 @@ class ArtifactStageTest(BootstrapTestCase):
                         record_url,
                         (
                             digest
-                            if len(records) == 1 and record_name == name and digest
+                            if record_name == name and digest
                             else hashlib.sha256(record_artifact).hexdigest()
                         ),
                         record_target,
@@ -390,6 +405,7 @@ class ArtifactStageTest(BootstrapTestCase):
             #!/bin/sh
             printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
             output=
+            url=
             fail=false
             location=false
             protocol=false
@@ -417,14 +433,18 @@ class ArtifactStageTest(BootstrapTestCase):
                   output=$2
                   shift 2
                   ;;
+                https://*)
+                  url=$1
+                  shift
+                  ;;
                 *)
                   shift
                   ;;
               esac
             done
             [ "$fail" = true ] && [ "$location" = true ] && \
-              [ "$protocol" = true ] && [ "$tls" = true ] && [ -n "$output" ] || exit 64
-            /bin/cp "$FAKE_DOWNLOAD_SOURCE" "$output"
+              [ "$protocol" = true ] && [ "$tls" = true ] && [ -n "$output" ] && [ -n "$url" ] || exit 64
+            /bin/cp "$FAKE_DOWNLOAD_FIXTURES/${url##*/}" "$output"
             ''',
         )
 
@@ -436,10 +456,68 @@ class ArtifactStageTest(BootstrapTestCase):
                 'BOOTSTRAP_TEST_ROOT': str(host),
                 'BOOTSTRAP_TEST_LOCK_FILE': str(lock),
                 'FAKE_CURL_LOG': str(curl_log),
-                'FAKE_DOWNLOAD_SOURCE': str(fixture),
+                'FAKE_DOWNLOAD_FIXTURES': str(fixtures),
             }
         )
         return environment, host, lock, curl_log
+
+    def approved_records(self) -> list[tuple[str, str, str, bytes, str]]:
+        return [
+            (
+                'containerd',
+                '2.3.1',
+                'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+                self.archive_bytes(
+                    [
+                        ('bin/containerd', b'containerd\n'),
+                        ('bin/ctr', b'ctr\n'),
+                        ('bin/containerd-shim-runc-v2', b'shim\n'),
+                    ]
+                ),
+                '/usr/local/bin',
+            ),
+            (
+                'runc',
+                '1.3.6',
+                'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64',
+                b'runc\n',
+                '/usr/local/sbin/runc',
+            ),
+            (
+                'cni-plugins',
+                '1.9.1',
+                'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+                self.archive_bytes(
+                    [
+                        ('bridge', b'bridge\n'),
+                        ('host-local', b'host-local\n'),
+                        ('loopback', b'loopback\n'),
+                    ]
+                ),
+                '/opt/cni/bin',
+            ),
+            (
+                'helm',
+                '3.21.0',
+                'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+                self.archive_bytes([('linux-amd64/helm', b'helm\n')]),
+                '/usr/local/bin/helm',
+            ),
+            (
+                'gateway-api',
+                '1.6.1',
+                'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml',
+                b'gateway\n',
+                'kubernetes://gateway-api/standard',
+            ),
+            (
+                'cilium-chart',
+                '1.20.0',
+                'https://helm.cilium.io/cilium-1.20.0.tgz',
+                b'cilium\n',
+                'kubernetes://kube-system/cilium',
+            ),
+        ]
 
     def run_stage(
         self, environment: dict[str, str], mode: str
@@ -454,6 +532,27 @@ class ArtifactStageTest(BootstrapTestCase):
             / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
             / basename
         )
+
+    def stage_records(
+        self, host: Path, records: list[tuple[str, str, str, bytes, str]]
+    ) -> Path:
+        staging = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+        staging.mkdir(parents=True, mode=0o700)
+        staging.parent.chmod(0o700)
+        staging.chmod(0o700)
+        for _, _, url, artifact, _ in records:
+            staged = staging / Path(url).name
+            staged.write_bytes(artifact)
+            staged.chmod(0o600)
+        return staging
+
+    def compliant_environment(
+        self,
+    ) -> tuple[dict[str, str], Path, list[tuple[str, str, str, bytes, str]], Path]:
+        records = self.approved_records()
+        environment, host, _, _ = self.make_environment(b'ignored\n', records=records)
+        staging = self.stage_records(host, records)
+        return environment, host, records, staging
 
     def archive_bytes(self, members: list[tuple[str, bytes | str]]) -> bytes:
         stream = io.BytesIO()
@@ -505,9 +604,9 @@ class ArtifactStageTest(BootstrapTestCase):
         self.assertFalse(self.staged_path(host, 'runc.amd64').exists())
 
     def test_check_refuses_existing_same_name_with_different_digest(self) -> None:
-        environment, host, _, _ = self.make_environment(b'approved\n')
+        environment, host, _, staging = self.compliant_environment()
         staged = self.staged_path(host, 'runc.amd64')
-        staged.parent.mkdir(parents=True, mode=0o700)
+        self.assertEqual(staged.parent, staging)
         staged.write_bytes(b'unknown\n')
 
         result = self.run_stage(environment, '--check')
@@ -666,42 +765,91 @@ class ArtifactStageTest(BootstrapTestCase):
                 self.assertEqual(self.staged_path(host, Path(url).name).read_bytes(), artifact)
 
     def test_check_reports_exact_existing_artifact_as_compliant(self) -> None:
-        artifact = b'approved\n'
-        environment, host, _, curl_log = self.make_environment(artifact)
-        staged = self.staged_path(host, 'runc.amd64')
-        staged.parent.mkdir(parents=True, mode=0o700)
-        staged.write_bytes(artifact)
-        staged.chmod(0o600)
+        environment, _, _, _ = self.compliant_environment()
 
         result = self.run_stage(environment, '--check')
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
-        self.assertFalse(curl_log.exists())
 
-    def test_apply_reports_already_compliant_only_when_all_locked_artifacts_match(self) -> None:
-        records = [
-            ('containerd', '2.3.1', 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz', b'containerd\n', '/usr/local/bin'),
-            ('runc', '1.3.6', 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64', b'runc\n', '/usr/local/sbin/runc'),
-            ('cni-plugins', '1.9.1', 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz', b'cni\n', '/opt/cni/bin'),
-            ('helm', '3.21.0', 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz', b'helm\n', '/usr/local/bin/helm'),
-            ('gateway-api', '1.6.1', 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml', b'gateway\n', 'kubernetes://gateway-api/standard'),
-            ('cilium-chart', '1.20.0', 'https://helm.cilium.io/cilium-1.20.0.tgz', b'cilium\n', 'kubernetes://kube-system/cilium'),
-        ]
-        environment, host, _, curl_log = self.make_environment(
-            b'ignored\n', records=records
-        )
-        for _, _, url, artifact, _ in records:
-            staged = self.staged_path(host, Path(url).name)
-            staged.parent.mkdir(parents=True, exist_ok=True)
-            staged.write_bytes(artifact)
-            staged.chmod(0o600)
+    def test_check_rejects_unknown_staging_entries(self) -> None:
+        for entry_type in ('file', 'directory', 'symlink'):
+            with self.subTest(entry_type=entry_type):
+                environment, _, _, staging = self.compliant_environment()
+                unknown = staging / 'unapproved'
+                if entry_type == 'file':
+                    unknown.write_bytes(b'unknown\n')
+                elif entry_type == 'directory':
+                    unknown.mkdir()
+                else:
+                    unknown.symlink_to('runc.amd64')
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertTrue(unknown.exists() or unknown.is_symlink())
+
+    def test_check_rejects_existing_artifact_directory_mode_drift(self) -> None:
+        environment, _, _, staging = self.compliant_environment()
+        staging.chmod(0o755)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 30)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertEqual(staging.stat().st_mode & 0o777, 0o755)
+
+    def test_apply_rejects_existing_artifact_root_mode_drift(self) -> None:
+        environment, host, _, _ = self.compliant_environment()
+        artifact_root = host / 'root/dev-infra-artifacts'
+        artifact_root.chmod(0o755)
 
         result = self.run_stage(environment, '--apply')
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
-        self.assertFalse(curl_log.exists())
+        self.assertEqual(result.returncode, 30)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertEqual(artifact_root.stat().st_mode & 0o777, 0o755)
+
+    def test_check_rejects_truncated_lock_even_when_its_artifacts_match(self) -> None:
+        records = self.approved_records()[:-1]
+        environment, host, _, _ = self.make_environment(b'ignored\n', records=records)
+        self.stage_records(host, records)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
+    def test_check_rejects_duplicate_lock_basename(self) -> None:
+        records = self.approved_records()
+        records[-1] = (
+            'cilium-chart',
+            '1.20.0',
+            'https://helm.cilium.io/helm-v3.21.0-linux-amd64.tar.gz',
+            records[3][3],
+            'kubernetes://kube-system/cilium',
+        )
+        environment, host, _, _ = self.make_environment(b'ignored\n', records=records)
+        self.stage_records(host, records)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertIn('REASON=lock-basename-duplicate', result.stdout)
+
+    def test_check_rejects_unapproved_lock_name(self) -> None:
+        records = self.approved_records()
+        name, version, url, artifact, target = records[-1]
+        records[-1] = ('unexpected-chart', version, url, artifact, target)
+        environment, host, _, _ = self.make_environment(b'ignored\n', records=records)
+        self.stage_records(host, records)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
 
 
 if __name__ == '__main__':

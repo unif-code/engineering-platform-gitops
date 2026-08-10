@@ -10,6 +10,7 @@ source "${script_dir}/lib/common.sh"
 
 readonly ARTIFACT_SET=pcs-2026-08-10.1
 readonly MINIMUM_AVAILABLE_KIB=1048576
+readonly APPROVED_RECORD_COUNT=6
 
 host_path() {
   local absolute=$1
@@ -52,6 +53,44 @@ artifact_basename() {
   local base=${path##*/}
   [[ -n "$base" && "$base" != . && "$base" != .. && "$base" != *$'\n'* ]] || return 1
   printf '%s\n' "$base"
+}
+
+approved_record() {
+  local name=$1
+
+  case "$name" in
+    containerd)
+      printf '%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' /usr/local/bin
+      ;;
+    runc)
+      printf '%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' /usr/local/sbin/runc
+      ;;
+    cni-plugins)
+      printf '%s\t%s\t%s\n' 1.9.1 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz' /opt/cni/bin
+      ;;
+    helm)
+      printf '%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' /usr/local/bin/helm
+      ;;
+    gateway-api)
+      printf '%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 'kubernetes://gateway-api/standard'
+      ;;
+    cilium-chart)
+      printf '%s\t%s\t%s\n' 1.20.0 'https://helm.cilium.io/cilium-1.20.0.tgz' 'kubernetes://kube-system/cilium'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+array_contains() {
+  local needle=$1
+  local value
+  shift
+  for value in "$@"; do
+    [[ "$value" == "$needle" ]] && return 0
+  done
+  return 1
 }
 
 safe_archive_member() {
@@ -137,9 +176,18 @@ artifact_state() {
   fi
 }
 
+private_directory() {
+  local directory=$1
+  local mode
+
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  mode=$(stat -f '%Lp' "$directory" 2>/dev/null || stat -c '%a' "$directory" 2>/dev/null) || return 1
+  [[ "$mode" == 700 ]]
+}
+
 parse_mode "$@" || exit "$?"
 
-for required_command in curl df grep mktemp mv rm tar; do
+for required_command in curl df grep mktemp mv rm stat tar; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION"
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -159,25 +207,35 @@ available_kib=$(df -Pk "$artifact_parent" 2>/dev/null | awk 'NR == 2 {print $4}'
 [[ "$available_kib" =~ ^[0-9]+$ ]] || complete STOP_PRECONDITION disk-space-invalid "$EXIT_PRECONDITION"
 (( available_kib >= MINIMUM_AVAILABLE_KIB )) || complete STOP_PRECONDITION disk-space-below-1-gib "$EXIT_PRECONDITION"
 
-declare -a names=() versions=() urls=() digests=() targets=() basenames=()
+declare -a names=() urls=() digests=() basenames=()
 while IFS=$'\t' read -r name version url digest target extra; do
   [[ -z "$name" && -z "$version" && -z "$url" && -z "$digest" && -z "$target" && -z "$extra" ]] && continue
   [[ -n "$name" && -n "$version" && -n "$target" && -z "$extra" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-record-invalid "$EXIT_SUPPLY_CHAIN"
+  expected_record=$(approved_record "$name") || complete STOP_SUPPLY_CHAIN_MISMATCH lock-name-unapproved "$EXIT_SUPPLY_CHAIN"
+  if array_contains "$name" "${names[@]-}"; then
+    complete STOP_SUPPLY_CHAIN_MISMATCH lock-name-duplicate "$EXIT_SUPPLY_CHAIN"
+  fi
   is_official_url "$url" || complete STOP_SUPPLY_CHAIN_MISMATCH url-not-official-https "$EXIT_SUPPLY_CHAIN"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-digest-invalid "$EXIT_SUPPLY_CHAIN"
   base=$(artifact_basename "$url") || complete STOP_SUPPLY_CHAIN_MISMATCH url-basename-invalid "$EXIT_SUPPLY_CHAIN"
+  if array_contains "$base" "${basenames[@]-}"; then
+    complete STOP_SUPPLY_CHAIN_MISMATCH lock-basename-duplicate "$EXIT_SUPPLY_CHAIN"
+  fi
+  IFS=$'\t' read -r expected_version expected_url expected_target <<<"$expected_record"
+  [[ "$version" == "$expected_version" && "$url" == "$expected_url" && "$target" == "$expected_target" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-schema-drift "$EXIT_SUPPLY_CHAIN"
   names+=("$name")
-  versions+=("$version")
   urls+=("$url")
   digests+=("$digest")
-  targets+=("$target")
   basenames+=("$base")
 done <"$lock_file"
 
-(( ${#names[@]} > 0 )) || complete STOP_SUPPLY_CHAIN_MISMATCH lock-file-empty "$EXIT_SUPPLY_CHAIN"
+(( ${#names[@]} == APPROVED_RECORD_COUNT )) || complete STOP_SUPPLY_CHAIN_MISMATCH lock-record-count-invalid "$EXIT_SUPPLY_CHAIN"
 
+if [[ -e "$artifact_root" || -L "$artifact_root" ]]; then
+  private_directory "$artifact_root" || complete STOP_UNKNOWN_STATE artifact-root-unsafe "$EXIT_UNKNOWN_STATE"
+fi
 if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
-  [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || complete STOP_UNKNOWN_STATE artifact-directory-unsafe "$EXIT_UNKNOWN_STATE"
+  private_directory "$artifact_dir" || complete STOP_UNKNOWN_STATE artifact-directory-unsafe "$EXIT_UNKNOWN_STATE"
 fi
 
 all_compliant=true
@@ -199,24 +257,34 @@ for index in "${!names[@]}"; do
   esac
 done
 
+if [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
+  shopt -s dotglob nullglob
+  for entry in "$artifact_dir"/*; do
+    entry_name=${entry##*/}
+    array_contains "$entry_name" "${basenames[@]}" || complete STOP_UNKNOWN_STATE "artifact-entry-unapproved-${entry_name}" "$EXIT_UNKNOWN_STATE"
+  done
+fi
+
 if [[ "$all_compliant" == true ]]; then
   printf 'RESULT=ALREADY_COMPLIANT\n'
   exit 0
 fi
 
+# parse_mode 在公共库中赋值。
+# shellcheck disable=SC2153
 if [[ "$MODE" == CHECK ]]; then
   printf 'RESULT=PASS_ARTIFACTS_CHECK\n'
   exit 0
 fi
 
 if [[ -e "$artifact_root" || -L "$artifact_root" ]]; then
-  [[ -d "$artifact_root" && ! -L "$artifact_root" ]] || complete STOP_UNKNOWN_STATE artifact-root-unsafe "$EXIT_UNKNOWN_STATE"
+  private_directory "$artifact_root" || complete STOP_UNKNOWN_STATE artifact-root-unsafe "$EXIT_UNKNOWN_STATE"
 else
   mkdir -p -- "$artifact_root" || complete STOP_APPLY_FAILED artifact-root-create-failed "$EXIT_APPLY_FAILED"
   chmod 700 "$artifact_root" || complete STOP_APPLY_FAILED artifact-root-mode-failed "$EXIT_APPLY_FAILED"
 fi
 if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
-  [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || complete STOP_UNKNOWN_STATE artifact-directory-unsafe "$EXIT_UNKNOWN_STATE"
+  private_directory "$artifact_dir" || complete STOP_UNKNOWN_STATE artifact-directory-unsafe "$EXIT_UNKNOWN_STATE"
 else
   mkdir -- "$artifact_dir" || complete STOP_APPLY_FAILED artifact-directory-create-failed "$EXIT_APPLY_FAILED"
   chmod 700 "$artifact_dir" || complete STOP_APPLY_FAILED artifact-directory-mode-failed "$EXIT_APPLY_FAILED"
