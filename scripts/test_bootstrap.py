@@ -19,6 +19,8 @@ PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
 STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
 PREPARE_KERNEL = ROOT / 'scripts/bootstrap/20-prepare-kernel.sh'
 INSTALL_CONTAINERD = ROOT / 'scripts/bootstrap/30-install-containerd.sh'
+INSTALL_KUBERNETES = ROOT / 'scripts/bootstrap/40-install-kubernetes.sh'
+KUBEADM_INIT = ROOT / 'scripts/bootstrap/50-kubeadm-init.sh'
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -759,7 +761,9 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
     def test_production_fixes_safe_path_before_command_lookup(self) -> None:
         """捕获 production 从调用者 PATH 执行伪造 id/systemctl/python3 的缺陷。"""
         self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
-        for script in (PREPARE_KERNEL, INSTALL_CONTAINERD):
+        for script in (
+            PREPARE_KERNEL, INSTALL_CONTAINERD, INSTALL_KUBERNETES, KUBEADM_INIT,
+        ):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
 
@@ -773,7 +777,9 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 
     def test_production_rejects_all_test_overrides_before_lookup(self) -> None:
         """捕获 production 接受 TEST_ROOT/LOCK/owner seam 或先执行不可信命令的缺陷。"""
-        for script in (PREPARE_KERNEL, INSTALL_CONTAINERD):
+        for script in (
+            PREPARE_KERNEL, INSTALL_CONTAINERD, INSTALL_KUBERNETES, KUBEADM_INIT,
+        ):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
                 environment.update(
@@ -794,7 +800,9 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 
     def test_test_mode_requires_non_root_mapped_root(self) -> None:
         """捕获 test mode 映射到真实 `/` 或省略隔离 test root 的缺陷。"""
-        for script in (PREPARE_KERNEL, INSTALL_CONTAINERD):
+        for script in (
+            PREPARE_KERNEL, INSTALL_CONTAINERD, INSTALL_KUBERNETES, KUBEADM_INIT,
+        ):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
                 environment.update(
@@ -963,20 +971,6 @@ class ArtifactStageTest(BootstrapTestCase):
                 '/usr/local/sbin/runc',
             ),
             (
-                'cni-plugins',
-                '1.9.1',
-                'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
-                self.archive_bytes(
-                    [
-                        ('bridge', b'bridge\n'),
-                        ('host-local', b'host-local\n'),
-                        ('loopback', b'loopback\n'),
-                        ('portmap', b'portmap\n'),
-                    ]
-                ),
-                '/opt/cni/bin',
-            ),
-            (
                 'crictl',
                 '1.36.0',
                 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
@@ -1142,22 +1136,6 @@ class ArtifactStageTest(BootstrapTestCase):
             self.staged_path(host, 'containerd-2.3.1-linux-amd64.tar.gz').exists()
         )
 
-    def test_apply_rejects_cni_archive_absolute_member(self) -> None:
-        artifact = self.archive_bytes([('/escape', b'escape\n')])
-        environment, host, _, _ = self.make_environment(
-            artifact,
-            name='cni-plugins',
-            version='1.9.1',
-            url='https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
-            target='/opt/cni/bin',
-        )
-
-        result = self.run_stage(environment, '--apply')
-
-        self.assertEqual(result.returncode, 20)
-        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
-        self.assertFalse(self.staged_path(host, 'cni-plugins-linux-amd64-v1.9.1.tgz').exists())
-
     def test_apply_rejects_helm_archive_path_traversal(self) -> None:
         artifact = self.archive_bytes([('linux-amd64/../../escape', b'escape\n')])
         environment, host, _, _ = self.make_environment(
@@ -1210,8 +1188,8 @@ class ArtifactStageTest(BootstrapTestCase):
         self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
         self.assertFalse(self.staged_path(host, 'helm-v3.21.0-linux-amd64.tar.gz').exists())
 
-    def test_check_rejects_six_record_lock_without_crictl(self) -> None:
-        """捕获 staging 继续接受缺少 crictl 的旧六项 schema 的缺陷。"""
+    def test_check_rejects_five_record_lock_without_crictl(self) -> None:
+        """捕获 staging 接受缺少 crictl 的五项 schema 的缺陷。"""
         records = [
             record
             for record in self.approved_records()
@@ -1276,33 +1254,6 @@ class ArtifactStageTest(BootstrapTestCase):
                     ).exists()
                 )
 
-    def test_apply_rejects_cni_archive_missing_portmap(self) -> None:
-        """捕获 staging 未校验 Task 5 必装 portmap 成员的缺陷。"""
-        artifact = self.archive_bytes(
-            [
-                ('bridge', b'bridge\n'),
-                ('host-local', b'host-local\n'),
-                ('loopback', b'loopback\n'),
-            ]
-        )
-        environment, host, _, _ = self.make_environment(
-            artifact,
-            name='cni-plugins',
-            version='1.9.1',
-            url='https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
-            target='/opt/cni/bin',
-        )
-
-        result = self.run_stage(environment, '--apply')
-
-        self.assertEqual(result.returncode, 20)
-        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
-        self.assertFalse(
-            self.staged_path(
-                host, 'cni-plugins-linux-amd64-v1.9.1.tgz'
-            ).exists()
-        )
-
     def test_apply_stages_archives_with_required_members(self) -> None:
         fixtures = [
             (
@@ -1311,13 +1262,6 @@ class ArtifactStageTest(BootstrapTestCase):
                 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
                 '/usr/local/bin',
                 [('bin/containerd', b'containerd\n'), ('bin/ctr', b'ctr\n'), ('bin/containerd-shim-runc-v2', b'shim\n')],
-            ),
-            (
-                'cni-plugins',
-                '1.9.1',
-                'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
-                '/opt/cni/bin',
-                [('bridge', b'bridge\n'), ('host-local', b'host-local\n'), ('loopback', b'loopback\n'), ('portmap', b'portmap\n')],
             ),
             (
                 'helm',
@@ -1438,6 +1382,45 @@ class ArtifactStageTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 20)
         self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
 
+    def test_check_accepts_six_artifacts_without_cni_archive(self) -> None:
+        """捕获 stager 继续要求第七项 CNI artifact 的双重 ownership 缺陷。"""
+        records = [
+            record for record in self.approved_records()
+            if record[0] != 'cni-plugins'
+        ]
+        environment, host, _, _ = self.make_environment(
+            b'ignored\n', records=records
+        )
+        self.stage_records(host, records)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+
+    def test_check_rejects_reintroduced_cni_archive(self) -> None:
+        """捕获 stager 再次批准 cni-plugins release artifact 的缺陷。"""
+        records = self.approved_records()
+        records.append(
+            (
+                'cni-plugins',
+                '1.9.1',
+                'https://github.com/containernetworking/plugins/releases/'
+                'download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+                self.archive_bytes([('bridge', b'bridge\n')]),
+                '/opt/cni/bin',
+            )
+        )
+        environment, host, _, _ = self.make_environment(
+            b'ignored\n', records=records
+        )
+        self.stage_records(host, records)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20, result.stderr)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
 
 class ContainerdInstallTest(BootstrapTestCase):
     endpoint = 'unix:///run/containerd/containerd.sock'
@@ -1469,13 +1452,6 @@ case "$*" in
   *) exit 64 ;;
 esac
 '''
-    cni_binaries = {
-        'bridge': b'#!/bin/sh\nexit 0\n',
-        'host-local': b'#!/bin/sh\nexit 0\n',
-        'loopback': b'#!/bin/sh\nexit 0\n',
-        'portmap': b'#!/bin/sh\nexit 0\n',
-    }
-
     def write_executable(self, path: Path, source: str | bytes) -> None:
         if isinstance(source, bytes):
             path.write_bytes(source)
@@ -1522,7 +1498,6 @@ esac
                 ]
             ),
             'runc': self.runc_binary,
-            'cni-plugins': self.archive_bytes(list(self.cni_binaries.items())),
             'crictl': self.archive_bytes([('crictl', self.crictl_binary)]),
             'helm': self.archive_bytes([('linux-amd64/helm', b'helm\n')]),
             'gateway-api': b'gateway\n',
@@ -1543,13 +1518,6 @@ esac
                 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64',
                 artifacts['runc'],
                 '/usr/local/sbin/runc',
-            ),
-            (
-                'cni-plugins',
-                '1.9.1',
-                'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
-                artifacts['cni-plugins'],
-                '/opt/cni/bin',
             ),
             (
                 'crictl',
@@ -1627,7 +1595,6 @@ esac
             host / 'usr/local/bin',
             host / 'usr/local/sbin',
             host / 'usr/local/lib/systemd/system',
-            host / 'opt/cni/bin',
             host / 'etc/containerd',
             host / 'var/lib',
             host / 'run',
@@ -1833,14 +1800,23 @@ esac
             'ctr': host / 'usr/local/bin/ctr',
             'shim': host / 'usr/local/bin/containerd-shim-runc-v2',
             'runc': host / 'usr/local/sbin/runc',
-            'bridge': host / 'opt/cni/bin/bridge',
-            'host-local': host / 'opt/cni/bin/host-local',
-            'loopback': host / 'opt/cni/bin/loopback',
-            'portmap': host / 'opt/cni/bin/portmap',
             'crictl': host / 'usr/local/bin/crictl',
             'config': host / 'etc/containerd/config.toml',
             'unit': host / 'usr/local/lib/systemd/system/containerd.service',
         }
+
+    def test_apply_succeeds_without_creating_or_managing_cni_path(self) -> None:
+        """捕获 Task 5 仍解析、解包或发布 CNI payload 的双重 ownership 缺陷。"""
+        environment, host, command_log, _ = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CONTAINERD_INSTALLED', result.stdout)
+        self.assertFalse((host / 'opt/cni/bin').exists())
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('.cni.extract.', commands)
+        self.assertNotIn('cni-plugins-linux-amd64-v1.9.1.tgz', commands)
 
     def install_compliant_targets(
         self, environment: dict[str, str], host: Path
@@ -1851,7 +1827,6 @@ esac
             'ctr': self.ctr_binary,
             'shim': self.shim_binary,
             'runc': self.runc_binary,
-            **self.cni_binaries,
             'crictl': self.crictl_binary,
         }
         for name, content in binaries.items():
@@ -1895,7 +1870,6 @@ esac
             ('containerd', 'content'),
             ('runc', 'symlink'),
             ('crictl', 'mode'),
-            ('bridge', 'directory'),
             ('config', 'content'),
             ('unit', 'mode'),
         ):
@@ -2130,8 +2104,8 @@ esac
             self.assertNotIn(forbidden, commands)
 
     def test_check_revalidates_every_staged_digest_and_file_safety(self) -> None:
-        """捕获信任前序结果、遗漏七项 digest 或接受不安全 staging 文件的缺陷。"""
-        for name in ('containerd', 'runc', 'cni-plugins', 'crictl', 'helm', 'gateway-api', 'cilium-chart'):
+        """捕获信任前序结果、遗漏六项 digest 或接受不安全 staging 文件的缺陷。"""
+        for name in ('containerd', 'runc', 'crictl', 'helm', 'gateway-api', 'cilium-chart'):
             with self.subTest(name=name):
                 environment, host, _, _ = self.make_environment()
                 lock_line = next(
@@ -2203,7 +2177,6 @@ esac
         """捕获 archive 缺成员、路径逃逸或 symlink 冒充 executable 的缺陷。"""
         cases = {
             'containerd': self.archive_bytes([('bin/containerd', self.containerd_version)]),
-            'cni-plugins': self.archive_bytes([('bridge', self.cni_binaries['bridge'])]),
             'crictl': self.archive_bytes([('crictl', 'bin/crictl')]),
             'escape': self.archive_bytes([('../escape', b'escape\n')]),
         }
@@ -2219,7 +2192,7 @@ esac
                 self.assertTrue(all(not path.exists() for path in self.managed_targets(host).values()))
 
     def test_apply_installs_exact_targets_and_verifies_health_without_leak(self) -> None:
-        """捕获漏装 crictl/CNI、错误 endpoint、宽松健康解析或 raw output 泄漏的缺陷。"""
+        """捕获漏装 crictl、错误 endpoint、宽松健康解析或 raw output 泄漏的缺陷。"""
         environment, host, command_log, _ = self.make_environment()
         environment['FAKE_CANARY'] = 'SECRET_CANARY_STDERR'
 
@@ -2417,12 +2390,6 @@ esac
                     )
                 )
 
-    def test_apply_revalidates_cni_parent_after_its_mktemp(self) -> None:
-        """捕获 CNI mktemp 后 parent mode/owner/type 漂移仍 tar 或发布的缺陷。"""
-        self.assert_extract_parent_race_stops_before_writes(
-            match='.cni.extract.', parent_path='opt/cni/bin'
-        )
-
     def test_apply_revalidates_crictl_parent_after_its_mktemp(self) -> None:
         """捕获 crictl mktemp 后 parent mode/owner/type 漂移仍 tar 或发布的缺陷。"""
         self.assert_extract_parent_race_stops_before_writes(
@@ -2433,9 +2400,7 @@ esac
         self, *, phase: str, component: str
     ) -> None:
         environment, host, command_log, _ = self.make_environment()
-        parent_path = (
-            'opt/cni/bin' if component == 'cni' else 'usr/local/bin'
-        )
+        parent_path = 'usr/local/bin'
         parent = host / parent_path
         marker = host.parent / f'{phase}-{component}-owner.marker'
         environment.update(
@@ -2454,16 +2419,10 @@ esac
         elif phase == 'pre-tar':
             environment['FAKE_PHASE_RACE_AFTER_TAR'] = (
                 'containerd-2.3.1-linux-amd64.tar.gz'
-                if component == 'cni'
-                else 'cni-plugins-linux-amd64-v1.9.1.tgz'
             )
         else:
             environment['FAKE_PHASE_RACE_AFTER_MV'] = str(
-                host / (
-                    'usr/local/sbin/runc'
-                    if component == 'cni'
-                    else 'opt/cni/bin/portmap'
-                )
+                host / 'usr/local/sbin/runc'
             )
 
         result = self.run_stage(environment, '--apply')
@@ -2488,41 +2447,27 @@ esac
         unpublished = (
             targets.values()
             if phase != 'pre-publish'
-            else (
-                (
-                    targets['bridge'], targets['host-local'],
-                    targets['loopback'], targets['portmap'], targets['crictl'],
-                    targets['config'], targets['unit'],
-                )
-                if component == 'cni'
-                else (targets['crictl'], targets['config'], targets['unit'])
-            )
+            else (targets['crictl'], targets['config'], targets['unit'])
         )
         self.assertTrue(all(not path.exists() for path in unpublished))
 
     def test_apply_post_mktemp_parent_gate_is_load_bearing(self) -> None:
-        """捕获绕过 CNI/crictl post-mktemp owner Gate 后继续写入的 mutation。"""
-        for component in ('cni', 'crictl'):
-            with self.subTest(component=component):
-                self.assert_phase_parent_race_stops_followup_writes(
-                    phase='post-mktemp', component=component
-                )
+        """捕获绕过 crictl post-mktemp owner Gate 后继续写入的 mutation。"""
+        self.assert_phase_parent_race_stops_followup_writes(
+            phase='post-mktemp', component='crictl'
+        )
 
     def test_apply_pre_tar_parent_gate_is_load_bearing(self) -> None:
-        """捕获绕过 CNI/crictl pre-tar owner Gate 后继续解压的 mutation。"""
-        for component in ('cni', 'crictl'):
-            with self.subTest(component=component):
-                self.assert_phase_parent_race_stops_followup_writes(
-                    phase='pre-tar', component=component
-                )
+        """捕获绕过 crictl pre-tar owner Gate 后继续解压的 mutation。"""
+        self.assert_phase_parent_race_stops_followup_writes(
+            phase='pre-tar', component='crictl'
+        )
 
     def test_apply_pre_publish_parent_gate_is_load_bearing(self) -> None:
-        """捕获绕过 CNI/crictl pre-publish owner Gate 后继续发布的 mutation。"""
-        for component in ('cni', 'crictl'):
-            with self.subTest(component=component):
-                self.assert_phase_parent_race_stops_followup_writes(
-                    phase='pre-publish', component=component
-                )
+        """捕获绕过 crictl pre-publish owner Gate 后继续发布的 mutation。"""
+        self.assert_phase_parent_race_stops_followup_writes(
+            phase='pre-publish', component='crictl'
+        )
 
     def test_health_rejects_version_and_plugin_drift(self) -> None:
         """捕获宽松接受 containerd/runc/crictl 版本或 CRI/overlayfs plugin 漂移的缺陷。"""
@@ -2570,6 +2515,988 @@ esac
                 self.assertEqual(result.returncode, 50, result.stderr)
                 self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
                 self.assertNotIn('SECRET_CANARY', result.stdout + result.stderr)
+
+
+class KubernetesInstallTest(BootstrapTestCase):
+    version = '1.36.3-1.1'
+    cni_version = '1.9.1-1.1'
+    release_key_digest = (
+        '7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d'
+    )
+    package_metadata = {
+        'kubeadm': (
+            'amd64/kubeadm_1.36.3-1.1_amd64.deb',
+            '12558824',
+            '7225b4b7928de8bb9b7a69b75524c2df1a6f78fcbb40724f7e5b49926119c2af',
+        ),
+        'kubectl': (
+            'amd64/kubectl_1.36.3-1.1_amd64.deb',
+            '11766348',
+            '22c1bbcecfdee50ad013ab7ab9e90ea9d3aaa01d3ac38ac578534976f856c330',
+        ),
+        'kubelet': (
+            'amd64/kubelet_1.36.3-1.1_amd64.deb',
+            '13386608',
+            '99c77d7c814ac0b0f1f346c11074160fbbab8243c27ba4236f84f2e536c8eaca',
+        ),
+        'kubernetes-cni': (
+            'amd64/kubernetes-cni_1.9.1-1.1_amd64.deb',
+            '38991216',
+            '4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93',
+        ),
+    }
+    cni_manifest = {
+        'LICENSE': (0o644, 11357, 'b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1'),
+        'README.md': (0o644, 2343, '43c32d29316a4a9fe23af500917bd89e51d6a84fa0dcbfcc75b5fbd834c3145a'),
+        'bandwidth': (0o755, 5042926, '01c59cee777ade0608361d94bf3bfe01bda82bc8da276d8be917e225aa660639'),
+        'bridge': (0o755, 5698763, '3553f5e8f47ed62aec728ab6f7444f6bf1624f916769852c6deb52cd216e22ba'),
+        'dhcp': (0o755, 13725422, 'bf0552ff2ef54fbd8846b21ffe149f4de63dcd98d86d6b91de5e0bd94473870d'),
+        'dummy': (0o755, 5251069, '88f9c9d018681a2b806db2c33184a0a4a532773cb71a60e975a9bf2f017199f6'),
+        'firewall': (0o755, 5702145, 'ecbd112d77192a125e85ab1fa4ded6cfaf4e9732172e072ee248caa81eba7aed'),
+        'host-device': (0o755, 5159967, 'a891bd77c5e25b6c4dfa65c8b78cf7f0a00be5ba5d5bbeccd902c08d7f0ea7f3'),
+        'host-local': (0o755, 4350778, 'ac5ff19b1120bd1d58203b20d45165f244691fcf9776ba55d6dd1747f043c90f'),
+        'ipvlan': (0o755, 5274322, '40ceded59770a0f28e7a45a0ed5f8c49044e786bc728f34d6c9de7bc5d3fb660'),
+        'loopback': (0o755, 4302030, '02956bdd03b9b71693b3efd72afce88384e4472b644a1c6410fe817f618c1a83'),
+        'macvlan': (0o755, 5307111, '33d2730d229dea786c56465a1a96db84ca27b3d5ac552bbc9aa5cdc942622814'),
+        'portmap': (0o755, 5108385, '10cc11a28d9c16465889eb59968be76cf04fa884939edf70c27b722cec2c0156'),
+        'ptp': (0o755, 5475470, '1cbbce28e96accfef5fe6021762a55ad2b114705f410b8837361a201df6c0b03'),
+        'sbr': (0o755, 4525826, 'bb886c24182afbad535f158b585524b08a9f1cf0618679987d6b0e11ebf50bb5'),
+        'static': (0o755, 3776708, '7bf980bedb303f6d314239413fd4aca5479a9affcd38509057ae203b0da67058'),
+        'tap': (0o755, 5453308, 'ebff11573fa4ed5793cc08776b8811a3c0f44705b2b530fd5014e6bf69275c1a'),
+        'tuning': (0o755, 4389084, '4659e9129d8c669c21c932cd778dc1ac17a717d100768ea23242883401cbb536'),
+        'vlan': (0o755, 5267679, '5f6973d15ad2b0d44d1dc0e59982ed05e34e4709630ecd367f766202f9034ac8'),
+        'vrf': (0o755, 4685012, '3f3363182c4777bd0d3ead028147f9ecebd60bb32f2d47b7c181877a00ae049b'),
+    }
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def make_environment(self) -> tuple[dict[str, str], Path, Path]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        fake_bin = directory / 'bin'
+        command_log = directory / 'commands.log'
+        cni_manifest = directory / 'cni-manifest.tsv'
+        for path in (
+            host / 'etc/apt/keyrings',
+            host / 'etc/apt/sources.list.d',
+            host / 'root/dev-infra-evidence',
+            host / 'var/lib/apt/lists',
+            host / 'var/tmp',
+            fake_bin,
+        ):
+            path.mkdir(parents=True)
+        (host / 'etc/apt/keyrings').chmod(0o755)
+        (host / 'etc/apt/sources.list.d').chmod(0o755)
+        (host / 'var/tmp').chmod(0o1777)
+        (host / 'etc/apt/sources.list').write_text('', encoding='utf-8')
+        cni_manifest.write_text(
+            ''.join(
+                f'{name}\t{mode:o}\t{size}\t{digest}\n'
+                for name, (mode, size, digest) in self.cni_manifest.items()
+            ),
+            encoding='utf-8',
+        )
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'curl',
+            '''
+            #!/bin/sh
+            printf 'curl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            output=
+            while [ "$#" -gt 0 ]; do
+              [ "$1" != --output ] || { output=$2; shift; }
+              shift
+            done
+            [ -n "$output" ] || exit 64
+            printf 'official-release-key\n' >"$output"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'gpg',
+            '''
+            #!/bin/sh
+            printf 'gpg %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            case " $* " in
+              *' --dearmor '*)
+                while [ "$#" -gt 0 ]; do
+                  [ "$1" != --output ] || { output=$2; shift; }
+                  shift
+                done
+                printf 'approved-keyring\n' >"$output"
+                ;;
+              *' --show-keys '*)
+                case "$(tail -c +1 "${!#}")" in
+                  approved-keyring*|official-release-key*) fingerprint=${FAKE_KEY_FINGERPRINT:?} ;;
+                  *) fingerprint=0000000000000000000000000000000000000000 ;;
+                esac
+                printf 'pub:-:2048:1:AAAAAAAAAAAAAAAA:0:0::::::scESC::::::23::0:\n'
+                printf 'fpr:::::::::%s:\n' "$fingerprint"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'apt-cache',
+            '''
+            #!/bin/sh
+            case "$1" in
+              policy)
+                if [ "$2" = kubernetes-cni ]; then
+                  default_candidate=1.9.1-1.1
+                else
+                  default_candidate=1.36.3-1.1
+                fi
+                candidate=${FAKE_CANDIDATE_VERSION:-$default_candidate}
+                printf '%s:\n  Installed: (none)\n  Candidate: %s\n' "$2" "$candidate"
+                printf '  Version table:\n *** %s 100\n' "$candidate"
+                printf '        100 https://pkgs.k8s.io/core:/stable:/v1.36/deb  Packages\n'
+                ;;
+              show)
+                package=${3%%=*}
+                case "$package" in
+                  kubeadm)
+                    filename=amd64/kubeadm_1.36.3-1.1_amd64.deb
+                    size=12558824
+                    digest=7225b4b7928de8bb9b7a69b75524c2df1a6f78fcbb40724f7e5b49926119c2af
+                    ;;
+                  kubectl)
+                    filename=amd64/kubectl_1.36.3-1.1_amd64.deb
+                    size=11766348
+                    digest=22c1bbcecfdee50ad013ab7ab9e90ea9d3aaa01d3ac38ac578534976f856c330
+                    ;;
+                  kubelet)
+                    filename=amd64/kubelet_1.36.3-1.1_amd64.deb
+                    size=13386608
+                    digest=99c77d7c814ac0b0f1f346c11074160fbbab8243c27ba4236f84f2e536c8eaca
+                    ;;
+                  kubernetes-cni)
+                    filename=amd64/kubernetes-cni_1.9.1-1.1_amd64.deb
+                    size=38991216
+                    digest=4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93
+                    ;;
+                  *) exit 64 ;;
+                esac
+                [ "${FAKE_INDEX_DIGEST_DRIFT:-}" != "$package" ] || digest=$(printf '0%.0s' $(seq 1 64))
+                if [ "$package" = kubernetes-cni ]; then version=1.9.1-1.1; else version=1.36.3-1.1; fi
+                printf 'Package: %s\nVersion: %s\nArchitecture: amd64\n' "$package" "$version"
+                printf 'Filename: %s\nSize: %s\nSHA256: %s\n' "$filename" "$size" "$digest"
+                [ "${FAKE_INDEX_DUPLICATE:-}" != "$package" ] || printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nFilename: %s\nSize: %s\nSHA256: %s\n' "$package" "$version" "$filename" "$size" "$digest"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'apt-get',
+            '''
+            #!/bin/sh
+            printf 'apt-get %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            case " $* " in
+              *' update '*)
+                case " $* " in *' -o APT::Update::Error-Mode=any '*) ;; *) exit 66 ;; esac
+                [ "${FAKE_APT_UPDATE_FAIL:-0}" != 1 ] || exit 67
+                : >"$FAKE_APT_UPDATED"
+                ;;
+              *' download '*)
+                package=
+                for argument in "$@"; do
+                  case "$argument" in kube*=*) package=${argument%%=*} ;; esac
+                done
+                [ -n "$package" ] || exit 64
+                [ -f "$FAKE_APT_UPDATED" ] || exit 65
+                case "$package" in
+                  kubeadm) version=1.36.3-1.1; size=12558824 ;;
+                  kubectl) version=1.36.3-1.1; size=11766348 ;;
+                  kubelet) version=1.36.3-1.1; size=13386608 ;;
+                  kubernetes-cni) version=1.9.1-1.1; size=38991216 ;;
+                  *) exit 64 ;;
+                esac
+                /usr/bin/python3 -c 'import os,sys; p=sys.argv[1]; open(p,"wb").close(); os.truncate(p,int(sys.argv[2]))' "${package}_${version}_amd64.deb" "$size"
+                [ "${FAKE_DOWNLOAD_EXTRA:-0}" != 1 ] || printf 'extra\n' >unexpected.deb
+                ;;
+              *' install '*)
+                case " $* " in *' --no-download '*) ;; *) exit 68 ;; esac
+                [ "$(printf '%s\n' "$*" | grep -o '\.deb' | wc -l | tr -d ' ')" = 4 ] || exit 69
+                case " $* " in *cri-tools*) exit 70 ;; esac
+                : >"$FAKE_PACKAGES_INSTALLED"
+                "$FAKE_CNI_INSTALL_HELPER"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'install-cni-fixture',
+            '''
+            #!/bin/sh
+            mkdir -p "$FAKE_CNI_ROOT"
+            chmod 0755 "$FAKE_CNI_ROOT"
+            while IFS='\t' read -r name mode size digest; do
+              : "$digest"
+              /usr/bin/python3 -c 'import os,sys; p=sys.argv[1]; open(p,"wb").close(); os.truncate(p,int(sys.argv[2]))' "$FAKE_CNI_ROOT/$name" "$size"
+              chmod "$mode" "$FAKE_CNI_ROOT/$name"
+            done <"$FAKE_CNI_MANIFEST"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'apt-mark',
+            '''
+            #!/bin/sh
+            case "$1" in
+              showhold)
+                if [ -f "$FAKE_PACKAGES_HELD" ]; then
+                  printf 'kubeadm\nkubectl\nkubelet\nkubernetes-cni\n'
+                elif [ -n "${FAKE_HOLDS:-}" ]; then
+                  printf '%s\n' "$FAKE_HOLDS"
+                fi
+                ;;
+              hold)
+                printf 'apt-mark %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+                : >"$FAKE_PACKAGES_HELD"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'dpkg-query',
+            '''
+            #!/bin/sh
+            package=${!#}
+            case "$1" in
+              -S)
+                [ -f "$FAKE_PACKAGES_INSTALLED" ] || [ "${FAKE_INSTALLED_STATE:-}" = exact ] || exit 1
+                logical=${2#"$FAKE_HOST_ROOT"}
+                printf 'kubernetes-cni: %s\n' "$logical"
+                exit 0
+                ;;
+            esac
+            case "$package" in
+              iptables|mount|util-linux|libc6)
+                [ "${FAKE_BASE_DEP_MISSING:-}" != "$package" ] || exit 1
+                printf 'install ok installed\n'
+                exit 0
+                ;;
+              cri-tools)
+                [ "${FAKE_CRI_TOOLS_INSTALLED:-0}" = 1 ] || exit 1
+                printf 'install ok installed\t1.36.0-1.1\tamd64\n'
+                exit 0
+                ;;
+            esac
+            if [ -f "$FAKE_PACKAGES_INSTALLED" ] || [ "${FAKE_INSTALLED_STATE:-}" = exact ]; then
+              if [ "$package" = kubernetes-cni ]; then version=1.9.1-1.1; else version=1.36.3-1.1; fi
+              printf 'install ok installed\t%s\tamd64\n' "$version"
+            elif [ "${FAKE_INSTALLED_STATE:-}" = partial ] && [ "$package" = kubeadm ]; then
+              printf 'install ok installed\t1.36.3-1.1\tamd64\n'
+            elif [ "${FAKE_INSTALLED_STATE:-}" = drift ] && [ "$package" = kubeadm ]; then
+              printf 'install ok installed\t1.35.0-1.1\tamd64\n'
+            else
+              exit 1
+            fi
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'dpkg-deb',
+            '''
+            #!/bin/sh
+            file=$2
+            package=${file##*/}
+            package=${package%%_*}
+            [ -z "${FAKE_DEB_PACKAGE_DRIFT:-}" ] || package=wrong-package
+            if [ "$package" = kubernetes-cni ]; then version=1.9.1-1.1; else version=1.36.3-1.1; fi
+            shift 2
+            for field in "$@"; do
+              case "$field" in
+                Package) value=$package ;;
+                Version) value=$version ;;
+                Architecture) value=amd64 ;;
+                *) exit 64 ;;
+              esac
+              if [ "$#" -eq 1 ]; then
+                printf '%s\n' "$value"
+              else
+                printf '%s: %s\n' "$field" "$value"
+              fi
+            done
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sha256sum',
+            '''
+            #!/bin/sh
+            case "${1##*/}" in
+              kubeadm_*) digest=7225b4b7928de8bb9b7a69b75524c2df1a6f78fcbb40724f7e5b49926119c2af ;;
+              kubectl_*) digest=22c1bbcecfdee50ad013ab7ab9e90ea9d3aaa01d3ac38ac578534976f856c330 ;;
+              kubelet_*) digest=99c77d7c814ac0b0f1f346c11074160fbbab8243c27ba4236f84f2e536c8eaca ;;
+              kubernetes-cni_*) digest=4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93 ;;
+              *.armored.*) digest=7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d ;;
+              *)
+                digest=$(awk -F '\t' -v name="${1##*/}" '$1 == name {print $4}' "$FAKE_CNI_MANIFEST")
+                [ -n "$digest" ] || exec /usr/bin/shasum -a 256 "$@"
+                ;;
+            esac
+            if [ -n "${FAKE_RELEASE_KEY_DIGEST_DRIFT:-}" ] && [ "${1##*/}" != "${1##*.armored.}" ]; then digest=$(printf '0%.0s' $(seq 1 64)); fi
+            if [ -n "${FAKE_DEB_DIGEST_DRIFT:-}" ] && [ "${1##*/}" = "${1##*.deb}" ]; then :; elif [ -n "${FAKE_DEB_DIGEST_DRIFT:-}" ]; then digest=$(printf '0%.0s' $(seq 1 64)); fi
+            [ "${FAKE_CNI_FILE_DIGEST_DRIFT:-}" != "${1##*/}" ] || digest=$(printf '0%.0s' $(seq 1 64))
+            printf '%s  %s\n' "$digest" "$1"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sync',
+            '''
+            #!/bin/sh
+            printf 'sync %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "${FAKE_SYNC_FAIL:-0}" != 1 ]
+            ''',
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'FAKE_COMMAND_LOG': str(command_log),
+                'FAKE_APT_UPDATED': str(directory / 'apt-updated'),
+                'FAKE_PACKAGES_INSTALLED': str(directory / 'packages-installed'),
+                'FAKE_PACKAGES_HELD': str(directory / 'packages-held'),
+                'FAKE_CNI_INSTALL_HELPER': str(fake_bin / 'install-cni-fixture'),
+                'FAKE_CNI_MANIFEST': str(cni_manifest),
+                'FAKE_CNI_ROOT': str(host / 'opt/cni/bin'),
+                # 官方 Release.key 的 fixture 指纹必须由生产 Gate 精确匹配。
+                'FAKE_KEY_FINGERPRINT': 'DE15B14486CD377B9E876E1A234654DA9A296436',
+            }
+        )
+        return environment, host, command_log
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str = '--check'
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', str(INSTALL_KUBERNETES), mode], env=environment
+        )
+
+    def install_repository_contract(self, host: Path) -> None:
+        (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').write_text(
+            'approved-keyring\n', encoding='utf-8'
+        )
+        (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').chmod(0o644)
+        (host / 'etc/apt/sources.list.d/kubernetes.list').write_text(
+            'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] '
+            'https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /\n',
+            encoding='utf-8',
+        )
+        (host / 'etc/apt/sources.list.d/kubernetes.list').chmod(0o644)
+
+    def install_cni_contract(self, host: Path) -> None:
+        root = host / 'opt/cni/bin'
+        root.mkdir(parents=True, mode=0o755, exist_ok=True)
+        root.chmod(0o755)
+        for name, (mode, size, _) in self.cni_manifest.items():
+            path = root / name
+            path.touch()
+            os.truncate(path, size)
+            path.chmod(mode)
+
+    def test_check_is_zero_write_on_clean_host(self) -> None:
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_CHECK', result.stdout)
+        self.assertFalse(command_log.exists())
+        self.assertFalse(
+            (host / 'etc/apt/sources.list.d/kubernetes.list').exists()
+        )
+
+    def test_rejects_other_minor_and_unknown_repository_state(self) -> None:
+        cases = ('other-minor', 'unknown-source', 'unknown-keyring', 'partial')
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'other-minor':
+                    (host / 'etc/apt/sources.list.d/legacy.list').write_text(
+                        'deb https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /\n',
+                        encoding='utf-8',
+                    )
+                elif case == 'unknown-source':
+                    self.install_repository_contract(host)
+                    (host / 'etc/apt/sources.list.d/kubernetes.list').write_text(
+                        'deb https://mirror.invalid/kubernetes /\n',
+                        encoding='utf-8',
+                    )
+                elif case == 'unknown-keyring':
+                    self.install_repository_contract(host)
+                    (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').write_text(
+                        'unapproved\n', encoding='utf-8'
+                    )
+                else:
+                    (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').write_text(
+                        'approved-keyring\n', encoding='utf-8'
+                    )
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_rejects_duplicate_deb822_legacy_and_broken_source_entries(self) -> None:
+        cases = ('duplicate', 'deb822', 'legacy', 'broken-symlink')
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                self.install_repository_contract(host)
+                target = host / 'etc/apt/sources.list.d/extra.list'
+                if case == 'duplicate':
+                    target.write_text(
+                        'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] '
+                        'https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /\n',
+                        encoding='utf-8',
+                    )
+                elif case == 'deb822':
+                    target = target.with_suffix('.sources')
+                    target.write_text(
+                        'Types: deb\nURIs: https://pkgs.k8s.io/core:/stable:/v1.36/deb/\n'
+                        'Suites: /\n',
+                        encoding='utf-8',
+                    )
+                elif case == 'legacy':
+                    target.write_text(
+                        'deb https://apt.kubernetes.io/ kubernetes-xenial main\n',
+                        encoding='utf-8',
+                    )
+                else:
+                    target.symlink_to('/missing/unapproved-source')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_rejects_missing_base_dependency_and_installed_cri_tools(self) -> None:
+        cases = (
+            {'FAKE_BASE_DEP_MISSING': 'iptables'},
+            {'FAKE_CRI_TOOLS_INSTALLED': '1'},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                environment, _, _ = self.make_environment()
+                environment.update(overrides)
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_rejects_unknown_or_partial_cni_directory_before_mutation(self) -> None:
+        for drift in ('unknown', 'partial', 'extra'):
+            with self.subTest(drift=drift):
+                environment, host, _ = self.make_environment()
+                root = host / 'opt/cni/bin'
+                root.mkdir(parents=True)
+                if drift == 'unknown':
+                    (root / 'bridge').write_bytes(b'unknown\n')
+                elif drift == 'partial':
+                    name, (mode, size, _) = next(iter(self.cni_manifest.items()))
+                    path = root / name
+                    path.touch()
+                    os.truncate(path, size)
+                    path.chmod(mode)
+                else:
+                    self.install_cni_contract(host)
+                    (root / 'unexpected').write_bytes(b'extra\n')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_rejects_candidate_installed_and_hold_drift(self) -> None:
+        cases = {
+            'candidate': {'FAKE_CANDIDATE_VERSION': '1.36.2-1.1'},
+            'installed': {'FAKE_INSTALLED_STATE': 'drift'},
+            'partial': {'FAKE_INSTALLED_STATE': 'partial'},
+            'hold': {'FAKE_HOLDS': 'kubeadm'},
+        }
+        for case, overrides in cases.items():
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                self.install_repository_contract(host)
+                environment.update(overrides)
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_apply_rejects_deb_metadata_and_signed_index_digest_drift(self) -> None:
+        cases = (
+            {'FAKE_DEB_PACKAGE_DRIFT': '1'},
+            {'FAKE_DEB_DIGEST_DRIFT': '1'},
+            {'FAKE_INDEX_DIGEST_DRIFT': 'kubectl'},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                environment, _, _ = self.make_environment()
+                environment.update(overrides)
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
+    def test_apply_rejects_release_key_digest_or_fingerprint_drift(self) -> None:
+        cases = (
+            {'FAKE_RELEASE_KEY_DIGEST_DRIFT': '1'},
+            {'FAKE_KEY_FINGERPRINT': '0' * 40},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                environment, _, _ = self.make_environment()
+                environment.update(overrides)
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
+    def test_apply_rejects_duplicate_index_stanza_and_extra_download(self) -> None:
+        cases = (
+            {'FAKE_INDEX_DUPLICATE': 'kubeadm'},
+            {'FAKE_DOWNLOAD_EXTRA': '1'},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                environment, _, _ = self.make_environment()
+                environment.update(overrides)
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
+    def test_apply_uses_fail_on_any_update_error(self) -> None:
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_APT_UPDATE_FAIL'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertIn(
+            'apt-get -o APT::Update::Error-Mode=any update',
+            command_log.read_text(encoding='utf-8'),
+        )
+
+    def test_apply_requires_standard_sticky_download_parent(self) -> None:
+        environment, host, _ = self.make_environment()
+        (host / 'var/tmp').chmod(0o755)
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_apply_installs_exact_local_debs_then_holds_and_records_evidence(self) -> None:
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertLess(
+            commands.index('apt-get -o APT::Update::Error-Mode=any update'),
+            commands.index('apt-get download'),
+        )
+        self.assertLess(commands.rindex('apt-get download'), commands.index('apt-get install'))
+        self.assertLess(commands.index('apt-get install'), commands.index('apt-mark hold'))
+        self.assertIn('kubeadm_1.36.3-1.1_amd64.deb', commands)
+        self.assertIn('kubernetes-cni_1.9.1-1.1_amd64.deb', commands)
+        install_command = next(
+            line for line in commands.splitlines() if line.startswith('apt-get install')
+        )
+        self.assertIn('--no-download', install_command)
+        self.assertEqual(install_command.count('.deb'), 4)
+        self.assertNotIn('cri-tools', install_command)
+        self.assertEqual(
+            set((host / 'opt/cni/bin').iterdir()),
+            {host / 'opt/cni/bin' / name for name in self.cni_manifest},
+        )
+        evidence = list(
+            (host / 'root/dev-infra-evidence').glob('11-kubernetes-*.txt')
+        )
+        self.assertEqual(len(evidence), 1)
+        evidence_text = evidence[0].read_text(encoding='utf-8')
+        for _, _, digest in self.package_metadata.values():
+            self.assertIn(digest, evidence_text)
+
+    def test_exact_state_is_idempotent_without_writes(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('apt-get ', commands)
+        self.assertNotIn('apt-mark hold', commands)
+
+    def test_exact_installed_cni_manifest_drift_is_not_idempotent(self) -> None:
+        environment, host, _ = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        (host / 'opt/cni/bin/bridge').chmod(0o644)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_apply_stops_if_atomic_sync_fails(self) -> None:
+        environment, host, _ = self.make_environment()
+        environment['FAKE_SYNC_FAIL'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertFalse(
+            (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').exists()
+        )
+
+
+class KubeadmInitTest(BootstrapTestCase):
+    canary = 'SECRET_CANARY_DO_NOT_LOG'
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def make_environment(self) -> tuple[dict[str, str], Path, Path]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        fake_bin = directory / 'bin'
+        gates = directory / 'gates'
+        command_log = directory / 'commands.log'
+        for path in (
+            host / 'etc/kubernetes/manifests',
+            host / 'etc/kubernetes/pki',
+            host / 'var/lib/etcd',
+            host / 'root/dev-infra-evidence',
+            fake_bin,
+            gates,
+        ):
+            path.mkdir(parents=True)
+        (host / 'etc/os-release').parent.mkdir(parents=True, exist_ok=True)
+        (host / 'etc/os-release').write_text(
+            'ID=ubuntu\nVERSION_ID="24.04"\n', encoding='utf-8'
+        )
+        (host / 'swap.img').write_bytes(b'preserve swap\n')
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'hostname',
+            '#!/bin/sh\nprintf "%s\\n" "${FAKE_HOSTNAME:-retail-test-workflow}"\n',
+        )
+        self.write_executable(
+            fake_bin / 'uname', '#!/bin/sh\nprintf "%s\\n" "${FAKE_ARCH:-x86_64}"\n'
+        )
+        self.write_executable(
+            fake_bin / 'ip',
+            '''
+            #!/bin/sh
+            case "$*" in
+              *address*) printf '%s\n' "${FAKE_IP_ADDRESS:-2: ens160 inet 10.93.1.27/24 scope global ens160}" ;;
+              *route*) printf '%s\n' "${FAKE_IP_ROUTES:-10.93.1.0/24 dev ens160 src 10.93.1.27}" ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'swapon',
+            '#!/bin/sh\nprintf "/swap.img 4294963200\\n"\n',
+        )
+        self.write_executable(
+            fake_bin / 'ss',
+            '#!/bin/sh\n[ "${FAKE_SS_FAIL:-0}" != 1 ] || exit 1\n[ "${FAKE_6443_LISTENER:-0}" != 1 ] && [ ! -f "$FAKE_LISTENER_MARKER" ] || printf "LISTEN 0 4096 [::]:6443 [::]:*\\n"\n',
+        )
+        self.write_executable(
+            fake_bin / 'systemctl',
+            '''
+            #!/bin/sh
+            case "$*" in
+              'is-active kubelet.service') printf 'active\n' ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'kubeadm',
+            '''
+            #!/bin/sh
+            printf 'kubeadm %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            printf '%s\n' "$FAKE_CANARY" >&2
+            case "$*" in
+              'config validate --config '* ) [ "${FAKE_VALIDATE_FAIL:-0}" != 1 ] ;;
+              'init phase preflight --config '* )
+                [ "${FAKE_PREFLIGHT_FAIL:-0}" != 1 ] || exit 1
+                [ "${FAKE_PREINIT_RACE:-}" != manifest ] || ln -s /missing "$FAKE_HOST_ROOT/etc/kubernetes/manifests/kube-controller-manager.yaml"
+                [ "${FAKE_PREINIT_RACE:-}" != listener ] || : >"$FAKE_LISTENER_MARKER"
+                ;;
+              'init --config '* )
+                [ "${FAKE_INIT_FAIL:-0}" != 1 ] || exit 1
+                printf '%s\n' "$FAKE_CANARY token certificate-key kubeconfig"
+                printf 'kubeconfig\n' >"$FAKE_HOST_ROOT/etc/kubernetes/admin.conf"
+                chmod 0600 "$FAKE_HOST_ROOT/etc/kubernetes/admin.conf"
+                for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+                  printf 'manifest\n' >"$FAKE_HOST_ROOT/etc/kubernetes/manifests/${component}.yaml"
+                  chmod 0600 "$FAKE_HOST_ROOT/etc/kubernetes/manifests/${component}.yaml"
+                done
+                [ "${FAKE_CREATE_KUBE_PROXY:-0}" != 1 ] || printf 'forbidden\n' >"$FAKE_HOST_ROOT/etc/kubernetes/manifests/kube-proxy.yaml"
+                mkdir -p "$FAKE_HOST_ROOT/var/lib/etcd/member"
+                printf 'certificate\n' >"$FAKE_HOST_ROOT/etc/kubernetes/pki/apiserver.crt"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'openssl',
+            '''
+            #!/bin/sh
+            printf '%s\n' "$FAKE_CANARY" >&2
+            printf 'subject=CN = kube-apiserver\n'
+            printf 'X509v3 Subject Alternative Name:\n    IP Address:10.93.1.27\n'
+            printf 'notAfter=Aug 10 00:00:00 2027 GMT\n'
+            ''',
+        )
+        for name, result_variable in (
+            ('kernel', 'FAKE_KERNEL_GATE_FAIL'),
+            ('containerd', 'FAKE_CONTAINERD_GATE_FAIL'),
+            ('kubernetes', 'FAKE_KUBERNETES_GATE_FAIL'),
+            ('cidr', 'FAKE_CIDR_GATE_FAIL'),
+        ):
+            self.write_executable(
+                gates / name,
+                f'''#!/bin/sh
+                printf '{name} %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+                printf '%s\n' "$FAKE_CANARY" >&2
+                [ "${{{result_variable}:-0}}" != 1 ]
+                ''',
+            )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_KERNEL_SCRIPT': str(gates / 'kernel'),
+                'BOOTSTRAP_TEST_CONTAINERD_SCRIPT': str(gates / 'containerd'),
+                'BOOTSTRAP_TEST_KUBERNETES_SCRIPT': str(gates / 'kubernetes'),
+                'BOOTSTRAP_TEST_CIDR_SCRIPT': str(gates / 'cidr'),
+                'FAKE_COMMAND_LOG': str(command_log),
+                'FAKE_HOST_ROOT': str(host),
+                'FAKE_CANARY': self.canary,
+                'FAKE_LISTENER_MARKER': str(directory / 'listener-6443'),
+            }
+        )
+        return environment, host, command_log
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str = '--check'
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', str(KUBEADM_INIT), mode], env=environment
+        )
+
+    def test_check_rejects_every_initialized_or_partial_marker_before_gates(self) -> None:
+        cases = (
+            'admin', 'apiserver', 'controller-manager', 'scheduler',
+            'static-broken-symlink', 'etcd', 'listener',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, command_log = self.make_environment()
+                if case == 'admin':
+                    (host / 'etc/kubernetes/admin.conf').write_text(
+                        'existing\n', encoding='utf-8'
+                    )
+                elif case == 'apiserver':
+                    (host / 'etc/kubernetes/manifests/kube-apiserver.yaml').write_text(
+                        'existing\n', encoding='utf-8'
+                    )
+                elif case == 'controller-manager':
+                    (host / 'etc/kubernetes/manifests/kube-controller-manager.yaml').write_text(
+                        'existing\n', encoding='utf-8'
+                    )
+                elif case == 'scheduler':
+                    (host / 'etc/kubernetes/manifests/kube-scheduler.yaml').write_text(
+                        'existing\n', encoding='utf-8'
+                    )
+                elif case == 'static-broken-symlink':
+                    (host / 'etc/kubernetes/manifests/unknown.yaml').symlink_to(
+                        '/missing'
+                    )
+                elif case == 'etcd':
+                    (host / 'var/lib/etcd/member').mkdir()
+                else:
+                    environment['FAKE_6443_LISTENER'] = '1'
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                if command_log.exists():
+                    self.assertNotIn(
+                        'kubeadm ', command_log.read_text(encoding='utf-8')
+                    )
+
+    def test_check_reruns_all_prior_gates_without_kubeadm_or_writes(self) -> None:
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        for gate in ('kernel --check', 'containerd --check', 'kubernetes --check'):
+            self.assertIn(gate, commands)
+        self.assertIn('cidr --service-cidr 172.20.0.0/16', commands)
+        self.assertNotIn('00-preflight', commands)
+        self.assertNotIn('kubeadm ', commands)
+        self.assertFalse(
+            list((host / 'root/dev-infra-evidence').glob('12-kubeadm-*.txt'))
+        )
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_listener_query_failure_stops_before_prior_gates(self) -> None:
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_SS_FAIL'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
+        self.assertFalse(command_log.exists())
+
+    def test_prior_gate_failure_stops_before_kubeadm(self) -> None:
+        for variable in (
+            'FAKE_KERNEL_GATE_FAIL',
+            'FAKE_CONTAINERD_GATE_FAIL',
+            'FAKE_KUBERNETES_GATE_FAIL',
+            'FAKE_CIDR_GATE_FAIL',
+        ):
+            with self.subTest(variable=variable):
+                environment, _, command_log = self.make_environment()
+                environment[variable] = '1'
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
+                self.assertNotIn(
+                    'kubeadm ', command_log.read_text(encoding='utf-8')
+                )
+
+    def test_validate_and_preflight_failure_never_reaches_init(self) -> None:
+        cases = (
+            ('FAKE_VALIDATE_FAIL', 'config validate'),
+            ('FAKE_PREFLIGHT_FAIL', 'init phase preflight'),
+        )
+        for variable, expected_command in cases:
+            with self.subTest(variable=variable):
+                environment, _, command_log = self.make_environment()
+                environment[variable] = '1'
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 40, result.stderr)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertIn(expected_command, commands)
+                self.assertNotIn('kubeadm init --config', commands)
+                self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_preinit_second_gate_catches_manifest_or_listener_race(self) -> None:
+        for race in ('manifest', 'listener'):
+            with self.subTest(race=race):
+                environment, _, command_log = self.make_environment()
+                environment['FAKE_PREINIT_RACE'] = race
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertIn('kubeadm init phase preflight --config', commands)
+                self.assertNotIn('kubeadm init --config', commands)
+                self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_apply_uses_only_fixed_config_sequence_and_redacts_raw_output(self) -> None:
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_INITIALIZED', result.stdout)
+        self.assertIn('NEXT=60-install-cilium.sh --check', result.stdout)
+        commands = [
+            line for line in command_log.read_text(encoding='utf-8').splitlines()
+            if line.startswith('kubeadm ')
+        ]
+        config = ROOT / 'bootstrap/kubeadm/init.yaml'
+        self.assertEqual(
+            commands,
+            [
+                f'kubeadm config validate --config {config}',
+                f'kubeadm init phase preflight --config {config}',
+                f'kubeadm init --config {config}',
+            ],
+        )
+        evidence = list((host / 'root/dev-infra-evidence').glob('12-kubeadm-*.txt'))
+        self.assertEqual(len(evidence), 1)
+        all_output = result.stdout + result.stderr + evidence[0].read_text(
+            encoding='utf-8'
+        )
+        self.assertNotIn(self.canary, all_output)
+        self.assertNotIn('token', all_output)
+        self.assertNotIn('certificate-key', all_output)
+        self.assertNotIn('kubeconfig\n', all_output)
+        self.assertIn('CERTIFICATE_SUBJECT=CN = kube-apiserver', all_output)
+
+    def test_init_failure_does_not_leak_raw_output_or_claim_success(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_INIT_FAIL'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertNotIn('PASS_KUBEADM_INITIALIZED', result.stdout)
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+        self.assertNotIn('kubeadm reset', result.stdout + result.stderr)
+
+    def test_post_init_rejects_any_kube_proxy_static_manifest(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_CREATE_KUBE_PROXY'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+        self.assertNotIn('PASS_KUBEADM_INITIALIZED', result.stdout)
 
 
 if __name__ == '__main__':

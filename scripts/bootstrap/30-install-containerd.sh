@@ -30,7 +30,7 @@ source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC2034
 readonly PHASE=containerd
 readonly ARTIFACT_SET=pcs-2026-08-10.1
-readonly APPROVED_RECORD_COUNT=7
+readonly APPROVED_RECORD_COUNT=6
 readonly CRI_ENDPOINT=unix:///run/containerd/containerd.sock
 
 host_path() {
@@ -91,7 +91,6 @@ approved_record() {
   case "$name" in
     containerd) printf '%s\t%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' 628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054 /usr/local/bin ;;
     runc) printf '%s\t%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' 3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c /usr/local/sbin/runc ;;
-    cni-plugins) printf '%s\t%s\t%s\t%s\n' 1.9.1 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz' b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303 /opt/cni/bin ;;
     crictl) printf '%s\t%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' 83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3 /usr/local/bin/crictl ;;
     helm) printf '%s\t%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' 0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36 /usr/local/bin/helm ;;
     gateway-api) printf '%s\t%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73 'kubernetes://gateway-api/standard' ;;
@@ -152,7 +151,6 @@ validate_archive() {
   done <<<"$verbose_listing"
   case "$name" in
     containerd) expected_members=(bin/containerd bin/ctr bin/containerd-shim-runc-v2) ;;
-    cni-plugins) expected_members=(bridge host-local loopback portmap) ;;
     crictl) expected_members=(crictl) ;;
     *) return 1 ;;
   esac
@@ -461,20 +459,18 @@ for index in "${!names[@]}"; do
   case "${names[index]}" in
     containerd) containerd_artifact=${staged_paths[index]} ;;
     runc) runc_artifact=${staged_paths[index]}; runc_digest=${digests[index]} ;;
-    cni-plugins) cni_artifact=${staged_paths[index]} ;;
     crictl) crictl_artifact=${staged_paths[index]} ;;
   esac
 done
-[[ -n "${containerd_artifact:-}" && -n "${runc_artifact:-}" && -n "${cni_artifact:-}" && -n "${crictl_artifact:-}" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH required-artifact-missing "$EXIT_SUPPLY_CHAIN" NONE
+[[ -n "${containerd_artifact:-}" && -n "${runc_artifact:-}" && -n "${crictl_artifact:-}" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH required-artifact-missing "$EXIT_SUPPLY_CHAIN" NONE
 
 validate_archive containerd "$containerd_artifact" || complete STOP_ARCHIVE_UNSAFE archive-validation-failed-containerd "$EXIT_SUPPLY_CHAIN" NONE
-validate_archive cni-plugins "$cni_artifact" || complete STOP_ARCHIVE_UNSAFE archive-validation-failed-cni-plugins "$EXIT_SUPPLY_CHAIN" NONE
 validate_archive crictl "$crictl_artifact" || complete STOP_ARCHIVE_UNSAFE archive-validation-failed-crictl "$EXIT_SUPPLY_CHAIN" NONE
 
 declare -a directory_paths=(
   /usr /usr/local /usr/local/bin /usr/local/sbin /usr/local/lib
-  /usr/local/lib/systemd /usr/local/lib/systemd/system /opt /opt/cni
-  /opt/cni/bin /etc /etc/containerd /var /var/lib
+  /usr/local/lib/systemd /usr/local/lib/systemd/system
+  /etc /etc/containerd /var /var/lib
 )
 declare -a missing_directories=()
 for absolute in "${directory_paths[@]}"; do
@@ -497,10 +493,6 @@ containerd_target=$(host_path /usr/local/bin/containerd)
 ctr_target=$(host_path /usr/local/bin/ctr)
 shim_target=$(host_path /usr/local/bin/containerd-shim-runc-v2)
 runc_target=$(host_path /usr/local/sbin/runc)
-bridge_target=$(host_path /opt/cni/bin/bridge)
-host_local_target=$(host_path /opt/cni/bin/host-local)
-loopback_target=$(host_path /opt/cni/bin/loopback)
-portmap_target=$(host_path /opt/cni/bin/portmap)
 crictl_target=$(host_path /usr/local/bin/crictl)
 config_target=$(host_path /etc/containerd/config.toml)
 unit_target=$(host_path /usr/local/lib/systemd/system/containerd.service)
@@ -508,17 +500,13 @@ config_source="${repo_root}/bootstrap/containerd/config.toml"
 unit_source="${repo_root}/bootstrap/containerd/containerd.service"
 [[ -f "$config_source" && ! -L "$config_source" && -f "$unit_source" && ! -L "$unit_source" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH repository-contract-unsafe "$EXIT_SUPPLY_CHAIN" NONE
 
-declare -a targets=("$containerd_target" "$ctr_target" "$shim_target" "$runc_target" "$bridge_target" "$host_local_target" "$loopback_target" "$portmap_target" "$crictl_target" "$config_target" "$unit_target")
-declare -a target_modes=(755 755 755 755 755 755 755 755 755 644 644)
+declare -a targets=("$containerd_target" "$ctr_target" "$shim_target" "$runc_target" "$crictl_target" "$config_target" "$unit_target")
+declare -a target_modes=(755 755 755 755 755 644 644)
 declare -a target_digests=(
   "$(archive_member_sha256 "$containerd_artifact" bin/containerd)"
   "$(archive_member_sha256 "$containerd_artifact" bin/ctr)"
   "$(archive_member_sha256 "$containerd_artifact" bin/containerd-shim-runc-v2)"
   "$runc_digest"
-  "$(archive_member_sha256 "$cni_artifact" bridge)"
-  "$(archive_member_sha256 "$cni_artifact" host-local)"
-  "$(archive_member_sha256 "$cni_artifact" loopback)"
-  "$(archive_member_sha256 "$cni_artifact" portmap)"
   "$(archive_member_sha256 "$crictl_artifact" crictl)"
   "$(sha256_file "$config_source")"
   "$(sha256_file "$unit_source")"
@@ -578,60 +566,49 @@ done
 
 [[ "$(directory_state "$(host_path /usr/local/bin)")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE containerd-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
 bin_parent=$(host_path /usr/local/bin)
-cni_parent=$(host_path /opt/cni/bin)
 containerd_extract=$(mktemp -d "${bin_parent}/.containerd.extract.XXXXXX") || complete STOP_APPLY_FAILED containerd-extract-create-failed "$EXIT_APPLY_FAILED" NONE
 private_extract_directory "$containerd_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE containerd-extract-state-raced "$EXIT_UNKNOWN_STATE" NONE
-[[ "$(directory_state "$cni_parent")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE cni-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
-cni_extract=$(mktemp -d "${cni_parent}/.cni.extract.XXXXXX") || { rm -r -- "$containerd_extract"; complete STOP_APPLY_FAILED cni-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
-private_extract_directory "$cni_extract" "$cni_parent" || complete STOP_UNKNOWN_STATE cni-extract-state-raced "$EXIT_UNKNOWN_STATE" NONE
 [[ "$(directory_state "$bin_parent")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE crictl-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
-crictl_extract=$(mktemp -d "${bin_parent}/.crictl.extract.XXXXXX") || { rm -r -- "$containerd_extract" "$cni_extract"; complete STOP_APPLY_FAILED crictl-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
+crictl_extract=$(mktemp -d "${bin_parent}/.crictl.extract.XXXXXX") || { rm -r -- "$containerd_extract"; complete STOP_APPLY_FAILED crictl-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
 private_extract_directory "$crictl_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE crictl-extract-state-raced "$EXIT_UNKNOWN_STATE" NONE
 private_extract_directory "$containerd_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE containerd-extract-pre-tar-raced "$EXIT_UNKNOWN_STATE" NONE
 if ! tar -xzf "$containerd_artifact" -C "$containerd_extract" -- bin/containerd bin/ctr bin/containerd-shim-runc-v2; then
-  rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
+  rm -r -- "$containerd_extract" "$crictl_extract"
   complete STOP_ARCHIVE_UNSAFE containerd-extract-failed "$EXIT_SUPPLY_CHAIN" NONE
-fi
-private_extract_directory "$cni_extract" "$cni_parent" || complete STOP_UNKNOWN_STATE cni-extract-pre-tar-raced "$EXIT_UNKNOWN_STATE" NONE
-if ! tar -xzf "$cni_artifact" -C "$cni_extract" -- bridge host-local loopback portmap; then
-  rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
-  complete STOP_ARCHIVE_UNSAFE cni-extract-failed "$EXIT_SUPPLY_CHAIN" NONE
 fi
 private_extract_directory "$crictl_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE crictl-extract-pre-tar-raced "$EXIT_UNKNOWN_STATE" NONE
 if ! tar -xzf "$crictl_artifact" -C "$crictl_extract" -- crictl; then
-  rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
+  rm -r -- "$containerd_extract" "$crictl_extract"
   complete STOP_ARCHIVE_UNSAFE crictl-extract-failed "$EXIT_SUPPLY_CHAIN" NONE
 fi
 
 declare -a sources=(
   "$containerd_extract/bin/containerd" "$containerd_extract/bin/ctr"
   "$containerd_extract/bin/containerd-shim-runc-v2" "$runc_artifact"
-  "$cni_extract/bridge" "$cni_extract/host-local" "$cni_extract/loopback"
-  "$cni_extract/portmap" "$crictl_extract/crictl" "$config_source" "$unit_source"
+  "$crictl_extract/crictl" "$config_source" "$unit_source"
 )
 for index in "${!sources[@]}"; do
   source_path=${sources[index]}
-  [[ -f "$source_path" && ! -L "$source_path" ]] || { rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"; complete STOP_ARCHIVE_UNSAFE extracted-member-unsafe "$EXIT_SUPPLY_CHAIN" NONE; }
-  if (( index < 9 )); then
-    [[ -x "$source_path" || "$source_path" == "$runc_artifact" ]] || { rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"; complete STOP_ARCHIVE_UNSAFE extracted-member-not-executable "$EXIT_SUPPLY_CHAIN" NONE; }
+  [[ -f "$source_path" && ! -L "$source_path" ]] || { rm -r -- "$containerd_extract" "$crictl_extract"; complete STOP_ARCHIVE_UNSAFE extracted-member-unsafe "$EXIT_SUPPLY_CHAIN" NONE; }
+  if (( index < 5 )); then
+    [[ -x "$source_path" || "$source_path" == "$runc_artifact" ]] || { rm -r -- "$containerd_extract" "$crictl_extract"; complete STOP_ARCHIVE_UNSAFE extracted-member-not-executable "$EXIT_SUPPLY_CHAIN" NONE; }
   fi
   case "$source_path" in
     "$containerd_extract"/*) private_extract_directory "$containerd_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE containerd-extract-pre-publish-raced "$EXIT_UNKNOWN_STATE" NONE ;;
-    "$cni_extract"/*) private_extract_directory "$cni_extract" "$cni_parent" || complete STOP_UNKNOWN_STATE cni-extract-pre-publish-raced "$EXIT_UNKNOWN_STATE" NONE ;;
     "$crictl_extract"/*) private_extract_directory "$crictl_extract" "$bin_parent" || complete STOP_UNKNOWN_STATE crictl-extract-pre-publish-raced "$EXIT_UNKNOWN_STATE" NONE ;;
   esac
   publish_result=0
   atomic_publish "$source_path" "${targets[index]}" "${target_modes[index]}" || publish_result=$?
   if (( publish_result != 0 )); then
-    rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
+    rm -r -- "$containerd_extract" "$crictl_extract"
     if (( publish_result == EXIT_UNKNOWN_STATE )); then
       complete STOP_UNKNOWN_STATE "target-appeared-${targets[index]##*/}" "$EXIT_UNKNOWN_STATE" NONE
     fi
     complete STOP_APPLY_FAILED "target-publish-failed-${targets[index]##*/}" "$EXIT_APPLY_FAILED" NONE
   fi
-  [[ "$(target_file_state "${targets[index]}" "${target_digests[index]}" "${target_modes[index]}")" == COMPLIANT ]] || { rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"; complete STOP_UNKNOWN_STATE "target-post-publish-drift-${targets[index]##*/}" "$EXIT_UNKNOWN_STATE" NONE; }
+  [[ "$(target_file_state "${targets[index]}" "${target_digests[index]}" "${target_modes[index]}")" == COMPLIANT ]] || { rm -r -- "$containerd_extract" "$crictl_extract"; complete STOP_UNKNOWN_STATE "target-post-publish-drift-${targets[index]##*/}" "$EXIT_UNKNOWN_STATE" NONE; }
 done
-rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"
+rm -r -- "$containerd_extract" "$crictl_extract"
 
 systemctl daemon-reload >/dev/null 2>&1 || complete STOP_APPLY_FAILED systemd-daemon-reload-failed "$EXIT_APPLY_FAILED" NONE
 systemctl enable containerd.service >/dev/null 2>&1 || complete STOP_APPLY_FAILED containerd-enable-failed "$EXIT_APPLY_FAILED" NONE

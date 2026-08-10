@@ -107,12 +107,6 @@ BOOTSTRAP_ARTIFACTS = {
         '3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c',
         '/usr/local/sbin/runc',
     ),
-    'cni-plugins': (
-        '1.9.1',
-        'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
-        'b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303',
-        '/opt/cni/bin',
-    ),
     'crictl': (
         '1.36.0',
         'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',

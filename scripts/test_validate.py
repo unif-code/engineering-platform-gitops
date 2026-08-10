@@ -186,15 +186,45 @@ class BootstrapContractTest(unittest.TestCase):
 
         self.assert_contract_fails(root)
 
-    def test_artifact_lock_rejects_six_records_without_crictl(self) -> None:
-        """捕获遗漏 crictl 时仍接受旧六项 supply-chain 合同的缺陷。"""
+    def test_artifact_lock_accepts_six_records_without_cni_archive(self) -> None:
+        """捕获 validator 继续要求 Task 5 拥有 CNI archive 的缺陷。"""
         root = self.copy_bootstrap_root()
         path = root / 'bootstrap' / 'artifacts.lock.tsv'
         path.write_text(
             ''.join(
                 line
                 for line in path.read_text(encoding='utf-8').splitlines(True)
-                if not line.startswith('crictl\t')
+                if not line.startswith('cni-plugins\t')
+            ),
+            encoding='utf-8',
+        )
+
+        validator.validate_bootstrap_contracts(root)
+
+    def test_artifact_lock_rejects_cni_archive_reintroduced(self) -> None:
+        """捕获重新引入 CNI release artifact、恢复双重 ownership 的缺陷。"""
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'artifacts.lock.tsv'
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(
+                'cni-plugins\t1.9.1\t'
+                'https://github.com/containernetworking/plugins/releases/'
+                'download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz\t'
+                'b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303\t'
+                '/opt/cni/bin\n'
+            )
+
+        self.assert_contract_fails(root)
+
+    def test_artifact_lock_rejects_five_records_without_crictl(self) -> None:
+        """捕获移除 CNI 后又遗漏 crictl 的 supply-chain 缺陷。"""
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'artifacts.lock.tsv'
+        path.write_text(
+            ''.join(
+                line
+                for line in path.read_text(encoding='utf-8').splitlines(True)
+                if not line.startswith(('cni-plugins\t', 'crictl\t'))
             ),
             encoding='utf-8',
         )
@@ -202,14 +232,14 @@ class BootstrapContractTest(unittest.TestCase):
         self.assert_contract_fails(root)
 
     def test_artifact_lock_accepts_exact_locked_crictl_record(self) -> None:
-        """捕获把批准的第七项 crictl 误判为 unexpected artifact 的缺陷。"""
+        """捕获把六项合同中的 crictl 误判为 unexpected artifact 的缺陷。"""
         root = self.copy_bootstrap_root()
         path = root / 'bootstrap' / 'artifacts.lock.tsv'
         path.write_text(
             ''.join(
                 line
                 for line in path.read_text(encoding='utf-8').splitlines(True)
-                if not line.startswith('crictl\t')
+                if not line.startswith(('cni-plugins\t', 'crictl\t'))
             ),
             encoding='utf-8',
         )

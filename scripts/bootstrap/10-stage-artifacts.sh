@@ -10,7 +10,7 @@ source "${script_dir}/lib/common.sh"
 
 readonly ARTIFACT_SET=pcs-2026-08-10.1
 readonly MINIMUM_AVAILABLE_KIB=1048576
-readonly APPROVED_RECORD_COUNT=7
+readonly APPROVED_RECORD_COUNT=6
 
 host_path() {
   local absolute=$1
@@ -64,9 +64,6 @@ approved_record() {
       ;;
     runc)
       printf '%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' /usr/local/sbin/runc
-      ;;
-    cni-plugins)
-      printf '%s\t%s\t%s\n' 1.9.1 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz' /opt/cni/bin
       ;;
     crictl)
       printf '%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' /usr/local/bin/crictl
@@ -155,12 +152,6 @@ validate_archive() {
       require_archive_member "$listing" bin/containerd || return 1
       require_archive_member "$listing" bin/ctr || return 1
       require_archive_member "$listing" bin/containerd-shim-runc-v2 || return 1
-      ;;
-    cni-plugins)
-      require_archive_member "$listing" bridge || return 1
-      require_archive_member "$listing" host-local || return 1
-      require_archive_member "$listing" loopback || return 1
-      require_archive_member "$listing" portmap || return 1
       ;;
     crictl)
       require_archive_member "$listing" crictl || return 1
@@ -326,7 +317,7 @@ for index in "${!names[@]}"; do
     complete STOP_SUPPLY_CHAIN_MISMATCH "download-digest-mismatch-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"
   fi
   case "${names[index]}" in
-    containerd|cni-plugins|crictl|helm)
+    containerd|crictl|helm)
       if ! validate_archive "${names[index]}" "$temporary"; then
         rm -f -- "$temporary"
         complete STOP_ARCHIVE_UNSAFE "archive-validation-failed-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"
