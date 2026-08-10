@@ -25,6 +25,7 @@
 | Database | PostgreSQL | `18.4` | `ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie` | index `sha256:f0cc49632b5cc1e51f65ba03658c89bd31d64ea2672b14843a808a8d281417e1`；amd64 `sha256:ae0ec6943c3c24b0de87f93b73ac531a8e546a4cc895655f793547eed2fdbef1` | Cluster 清单按 amd64 digest 引用 |
 | Database | Barman Cloud Plugin | `0.13.0` | Helm chart `plugin-barman-cloud` `0.7.0` | chart `sha256:683494c04cc94f7d33c4ac5f3d8d64c209634b48bd0e84da31d7d1fad22cdcdb`；运行镜像待部署回填 | Chart `appVersion=v0.13.0` |
 | Observability | kube-prometheus-stack | `88.1.5` | Helm chart `kube-prometheus-stack` | 待部署回填 | 单副本；Grafana Managed Alerting off |
+| Observability | Metrics Server | app `0.8.1` / chart `3.13.1` | Helm chart `metrics-server` | chart `sha256:084e6edb680cf4e2acc30bd496568c53fdf663cbacf6e17876b25785c35b7a13`；index `sha256:b2d2efaf5ac3b366ed0f839d2412a2c4279d4fc2a2a733f12c52133faed36c41`；amd64 `sha256:6231fb0a1ffab76c92ab880f51a0d11b290f688373647bcedff85af025dfd8a9` | Kubernetes 1.31+；使用 cert-manager 签发 serving certificate，禁止跳过 APIService TLS 校验 |
 | Application | engineering-platform-backend | 待 Task 7 构建 | `ghcr.io/unif-code/engineering-platform-backend@sha256:…` | **BLOCKED** | 由 backend owner 提供首个 digest |
 | Application | engineering-platform frontend | 待 Task 7 构建 | `ghcr.io/unif-code/engineering-platform@sha256:…` | **BLOCKED** | 由 frontend owner 提供首个 digest |
 

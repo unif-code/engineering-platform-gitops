@@ -18,7 +18,9 @@ MANIFEST_ROOTS = (ROOT / 'clusters', ROOT / 'infrastructure', ROOT / 'apps')
 EXACT_VERSION = re.compile(r'^v?\d+\.\d+\.\d+$')
 FLOATING_IMAGE = re.compile(r':(?:latest|main|master)$')
 PLACEHOLDER = re.compile(r'(?:REPLACE_ME|TODO_DIGEST|<[^>]+>)')
-INSECURE_TLS = re.compile(r'(?:--insecure\b|insecureSkipVerify:\s*true)')
+INSECURE_TLS = re.compile(
+    r'(?:--insecure\b|insecureSkip(?:TLS)?Verify:\s*true)'
+)
 
 REQUIRED_TASK4_RESOURCES = {
     ('storage.k8s.io/v1', 'StorageClass', '', 'stateful-rwo-lowlatency'),
@@ -71,6 +73,15 @@ REQUIRED_TASK6_RESOURCES = {
 REQUIRED_TASK8_FOUNDATION_RESOURCES = {
     ('cert-manager.io/v1', 'Certificate', 'platform', 'platform-gateway-tls'),
     ('gateway.networking.k8s.io/v1', 'Gateway', 'platform', 'platform-gateway'),
+}
+
+REQUIRED_METRICS_SERVER_RESOURCES = {
+    (
+        'helm.toolkit.fluxcd.io/v2',
+        'HelmRelease',
+        'monitoring',
+        'metrics-server',
+    ),
 }
 
 
@@ -522,6 +533,14 @@ def validate_single_user_resources() -> Tuple[int, int]:
             '50m', '128Mi', '300m', '256Mi', True,
         ),
         (
+            'metrics-server',
+            'infrastructure/observability/controller/metrics-server-release.yaml',
+            'HelmRelease',
+            'metrics-server',
+            ('spec', 'values', 'resources'),
+            '20m', '64Mi', '100m', '128Mi', True,
+        ),
+        (
             'etcd backup upload',
             'infrastructure/etcd-backup/cronjob.yaml',
             'CronJob',
@@ -670,6 +689,133 @@ def validate_single_user_resources() -> Tuple[int, int]:
     return total_cpu_millicores, total_memory_mib
 
 
+def validate_metrics_server() -> None:
+    repository_path = (
+        ROOT
+        / 'infrastructure/observability/controller/metrics-server-repository.yaml'
+    )
+    release_path = (
+        ROOT
+        / 'infrastructure/observability/controller/metrics-server-release.yaml'
+    )
+    for path in (repository_path, release_path):
+        if not path.exists():
+            fail(f'缺少 {path.relative_to(ROOT)}')
+
+    expect_value(
+        'infrastructure/observability/controller/metrics-server-repository.yaml',
+        'HelmRepository',
+        'metrics-server',
+        ('spec', 'url'),
+        'https://kubernetes-sigs.github.io/metrics-server',
+    )
+
+    release_contracts = (
+        (('spec', 'chart', 'spec', 'chart'), 'metrics-server'),
+        (('spec', 'chart', 'spec', 'reconcileStrategy'), 'ChartVersion'),
+        (('spec', 'chart', 'spec', 'sourceRef', 'kind'), 'HelmRepository'),
+        (('spec', 'chart', 'spec', 'sourceRef', 'name'), 'metrics-server'),
+        (('spec', 'chart', 'spec', 'version'), '3.13.1'),
+        (('spec', 'targetNamespace'), 'kube-system'),
+        (('spec', 'values', 'apiService', 'insecureSkipTLSVerify'), False),
+        (
+            ('spec', 'values', 'image', 'repository'),
+            'registry.k8s.io/metrics-server/metrics-server',
+        ),
+        (
+            ('spec', 'values', 'image', 'tag'),
+            'v0.8.1@sha256:6231fb0a1ffab76c92ab880f51a0d11b290f688373647bcedff85af025dfd8a9',
+        ),
+        (('spec', 'values', 'replicas'), 1),
+        (('spec', 'values', 'tls', 'type'), 'cert-manager'),
+        (
+            (
+                'spec',
+                'values',
+                'tls',
+                'certManager',
+                'existingIssuer',
+                'enabled',
+            ),
+            True,
+        ),
+        (
+            (
+                'spec',
+                'values',
+                'tls',
+                'certManager',
+                'existingIssuer',
+                'kind',
+            ),
+            'ClusterIssuer',
+        ),
+        (
+            (
+                'spec',
+                'values',
+                'tls',
+                'certManager',
+                'existingIssuer',
+                'name',
+            ),
+            'dev-selfsigned',
+        ),
+        (('spec', 'values', 'resources', 'requests', 'cpu'), '20m'),
+        (('spec', 'values', 'resources', 'requests', 'memory'), '64Mi'),
+        (('spec', 'values', 'resources', 'limits', 'cpu'), '100m'),
+        (('spec', 'values', 'resources', 'limits', 'memory'), '128Mi'),
+    )
+    for path, expected in release_contracts:
+        expect_value(
+            'infrastructure/observability/controller/metrics-server-release.yaml',
+            'HelmRelease',
+            'metrics-server',
+            path,
+            expected,
+        )
+
+    controller_kustomization = next(
+        load_documents(
+            ROOT / 'infrastructure/observability/controller/kustomization.yaml'
+        )
+    )
+    resources = set(controller_kustomization.get('resources', []))
+    required_resources = {
+        'metrics-server-repository.yaml',
+        'metrics-server-release.yaml',
+    }
+    if not required_resources.issubset(resources):
+        fail('observability controller Kustomization 未接入 metrics-server')
+
+    infrastructure = document_by_identity(
+        ROOT / 'clusters/dev/infrastructure.yaml',
+        'Kustomization',
+        'observability-controller',
+    )
+    dependencies = {
+        dependency.get('name')
+        for dependency in value_at(infrastructure, ('spec', 'dependsOn'))
+        if isinstance(dependency, dict)
+    }
+    required_dependencies = {'cert-manager-config', 'infrastructure-foundation'}
+    if not required_dependencies.issubset(dependencies):
+        fail('observability-controller 必须等待 cert-manager-config 与 foundation')
+
+    pcs = (ROOT / 'pcs/candidate-1.md').read_text(encoding='utf-8')
+    pcs_contracts = (
+        'Metrics Server',
+        '0.8.1',
+        '3.13.1',
+        'sha256:084e6edb680cf4e2acc30bd496568c53fdf663cbacf6e17876b25785c35b7a13',
+        'sha256:b2d2efaf5ac3b366ed0f839d2412a2c4279d4fc2a2a733f12c52133faed36c41',
+        'sha256:6231fb0a1ffab76c92ab880f51a0d11b290f688373647bcedff85af025dfd8a9',
+    )
+    for expected in pcs_contracts:
+        if expected not in pcs:
+            fail(f'PCS 缺少 Metrics Server 供应链事实：{expected}')
+
+
 def resource_id(document: dict[str, Any]) -> tuple[str, str, str, str] | None:
     api_version = document.get('apiVersion')
     kind = document.get('kind')
@@ -794,12 +940,21 @@ def validate_documents() -> None:
         )
         fail(f'Task 8 入口基础资源缺少：{formatted}')
 
+    missing = sorted(REQUIRED_METRICS_SERVER_RESOURCES - found)
+    if missing:
+        formatted = ', '.join(
+            f'{kind}/{namespace or "_cluster"}/{name}'
+            for _, kind, namespace, name in missing
+        )
+        fail(f'DEV-002 Metrics API 缺少资源：{formatted}')
+
 
 def main() -> None:
     validate_kustomize_builds()
     validate_documents()
     validate_single_user_storage()
     validate_single_user_resources()
+    validate_metrics_server()
     print('GitOps manifests validated successfully.')
 
 

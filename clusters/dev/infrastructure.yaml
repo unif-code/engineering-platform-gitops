@@ -85,6 +85,7 @@ metadata:
   namespace: flux-system
 spec:
   dependsOn:
+    - name: cert-manager-config
     - name: infrastructure-foundation
   interval: 10m
   path: ./infrastructure/observability/controller

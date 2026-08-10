@@ -7,7 +7,9 @@ from pathlib import Path
 import yaml
 
 from validate import (
+    INSECURE_TLS,
     document_by_identity,
+    validate_metrics_server,
     validate_single_user_resources,
     validate_single_user_storage,
     value_at,
@@ -15,6 +17,11 @@ from validate import (
 
 
 class ProfileValidationTest(unittest.TestCase):
+    def test_insecure_metrics_tls_is_detected(self) -> None:
+        self.assertIsNotNone(
+            INSECURE_TLS.search('insecureSkipTLSVerify: true')
+        )
+
     def test_document_and_named_list_item_are_selected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'deployment.yaml'
@@ -75,8 +82,11 @@ class ProfileValidationTest(unittest.TestCase):
 
 
 class RepositoryProfileContractTest(unittest.TestCase):
+    def test_metrics_server_contract(self) -> None:
+        validate_metrics_server()
+
     def test_single_user_resource_contract(self) -> None:
-        self.assertEqual(validate_single_user_resources(), (1095, 2656))
+        self.assertEqual(validate_single_user_resources(), (1115, 2720))
 
     def test_single_user_storage_contract(self) -> None:
         validate_single_user_storage()
