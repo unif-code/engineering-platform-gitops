@@ -3,6 +3,24 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
+if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
+  if [[ "$EUID" -eq 0 ]]; then
+    printf 'RESULT=STOP_TEST_MODE\nREASON=test-mode-is-for-unprivileged-tests-only\n' >&2
+    exit 10
+  fi
+  if [[ -z "${BOOTSTRAP_TEST_ROOT:-}" || "$BOOTSTRAP_TEST_ROOT" != /* || "$BOOTSTRAP_TEST_ROOT" == / || ! -d "$BOOTSTRAP_TEST_ROOT" || -L "$BOOTSTRAP_TEST_ROOT" || ! -O "$BOOTSTRAP_TEST_ROOT" ]]; then
+    printf 'RESULT=STOP_TEST_MODE\nREASON=test-root-must-be-isolated\n' >&2
+    exit 10
+  fi
+else
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  for test_override in "${!BOOTSTRAP_TEST_@}"; do
+    : "$test_override"
+    printf 'RESULT=STOP_TEST_OVERRIDE\nREASON=test-override-in-production\n' >&2
+    exit 10
+  done
+fi
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
@@ -35,13 +53,31 @@ path_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
 }
 
+path_owner() {
+  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
+}
+
+owned_by_expected() {
+  local path=$1
+  local expected_uid=0
+  local expected_gid=0
+  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 ]]; then
+    expected_uid=$EUID
+    expected_gid=${GROUPS[0]}
+    if [[ "${BOOTSTRAP_TEST_OWNER_DRIFT_PATH:-}" == "$path" ]]; then
+      expected_uid=$((expected_uid + 1))
+    fi
+  fi
+  [[ "$(path_owner "$path")" == "${expected_uid}:${expected_gid}" ]]
+}
+
 require_managed_parent() {
   local parent=$1
   local mode
 
   [[ -d "$parent" && ! -L "$parent" ]] || return 1
   mode=$(path_mode "$parent") || return 1
-  [[ "$mode" == 755 ]]
+  [[ "$mode" == 755 ]] && owned_by_expected "$parent"
 }
 
 content_file_state() {
@@ -61,7 +97,7 @@ content_file_state() {
     printf 'UNKNOWN\n'
     return 0
   }
-  if [[ "$mode" == 644 ]] && cmp -s <(printf '%s' "$expected") "$target"; then
+  if [[ "$mode" == 644 ]] && owned_by_expected "$target" && cmp -s <(printf '%s' "$expected") "$target"; then
     printf 'COMPLIANT\n'
   else
     printf 'UNKNOWN\n'
@@ -101,7 +137,12 @@ atomic_publish_content() {
   local content=$2
   local temporary
 
+  require_managed_parent "${target%/*}" || return "$EXIT_UNKNOWN_STATE"
   temporary=$(mktemp "${target}.tmp.XXXXXX") || return "$EXIT_APPLY_FAILED"
+  if ! require_managed_parent "${target%/*}" || ! owned_by_expected "$temporary"; then
+    rm -f -- "$temporary"
+    return "$EXIT_UNKNOWN_STATE"
+  fi
   if ! printf '%s' "$content" >"$temporary"; then
     rm -f -- "$temporary"
     return "$EXIT_APPLY_FAILED"
@@ -110,9 +151,17 @@ atomic_publish_content() {
     rm -f -- "$temporary"
     return "$EXIT_APPLY_FAILED"
   fi
+  if [[ "$(path_mode "$temporary")" != 644 ]] || ! owned_by_expected "$temporary"; then
+    rm -f -- "$temporary"
+    return "$EXIT_UNKNOWN_STATE"
+  fi
   if ! sync "$temporary"; then
     rm -f -- "$temporary"
     return "$EXIT_APPLY_FAILED"
+  fi
+  if ! require_managed_parent "${target%/*}"; then
+    rm -f -- "$temporary"
+    return "$EXIT_UNKNOWN_STATE"
   fi
   if ! mv -n "$temporary" "$target"; then
     rm -f -- "$temporary"
@@ -125,20 +174,23 @@ atomic_publish_content() {
 }
 
 parse_mode "$@" || exit "$?"
+require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
 for required_command in chmod cmp date id mktemp modprobe mv rm stat sync sysctl; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   complete STOP_PRECONDITION missing-command-sha256 "$EXIT_PRECONDITION" NONE
 fi
-require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-
-modules_file=$(host_path /etc/modules-load.d/containerd.conf)
+modules_file=$(host_path /etc/modules-load.d/99-kubernetes.conf)
+legacy_modules_file=$(host_path /etc/modules-load.d/containerd.conf)
 sysctl_file=$(host_path /etc/sysctl.d/99-kubernetes-cri.conf)
 modules_parent=$(dirname "$modules_file")
 sysctl_parent=$(dirname "$sysctl_file")
 require_managed_parent "$modules_parent" || complete STOP_UNKNOWN_STATE modules-parent-unsafe "$EXIT_UNKNOWN_STATE" NONE
 require_managed_parent "$sysctl_parent" || complete STOP_UNKNOWN_STATE sysctl-parent-unsafe "$EXIT_UNKNOWN_STATE" NONE
+if [[ -e "$legacy_modules_file" || -L "$legacy_modules_file" ]]; then
+  complete STOP_UNKNOWN_STATE legacy-modules-file-present "$EXIT_UNKNOWN_STATE" NONE
+fi
 
 modules_state=$(content_file_state "$modules_file" "$MODULES_CONTENT")
 sysctl_state=$(content_file_state "$sysctl_file" "$SYSCTL_CONTENT")

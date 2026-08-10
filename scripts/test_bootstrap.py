@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -385,6 +386,17 @@ class KernelStageTest(BootstrapTestCase):
             ''',
         )
         self.write_executable(
+            fake_bin / 'mktemp',
+            '''
+            #!/bin/sh
+            temporary=$(/usr/bin/mktemp "$@") || exit
+            printf '%s\n' "$temporary"
+            if [ -n "${FAKE_MKTEMP_RACE_PARENT:-}" ]; then
+              chmod 0700 "$FAKE_MKTEMP_RACE_PARENT"
+            fi
+            ''',
+        )
+        self.write_executable(
             fake_bin / 'mv',
             '''
             #!/bin/sh
@@ -432,7 +444,10 @@ class KernelStageTest(BootstrapTestCase):
         )
 
     def modules_file(self, host: Path) -> Path:
-        return host / 'etc/modules-load.d/containerd.conf'
+        return host / 'etc/modules-load.d/99-kubernetes.conf'
+
+    def canonical_modules_file(self, host: Path) -> Path:
+        return host / 'etc/modules-load.d/99-kubernetes.conf'
 
     def sysctl_file(self, host: Path) -> Path:
         return host / 'etc/sysctl.d/99-kubernetes-cri.conf'
@@ -510,6 +525,30 @@ class KernelStageTest(BootstrapTestCase):
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
                 self.assertFalse(command_log.exists())
+
+    def test_check_uses_canonical_modules_path_and_rejects_legacy_alias(self) -> None:
+        """捕获继续管理旧 containerd.conf 或忽略该未知旧别名的缺陷。"""
+        environment, host, _ = self.make_environment()
+        self.canonical_modules_file(host).write_text(
+            self.modules_content, encoding='utf-8'
+        )
+        self.canonical_modules_file(host).chmod(0o644)
+        self.sysctl_file(host).write_text(self.sysctl_content, encoding='utf-8')
+        self.sysctl_file(host).chmod(0o644)
+        self.set_runtime(host)
+
+        canonical = self.run_stage(environment, '--check')
+
+        self.assertEqual(canonical.returncode, 0, canonical.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', canonical.stdout)
+
+        legacy = host / 'etc/modules-load.d/containerd.conf'
+        legacy.write_text(self.modules_content, encoding='utf-8')
+        legacy.chmod(0o644)
+        legacy_result = self.run_stage(environment, '--check')
+
+        self.assertEqual(legacy_result.returncode, 30, legacy_result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', legacy_result.stdout)
 
     def test_check_is_read_only_when_kernel_changes_are_needed(self) -> None:
         """捕获默认 CHECK 调用写命令、创建目标或改动 swap 的缺陷。"""
@@ -647,6 +686,131 @@ class KernelStageTest(BootstrapTestCase):
         self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
         self.assertEqual(target.read_text(encoding='utf-8'), 'concurrent\n')
         self.assertFalse(self.sysctl_file(host).exists())
+
+    def test_check_rejects_kernel_parent_and_file_owner_drift(self) -> None:
+        """捕获忽略 kernel 受管 parent/file uid:gid 漂移的缺陷。"""
+        for target_name in ('modules-parent', 'sysctl-parent', 'modules', 'sysctl'):
+            with self.subTest(target=target_name):
+                environment, host, _ = self.make_environment()
+                self.set_persistent_files(host)
+                self.set_runtime(host)
+                paths = {
+                    'modules-parent': self.modules_file(host).parent,
+                    'sysctl-parent': self.sysctl_file(host).parent,
+                    'modules': self.modules_file(host),
+                    'sysctl': self.sysctl_file(host),
+                }
+                environment['BOOTSTRAP_TEST_OWNER_DRIFT_PATH'] = str(
+                    paths[target_name]
+                )
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_apply_revalidates_kernel_parent_after_mktemp_race(self) -> None:
+        """捕获 mktemp 后 parent 权限竞态仍发布 kernel 文件的缺陷。"""
+        environment, host, _ = self.make_environment()
+        parent = self.modules_file(host).parent
+        environment['FAKE_MKTEMP_RACE_PARENT'] = str(parent)
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertFalse(self.modules_file(host).exists())
+
+
+class BootstrapEntrySecurityTest(BootstrapTestCase):
+    def write_executable(self, path: Path, source: str) -> None:
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def production_environment(self) -> tuple[dict[str, str], Path]:
+        directory = self.temporary_directory()
+        fake_bin = directory / 'fake-bin'
+        fake_bin.mkdir()
+        command_log = directory / 'commands.log'
+        for name, output in (
+            ('id', '0'),
+            ('systemctl', 'active'),
+            ('python3', 'FAKE_PYTHON_CONTROLLED'),
+        ):
+            self.write_executable(
+                fake_bin / name,
+                f'''#!/bin/sh
+                printf '{name} controlled\\n' >>"$FAKE_COMMAND_LOG"
+                printf '%s\\n' '{output}'
+                ''',
+            )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'FAKE_COMMAND_LOG': str(command_log),
+            }
+        )
+        for name in tuple(environment):
+            if name.startswith('BOOTSTRAP_TEST_'):
+                del environment[name]
+        return environment, command_log
+
+    def test_production_fixes_safe_path_before_command_lookup(self) -> None:
+        """捕获 production 从调用者 PATH 执行伪造 id/systemctl/python3 的缺陷。"""
+        self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
+        for script in (PREPARE_KERNEL, INSTALL_CONTAINERD):
+            with self.subTest(script=script.name):
+                environment, command_log = self.production_environment()
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn('REASON=not-root', result.stdout)
+                self.assertFalse(command_log.exists())
+
+    def test_production_rejects_all_test_overrides_before_lookup(self) -> None:
+        """捕获 production 接受 TEST_ROOT/LOCK/owner seam 或先执行不可信命令的缺陷。"""
+        for script in (PREPARE_KERNEL, INSTALL_CONTAINERD):
+            with self.subTest(script=script.name):
+                environment, command_log = self.production_environment()
+                environment.update(
+                    {
+                        'BOOTSTRAP_TEST_ROOT': '/',
+                        'BOOTSTRAP_TEST_LOCK_FILE': '/tmp/unapproved.lock',
+                        'BOOTSTRAP_TEST_OWNER_DRIFT_PATH': '/etc',
+                    }
+                )
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn('REASON=test-override-in-production', result.stderr)
+                self.assertFalse(command_log.exists())
+
+    def test_test_mode_requires_non_root_mapped_root(self) -> None:
+        """捕获 test mode 映射到真实 `/` 或省略隔离 test root 的缺陷。"""
+        for script in (PREPARE_KERNEL, INSTALL_CONTAINERD):
+            with self.subTest(script=script.name):
+                environment, command_log = self.production_environment()
+                environment.update(
+                    {
+                        'BOOTSTRAP_TEST_MODE': '1',
+                        'BOOTSTRAP_TEST_ROOT': '/',
+                    }
+                )
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn('REASON=test-root-must-be-isolated', result.stderr)
+                self.assertFalse(command_log.exists())
 
 
 class ArtifactStageTest(BootstrapTestCase):
@@ -1319,6 +1483,16 @@ esac
             path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
         path.chmod(0o755)
 
+    def create_cri_socket(self, host: Path) -> Path:
+        socket_path = host / 'run/containerd/containerd.sock'
+        socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
+        socket_path.parent.chmod(0o711)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(socket_path))
+        listener.close()
+        socket_path.chmod(0o660)
+        return socket_path
+
     def archive_bytes(self, members: list[tuple[str, bytes | str]]) -> bytes:
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode='w:gz') as archive:
@@ -1446,6 +1620,7 @@ esac
         fake_bin = directory / 'bin'
         command_log = directory / 'commands.log'
         lock = directory / 'artifacts.lock.tsv'
+        approved_lock = directory / 'approved-artifacts.lock.tsv'
         staging = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
         for path in (
             host / 'root/dev-infra-evidence',
@@ -1484,6 +1659,7 @@ esac
                 )
             )
         lock.write_text('\n'.join(lock_lines) + '\n', encoding='utf-8')
+        approved_lock.write_text('\n'.join(lock_lines) + '\n', encoding='utf-8')
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
         self.write_executable(
@@ -1492,6 +1668,17 @@ esac
             #!/bin/sh
             printf 'install %s\n' "$*" >>"$FAKE_COMMAND_LOG"
             exec /usr/bin/install "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'mktemp',
+            '''
+            #!/bin/sh
+            temporary=$(/usr/bin/mktemp "$@") || exit
+            printf '%s\n' "$temporary"
+            if [ -n "${FAKE_MKTEMP_RACE_PARENT:-}" ]; then
+              chmod 0700 "$FAKE_MKTEMP_RACE_PARENT"
+            fi
             ''',
         )
         self.write_executable(
@@ -1525,6 +1712,21 @@ esac
             ''',
         )
         self.write_executable(
+            fake_bin / 'make-cri-socket',
+            '''
+            #!/usr/bin/python3
+            import os
+            import socket
+            import sys
+
+            path = sys.argv[1]
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(path)
+            listener.close()
+            os.chmod(path, 0o660)
+            ''',
+        )
+        self.write_executable(
             fake_bin / 'systemctl',
             '''
             #!/bin/sh
@@ -1532,11 +1734,20 @@ esac
             case "$1" in
               is-enabled) [ -f "$FAKE_SERVICE_ENABLED" ] ;;
               is-active) [ -f "$FAKE_SERVICE_ACTIVE" ] && printf 'active\n' ;;
-              daemon-reload) exit 0 ;;
+              show)
+                [ -f "$FAKE_SERVICE_UNIT_LOADED" ] || exit 1
+                printf 'FragmentPath=%s\nDropInPaths=%s\n' \
+                  "$FAKE_FRAGMENT_PATH" "${FAKE_DROP_IN_PATHS:-}"
+                ;;
+              daemon-reload)
+                [ ! -f "$FAKE_UNIT_TARGET" ] || : >"$FAKE_SERVICE_UNIT_LOADED"
+                ;;
               enable) : >"$FAKE_SERVICE_ENABLED" ;;
               start)
                 : >"$FAKE_SERVICE_ACTIVE"
-                mkdir -p "$FAKE_HOST_ROOT/run/containerd"
+                mkdir -p -m 0711 "$FAKE_HOST_ROOT/run/containerd"
+                mkdir -p -m 0700 "$FAKE_HOST_ROOT/var/lib/containerd"
+                "$FAKE_SOCKET_HELPER" "$FAKE_HOST_ROOT/run/containerd/containerd.sock"
                 ;;
               *) exit 64 ;;
             esac
@@ -1549,10 +1760,19 @@ esac
                 'BOOTSTRAP_TEST_MODE': '1',
                 'BOOTSTRAP_TEST_ROOT': str(host),
                 'BOOTSTRAP_TEST_LOCK_FILE': str(lock),
+                'BOOTSTRAP_TEST_APPROVED_LOCK_FILE': str(approved_lock),
                 'FAKE_COMMAND_LOG': str(command_log),
                 'FAKE_HOST_ROOT': str(host),
                 'FAKE_SERVICE_ENABLED': str(directory / 'service-enabled'),
                 'FAKE_SERVICE_ACTIVE': str(directory / 'service-active'),
+                'FAKE_SERVICE_UNIT_LOADED': str(directory / 'service-unit-loaded'),
+                'FAKE_UNIT_TARGET': str(
+                    host / 'usr/local/lib/systemd/system/containerd.service'
+                ),
+                'FAKE_FRAGMENT_PATH': str(
+                    host / 'usr/local/lib/systemd/system/containerd.service'
+                ),
+                'FAKE_SOCKET_HELPER': str(fake_bin / 'make-cri-socket'),
                 'FAKE_CRICTL_INFO': self.valid_info(),
             }
         )
@@ -1603,9 +1823,11 @@ esac
         )
         targets['config'].chmod(0o644)
         targets['unit'].chmod(0o644)
-        (host / 'var/lib/containerd').mkdir()
+        (host / 'var/lib/containerd').mkdir(mode=0o700)
+        self.create_cri_socket(host)
         Path(environment['FAKE_SERVICE_ENABLED']).touch()
         Path(environment['FAKE_SERVICE_ACTIVE']).touch()
+        Path(environment['FAKE_SERVICE_UNIT_LOADED']).touch()
 
     def test_check_is_read_only_for_clean_missing_state(self) -> None:
         """捕获 CHECK 解包、安装、启动服务、创建 evidence 或改 swap 的缺陷。"""
@@ -1674,6 +1896,94 @@ esac
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
 
+    def test_check_rejects_unsafe_run_directory_before_install(self) -> None:
+        """捕获 targets 尚缺时忽略 run dir 类型、mode 或 owner 漂移的缺陷。"""
+        for drift in ('file', 'symlink', 'mode', 'owner'):
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                run_dir = host / 'run/containerd'
+                if drift == 'file':
+                    run_dir.write_bytes(b'unknown\n')
+                elif drift == 'symlink':
+                    run_dir.symlink_to('/tmp/escape')
+                else:
+                    run_dir.mkdir(mode=0o711)
+                    run_dir.chmod(0o755 if drift == 'mode' else 0o711)
+                    if drift == 'owner':
+                        environment['BOOTSTRAP_TEST_OWNER_DRIFT_PATH'] = str(
+                            run_dir
+                        )
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_orphan_socket_before_install(self) -> None:
+        """捕获 targets/service 尚缺时把孤立 socket entry 当作 fresh state 的缺陷。"""
+        for drift in ('socket', 'file', 'symlink'):
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                run_dir = host / 'run/containerd'
+                run_dir.mkdir(mode=0o711)
+                run_dir.chmod(0o711)
+                socket_path = run_dir / 'containerd.sock'
+                if drift == 'socket':
+                    self.create_cri_socket(host)
+                elif drift == 'file':
+                    socket_path.write_bytes(b'orphan\n')
+                else:
+                    socket_path.symlink_to('/tmp/escape')
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_shadow_unit_or_dropin_before_install(self) -> None:
+        """捕获 targets 尚缺时忽略已加载 shadow unit 或 drop-in 的缺陷。"""
+        for drift in ('fragment', 'dropin'):
+            with self.subTest(drift=drift):
+                environment, _, _, _ = self.make_environment()
+                Path(environment['FAKE_SERVICE_UNIT_LOADED']).touch()
+                if drift == 'fragment':
+                    environment['FAKE_FRAGMENT_PATH'] = (
+                        '/etc/systemd/system/containerd.service'
+                    )
+                else:
+                    environment['FAKE_DROP_IN_PATHS'] = (
+                        '/etc/systemd/system/containerd.service.d/override.conf'
+                    )
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_allows_managed_runtime_data_after_successful_apply(self) -> None:
+        """捕获首次启动填充 data root 后把精确安装误判为未知状态的缺陷。"""
+        environment, host, command_log, _ = self.make_environment()
+
+        applied = self.run_stage(environment, '--apply')
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        data_root = host / 'var/lib/containerd'
+        (data_root / 'io.containerd.metadata.v1.bolt').mkdir(parents=True)
+        (data_root / 'io.containerd.metadata.v1.bolt/meta.db').write_bytes(
+            b'runtime managed\n'
+        )
+        command_log.write_text('', encoding='utf-8')
+
+        checked = self.run_stage(environment, '--check')
+
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', checked.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        for forbidden in (
+            'install ', 'mv ', 'tar-write ', 'daemon-reload',
+            ' enable ', ' start ', ' restart ',
+        ):
+            self.assertNotIn(forbidden, commands)
+
     def test_check_revalidates_every_staged_digest_and_file_safety(self) -> None:
         """捕获信任前序结果、遗漏七项 digest 或接受不安全 staging 文件的缺陷。"""
         for name in ('containerd', 'runc', 'cni-plugins', 'crictl', 'helm', 'gateway-api', 'cilium-chart'):
@@ -1697,6 +2007,37 @@ esac
         result = self.run_stage(environment, '--check')
         self.assertEqual(result.returncode, 30, result.stderr)
         self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_active_lock_digest_not_in_approved_contract(self) -> None:
+        """捕获把 active lock 的任意匹配 digest 当作批准 digest 的缺陷。"""
+        environment, host, command_log, _ = self.make_environment()
+        lock = Path(environment['BOOTSTRAP_TEST_LOCK_FILE'])
+        staged = (
+            host
+            / 'root/dev-infra-artifacts/pcs-2026-08-10.1/runc.amd64'
+        )
+        tampered = b'tampered but internally consistent\n'
+        staged.write_bytes(tampered)
+        staged.chmod(0o600)
+        digest = hashlib.sha256(tampered).hexdigest()
+        lines = [
+            '\t'.join(
+                [*line.split('\t')[:3], digest, line.split('\t')[4]]
+            )
+            if line.startswith('runc\t')
+            else line
+            for line in lock.read_text(encoding='utf-8').splitlines()
+        ]
+        lock.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20, result.stderr)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertTrue(
+            all(not path.exists() for path in self.managed_targets(host).values())
+        )
+        self.assertFalse(command_log.exists())
 
     def test_check_rejects_unsafe_target_parent(self) -> None:
         """捕获沿父目录 symlink 逃逸或容忍父目录权限漂移的缺陷。"""
@@ -1811,6 +2152,92 @@ esac
                 result = self.run_stage(environment, '--check')
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_shadow_unit_dropins_and_socket_drift(self) -> None:
+        """捕获只看 active/enabled 而接受 shadow unit、drop-in 或伪 socket 的缺陷。"""
+        cases = ('fragment', 'dropin', 'missing', 'file', 'symlink', 'mode')
+        for drift in cases:
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                self.install_compliant_targets(environment, host)
+                socket_path = host / 'run/containerd/containerd.sock'
+                if drift == 'fragment':
+                    environment['FAKE_FRAGMENT_PATH'] = (
+                        '/etc/systemd/system/containerd.service'
+                    )
+                elif drift == 'dropin':
+                    environment['FAKE_DROP_IN_PATHS'] = (
+                        '/etc/systemd/system/containerd.service.d/override.conf'
+                    )
+                else:
+                    socket_path.unlink()
+                    if drift == 'file':
+                        socket_path.write_bytes(b'not a socket\n')
+                    elif drift == 'symlink':
+                        socket_path.symlink_to('/tmp/escape')
+                    elif drift == 'mode':
+                        self.create_cri_socket(host).chmod(0o600)
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_owner_and_runtime_directory_mode_drift(self) -> None:
+        """捕获 staging/target/data/run/socket owner 或 runtime dir mode 漂移的缺陷。"""
+        cases = (
+            'artifact-root', 'staged-file', 'target-parent', 'managed-target',
+            'data-root', 'run-dir', 'socket', 'data-missing', 'data-mode',
+            'run-mode',
+        )
+        for drift in cases:
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                if drift in {
+                    'managed-target', 'data-root', 'run-dir', 'socket',
+                    'data-missing', 'data-mode', 'run-mode',
+                }:
+                    self.install_compliant_targets(environment, host)
+                paths = {
+                    'artifact-root': host / 'root/dev-infra-artifacts',
+                    'staged-file': (
+                        host / 'root/dev-infra-artifacts/pcs-2026-08-10.1/runc.amd64'
+                    ),
+                    'target-parent': host / 'usr/local/bin',
+                    'managed-target': self.managed_targets(host)['containerd'],
+                    'data-root': host / 'var/lib/containerd',
+                    'run-dir': host / 'run/containerd',
+                    'socket': host / 'run/containerd/containerd.sock',
+                }
+                if drift == 'data-missing':
+                    (host / 'var/lib/containerd').rmdir()
+                elif drift == 'data-mode':
+                    (host / 'var/lib/containerd').chmod(0o755)
+                elif drift == 'run-mode':
+                    (host / 'run/containerd').chmod(0o755)
+                else:
+                    environment['BOOTSTRAP_TEST_OWNER_DRIFT_PATH'] = str(
+                        paths[drift]
+                    )
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_apply_revalidates_target_parent_after_mktemp_race(self) -> None:
+        """捕获 extract/publish mktemp 后 parent 漂移仍继续安装的缺陷。"""
+        environment, host, _, _ = self.make_environment()
+        parent = host / 'usr/local/bin'
+        environment['FAKE_MKTEMP_RACE_PARENT'] = str(parent)
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertTrue(
+            all(not path.exists() for path in self.managed_targets(host).values())
+        )
 
     def test_health_rejects_version_and_plugin_drift(self) -> None:
         """捕获宽松接受 containerd/runc/crictl 版本或 CRI/overlayfs plugin 漂移的缺陷。"""

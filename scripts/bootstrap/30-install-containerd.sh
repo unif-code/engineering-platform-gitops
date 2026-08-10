@@ -3,6 +3,24 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
+if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
+  if [[ "$EUID" -eq 0 ]]; then
+    printf 'RESULT=STOP_TEST_MODE\nREASON=test-mode-is-for-unprivileged-tests-only\n' >&2
+    exit 10
+  fi
+  if [[ -z "${BOOTSTRAP_TEST_ROOT:-}" || "$BOOTSTRAP_TEST_ROOT" != /* || "$BOOTSTRAP_TEST_ROOT" == / || ! -d "$BOOTSTRAP_TEST_ROOT" || -L "$BOOTSTRAP_TEST_ROOT" || ! -O "$BOOTSTRAP_TEST_ROOT" ]]; then
+    printf 'RESULT=STOP_TEST_MODE\nREASON=test-root-must-be-isolated\n' >&2
+    exit 10
+  fi
+else
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  for test_override in "${!BOOTSTRAP_TEST_@}"; do
+    : "$test_override"
+    printf 'RESULT=STOP_TEST_OVERRIDE\nREASON=test-override-in-production\n' >&2
+    exit 10
+  done
+fi
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck disable=SC1091
@@ -37,16 +55,44 @@ path_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
 }
 
+path_owner() {
+  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
+}
+
+owned_by_expected() {
+  local path=$1
+  local expected_uid=0
+  local expected_gid=0
+  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 ]]; then
+    expected_uid=$EUID
+    expected_gid=${GROUPS[0]}
+    if [[ "${BOOTSTRAP_TEST_OWNER_DRIFT_PATH:-}" == "$path" ]]; then
+      expected_uid=$((expected_uid + 1))
+    fi
+  fi
+  [[ "$(path_owner "$path")" == "${expected_uid}:${expected_gid}" ]]
+}
+
 approved_record() {
   local name=$1
+  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 && -n "${BOOTSTRAP_TEST_APPROVED_LOCK_FILE:-}" ]]; then
+    awk -F '\t' -v approved_name="$name" '
+      $1 == approved_name {
+        print $2 "\t" $3 "\t" $4 "\t" $5
+        count++
+      }
+      END { exit count != 1 }
+    ' "$BOOTSTRAP_TEST_APPROVED_LOCK_FILE"
+    return
+  fi
   case "$name" in
-    containerd) printf '%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' /usr/local/bin ;;
-    runc) printf '%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' /usr/local/sbin/runc ;;
-    cni-plugins) printf '%s\t%s\t%s\n' 1.9.1 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz' /opt/cni/bin ;;
-    crictl) printf '%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' /usr/local/bin/crictl ;;
-    helm) printf '%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' /usr/local/bin/helm ;;
-    gateway-api) printf '%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 'kubernetes://gateway-api/standard' ;;
-    cilium-chart) printf '%s\t%s\t%s\n' 1.20.0 'https://helm.cilium.io/cilium-1.20.0.tgz' 'kubernetes://kube-system/cilium' ;;
+    containerd) printf '%s\t%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' 628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054 /usr/local/bin ;;
+    runc) printf '%s\t%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' 3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c /usr/local/sbin/runc ;;
+    cni-plugins) printf '%s\t%s\t%s\t%s\n' 1.9.1 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz' b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303 /opt/cni/bin ;;
+    crictl) printf '%s\t%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' 83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3 /usr/local/bin/crictl ;;
+    helm) printf '%s\t%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' 0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36 /usr/local/bin/helm ;;
+    gateway-api) printf '%s\t%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73 'kubernetes://gateway-api/standard' ;;
+    cilium-chart) printf '%s\t%s\t%s\t%s\n' 1.20.0 'https://helm.cilium.io/cilium-1.20.0.tgz' c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883 'kubernetes://kube-system/cilium' ;;
     *) return 1 ;;
   esac
 }
@@ -129,14 +175,14 @@ archive_member_sha256() {
 
 private_staging_directory() {
   local directory=$1
-  [[ -d "$directory" && ! -L "$directory" && "$(path_mode "$directory")" == 700 ]]
+  [[ -d "$directory" && ! -L "$directory" && "$(path_mode "$directory")" == 700 ]] && owned_by_expected "$directory"
 }
 
 staged_file_state() {
   local path=$1
   local expected_digest=$2
   local actual_digest
-  if [[ -L "$path" || ! -f "$path" || "$(path_mode "$path")" != 600 ]]; then
+  if [[ -L "$path" || ! -f "$path" || "$(path_mode "$path")" != 600 ]] || ! owned_by_expected "$path"; then
     printf 'UNSAFE\n'
     return 0
   fi
@@ -157,7 +203,7 @@ target_file_state() {
     printf 'MISSING\n'
     return 0
   fi
-  if [[ -L "$path" || ! -f "$path" || "$(path_mode "$path")" != "$expected_mode" ]]; then
+  if [[ -L "$path" || ! -f "$path" || "$(path_mode "$path")" != "$expected_mode" ]] || ! owned_by_expected "$path"; then
     printf 'UNKNOWN\n'
     return 0
   fi
@@ -176,7 +222,7 @@ directory_state() {
   local directory=$1
   if [[ ! -e "$directory" && ! -L "$directory" ]]; then
     printf 'MISSING\n'
-  elif [[ -d "$directory" && ! -L "$directory" && "$(path_mode "$directory")" == 755 ]]; then
+  elif [[ -d "$directory" && ! -L "$directory" && "$(path_mode "$directory")" == 755 ]] && owned_by_expected "$directory"; then
     printf 'COMPLIANT\n'
   else
     printf 'UNKNOWN\n'
@@ -189,11 +235,24 @@ data_root_safe() {
   if [[ ! -e "$data_root" && ! -L "$data_root" ]]; then
     return 0
   fi
-  [[ -d "$data_root" && ! -L "$data_root" ]] || return 1
+  [[ -d "$data_root" && ! -L "$data_root" && "$(path_mode "$data_root")" == 700 ]] || return 2
+  owned_by_expected "$data_root" || return 2
   shopt -s dotglob nullglob
   entries=("$data_root"/*)
   shopt -u dotglob nullglob
-  (( ${#entries[@]} == 0 ))
+  (( ${#entries[@]} == 0 )) && return 0
+  return 1
+}
+
+runtime_directory_state() {
+  local run_dir=$1
+  if [[ ! -e "$run_dir" && ! -L "$run_dir" ]]; then
+    printf 'MISSING\n'
+  elif [[ -d "$run_dir" && ! -L "$run_dir" && "$(path_mode "$run_dir")" == 711 ]] && owned_by_expected "$run_dir"; then
+    printf 'COMPLIANT\n'
+  else
+    printf 'UNKNOWN\n'
+  fi
 }
 
 atomic_publish() {
@@ -201,14 +260,29 @@ atomic_publish() {
   local target=$2
   local mode=$3
   local temporary
+  local parent=${target%/*}
+  [[ "$(directory_state "$parent")" == COMPLIANT ]] || return "$EXIT_UNKNOWN_STATE"
   temporary=$(mktemp "${target}.tmp.XXXXXX") || return "$EXIT_APPLY_FAILED"
+  if [[ "$(directory_state "$parent")" != COMPLIANT ]] || ! owned_by_expected "$temporary"; then
+    rm -f -- "$temporary"
+    return "$EXIT_UNKNOWN_STATE"
+  fi
+  [[ "$(directory_state "$parent")" == COMPLIANT ]] || { rm -f -- "$temporary"; return "$EXIT_UNKNOWN_STATE"; }
   if ! install -m "$mode" "$source" "$temporary"; then
     rm -f -- "$temporary"
     return "$EXIT_APPLY_FAILED"
   fi
+  if [[ ! -f "$temporary" || -L "$temporary" || "$(path_mode "$temporary")" != "$mode" ]] || ! owned_by_expected "$temporary"; then
+    rm -f -- "$temporary"
+    return "$EXIT_UNKNOWN_STATE"
+  fi
   if ! sync "$temporary"; then
     rm -f -- "$temporary"
     return "$EXIT_APPLY_FAILED"
+  fi
+  if [[ "$(directory_state "$parent")" != COMPLIANT ]]; then
+    rm -f -- "$temporary"
+    return "$EXIT_UNKNOWN_STATE"
   fi
   if ! mv -n "$temporary" "$target"; then
     rm -f -- "$temporary"
@@ -268,15 +342,32 @@ print("CRI_RUNTIME_READY=true")
   [[ "$marker" == CRI_RUNTIME_READY=true ]]
 }
 
+service_contract_compliant() {
+  local unit_target=$1
+  local socket_target=$2
+  local data_root=$3
+  local properties data_result=0
+  properties=$(systemctl show \
+    --property=FragmentPath \
+    --property=DropInPaths \
+    containerd.service 2>/dev/null) || return 1
+  [[ "$properties" == $'FragmentPath='"${unit_target}"$'\nDropInPaths=' ]] || return 1
+  [[ "$(runtime_directory_state "${socket_target%/*}")" == COMPLIANT ]] || return 1
+  [[ -S "$socket_target" && ! -L "$socket_target" ]] || return 1
+  [[ "$(path_mode "$socket_target")" == 660 ]] && owned_by_expected "$socket_target" || return 1
+  [[ -d "$data_root" && ! -L "$data_root" ]] || return 1
+  data_root_safe "$data_root" || data_result=$?
+  (( data_result == 0 || data_result == 1 ))
+}
+
 parse_mode "$@" || exit "$?"
+require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
 for required_command in awk chmod cmp date grep id install mktemp mv python3 rm stat sync systemctl tar; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   complete STOP_PRECONDITION missing-command-sha256 "$EXIT_PRECONDITION" NONE
 fi
-require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-
 lock_file=${BOOTSTRAP_TEST_LOCK_FILE:-"${repo_root}/bootstrap/artifacts.lock.tsv"}
 [[ -f "$lock_file" && ! -L "$lock_file" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-file-missing-or-unsafe "$EXIT_SUPPLY_CHAIN" NONE
 declare -a names=() urls=() digests=() basenames=()
@@ -285,8 +376,8 @@ while IFS=$'\t' read -r name version url digest target extra; do
   expected_record=$(approved_record "$name") || complete STOP_SUPPLY_CHAIN_MISMATCH lock-name-unapproved "$EXIT_SUPPLY_CHAIN" NONE
   array_contains "$name" "${names[@]-}" && complete STOP_SUPPLY_CHAIN_MISMATCH lock-name-duplicate "$EXIT_SUPPLY_CHAIN" NONE
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-digest-invalid "$EXIT_SUPPLY_CHAIN" NONE
-  IFS=$'\t' read -r expected_version expected_url expected_target <<<"$expected_record"
-  [[ "$version" == "$expected_version" && "$url" == "$expected_url" && "$target" == "$expected_target" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-schema-drift "$EXIT_SUPPLY_CHAIN" NONE
+  IFS=$'\t' read -r expected_version expected_url expected_digest expected_target <<<"$expected_record"
+  [[ "$version" == "$expected_version" && "$url" == "$expected_url" && "$digest" == "$expected_digest" && "$target" == "$expected_target" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-schema-drift "$EXIT_SUPPLY_CHAIN" NONE
   basename=${url##*/}
   [[ -n "$basename" ]] || complete STOP_SUPPLY_CHAIN_MISMATCH lock-basename-invalid "$EXIT_SUPPLY_CHAIN" NONE
   array_contains "$basename" "${basenames[@]-}" && complete STOP_SUPPLY_CHAIN_MISMATCH lock-basename-duplicate "$EXIT_SUPPLY_CHAIN" NONE
@@ -344,7 +435,9 @@ for absolute in "${directory_paths[@]}"; do
   esac
 done
 data_root=$(host_path /var/lib/containerd)
-data_root_safe "$data_root" || complete STOP_UNKNOWN_STATE containerd-data-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
+run_dir=$(host_path /run/containerd)
+socket_target=$(host_path /run/containerd/containerd.sock)
+[[ "$(runtime_directory_state "$run_dir")" != UNKNOWN ]] || complete STOP_UNKNOWN_STATE containerd-run-directory-unsafe "$EXIT_UNKNOWN_STATE" NONE
 
 containerd_target=$(host_path /usr/local/bin/containerd)
 ctr_target=$(host_path /usr/local/bin/ctr)
@@ -389,6 +482,20 @@ done
 if (( missing_count > 0 && compliant_count > 0 )); then
   complete STOP_UNKNOWN_STATE partial-containerd-installation "$EXIT_UNKNOWN_STATE" NONE
 fi
+if (( compliant_count != ${#targets[@]} )) && [[ -e "$socket_target" || -L "$socket_target" ]]; then
+  complete STOP_UNKNOWN_STATE orphan-containerd-socket "$EXIT_UNKNOWN_STATE" NONE
+fi
+if (( compliant_count != ${#targets[@]} )) && systemctl show \
+  --property=FragmentPath \
+  --property=DropInPaths \
+  containerd.service >/dev/null 2>&1; then
+  complete STOP_UNKNOWN_STATE partial-containerd-unit-state "$EXIT_UNKNOWN_STATE" NONE
+fi
+data_root_result=0
+data_root_safe "$data_root" || data_root_result=$?
+if (( data_root_result == 2 || (data_root_result == 1 && compliant_count != ${#targets[@]}) )); then
+  complete STOP_UNKNOWN_STATE containerd-data-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
+fi
 
 service_enabled=false
 service_active=false
@@ -396,6 +503,7 @@ systemctl is-enabled containerd.service >/dev/null 2>&1 && service_enabled=true
 systemctl is-active containerd.service >/dev/null 2>&1 && service_active=true
 if (( compliant_count == ${#targets[@]} )); then
   [[ "$service_enabled" == true && "$service_active" == true ]] || complete STOP_UNKNOWN_STATE containerd-service-state-drift "$EXIT_UNKNOWN_STATE" NONE
+  service_contract_compliant "$unit_target" "$socket_target" "$data_root" || complete STOP_UNKNOWN_STATE containerd-service-contract-drift "$EXIT_UNKNOWN_STATE" NONE
   verify_health "$containerd_target" "$runc_target" "$ctr_target" "$crictl_target" || complete STOP_VERIFY_FAILED containerd-health-verification-failed "$EXIT_VERIFY_FAILED" NONE
   complete ALREADY_COMPLIANT containerd-ready 0 40-install-kubernetes
 fi
@@ -411,11 +519,16 @@ evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 10-containerd "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
 for directory in "${missing_directories[@]-}"; do
   [[ -n "$directory" ]] || continue
+  [[ "$(directory_state "${directory%/*}")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE target-directory-parent-raced "$EXIT_UNKNOWN_STATE" NONE
   install -d -m 0755 "$directory" || complete STOP_APPLY_FAILED target-directory-create-failed "$EXIT_APPLY_FAILED" NONE
+  [[ "$(directory_state "$directory")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE target-directory-post-create-drift "$EXIT_UNKNOWN_STATE" NONE
 done
 
+[[ "$(directory_state "$(host_path /usr/local/bin)")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE containerd-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
 containerd_extract=$(mktemp -d "$(host_path /usr/local/bin)/.containerd.extract.XXXXXX") || complete STOP_APPLY_FAILED containerd-extract-create-failed "$EXIT_APPLY_FAILED" NONE
+[[ "$(directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE cni-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE
 cni_extract=$(mktemp -d "$(host_path /opt/cni/bin)/.cni.extract.XXXXXX") || { rm -r -- "$containerd_extract"; complete STOP_APPLY_FAILED cni-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
+[[ "$(directory_state "$(host_path /usr/local/bin)")" == COMPLIANT ]] || { rm -r -- "$containerd_extract" "$cni_extract"; complete STOP_UNKNOWN_STATE crictl-extract-parent-raced "$EXIT_UNKNOWN_STATE" NONE; }
 crictl_extract=$(mktemp -d "$(host_path /usr/local/bin)/.crictl.extract.XXXXXX") || { rm -r -- "$containerd_extract" "$cni_extract"; complete STOP_APPLY_FAILED crictl-extract-create-failed "$EXIT_APPLY_FAILED" NONE; }
 chmod 0700 "$containerd_extract" "$cni_extract" "$crictl_extract" || { rm -r -- "$containerd_extract" "$cni_extract" "$crictl_extract"; complete STOP_APPLY_FAILED extract-directory-mode-failed "$EXIT_APPLY_FAILED" NONE; }
 if ! tar -xzf "$containerd_artifact" -C "$containerd_extract" -- bin/containerd bin/ctr bin/containerd-shim-runc-v2; then
@@ -461,6 +574,7 @@ systemctl enable containerd.service >/dev/null 2>&1 || complete STOP_APPLY_FAILE
 systemctl start containerd.service >/dev/null 2>&1 || complete STOP_APPLY_FAILED containerd-start-failed "$EXIT_APPLY_FAILED" NONE
 systemctl is-enabled containerd.service >/dev/null 2>&1 || complete STOP_VERIFY_FAILED containerd-not-enabled "$EXIT_VERIFY_FAILED" NONE
 systemctl is-active containerd.service >/dev/null 2>&1 || complete STOP_VERIFY_FAILED containerd-not-active "$EXIT_VERIFY_FAILED" NONE
+service_contract_compliant "$unit_target" "$socket_target" "$data_root" || complete STOP_VERIFY_FAILED containerd-service-contract-verification-failed "$EXIT_VERIFY_FAILED" NONE
 verify_health "$containerd_target" "$runc_target" "$ctr_target" "$crictl_target" || complete STOP_VERIFY_FAILED containerd-health-verification-failed "$EXIT_VERIFY_FAILED" NONE
 
 log_evidence ARTIFACT_SET="$ARTIFACT_SET"
