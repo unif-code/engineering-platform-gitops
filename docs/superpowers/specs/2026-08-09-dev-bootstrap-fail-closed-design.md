@@ -16,7 +16,7 @@
 1. 验证主机身份、网络、内核与旧运行时清退证据。
 2. 从官方来源获取并固定 containerd 及全部配套制品。
 3. 配置 Kubernetes 所需内核模块与 sysctl。
-4. 安装并验证 containerd、runc 和 CNI plugins。
+4. 安装并验证 containerd、runc、CNI plugins 和 crictl。
 5. 安装并锁定 Kubernetes `v1.36.3` 的 kubelet、kubeadm 和 kubectl。
 6. 使用固定 IP 初始化无 kube-proxy 的单节点 control plane。
 7. 安装 Gateway API Standard CRD `v1.6.1` 与 Cilium `1.20.0`。
@@ -49,6 +49,7 @@
 | containerd 配置 | config version 4、CRI v1、overlayfs、runc v2、`SystemdCgroup = true` |
 | runc | `v1.3.6` 官方 `linux/amd64` artifact |
 | CNI plugins | `v1.9.1` 官方 `linux/amd64` artifact |
+| crictl | `v1.36.0` 官方 `linux/amd64` artifact；固定显式 containerd endpoint |
 | Kubernetes | `v1.36.3`，只接受官方 `pkgs.k8s.io` v1.36 APT repository 的精确 package 版本 |
 | Helm CLI | `v3.21.0` 官方 `linux/amd64` artifact；只用于固定 Cilium chart 的安装与核验 |
 | Cilium | Helm chart `1.20.0`，启用 kube-proxy replacement 与 Gateway API |
@@ -163,7 +164,7 @@ name<TAB>version<TAB>url<TAB>sha256<TAB>target
 7. Kubernetes APT repository 必须使用独立 `signed-by` keyring；package candidate 和实际 `.deb` metadata 必须精确匹配 `v1.36.3`，安装后立即 `apt-mark hold`。
 8. 下载或 APT metadata 中出现同版本不同 digest 时，结果是 `STOP_SUPPLY_CHAIN_MISMATCH`，不得自动接受新值。
 
-锁清单覆盖 containerd archive、runc、CNI plugins、Helm CLI、Gateway API Standard manifest 和 Cilium chart。containerd systemd unit 作为仓库内审阅文件交付，安装时记录 Git blob 与文件 SHA-256，不属于网络下载制品。Kubernetes package 的签名 repository metadata、package version 与下载后的 `.deb` SHA-256 同样进入 evidence。
+锁清单精确覆盖七项：containerd archive、runc、CNI plugins、crictl、Helm CLI、Gateway API Standard manifest 和 Cilium chart。containerd systemd unit 作为仓库内审阅文件交付，安装时记录 Git blob 与文件 SHA-256，不属于网络下载制品。Kubernetes package 的签名 repository metadata、package version 与下载后的 `.deb` SHA-256 同样进入 evidence。
 
 ## 7. 阶段数据流
 
@@ -215,12 +216,13 @@ net.ipv4.ip_forward=1
 - containerd binaries：`/usr/local/bin`
 - runc：`/usr/local/sbin/runc`
 - CNI plugins：`/opt/cni/bin`
+- crictl：`/usr/local/bin/crictl`
 - systemd unit：`/usr/local/lib/systemd/system/containerd.service`
 - config：`/etc/containerd/config.toml`
 - root：`/var/lib/containerd`
 - state/socket：`/run/containerd` 与 `/run/containerd/containerd.sock`
 
-任何未知 containerd/runc binary、非空旧 data root、未知 service unit 或未知 config 都是停止条件。安装后验证 binary version、config version 4、CRI plugin、overlayfs、runc v2、`SystemdCgroup=true`、service active/enabled 与 socket 权限。
+任何未知 containerd/runc/crictl binary、非空旧 data root、未知 service unit 或未知 config 都是停止条件。安装后验证 binary version、config version 4、CRI plugin、overlayfs、runc v2、`SystemdCgroup=true`、service active/enabled 与 socket 权限；`crictl info` 必须显式使用 `unix:///run/containerd/containerd.sock`，要求 `RuntimeReady=true`，Cilium 安装前允许 `NetworkReady=false`。
 
 ### 7.5 `40-install-kubernetes.sh`
 

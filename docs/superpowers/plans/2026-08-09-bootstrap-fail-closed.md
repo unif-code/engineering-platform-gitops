@@ -6,7 +6,7 @@
 
 **Architecture:** 仓库保存机器可读 artifact lock、完整目标配置和一组独立 Bash 阶段入口；公共库统一模式解析、证据输出、摘要校验、未知状态判定与原子文件安装。Python `unittest` 通过临时目录和 fake `PATH` 执行真实入口或可独立调用的阶段函数，先证明危险状态会失败，再补最小实现；服务器运行态仍必须逐阶段获得人工授权与回执。
 
-**Tech Stack:** Bash 5、Python 3 标准库、PyYAML（沿用现有 validator）、Kustomize、ShellCheck、systemd、containerd 2.3.1、kubeadm 1.36.3、Helm 3.21.0。
+**Tech Stack:** Bash 5、Python 3 标准库、PyYAML（沿用现有 validator）、Kustomize、ShellCheck、systemd、containerd 2.3.1、crictl 1.36.0、kubeadm 1.36.3、Helm 3.21.0。
 
 ## Global Constraints
 
@@ -118,12 +118,13 @@ Expected: FAIL，原因是 bootstrap 合同校验尚不存在。
 
 - [ ] **Step 3: 写入已由官方 release metadata 核对的 lock**
 
-lock 精确包含以下六项，不允许占位符：
+lock 精确包含以下七项，不允许占位符：
 
 ```text
 containerd	2.3.1	https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz	628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054	/usr/local/bin
 runc	1.3.6	https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64	3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c	/usr/local/sbin/runc
 cni-plugins	1.9.1	https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz	b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303	/opt/cni/bin
+crictl	1.36.0	https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz	83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3	/usr/local/bin/crictl
 helm	3.21.0	https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz	0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36	/usr/local/bin/helm
 gateway-api	1.6.1	https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml	24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73	kubernetes://gateway-api/standard
 cilium-chart	1.20.0	https://helm.cilium.io/cilium-1.20.0.tgz	c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883	kubernetes://kube-system/cilium
@@ -240,8 +241,8 @@ git commit -m "feat(bootstrap): stage verified release artifacts"
 - Modify: `scripts/test_bootstrap.py`
 
 **Interfaces:**
-- Consumes: staged containerd、runc、CNI artifacts 与仓库内 config/unit。
-- Produces: 两个受管 kernel 文件、containerd binaries、runc、CNI、systemd unit、config、active/enabled service 与 CRI socket。
+- Consumes: staged containerd、runc、CNI、crictl artifacts 与仓库内 config/unit。
+- Produces: 两个受管 kernel 文件、containerd binaries、runc、CNI、crictl、systemd unit、config、active/enabled service 与 CRI socket。
 
 - [ ] **Step 1: 写 kernel RED 测试**
 
@@ -257,7 +258,7 @@ git commit -m "feat(bootstrap): stage verified release artifacts"
 
 - [ ] **Step 4: 实现 containerd 阶段并转绿**
 
-APPLY 先将 archive 解到同 filesystem 临时目录，逐个校验预期可执行文件，再以 `install` 安装；CNI 同理。config 与 unit 只允许 MISSING 或精确 COMPLIANT，data root 只允许不存在或空目录。完成后 daemon-reload、enable/start，并用 `containerd --version`、`runc --version`、`ctr plugins ls`、`crictl info` 的 allowlisted 字段验证 config v4、CRI v1、overlayfs、runc v2 与 systemd cgroup。
+APPLY 先将 archive 解到同 filesystem 临时目录，逐个校验预期可执行文件，再以 `install` 安装；CNI 与 crictl 同理。config 与 unit 只允许 MISSING 或精确 COMPLIANT，data root 只允许不存在或空目录。完成后 daemon-reload、enable/start，并用 `containerd --version`、`runc --version`、`crictl version`、`ctr plugins ls`、显式 endpoint 的 `crictl info` allowlisted 字段验证 config v4、CRI v1、RuntimeReady、overlayfs、runc v2 与 systemd cgroup。
 
 - [ ] **Step 5: 验证并提交**
 
@@ -390,7 +391,7 @@ git commit -m "docs(runbook): wire staged bootstrap workflow"
 
 ## Self-Review
 
-- Spec coverage：活动根隔离、六项固定制品、CIDR、host preflight、artifact staging、kernel、containerd、Kubernetes packages、kubeadm、Gateway/Cilium、最终验证、evidence 与服务器人工 Gate 均有对应任务。
+- Spec coverage：活动根隔离、七项固定制品、CIDR、host preflight、artifact staging、kernel、containerd/crictl、Kubernetes packages、kubeadm、Gateway/Cilium、最终验证、evidence 与服务器人工 Gate 均有对应任务。
 - Placeholder scan：计划不含待补内容、猜测 digest 或浮动版本；运行态未知值明确由脚本读取并形成 evidence，而非静态占位。
 - Interface consistency：所有阶段共用 Task 3 的模式、evidence 与退出码；`validate_active_root` 和 `validate_bootstrap_contracts` 都接受可替换 `root` 以便真实 fixture 测试。
 - Mutation coverage：每个修改型阶段至少覆盖未知既有状态、CHECK 禁止写、精确幂等、摘要/版本漂移和敏感信息 canary；删除关键 Gate、放宽版本或接回 staged 入口都会使测试失败。

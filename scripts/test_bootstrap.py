@@ -16,6 +16,8 @@ COMMON = ROOT / 'scripts/bootstrap/lib/common.sh'
 CIDR_CHECK = ROOT / 'scripts/bootstrap/check_cidrs.py'
 PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
 STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
+PREPARE_KERNEL = ROOT / 'scripts/bootstrap/20-prepare-kernel.sh'
+INSTALL_CONTAINERD = ROOT / 'scripts/bootstrap/30-install-containerd.sh'
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -334,6 +336,319 @@ class PreflightTest(BootstrapTestCase):
         self.assertNotIn(canary, self.evidence_text(host))
 
 
+class KernelStageTest(BootstrapTestCase):
+    modules_content = 'overlay\nbr_netfilter\n'
+    sysctl_content = (
+        'net.bridge.bridge-nf-call-iptables = 1\n'
+        'net.bridge.bridge-nf-call-ip6tables = 1\n'
+        'net.ipv4.ip_forward = 1\n'
+    )
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def make_environment(self) -> tuple[dict[str, str], Path, Path]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        fake_bin = directory / 'bin'
+        command_log = directory / 'commands.log'
+        (host / 'etc/modules-load.d').mkdir(parents=True)
+        (host / 'etc/sysctl.d').mkdir(parents=True)
+        (host / 'proc/sys/net/bridge').mkdir(parents=True)
+        (host / 'proc/sys/net/ipv4').mkdir(parents=True)
+        (host / 'sys/module').mkdir(parents=True)
+        (host / 'root/dev-infra-evidence').mkdir(parents=True)
+        (host / 'swap.img').write_bytes(b'preserve swap\n')
+        fake_bin.mkdir()
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'modprobe',
+            '''
+            #!/bin/sh
+            printf 'modprobe %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "${FAKE_MODPROBE_FAIL:-}" != "$1" ] || exit 1
+            mkdir -p "$FAKE_HOST_ROOT/sys/module/$1"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sysctl',
+            '''
+            #!/bin/sh
+            printf 'sysctl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "${FAKE_SYSCTL_FAIL:-0}" != 1 ] || exit 1
+            [ "$1" = "--load" ] && [ "$2" = "$FAKE_HOST_ROOT/etc/sysctl.d/99-kubernetes-cri.conf" ] || exit 2
+            printf '%s\n' "${FAKE_BRIDGE_IPV4_VALUE:-1}" >"$FAKE_HOST_ROOT/proc/sys/net/bridge/bridge-nf-call-iptables"
+            printf '%s\n' "${FAKE_BRIDGE_IPV6_VALUE:-1}" >"$FAKE_HOST_ROOT/proc/sys/net/bridge/bridge-nf-call-ip6tables"
+            printf '%s\n' "${FAKE_IP_FORWARD_VALUE:-1}" >"$FAKE_HOST_ROOT/proc/sys/net/ipv4/ip_forward"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'mv',
+            '''
+            #!/bin/sh
+            printf 'mv %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            if [ "${FAKE_MV_RACE_TARGET:-}" = "${3:-}" ]; then
+              printf 'concurrent\n' >"$FAKE_MV_RACE_TARGET"
+            fi
+            exec /bin/mv "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'install',
+            '''
+            #!/bin/sh
+            printf 'install %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            exec /usr/bin/install "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sync',
+            '''
+            #!/bin/sh
+            printf 'sync %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "${FAKE_SYNC_FAIL:-0}" != 1 ]
+            ''',
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'FAKE_COMMAND_LOG': str(command_log),
+                'FAKE_HOST_ROOT': str(host),
+            }
+        )
+        return environment, host, command_log
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', str(PREPARE_KERNEL), mode], env=environment
+        )
+
+    def modules_file(self, host: Path) -> Path:
+        return host / 'etc/modules-load.d/containerd.conf'
+
+    def sysctl_file(self, host: Path) -> Path:
+        return host / 'etc/sysctl.d/99-kubernetes-cri.conf'
+
+    def set_persistent_files(self, host: Path) -> None:
+        self.modules_file(host).write_text(self.modules_content, encoding='utf-8')
+        self.sysctl_file(host).write_text(self.sysctl_content, encoding='utf-8')
+        self.modules_file(host).chmod(0o644)
+        self.sysctl_file(host).chmod(0o644)
+
+    def set_runtime(self, host: Path, value: str = '1') -> None:
+        (host / 'sys/module/overlay').mkdir(exist_ok=True)
+        (host / 'sys/module/br_netfilter').mkdir(exist_ok=True)
+        for path in (
+            host / 'proc/sys/net/bridge/bridge-nf-call-iptables',
+            host / 'proc/sys/net/bridge/bridge-nf-call-ip6tables',
+            host / 'proc/sys/net/ipv4/ip_forward',
+        ):
+            path.write_text(f'{value}\n', encoding='utf-8')
+
+    def test_check_rejects_unknown_managed_file_without_overwriting_it(self) -> None:
+        """捕获把未知内容、类型或权限漂移误判为可安全覆盖的缺陷。"""
+        cases = ('content', 'mode', 'symlink', 'directory')
+        for target_name in ('modules', 'sysctl'):
+            for drift in cases:
+                with self.subTest(target=target_name, drift=drift):
+                    environment, host, command_log = self.make_environment()
+                    target = (
+                        self.modules_file(host)
+                        if target_name == 'modules'
+                        else self.sysctl_file(host)
+                    )
+                    expected = (
+                        self.modules_content
+                        if target_name == 'modules'
+                        else self.sysctl_content
+                    )
+                    if drift == 'content':
+                        target.write_text('unknown\n', encoding='utf-8')
+                    elif drift == 'mode':
+                        target.write_text(expected, encoding='utf-8')
+                        target.chmod(0o600)
+                    elif drift == 'symlink':
+                        target.symlink_to('/tmp/escape')
+                    else:
+                        target.mkdir()
+
+                    result = self.run_stage(environment, '--check')
+
+                    self.assertEqual(result.returncode, 30, result.stderr)
+                    self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                    self.assertTrue(target.exists() or target.is_symlink())
+                    self.assertFalse(command_log.exists())
+
+    def test_check_rejects_partial_persistent_installation(self) -> None:
+        """捕获只存在一个受管文件时继续安装、掩盖部分安装的缺陷。"""
+        for existing in ('modules', 'sysctl'):
+            with self.subTest(existing=existing):
+                environment, host, command_log = self.make_environment()
+                target = (
+                    self.modules_file(host)
+                    if existing == 'modules'
+                    else self.sysctl_file(host)
+                )
+                content = (
+                    self.modules_content
+                    if existing == 'modules'
+                    else self.sysctl_content
+                )
+                target.write_text(content, encoding='utf-8')
+                target.chmod(0o644)
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertFalse(command_log.exists())
+
+    def test_check_is_read_only_when_kernel_changes_are_needed(self) -> None:
+        """捕获默认 CHECK 调用写命令、创建目标或改动 swap 的缺陷。"""
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KERNEL_CHECK', result.stdout)
+        self.assertFalse(self.modules_file(host).exists())
+        self.assertFalse(self.sysctl_file(host).exists())
+        self.assertFalse(command_log.exists())
+        self.assertEqual((host / 'swap.img').read_bytes(), b'preserve swap\n')
+        self.assertEqual(list((host / 'root/dev-infra-evidence').iterdir()), [])
+
+    def test_check_reports_only_fully_compliant_state_as_already_compliant(self) -> None:
+        """捕获仅检查持久文件、遗漏 runtime 模块或 sysctl 的缺陷。"""
+        environment, host, command_log = self.make_environment()
+        self.set_persistent_files(host)
+        self.set_runtime(host)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertFalse(command_log.exists())
+
+        (host / 'sys/module/overlay').rmdir()
+        result = self.run_stage(environment, '--check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KERNEL_CHECK', result.stdout)
+        self.assertFalse(command_log.exists())
+
+    def test_apply_atomically_writes_contract_and_verifies_runtime(self) -> None:
+        """捕获内容错误、非原子发布、漏加载模块、漏应用 sysctl 或改 swap 的缺陷。"""
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KERNEL_PREPARED', result.stdout)
+        self.assertEqual(
+            self.modules_file(host).read_text(encoding='utf-8'),
+            self.modules_content,
+        )
+        self.assertEqual(
+            self.sysctl_file(host).read_text(encoding='utf-8'),
+            self.sysctl_content,
+        )
+        self.assertEqual(self.modules_file(host).stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.sysctl_file(host).stat().st_mode & 0o777, 0o644)
+        self.assertEqual((host / 'swap.img').read_bytes(), b'preserve swap\n')
+        command_text = command_log.read_text(encoding='utf-8')
+        self.assertIn('modprobe overlay\n', command_text)
+        self.assertIn('modprobe br_netfilter\n', command_text)
+        self.assertIn(
+            f'sysctl --load {self.sysctl_file(host)}\n', command_text
+        )
+        evidence = list(
+            (host / 'root/dev-infra-evidence').glob('09-prepare-kernel-*.txt')
+        )
+        self.assertEqual(len(evidence), 1)
+        evidence_keys = {
+            line.split('=', 1)[0]
+            for line in evidence[0].read_text(encoding='utf-8').splitlines()
+        }
+        self.assertEqual(
+            evidence_keys,
+            {
+                'MODULE_BR_NETFILTER',
+                'MODULE_OVERLAY',
+                'SYSCTL_BRIDGE_IPV4',
+                'SYSCTL_BRIDGE_IPV6',
+                'SYSCTL_IP_FORWARD',
+                'PHASE',
+                'MODE',
+                'RESULT',
+                'REASON',
+                'EVIDENCE',
+                'EXIT_CODE',
+                'NEXT',
+            },
+        )
+
+    def test_apply_does_not_rewrite_exact_files_when_only_runtime_drifted(self) -> None:
+        """捕获 runtime 修复时无谓覆盖精确持久文件的缺陷。"""
+        environment, host, command_log = self.make_environment()
+        self.set_persistent_files(host)
+        before = (
+            self.modules_file(host).stat().st_ino,
+            self.sysctl_file(host).stat().st_ino,
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KERNEL_PREPARED', result.stdout)
+        after = (
+            self.modules_file(host).stat().st_ino,
+            self.sysctl_file(host).stat().st_ino,
+        )
+        self.assertEqual(after, before)
+        command_text = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('mv ', command_text)
+        self.assertNotIn('install ', command_text)
+
+    def test_apply_fails_when_sync_or_runtime_verification_fails(self) -> None:
+        """捕获忽略 sync 失败或未逐项验证 /proc/sys 值的缺陷。"""
+        environment, host, _ = self.make_environment()
+        environment['FAKE_SYNC_FAIL'] = '1'
+
+        sync_result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(sync_result.returncode, 40, sync_result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', sync_result.stdout)
+        self.assertFalse(self.modules_file(host).exists())
+        self.assertFalse(self.sysctl_file(host).exists())
+
+        environment, host, _ = self.make_environment()
+        environment['FAKE_IP_FORWARD_VALUE'] = '0'
+        verify_result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(verify_result.returncode, 50, verify_result.stderr)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', verify_result.stdout)
+
+    def test_apply_never_overwrites_target_that_appears_during_publish(self) -> None:
+        """捕获发布竞态覆盖并发创建目标的缺陷。"""
+        environment, host, _ = self.make_environment()
+        target = self.modules_file(host)
+        environment['FAKE_MV_RACE_TARGET'] = str(target)
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertEqual(target.read_text(encoding='utf-8'), 'concurrent\n')
+        self.assertFalse(self.sysctl_file(host).exists())
+
+
 class ArtifactStageTest(BootstrapTestCase):
     def write_executable(self, path: Path, source: str) -> None:
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
@@ -492,9 +807,17 @@ class ArtifactStageTest(BootstrapTestCase):
                         ('bridge', b'bridge\n'),
                         ('host-local', b'host-local\n'),
                         ('loopback', b'loopback\n'),
+                        ('portmap', b'portmap\n'),
                     ]
                 ),
                 '/opt/cni/bin',
+            ),
+            (
+                'crictl',
+                '1.36.0',
+                'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+                self.archive_bytes([('crictl', b'crictl\n')]),
+                '/usr/local/bin/crictl',
             ),
             (
                 'helm',
@@ -723,6 +1046,99 @@ class ArtifactStageTest(BootstrapTestCase):
         self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
         self.assertFalse(self.staged_path(host, 'helm-v3.21.0-linux-amd64.tar.gz').exists())
 
+    def test_check_rejects_six_record_lock_without_crictl(self) -> None:
+        """捕获 staging 继续接受缺少 crictl 的旧六项 schema 的缺陷。"""
+        records = [
+            record
+            for record in self.approved_records()
+            if record[0] != 'crictl'
+        ]
+        environment, host, _, _ = self.make_environment(
+            b'ignored\n', records=records
+        )
+        self.stage_records(host, records)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertIn('REASON=lock-record-count-invalid', result.stdout)
+
+    def test_apply_stages_locked_crictl_archive(self) -> None:
+        """捕获 staging 拒绝批准 crictl 或未验证其 regular 成员的缺陷。"""
+        artifact = self.archive_bytes([('crictl', b'crictl\n')])
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='crictl',
+            version='1.36.0',
+            url='https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+            target='/usr/local/bin/crictl',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_ARTIFACTS_STAGED', result.stdout)
+        self.assertEqual(
+            self.staged_path(
+                host, 'crictl-v1.36.0-linux-amd64.tar.gz'
+            ).read_bytes(),
+            artifact,
+        )
+
+    def test_apply_rejects_crictl_archive_missing_regular_member(self) -> None:
+        """捕获接受缺成员或同名 symlink 冒充 crictl binary 的缺陷。"""
+        fixtures = (
+            self.archive_bytes([('README.md', b'missing\n')]),
+            self.archive_bytes([('crictl', 'bin/crictl')]),
+        )
+        for artifact in fixtures:
+            with self.subTest(artifact=hashlib.sha256(artifact).hexdigest()):
+                environment, host, _, _ = self.make_environment(
+                    artifact,
+                    name='crictl',
+                    version='1.36.0',
+                    url='https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+                    target='/usr/local/bin/crictl',
+                )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20)
+                self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+                self.assertFalse(
+                    self.staged_path(
+                        host, 'crictl-v1.36.0-linux-amd64.tar.gz'
+                    ).exists()
+                )
+
+    def test_apply_rejects_cni_archive_missing_portmap(self) -> None:
+        """捕获 staging 未校验 Task 5 必装 portmap 成员的缺陷。"""
+        artifact = self.archive_bytes(
+            [
+                ('bridge', b'bridge\n'),
+                ('host-local', b'host-local\n'),
+                ('loopback', b'loopback\n'),
+            ]
+        )
+        environment, host, _, _ = self.make_environment(
+            artifact,
+            name='cni-plugins',
+            version='1.9.1',
+            url='https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+            target='/opt/cni/bin',
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20)
+        self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+        self.assertFalse(
+            self.staged_path(
+                host, 'cni-plugins-linux-amd64-v1.9.1.tgz'
+            ).exists()
+        )
+
     def test_apply_stages_archives_with_required_members(self) -> None:
         fixtures = [
             (
@@ -737,7 +1153,7 @@ class ArtifactStageTest(BootstrapTestCase):
                 '1.9.1',
                 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
                 '/opt/cni/bin',
-                [('bridge', b'bridge\n'), ('host-local', b'host-local\n'), ('loopback', b'loopback\n')],
+                [('bridge', b'bridge\n'), ('host-local', b'host-local\n'), ('loopback', b'loopback\n'), ('portmap', b'portmap\n')],
             ),
             (
                 'helm',
@@ -745,6 +1161,13 @@ class ArtifactStageTest(BootstrapTestCase):
                 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
                 '/usr/local/bin/helm',
                 [('linux-amd64/helm', b'helm\n')],
+            ),
+            (
+                'crictl',
+                '1.36.0',
+                'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+                '/usr/local/bin/crictl',
+                [('crictl', b'crictl\n')],
             ),
         ]
         for name, version, url, target, members in fixtures:
@@ -850,6 +1273,591 @@ class ArtifactStageTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 20)
         self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
+
+class ContainerdInstallTest(BootstrapTestCase):
+    endpoint = 'unix:///run/containerd/containerd.sock'
+    containerd_version = b'''#!/bin/sh
+[ "$1" = "--version" ] || exit 64
+printf '%s\n' "${FAKE_CONTAINERD_VERSION:-containerd github.com/containerd/containerd/v2 v2.3.1 test}"
+'''
+    ctr_binary = b'''#!/bin/sh
+printf 'ctr %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+[ "$*" = "plugins ls" ] || exit 64
+printf '%s\n' "${FAKE_CTR_OUTPUT:-TYPE ID PLATFORMS STATUS
+io.containerd.snapshotter.v1 overlayfs linux/amd64 ok
+io.containerd.cri.v1 images - ok
+io.containerd.cri.v1 runtime linux/amd64 ok}"
+'''
+    shim_binary = b'#!/bin/sh\nexit 0\n'
+    runc_binary = b'''#!/bin/sh
+[ "$1" = "--version" ] || exit 64
+printf '%s\n' "${FAKE_RUNC_VERSION:-runc version 1.3.6}"
+'''
+    crictl_binary = b'''#!/bin/sh
+printf 'crictl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+printf '%s\n' "${FAKE_CANARY:-}" >&2
+case "$*" in
+  --version) printf '%s\n' "${FAKE_CRICTL_VERSION:-crictl version v1.36.0}" ;;
+  "--runtime-endpoint unix:///run/containerd/containerd.sock --image-endpoint unix:///run/containerd/containerd.sock info --output json")
+    printf '%s\n' "$FAKE_CRICTL_INFO"
+    ;;
+  *) exit 64 ;;
+esac
+'''
+    cni_binaries = {
+        'bridge': b'#!/bin/sh\nexit 0\n',
+        'host-local': b'#!/bin/sh\nexit 0\n',
+        'loopback': b'#!/bin/sh\nexit 0\n',
+        'portmap': b'#!/bin/sh\nexit 0\n',
+    }
+
+    def write_executable(self, path: Path, source: str | bytes) -> None:
+        if isinstance(source, bytes):
+            path.write_bytes(source)
+        else:
+            path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def archive_bytes(self, members: list[tuple[str, bytes | str]]) -> bytes:
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            for name, content in members:
+                member = tarfile.TarInfo(name)
+                if isinstance(content, str):
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = content
+                    member.size = 0
+                else:
+                    member.mode = 0o755
+                    member.size = len(content)
+                    archive.addfile(member, io.BytesIO(content))
+                    continue
+                archive.addfile(member)
+        return stream.getvalue()
+
+    def artifact_records(
+        self, overrides: dict[str, bytes] | None = None
+    ) -> list[tuple[str, str, str, bytes, str]]:
+        artifacts = {
+            'containerd': self.archive_bytes(
+                [
+                    ('bin/containerd', self.containerd_version),
+                    ('bin/ctr', self.ctr_binary),
+                    ('bin/containerd-shim-runc-v2', self.shim_binary),
+                ]
+            ),
+            'runc': self.runc_binary,
+            'cni-plugins': self.archive_bytes(list(self.cni_binaries.items())),
+            'crictl': self.archive_bytes([('crictl', self.crictl_binary)]),
+            'helm': self.archive_bytes([('linux-amd64/helm', b'helm\n')]),
+            'gateway-api': b'gateway\n',
+            'cilium-chart': b'cilium\n',
+        }
+        artifacts.update(overrides or {})
+        return [
+            (
+                'containerd',
+                '2.3.1',
+                'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+                artifacts['containerd'],
+                '/usr/local/bin',
+            ),
+            (
+                'runc',
+                '1.3.6',
+                'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64',
+                artifacts['runc'],
+                '/usr/local/sbin/runc',
+            ),
+            (
+                'cni-plugins',
+                '1.9.1',
+                'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+                artifacts['cni-plugins'],
+                '/opt/cni/bin',
+            ),
+            (
+                'crictl',
+                '1.36.0',
+                'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+                artifacts['crictl'],
+                '/usr/local/bin/crictl',
+            ),
+            (
+                'helm',
+                '3.21.0',
+                'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+                artifacts['helm'],
+                '/usr/local/bin/helm',
+            ),
+            (
+                'gateway-api',
+                '1.6.1',
+                'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml',
+                artifacts['gateway-api'],
+                'kubernetes://gateway-api/standard',
+            ),
+            (
+                'cilium-chart',
+                '1.20.0',
+                'https://helm.cilium.io/cilium-1.20.0.tgz',
+                artifacts['cilium-chart'],
+                'kubernetes://kube-system/cilium',
+            ),
+        ]
+
+    def valid_info(self, *, runtime_ready: object = True) -> str:
+        import json
+
+        return json.dumps(
+            {
+                'status': {
+                    'conditions': [
+                        {'type': 'RuntimeReady', 'status': runtime_ready},
+                        {
+                            'type': 'NetworkReady',
+                            'status': False,
+                            'reason': 'SECRET_CANARY_REASON',
+                            'message': 'SECRET_CANARY_MESSAGE',
+                        },
+                    ]
+                },
+                'config': {
+                    'containerd': {
+                        'defaultRuntimeName': 'runc',
+                        'runtimes': {
+                            'runc': {
+                                'runtimeType': 'io.containerd.runc.v2',
+                                'options': {'SystemdCgroup': True},
+                            }
+                        },
+                    }
+                },
+                'unapprovedExtra': 'SECRET_CANARY_EXTRA',
+            }
+        )
+
+    def make_environment(
+        self, overrides: dict[str, bytes] | None = None
+    ) -> tuple[dict[str, str], Path, Path, dict[str, bytes]]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        fake_bin = directory / 'bin'
+        command_log = directory / 'commands.log'
+        lock = directory / 'artifacts.lock.tsv'
+        staging = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+        for path in (
+            host / 'root/dev-infra-evidence',
+            host / 'usr/local/bin',
+            host / 'usr/local/sbin',
+            host / 'usr/local/lib/systemd/system',
+            host / 'opt/cni/bin',
+            host / 'etc/containerd',
+            host / 'var/lib',
+            host / 'run',
+            fake_bin,
+            staging,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        (host / 'root/dev-infra-artifacts').chmod(0o700)
+        staging.chmod(0o700)
+        (host / 'swap.img').write_bytes(b'preserve swap\n')
+
+        records = self.artifact_records(overrides)
+        artifact_map: dict[str, bytes] = {}
+        lock_lines = []
+        for name, version, url, artifact, target in records:
+            artifact_map[name] = artifact
+            staged = staging / Path(url).name
+            staged.write_bytes(artifact)
+            staged.chmod(0o600)
+            lock_lines.append(
+                '\t'.join(
+                    (
+                        name,
+                        version,
+                        url,
+                        hashlib.sha256(artifact).hexdigest(),
+                        target,
+                    )
+                )
+            )
+        lock.write_text('\n'.join(lock_lines) + '\n', encoding='utf-8')
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'install',
+            '''
+            #!/bin/sh
+            printf 'install %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            exec /usr/bin/install "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'mv',
+            '''
+            #!/bin/sh
+            printf 'mv %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            if [ -n "${FAKE_MV_RACE_TARGET:-}" ]; then
+              eval "last=\${${#}}"
+              if [ "$last" = "$FAKE_MV_RACE_TARGET" ]; then
+                printf 'concurrent\n' >"$last"
+              fi
+            fi
+            exec /bin/mv "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sync',
+            '''
+            #!/bin/sh
+            printf 'sync %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "${FAKE_SYNC_FAIL:-0}" != 1 ]
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'tar',
+            '''
+            #!/bin/sh
+            [ "$1" != "-xzf" ] || printf 'tar-write %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            exec /usr/bin/tar "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'systemctl',
+            '''
+            #!/bin/sh
+            printf 'systemctl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            case "$1" in
+              is-enabled) [ -f "$FAKE_SERVICE_ENABLED" ] ;;
+              is-active) [ -f "$FAKE_SERVICE_ACTIVE" ] && printf 'active\n' ;;
+              daemon-reload) exit 0 ;;
+              enable) : >"$FAKE_SERVICE_ENABLED" ;;
+              start)
+                : >"$FAKE_SERVICE_ACTIVE"
+                mkdir -p "$FAKE_HOST_ROOT/run/containerd"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_LOCK_FILE': str(lock),
+                'FAKE_COMMAND_LOG': str(command_log),
+                'FAKE_HOST_ROOT': str(host),
+                'FAKE_SERVICE_ENABLED': str(directory / 'service-enabled'),
+                'FAKE_SERVICE_ACTIVE': str(directory / 'service-active'),
+                'FAKE_CRICTL_INFO': self.valid_info(),
+            }
+        )
+        return environment, host, command_log, artifact_map
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', str(INSTALL_CONTAINERD), mode], env=environment
+        )
+
+    def managed_targets(self, host: Path) -> dict[str, Path]:
+        return {
+            'containerd': host / 'usr/local/bin/containerd',
+            'ctr': host / 'usr/local/bin/ctr',
+            'shim': host / 'usr/local/bin/containerd-shim-runc-v2',
+            'runc': host / 'usr/local/sbin/runc',
+            'bridge': host / 'opt/cni/bin/bridge',
+            'host-local': host / 'opt/cni/bin/host-local',
+            'loopback': host / 'opt/cni/bin/loopback',
+            'portmap': host / 'opt/cni/bin/portmap',
+            'crictl': host / 'usr/local/bin/crictl',
+            'config': host / 'etc/containerd/config.toml',
+            'unit': host / 'usr/local/lib/systemd/system/containerd.service',
+        }
+
+    def install_compliant_targets(
+        self, environment: dict[str, str], host: Path
+    ) -> None:
+        targets = self.managed_targets(host)
+        binaries = {
+            'containerd': self.containerd_version,
+            'ctr': self.ctr_binary,
+            'shim': self.shim_binary,
+            'runc': self.runc_binary,
+            **self.cni_binaries,
+            'crictl': self.crictl_binary,
+        }
+        for name, content in binaries.items():
+            targets[name].write_bytes(content)
+            targets[name].chmod(0o755)
+        targets['config'].write_bytes(
+            (ROOT / 'bootstrap/containerd/config.toml').read_bytes()
+        )
+        targets['unit'].write_bytes(
+            (ROOT / 'bootstrap/containerd/containerd.service').read_bytes()
+        )
+        targets['config'].chmod(0o644)
+        targets['unit'].chmod(0o644)
+        (host / 'var/lib/containerd').mkdir()
+        Path(environment['FAKE_SERVICE_ENABLED']).touch()
+        Path(environment['FAKE_SERVICE_ACTIVE']).touch()
+
+    def test_check_is_read_only_for_clean_missing_state(self) -> None:
+        """捕获 CHECK 解包、安装、启动服务、创建 evidence 或改 swap 的缺陷。"""
+        environment, host, command_log, _ = self.make_environment()
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CONTAINERD_CHECK', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        for forbidden in (
+            'install ', 'mv ', 'sync ', 'tar-write ', 'daemon-reload',
+            ' enable ', ' start ', ' restart ',
+        ):
+            self.assertNotIn(forbidden, commands)
+        self.assertTrue(all(not path.exists() for path in self.managed_targets(host).values()))
+        self.assertEqual((host / 'swap.img').read_bytes(), b'preserve swap\n')
+        self.assertEqual(list((host / 'root/dev-infra-evidence').iterdir()), [])
+
+    def test_check_rejects_unknown_and_partial_managed_targets(self) -> None:
+        """捕获覆盖 binary/config/unit 漂移或把部分安装误判为幂等成功的缺陷。"""
+        for name, drift in (
+            ('containerd', 'content'),
+            ('runc', 'symlink'),
+            ('crictl', 'mode'),
+            ('bridge', 'directory'),
+            ('config', 'content'),
+            ('unit', 'mode'),
+        ):
+            with self.subTest(name=name, drift=drift):
+                environment, host, _, _ = self.make_environment()
+                target = self.managed_targets(host)[name]
+                if drift == 'symlink':
+                    target.symlink_to('/tmp/escape')
+                elif drift == 'directory':
+                    target.mkdir()
+                else:
+                    target.write_bytes(b'unknown\n')
+                    target.chmod(0o600 if drift == 'mode' else 0o755)
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+        environment, host, _, _ = self.make_environment()
+        target = self.managed_targets(host)['containerd']
+        target.write_bytes(self.containerd_version)
+        target.chmod(0o755)
+        result = self.run_stage(environment, '--check')
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_unsafe_or_nonempty_data_root(self) -> None:
+        """捕获接管非空、文件或 symlink data root 的缺陷。"""
+        for drift in ('nonempty', 'file', 'symlink'):
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                data_root = host / 'var/lib/containerd'
+                if drift == 'nonempty':
+                    data_root.mkdir()
+                    (data_root / 'unknown').write_text('preserve\n', encoding='utf-8')
+                elif drift == 'file':
+                    data_root.write_text('preserve\n', encoding='utf-8')
+                else:
+                    data_root.symlink_to('/tmp/escape')
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_revalidates_every_staged_digest_and_file_safety(self) -> None:
+        """捕获信任前序结果、遗漏七项 digest 或接受不安全 staging 文件的缺陷。"""
+        for name in ('containerd', 'runc', 'cni-plugins', 'crictl', 'helm', 'gateway-api', 'cilium-chart'):
+            with self.subTest(name=name):
+                environment, host, _, _ = self.make_environment()
+                lock_line = next(
+                    line
+                    for line in Path(environment['BOOTSTRAP_TEST_LOCK_FILE']).read_text(encoding='utf-8').splitlines()
+                    if line.startswith(f'{name}\t')
+                )
+                url = lock_line.split('\t')[2]
+                staged = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1' / Path(url).name
+                staged.write_bytes(b'drift\n')
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+
+        environment, host, _, _ = self.make_environment()
+        staged = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1/crictl-v1.36.0-linux-amd64.tar.gz'
+        staged.chmod(0o644)
+        result = self.run_stage(environment, '--check')
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_check_rejects_unsafe_target_parent(self) -> None:
+        """捕获沿父目录 symlink 逃逸或容忍父目录权限漂移的缺陷。"""
+        for drift in ('symlink', 'mode'):
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                parent = host / 'etc/containerd'
+                parent.rmdir()
+                if drift == 'symlink':
+                    parent.symlink_to('/tmp')
+                else:
+                    parent.mkdir(mode=0o700)
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_apply_rejects_archive_missing_or_unsafe_expected_member(self) -> None:
+        """捕获 archive 缺成员、路径逃逸或 symlink 冒充 executable 的缺陷。"""
+        cases = {
+            'containerd': self.archive_bytes([('bin/containerd', self.containerd_version)]),
+            'cni-plugins': self.archive_bytes([('bridge', self.cni_binaries['bridge'])]),
+            'crictl': self.archive_bytes([('crictl', 'bin/crictl')]),
+            'escape': self.archive_bytes([('../escape', b'escape\n')]),
+        }
+        for name, artifact in cases.items():
+            with self.subTest(name=name):
+                artifact_name = 'containerd' if name == 'escape' else name
+                environment, host, _, _ = self.make_environment(
+                    {artifact_name: artifact}
+                )
+                result = self.run_stage(environment, '--apply')
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_ARCHIVE_UNSAFE', result.stdout)
+                self.assertTrue(all(not path.exists() for path in self.managed_targets(host).values()))
+
+    def test_apply_installs_exact_targets_and_verifies_health_without_leak(self) -> None:
+        """捕获漏装 crictl/CNI、错误 endpoint、宽松健康解析或 raw output 泄漏的缺陷。"""
+        environment, host, command_log, _ = self.make_environment()
+        environment['FAKE_CANARY'] = 'SECRET_CANARY_STDERR'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CONTAINERD_INSTALLED', result.stdout)
+        self.assertNotIn('SECRET_CANARY', result.stdout + result.stderr)
+        for path in self.managed_targets(host).values():
+            self.assertTrue(path.is_file(), path)
+        self.assertEqual(self.managed_targets(host)['crictl'].stat().st_mode & 0o777, 0o755)
+        self.assertEqual((host / 'swap.img').read_bytes(), b'preserve swap\n')
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(
+            f'crictl --runtime-endpoint {self.endpoint} --image-endpoint {self.endpoint} info --output json\n',
+            commands,
+        )
+        self.assertIn('systemctl daemon-reload\n', commands)
+        self.assertIn('systemctl enable containerd.service\n', commands)
+        self.assertIn('systemctl start containerd.service\n', commands)
+        evidence = list((host / 'root/dev-infra-evidence').glob('10-containerd-*.txt'))
+        self.assertEqual(len(evidence), 1)
+        evidence_text = evidence[0].read_text(encoding='utf-8')
+        self.assertNotIn('SECRET_CANARY', evidence_text)
+        evidence_keys = {line.split('=', 1)[0] for line in evidence_text.splitlines()}
+        self.assertEqual(
+            evidence_keys,
+            {
+                'ARTIFACT_SET', 'CONTAINERD_VERSION', 'RUNC_VERSION',
+                'CRICTL_VERSION', 'CRI_RUNTIME_READY', 'SNAPSHOTTER',
+                'RUNTIME_NAME', 'RUNTIME_TYPE', 'SYSTEMD_CGROUP',
+                'SERVICE_ACTIVE', 'SERVICE_ENABLED', 'CRI_SOCKET',
+                'PHASE', 'MODE', 'RESULT', 'REASON', 'EVIDENCE',
+                'EXIT_CODE', 'NEXT',
+            },
+        )
+
+    def test_apply_fails_closed_on_sync_or_concurrent_target(self) -> None:
+        """捕获忽略 sync 失败或覆盖并发出现目标的缺陷。"""
+        environment, host, _, _ = self.make_environment()
+        environment['FAKE_SYNC_FAIL'] = '1'
+        result = self.run_stage(environment, '--apply')
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertTrue(all(not path.exists() for path in self.managed_targets(host).values()))
+
+        environment, host, _, _ = self.make_environment()
+        target = self.managed_targets(host)['containerd']
+        environment['FAKE_MV_RACE_TARGET'] = str(target)
+        result = self.run_stage(environment, '--apply')
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertEqual(target.read_bytes(), b'concurrent\n')
+
+    def test_check_exact_install_is_idempotent_without_service_restart(self) -> None:
+        """捕获精确已安装状态仍重写文件、reload、enable 或 restart 的缺陷。"""
+        environment, host, command_log, _ = self.make_environment()
+        self.install_compliant_targets(environment, host)
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        for forbidden in ('install ', 'mv ', 'tar-write ', 'daemon-reload', ' enable ', ' start ', ' restart '):
+            self.assertNotIn(forbidden, commands)
+
+    def test_check_rejects_exact_files_with_service_state_drift(self) -> None:
+        """捕获自动修复 inactive/disabled 精确安装而非 STOP 的缺陷。"""
+        for missing_state in ('active', 'enabled'):
+            with self.subTest(missing_state=missing_state):
+                environment, host, _, _ = self.make_environment()
+                self.install_compliant_targets(environment, host)
+                Path(environment[f'FAKE_SERVICE_{missing_state.upper()}']).unlink()
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_health_rejects_version_and_plugin_drift(self) -> None:
+        """捕获宽松接受 containerd/runc/crictl 版本或 CRI/overlayfs plugin 漂移的缺陷。"""
+        cases = {
+            'FAKE_CONTAINERD_VERSION': 'containerd v2.3.0',
+            'FAKE_RUNC_VERSION': 'runc version 1.3.5',
+            'FAKE_CRICTL_VERSION': 'crictl version v1.35.0',
+            'FAKE_CTR_OUTPUT': 'io.containerd.snapshotter.v1 overlayfs linux/amd64 error',
+        }
+        for variable, value in cases.items():
+            with self.subTest(variable=variable):
+                environment, host, _, _ = self.make_environment()
+                self.install_compliant_targets(environment, host)
+                environment[variable] = value
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 50, result.stderr)
+                self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+
+    def test_health_strictly_parses_runtime_ready_and_allowlisted_json(self) -> None:
+        """捕获 RuntimeReady 非唯一/非 boolean、runtime config 漂移或 malformed JSON 被接受及泄漏的缺陷。"""
+        duplicate = self.valid_info()
+        import json
+
+        duplicate_data = json.loads(duplicate)
+        duplicate_data['status']['conditions'].append(
+            {'type': 'RuntimeReady', 'status': True}
+        )
+        drifted = json.loads(self.valid_info())
+        drifted['config']['containerd']['runtimes']['runc']['options'][
+            'SystemdCgroup'
+        ] = False
+        cases = (
+            self.valid_info(runtime_ready=False),
+            self.valid_info(runtime_ready='true'),
+            json.dumps(duplicate_data),
+            json.dumps(drifted),
+            '{SECRET_CANARY_MALFORMED',
+        )
+        for info in cases:
+            with self.subTest(info=hashlib.sha256(info.encode()).hexdigest()):
+                environment, host, _, _ = self.make_environment()
+                self.install_compliant_targets(environment, host)
+                environment['FAKE_CRICTL_INFO'] = info
+                result = self.run_stage(environment, '--check')
+                self.assertEqual(result.returncode, 50, result.stderr)
+                self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+                self.assertNotIn('SECRET_CANARY', result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

@@ -186,6 +186,44 @@ class BootstrapContractTest(unittest.TestCase):
 
         self.assert_contract_fails(root)
 
+    def test_artifact_lock_rejects_six_records_without_crictl(self) -> None:
+        """捕获遗漏 crictl 时仍接受旧六项 supply-chain 合同的缺陷。"""
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'artifacts.lock.tsv'
+        path.write_text(
+            ''.join(
+                line
+                for line in path.read_text(encoding='utf-8').splitlines(True)
+                if not line.startswith('crictl\t')
+            ),
+            encoding='utf-8',
+        )
+
+        self.assert_contract_fails(root)
+
+    def test_artifact_lock_accepts_exact_locked_crictl_record(self) -> None:
+        """捕获把批准的第七项 crictl 误判为 unexpected artifact 的缺陷。"""
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'artifacts.lock.tsv'
+        path.write_text(
+            ''.join(
+                line
+                for line in path.read_text(encoding='utf-8').splitlines(True)
+                if not line.startswith('crictl\t')
+            ),
+            encoding='utf-8',
+        )
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(
+                'crictl\t1.36.0\t'
+                'https://github.com/kubernetes-sigs/cri-tools/releases/'
+                'download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz\t'
+                '83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3\t'
+                '/usr/local/bin/crictl\n'
+            )
+
+        validator.validate_bootstrap_contracts(root)
+
     def test_containerd_contract_rejects_non_systemd_cgroup(self) -> None:
         root = self.copy_bootstrap_root()
         path = root / 'bootstrap' / 'containerd' / 'config.toml'

@@ -10,7 +10,7 @@ source "${script_dir}/lib/common.sh"
 
 readonly ARTIFACT_SET=pcs-2026-08-10.1
 readonly MINIMUM_AVAILABLE_KIB=1048576
-readonly APPROVED_RECORD_COUNT=6
+readonly APPROVED_RECORD_COUNT=7
 
 host_path() {
   local absolute=$1
@@ -68,6 +68,9 @@ approved_record() {
     cni-plugins)
       printf '%s\t%s\t%s\n' 1.9.1 'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz' /opt/cni/bin
       ;;
+    crictl)
+      printf '%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' /usr/local/bin/crictl
+      ;;
     helm)
       printf '%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' /usr/local/bin/helm
       ;;
@@ -115,6 +118,15 @@ require_archive_member() {
   grep -Fqx -- "$expected" <<<"$listing"
 }
 
+require_regular_archive_member() {
+  local archive=$1
+  local expected=$2
+  local detail
+
+  detail=$(tar -tvzf "$archive" "$expected" 2>/dev/null) || return 1
+  [[ "$detail" != *$'\n'* && "$detail" == -* ]]
+}
+
 validate_archive() {
   local name=$1
   local archive=$2
@@ -148,6 +160,11 @@ validate_archive() {
       require_archive_member "$listing" bridge || return 1
       require_archive_member "$listing" host-local || return 1
       require_archive_member "$listing" loopback || return 1
+      require_archive_member "$listing" portmap || return 1
+      ;;
+    crictl)
+      require_archive_member "$listing" crictl || return 1
+      require_regular_archive_member "$archive" crictl || return 1
       ;;
     helm)
       require_archive_member "$listing" linux-amd64/helm || return 1
@@ -309,7 +326,7 @@ for index in "${!names[@]}"; do
     complete STOP_SUPPLY_CHAIN_MISMATCH "download-digest-mismatch-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"
   fi
   case "${names[index]}" in
-    containerd|cni-plugins|helm)
+    containerd|cni-plugins|crictl|helm)
       if ! validate_archive "${names[index]}" "$temporary"; then
         rm -f -- "$temporary"
         complete STOP_ARCHIVE_UNSAFE "archive-validation-failed-${basenames[index]}" "$EXIT_SUPPLY_CHAIN"

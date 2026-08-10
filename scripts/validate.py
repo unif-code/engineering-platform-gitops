@@ -113,6 +113,12 @@ BOOTSTRAP_ARTIFACTS = {
         'b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303',
         '/opt/cni/bin',
     ),
+    'crictl': (
+        '1.36.0',
+        'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+        '83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3',
+        '/usr/local/bin/crictl',
+    ),
     'helm': (
         '3.21.0',
         'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
