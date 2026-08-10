@@ -1,3 +1,7 @@
+# STATUS: STAGED
+# ACTIVE: false
+# REASON: Cluster foundation 与平台基础设施尚未获准激活
+# ACTIVATION_GATES: bootstrap 最终验证、Flux bootstrap 与各组件供应链 Gate 全部通过
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:

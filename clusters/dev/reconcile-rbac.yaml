@@ -1,3 +1,7 @@
+# STATUS: STAGED
+# ACTIVE: false
+# REASON: Flux 与平台组件尚未获准激活
+# ACTIVATION_GATES: bootstrap 最终验证、Flux bootstrap 与 RBAC 独立审阅全部通过
 apiVersion: v1
 kind: Namespace
 metadata:

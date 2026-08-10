@@ -84,6 +84,15 @@ REQUIRED_METRICS_SERVER_RESOURCES = {
     ),
 }
 
+ACTIVE_ROOT_RESOURCES = ('flux-system',)
+INACTIVE_ENTRYPOINTS = (
+    'clusters/dev/reconcile-rbac.yaml',
+    'clusters/dev/infrastructure.yaml',
+    'clusters/dev/apps.yaml',
+    'clusters/dev/flux-system/gotk-components.yaml',
+    'clusters/dev/flux-system/gotk-sync.yaml',
+)
+
 
 def fail(message: str) -> None:
     print(f'ERROR: {message}', file=sys.stderr)
@@ -107,6 +116,41 @@ def load_documents(path: Path) -> Iterable[dict[str, Any]]:
                 yield document
     except yaml.YAMLError as error:
         fail(f'{path.relative_to(ROOT)} YAML 解析失败：{error}')
+
+
+def validate_active_root(root: Path = ROOT) -> None:
+    root_kustomization = root / 'clusters/dev/kustomization.yaml'
+    if not root_kustomization.is_file():
+        fail('clusters/dev/kustomization.yaml 不存在')
+
+    try:
+        document = yaml.safe_load(root_kustomization.read_text(encoding='utf-8'))
+    except yaml.YAMLError as error:
+        fail(f'clusters/dev/kustomization.yaml YAML 解析失败：{error}')
+    if not isinstance(document, dict):
+        fail('clusters/dev/kustomization.yaml 顶层必须是 YAML mapping')
+
+    resources = document.get('resources')
+    if resources != list(ACTIVE_ROOT_RESOURCES):
+        fail(
+            'clusters/dev 活动根只允许引用 flux-system；'
+            f'实测 resources={resources!r}'
+        )
+
+    required_headers = (
+        '# STATUS: ',
+        '# ACTIVE: false',
+        '# REASON: ',
+        '# ACTIVATION_GATES: ',
+    )
+    for relative_path in INACTIVE_ENTRYPOINTS:
+        path = root / relative_path
+        if not path.exists():
+            continue
+        header = '\n'.join(path.read_text(encoding='utf-8').splitlines()[:8])
+        for required in required_headers:
+            if required not in header:
+                fail(f'{relative_path} 缺少 inactive 审计字段：{required.strip()}')
 
 
 PathToken = Union[str, Tuple[str, str]]
@@ -950,6 +994,7 @@ def validate_documents() -> None:
 
 
 def main() -> None:
+    validate_active_root()
     validate_kustomize_builds()
     validate_documents()
     validate_single_user_storage()
