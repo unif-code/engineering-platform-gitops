@@ -98,10 +98,25 @@ APT 报告的可自动移除项包含 `iptables`、`nftables`、`libnetfilter-co
 
 执行清退前仍须以进程 UID、cwd、executable、cgroup 与证据 SHA-256 做 fail-closed 复核；任一身份漂移必须停止，不得扩大删除范围。不得执行 `apt autoremove`，且必须保留 `/root/dev-infra-evidence` 与基础系统服务。
 
+### 宿主机 Workflow/Node 清退执行记录
+
+| 字段 | 回执 |
+| --- | --- |
+| 证据文件 | `/root/dev-infra-evidence/06-host-workflow-cleanup-20260810T033358Z.txt` |
+| SHA-256 | `a68a3d2ff340bcdcb4265853107a3a2c22a9f7328728473d81d9be2d1486e635` |
+| Exit code | 脚本 `0`；外层命令 `0`；结果 `SUCCESS` |
+| Fail-closed 复核 | 前序 `04`、`05` 证据 SHA-256 均通过；目标进程 UID、cwd、executable 与旧 `session-397.scope` 全部匹配；执行命令位于当前 `session-875.scope` |
+| 进程 | 已结束 PID `1034710`、`1034712`、`1034740`、`1034741`、`1034757` 的完整旧 Workflow 进程链；`*:3001` 已关闭 |
+| 永久删除 | `/data/workflow`、`/usr/local/lib/node-v24.18.0`、对应的 6 个 `/usr/local/bin` 链接、`uniflow` 账号/home/私有组，以及已无成员的旧 `docker` 组 |
+| 非致命提示 | `userdel` 报告 `/var/mail/uniflow` 不存在；不影响账号删除与最终验证 |
+| 主机健康 | SSH、DNS、NTP 与基础网络监听保留；未发现其他旧应用监听；证据目录未删除 |
+| 清退后容量 | 根文件系统使用 `9.9G/489G`，可用 `459G`，使用率 `3%`；内存可用 `61Gi` |
+| Swap | `/swap.img` `3.8Gi` 保留且当前未使用 |
+
 清退完成回执：
 
 ```text
-Docker/Caddy/旧 containerd 清退完成；宿主机 workflow/Node 已核验，清退仍 PENDING。
+Docker/Caddy/旧 containerd 与宿主机 Workflow/Node 清退完成；服务器旧应用清退 CLOSED。
 ```
 
 ## containerd 与内核前置
