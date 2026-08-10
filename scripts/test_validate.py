@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,6 +143,84 @@ class ActiveRootIsolationTest(unittest.TestCase):
         )
 
         validator.validate_active_root(validator.ROOT)
+
+
+class BootstrapContractTest(unittest.TestCase):
+    def assert_contract_fails(self, root: Path) -> None:
+        self.assertTrue(
+            hasattr(validator, 'validate_bootstrap_contracts'),
+            'validate_bootstrap_contracts must enforce locked bootstrap inputs',
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                validator.validate_bootstrap_contracts(root)
+
+    def copy_bootstrap_root(self) -> Path:
+        self.assertTrue(
+            (validator.ROOT / 'bootstrap').is_dir(),
+            'bootstrap contracts must exist before mutation tests can run',
+        )
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        shutil.copytree(validator.ROOT / 'bootstrap', root / 'bootstrap')
+        return root
+
+    def test_repository_bootstrap_contracts(self) -> None:
+        self.assertTrue(
+            hasattr(validator, 'validate_bootstrap_contracts'),
+            'validate_bootstrap_contracts must enforce locked bootstrap inputs',
+        )
+
+        validator.validate_bootstrap_contracts(validator.ROOT)
+
+    def test_artifact_lock_rejects_floating_version(self) -> None:
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'artifacts.lock.tsv'
+        path.write_text(
+            path.read_text(encoding='utf-8').replace(
+                'containerd\t2.3.1\t', 'containerd\tlatest\t', 1
+            ),
+            encoding='utf-8',
+        )
+
+        self.assert_contract_fails(root)
+
+    def test_containerd_contract_rejects_non_systemd_cgroup(self) -> None:
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'containerd' / 'config.toml'
+        path.write_text(
+            path.read_text(encoding='utf-8').replace(
+                'SystemdCgroup = true', 'SystemdCgroup = false', 1
+            ),
+            encoding='utf-8',
+        )
+
+        self.assert_contract_fails(root)
+
+    def test_kubeadm_contract_rejects_pod_cidr_drift(self) -> None:
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'kubeadm' / 'init.yaml'
+        path.write_text(
+            path.read_text(encoding='utf-8').replace(
+                '172.21.0.0/16', '10.244.0.0/16', 1
+            ),
+            encoding='utf-8',
+        )
+
+        self.assert_contract_fails(root)
+
+    def test_cilium_contract_rejects_disabled_kube_proxy_replacement(self) -> None:
+        root = self.copy_bootstrap_root()
+        path = root / 'bootstrap' / 'cilium' / 'values.yaml'
+        path.write_text(
+            path.read_text(encoding='utf-8').replace(
+                'kubeProxyReplacement: true', 'kubeProxyReplacement: false', 1
+            ),
+            encoding='utf-8',
+        )
+
+        self.assert_contract_fails(root)
 
 
 if __name__ == '__main__':

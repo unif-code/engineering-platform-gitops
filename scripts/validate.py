@@ -9,6 +9,7 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Tuple, Union
+from urllib.parse import urlparse
 
 import yaml
 
@@ -92,6 +93,51 @@ INACTIVE_ENTRYPOINTS = (
     'clusters/dev/flux-system/gotk-components.yaml',
     'clusters/dev/flux-system/gotk-sync.yaml',
 )
+
+BOOTSTRAP_ARTIFACTS = {
+    'containerd': (
+        '2.3.1',
+        'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+        '628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054',
+        '/usr/local/bin',
+    ),
+    'runc': (
+        '1.3.6',
+        'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64',
+        '3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c',
+        '/usr/local/sbin/runc',
+    ),
+    'cni-plugins': (
+        '1.9.1',
+        'https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz',
+        'b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303',
+        '/opt/cni/bin',
+    ),
+    'helm': (
+        '3.21.0',
+        'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+        '0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36',
+        '/usr/local/bin/helm',
+    ),
+    'gateway-api': (
+        '1.6.1',
+        'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml',
+        '24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73',
+        'kubernetes://gateway-api/standard',
+    ),
+    'cilium-chart': (
+        '1.20.0',
+        'https://helm.cilium.io/cilium-1.20.0.tgz',
+        'c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883',
+        'kubernetes://kube-system/cilium',
+    ),
+}
+
+BOOTSTRAP_ARTIFACT_HOSTS = {
+    'github.com',
+    'get.helm.sh',
+    'helm.cilium.io',
+}
 
 
 def fail(message: str) -> None:
@@ -186,6 +232,172 @@ def value_at(value: Any, path: Tuple[PathToken, ...]) -> Any:
                 fail(f'路径缺少 key {token}')
             current = current[token]
     return current
+
+
+def validate_artifact_lock(path: Path) -> None:
+    if not path.is_file():
+        fail('bootstrap/artifacts.lock.tsv 不存在')
+
+    seen: dict[str, tuple[str, str, str, str]] = {}
+    for line_number, line in enumerate(
+        path.read_text(encoding='utf-8').splitlines(), start=1
+    ):
+        if not line:
+            fail(f'artifacts.lock.tsv 第 {line_number} 行不能为空')
+        fields = line.split('\t')
+        if len(fields) != 5:
+            fail(f'artifacts.lock.tsv 第 {line_number} 行必须恰好为五列')
+        name, version, url, digest, target = fields
+        if name in seen:
+            fail(f'artifacts.lock.tsv 重复 artifact：{name}')
+        if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+            fail(f'artifacts.lock.tsv {name} 版本不是精确三段版本：{version}')
+        parsed = urlparse(url)
+        if parsed.scheme != 'https' or parsed.hostname not in BOOTSTRAP_ARTIFACT_HOSTS:
+            fail(f'artifacts.lock.tsv {name} URL 不是获准官方 HTTPS 来源')
+        if parsed.query or parsed.fragment or version not in parsed.path:
+            fail(f'artifacts.lock.tsv {name} URL 未固定同一精确版本')
+        if not re.fullmatch(r'[0-9a-f]{64}', digest):
+            fail(f'artifacts.lock.tsv {name} SHA-256 格式无效')
+        seen[name] = (version, url, digest, target)
+
+    if seen != BOOTSTRAP_ARTIFACTS:
+        missing = sorted(set(BOOTSTRAP_ARTIFACTS) - set(seen))
+        unexpected = sorted(set(seen) - set(BOOTSTRAP_ARTIFACTS))
+        drifted = sorted(
+            name
+            for name in set(seen) & set(BOOTSTRAP_ARTIFACTS)
+            if seen[name] != BOOTSTRAP_ARTIFACTS[name]
+        )
+        fail(
+            'artifacts.lock.tsv 与批准锁不一致：'
+            f'missing={missing}, unexpected={unexpected}, drifted={drifted}'
+        )
+
+
+def expect_contract(label: str, actual: Any, expected: Any) -> None:
+    if actual != expected:
+        fail(f'{label} 期望 {expected!r}，实测 {actual!r}')
+
+
+def validate_bootstrap_contracts(root: Path = ROOT) -> None:
+    bootstrap = root / 'bootstrap'
+    validate_artifact_lock(bootstrap / 'artifacts.lock.tsv')
+
+    containerd_config = bootstrap / 'containerd/config.toml'
+    containerd_unit = bootstrap / 'containerd/containerd.service'
+    kubeadm_config = bootstrap / 'kubeadm/init.yaml'
+    cilium_values = bootstrap / 'cilium/values.yaml'
+    for path in (
+        containerd_config,
+        containerd_unit,
+        kubeadm_config,
+        cilium_values,
+    ):
+        if not path.is_file():
+            fail(f'{path.relative_to(root)} 不存在')
+
+    containerd_source = containerd_config.read_text(encoding='utf-8')
+    containerd_fragments = (
+        'version = 4',
+        'root = "/var/lib/containerd"',
+        'state = "/run/containerd"',
+        '[plugins."io.containerd.server.v1.grpc"]',
+        'address = "/run/containerd/containerd.sock"',
+        '[plugins."io.containerd.cri.v1.images"]',
+        'snapshotter = "overlayfs"',
+        '[plugins."io.containerd.cri.v1.runtime"]',
+        'default_runtime_name = "runc"',
+        'runtime_type = "io.containerd.runc.v2"',
+        'BinaryName = "/usr/local/sbin/runc"',
+        'SystemdCgroup = true',
+        'bin_dirs = ["/opt/cni/bin"]',
+        'conf_dir = "/etc/cni/net.d"',
+    )
+    for fragment in containerd_fragments:
+        if containerd_source.count(fragment) != 1:
+            fail(f'bootstrap/containerd/config.toml 必须且只能包含一次：{fragment}')
+    if 'io.containerd.grpc.v1.cri' in containerd_source:
+        fail('bootstrap/containerd/config.toml 禁止使用 containerd 1.x CRI plugin ID')
+
+    unit_source = containerd_unit.read_text(encoding='utf-8')
+    unit_fragments = (
+        '[Unit]',
+        'After=network.target dbus.service',
+        '[Service]',
+        'ExecStart=/usr/local/bin/containerd',
+        'Type=notify',
+        'Delegate=yes',
+        'KillMode=process',
+        'Restart=always',
+        'OOMScoreAdjust=-999',
+        '[Install]',
+        'WantedBy=multi-user.target',
+    )
+    for fragment in unit_fragments:
+        if unit_source.count(fragment) != 1:
+            fail(f'bootstrap/containerd/containerd.service 合同漂移：{fragment}')
+
+    try:
+        kubeadm_documents = {
+            document.get('kind'): document
+            for document in yaml.safe_load_all(
+                kubeadm_config.read_text(encoding='utf-8')
+            )
+            if isinstance(document, dict)
+        }
+    except yaml.YAMLError as error:
+        fail(f'bootstrap/kubeadm/init.yaml YAML 解析失败：{error}')
+    expect_contract(
+        'kubeadm kinds',
+        set(kubeadm_documents),
+        {'InitConfiguration', 'ClusterConfiguration', 'KubeletConfiguration'},
+    )
+
+    init = kubeadm_documents['InitConfiguration']
+    expect_contract('InitConfiguration apiVersion', init.get('apiVersion'), 'kubeadm.k8s.io/v1beta4')
+    expect_contract('API advertiseAddress', value_at(init, ('localAPIEndpoint', 'advertiseAddress')), '10.93.1.27')
+    expect_contract('API bindPort', value_at(init, ('localAPIEndpoint', 'bindPort')), 6443)
+    expect_contract('Node name', value_at(init, ('nodeRegistration', 'name')), 'retail-test-workflow')
+    expect_contract('CRI socket', value_at(init, ('nodeRegistration', 'criSocket')), 'unix:///run/containerd/containerd.sock')
+    expect_contract('single-node taints', value_at(init, ('nodeRegistration', 'taints')), [])
+    expect_contract('kube-proxy skip phase', init.get('skipPhases'), ['addon/kube-proxy'])
+
+    cluster = kubeadm_documents['ClusterConfiguration']
+    expect_contract('ClusterConfiguration apiVersion', cluster.get('apiVersion'), 'kubeadm.k8s.io/v1beta4')
+    expect_contract('Kubernetes version', cluster.get('kubernetesVersion'), 'v1.36.3')
+    expect_contract('controlPlaneEndpoint', cluster.get('controlPlaneEndpoint'), '10.93.1.27:6443')
+    expect_contract('API certificate SANs', value_at(cluster, ('apiServer', 'certSANs')), ['10.93.1.27'])
+    expect_contract('Service CIDR', value_at(cluster, ('networking', 'serviceSubnet')), '172.20.0.0/16')
+    expect_contract('Pod CIDR', value_at(cluster, ('networking', 'podSubnet')), '172.21.0.0/16')
+    expect_contract('kube-proxy disabled', value_at(cluster, ('proxy', 'disabled')), True)
+
+    kubelet = kubeadm_documents['KubeletConfiguration']
+    expect_contract('KubeletConfiguration apiVersion', kubelet.get('apiVersion'), 'kubelet.config.k8s.io/v1beta1')
+    expect_contract('kubelet cgroup driver', kubelet.get('cgroupDriver'), 'systemd')
+    expect_contract('kubelet failSwapOn', kubelet.get('failSwapOn'), False)
+    expect_contract('kubelet swap behavior', value_at(kubelet, ('memorySwap', 'swapBehavior')), 'NoSwap')
+    expect_contract('kubelet serverTLSBootstrap', kubelet.get('serverTLSBootstrap'), True)
+
+    try:
+        cilium = yaml.safe_load(cilium_values.read_text(encoding='utf-8'))
+    except yaml.YAMLError as error:
+        fail(f'bootstrap/cilium/values.yaml YAML 解析失败：{error}')
+    if not isinstance(cilium, dict):
+        fail('bootstrap/cilium/values.yaml 顶层必须是 YAML mapping')
+    cilium_contracts = (
+        (('kubeProxyReplacement',), True, 'kube-proxy replacement'),
+        (('k8sServiceHost',), '10.93.1.27', 'Cilium API host'),
+        (('k8sServicePort',), 6443, 'Cilium API port'),
+        (('ipam', 'mode'), 'kubernetes', 'Cilium IPAM'),
+        (('gatewayAPI', 'enabled'), True, 'Cilium Gateway API'),
+        (('cgroup', 'autoMount', 'enabled'), False, 'Cilium cgroup automount'),
+        (('cgroup', 'hostRoot'), '/sys/fs/cgroup', 'Cilium cgroup root'),
+        (('operator', 'replicas'), 1, 'Cilium operator replicas'),
+        (('hubble', 'enabled'), False, 'Hubble staged state'),
+    )
+    for path, expected, label in cilium_contracts:
+        expect_contract(label, value_at(cilium, path), expected)
 
 
 def expect_value(
@@ -995,6 +1207,7 @@ def validate_documents() -> None:
 
 def main() -> None:
     validate_active_root()
+    validate_bootstrap_contracts()
     validate_kustomize_builds()
     validate_documents()
     validate_single_user_storage()
