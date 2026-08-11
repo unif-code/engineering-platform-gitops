@@ -22,6 +22,8 @@ PREPARE_KERNEL = ROOT / 'scripts/bootstrap/20-prepare-kernel.sh'
 INSTALL_CONTAINERD = ROOT / 'scripts/bootstrap/30-install-containerd.sh'
 INSTALL_KUBERNETES = ROOT / 'scripts/bootstrap/40-install-kubernetes.sh'
 KUBEADM_INIT = ROOT / 'scripts/bootstrap/50-kubeadm-init.sh'
+INSTALL_CILIUM = ROOT / 'scripts/bootstrap/60-install-cilium.sh'
+FINAL_VERIFY = ROOT / 'scripts/bootstrap/90-verify.sh'
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -44,6 +46,65 @@ class BootstrapTestCase(unittest.TestCase):
             check=False,
             text=True,
         )
+
+    def tree_snapshot(self, root: Path) -> dict[str, tuple[object, ...]]:
+        snapshot: dict[str, tuple[object, ...]] = {}
+        paths = [root]
+        paths.extend(sorted(root.rglob('*')))
+        for path in paths:
+            relative = '.' if path == root else str(path.relative_to(root))
+            stat_result = path.lstat()
+            mode = stat_result.st_mode & 0o7777
+            metadata = (stat_result.st_uid, stat_result.st_gid)
+            if path.is_symlink():
+                snapshot[relative] = (
+                    'symlink', mode, metadata, os.readlink(path)
+                )
+            elif path.is_file():
+                snapshot[relative] = (
+                    'file', mode, metadata,
+                    hashlib.sha256(path.read_bytes()).hexdigest()
+                )
+            elif path.is_dir():
+                snapshot[relative] = ('directory', mode, metadata)
+            else:
+                snapshot[relative] = ('other', mode, metadata)
+        return snapshot
+
+    def admin_config_object(self) -> dict[str, object]:
+        return {
+            'apiVersion': 'v1',
+            'kind': 'Config',
+            'preferences': {},
+            'clusters': [
+                {
+                    'name': 'kubernetes',
+                    'cluster': {
+                        'server': 'https://10.93.1.27:6443',
+                        'certificate-authority-data': 'Y2EtZml4dHVyZQ==',
+                    },
+                }
+            ],
+            'contexts': [
+                {
+                    'name': 'kubernetes-admin@kubernetes',
+                    'context': {
+                        'cluster': 'kubernetes',
+                        'user': 'kubernetes-admin',
+                    },
+                }
+            ],
+            'current-context': 'kubernetes-admin@kubernetes',
+            'users': [
+                {
+                    'name': 'kubernetes-admin',
+                    'user': {
+                        'client-certificate-data': 'Y2VydC1maXh0dXJl',
+                        'client-key-data': 'a2V5LWZpeHR1cmU=',
+                    },
+                }
+            ],
+        }
 
 
 class CommonLibraryTest(BootstrapTestCase):
@@ -5157,6 +5218,3618 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 50, result.stderr)
         self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
         self.assertNotIn('PASS_KUBEADM_INITIALIZED', result.stdout)
+
+
+class CiliumInstallTest(BootstrapTestCase):
+    canary = 'SECRET_CANARY_CILIUM_DO_NOT_LOG'
+    cilium_image = (
+        'quay.io/cilium/cilium:v1.20.0@sha256:'
+        '383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93'
+    )
+    operator_image = (
+        'quay.io/cilium/operator-generic:v1.20.0@sha256:'
+        '80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3'
+    )
+    envoy_image = (
+        'quay.io/cilium/cilium-envoy:'
+        'v1.37.5-1782911245-7cffc778c923f68a77954a53b1a98d6b5353f004@sha256:'
+        '583057dd4f7d54cd41efff3c413aa0b148ac201f522e2c3336851fa89c78b039'
+    )
+    desired_values = '''kubeProxyReplacement: true
+k8sServiceHost: 10.93.1.27
+k8sServicePort: 6443
+
+cgroup:
+  autoMount:
+    enabled: false
+  hostRoot: /sys/fs/cgroup
+
+gatewayAPI:
+  enabled: true
+
+hubble:
+  enabled: false
+
+image:
+  digest: sha256:383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93
+  useDigest: true
+
+ipam:
+  mode: kubernetes
+
+operator:
+  image:
+    genericDigest: sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3
+    useDigest: true
+  replicas: 1
+'''
+    desired_values_object = {
+        'kubeProxyReplacement': True,
+        'k8sServiceHost': '10.93.1.27',
+        'k8sServicePort': 6443,
+        'cgroup': {
+            'autoMount': {'enabled': False},
+            'hostRoot': '/sys/fs/cgroup',
+        },
+        'gatewayAPI': {'enabled': True},
+        'hubble': {'enabled': False},
+        'image': {
+            'digest': (
+                'sha256:'
+                '383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93'
+            ),
+            'useDigest': True,
+        },
+        'ipam': {'mode': 'kubernetes'},
+        'operator': {
+            'image': {
+                'genericDigest': (
+                    'sha256:'
+                    '80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3'
+                ),
+                'useDigest': True,
+            },
+            'replicas': 1,
+        },
+    }
+    gateway_names = (
+        'backendtlspolicies.gateway.networking.k8s.io',
+        'gatewayclasses.gateway.networking.k8s.io',
+        'gateways.gateway.networking.k8s.io',
+        'grpcroutes.gateway.networking.k8s.io',
+        'httproutes.gateway.networking.k8s.io',
+        'listenersets.gateway.networking.k8s.io',
+        'referencegrants.gateway.networking.k8s.io',
+        'tcproutes.gateway.networking.k8s.io',
+        'tlsroutes.gateway.networking.k8s.io',
+        'udproutes.gateway.networking.k8s.io',
+    )
+
+    def write_executable(self, path: Path, source: str | bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(source, bytes):
+            path.write_bytes(source)
+        else:
+            path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def helm_archive(self, member: bytes | None = None) -> bytes:
+        if member is None:
+            member = textwrap.dedent(
+                '''
+                #!/usr/bin/python3 -B
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
+                    log.write('helm ' + ' '.join(args) + '\\n')
+                sys.stderr.write(os.environ['FAKE_CANARY'] + '\\n')
+                if (
+                    os.environ.get('FAKE_SIMULATE_CLIENT_CACHE', '0') == '1'
+                    and os.environ.get('KUBECACHEDIR') != '/dev/null'
+                ):
+                    cache = Path(os.environ['HOME']) / '.kube/cache/helm-write'
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    cache.write_text('cache\\n', encoding='utf-8')
+
+                if args == ['version', '--short']:
+                    print(os.environ.get('FAKE_HELM_VERSION', 'v3.21.0+gfixture'))
+                    raise SystemExit(0)
+
+                if len(args) < 2 or args[0] != '--kubeconfig':
+                    raise SystemExit(64)
+                try:
+                    supplied = Path(args[1]).read_text(encoding='utf-8')
+                except OSError:
+                    raise SystemExit(64)
+                if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+                    raise SystemExit(64)
+                prefix = ['--kubeconfig', args[1]]
+                if args == prefix + ['list', '--all-namespaces', '--all', '--output', 'json']:
+                    override = os.environ.get('FAKE_HELM_LIST_JSON')
+                    if override is not None:
+                        print(override)
+                        raise SystemExit(0)
+                    state = os.environ.get('FAKE_HELM_LIST_STATE', '')
+                    if not state:
+                        state = 'exact' if Path(os.environ['FAKE_RELEASE_MARKER']).exists() else 'missing'
+                    if state == 'failure':
+                        raise SystemExit(1)
+                    if state == 'missing':
+                        print('[]')
+                    elif state == 'exact':
+                        print(json.dumps([{
+                            'name': 'cilium',
+                            'namespace': 'kube-system',
+                            'revision': '1',
+                            'updated': '2026-08-10 00:00:00.000000000 +0000 UTC',
+                            'status': 'deployed',
+                            'chart': 'cilium-1.20.0',
+                            'app_version': '1.20.0',
+                        }]))
+                    else:
+                        print(json.dumps([{
+                            'name': 'cilium', 'namespace': 'kube-system',
+                            'revision': '2', 'status': 'failed',
+                            'updated': '2026-08-10 00:00:00.000000000 +0000 UTC',
+                            'chart': 'cilium-1.19.0', 'app_version': '1.19.0',
+                        }]))
+                    raise SystemExit(0)
+
+                if args == prefix + [
+                    'get', 'values', 'cilium', '--namespace', 'kube-system',
+                    '--revision', '1', '--output', 'json',
+                ]:
+                    if os.environ.get('FAKE_HELM_VALUES_FAIL', '0') == '1':
+                        raise SystemExit(1)
+                    sys.stdout.write(os.environ['FAKE_HELM_VALUES_JSON'])
+                    raise SystemExit(0)
+
+                if len(args) >= 3 and args[:3] == prefix + ['install']:
+                    race = os.environ.get('FAKE_INPUT_RACE_AT_CONSUMER', '')
+                    if race == 'chart':
+                        Path(os.environ['FAKE_CILIUM_CHART']).write_text(
+                            'malicious\\n', encoding='utf-8'
+                        )
+                    elif race == 'values':
+                        Path(os.environ['FAKE_VALUES_FILE']).write_text(
+                            'malicious\\n', encoding='utf-8'
+                        )
+                    chart_input = Path(args[4])
+                    values_input = Path(args[args.index('--values') + 1])
+                    if os.environ.get('FAKE_SNAPSHOT_UNKNOWN_ENTRY', '0') == '1':
+                        (chart_input.parent / 'unapproved').write_text(
+                            'preserve-me\\n', encoding='utf-8'
+                        )
+                    if (
+                        chart_input.read_text(encoding='utf-8') == 'malicious\\n'
+                        or values_input.read_text(encoding='utf-8') == 'malicious\\n'
+                    ):
+                        with open(
+                            os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8'
+                        ) as log:
+                            log.write('malicious-helm-input-consumed\\n')
+                    if os.environ.get('FAKE_HELM_INSTALL_FAIL', '0') == '1':
+                        raise SystemExit(1)
+                    Path(os.environ['FAKE_RELEASE_MARKER']).touch()
+                    Path(os.environ['FAKE_CILIUM_MARKER']).touch()
+                    print(os.environ['FAKE_CANARY'])
+                    raise SystemExit(0)
+                raise SystemExit(64)
+                '''
+            ).lstrip().encode()
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            entry = tarfile.TarInfo('linux-amd64/helm')
+            entry.mode = 0o755
+            entry.size = len(member)
+            archive.addfile(entry, io.BytesIO(member))
+        return stream.getvalue()
+
+    def hostile_helm_archive(self, mutation: str) -> bytes:
+        stream = io.BytesIO()
+        member = b'#!/bin/sh\nexit 0\n'
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            if mutation != 'absent':
+                target = tarfile.TarInfo('linux-amd64/helm')
+                target.mode = 0o644 if mutation == 'nonexec' else 0o755
+                if mutation == 'target-symlink':
+                    target.type = tarfile.SYMTYPE
+                    target.linkname = '/tmp/unapproved-helm'
+                    archive.addfile(target)
+                else:
+                    target.size = len(member)
+                    archive.addfile(target, io.BytesIO(member))
+                    if mutation == 'duplicate':
+                        duplicate = tarfile.TarInfo('linux-amd64/helm')
+                        duplicate.mode = 0o755
+                        duplicate.size = len(member)
+                        archive.addfile(duplicate, io.BytesIO(member))
+            if mutation == 'absent':
+                readme = tarfile.TarInfo('linux-amd64/README.md')
+                readme.mode = 0o644
+                readme.size = len(member)
+                archive.addfile(readme, io.BytesIO(member))
+            elif mutation == 'traversal':
+                traversal = tarfile.TarInfo('../outside')
+                traversal.mode = 0o644
+                traversal.size = len(member)
+                archive.addfile(traversal, io.BytesIO(member))
+            elif mutation == 'unrelated-link':
+                link = tarfile.TarInfo('linux-amd64/unapproved-link')
+                link.type = tarfile.SYMTYPE
+                link.linkname = '/tmp/outside'
+                archive.addfile(link)
+        return stream.getvalue()
+
+    def gateway_bundle_json(self, *, partial: bool = False) -> str:
+        annotations = {
+            'gateway.networking.k8s.io/bundle-version': 'v1.6.1',
+            'gateway.networking.k8s.io/channel': 'standard',
+        }
+        crd_annotations = {
+            'api-approved.kubernetes.io': (
+                'https://github.com/kubernetes-sigs/gateway-api/pull/4530'
+            ),
+            **annotations,
+        }
+        items: list[dict[str, object]] = [
+            {
+                'apiVersion': 'apiextensions.k8s.io/v1',
+                'kind': 'CustomResourceDefinition',
+                'metadata': {
+                    'name': name,
+                    'annotations': dict(crd_annotations),
+                },
+            }
+            for name in self.gateway_names
+        ]
+        items.extend(
+            [
+                {
+                    'apiVersion': 'admissionregistration.k8s.io/v1',
+                    'kind': 'ValidatingAdmissionPolicy',
+                    'metadata': {
+                        'name': 'safe-upgrades.gateway.networking.k8s.io',
+                        'annotations': annotations,
+                    },
+                    'status': {'typeChecking': {'expressionWarnings': []}},
+                },
+                {
+                    'apiVersion': 'admissionregistration.k8s.io/v1',
+                    'kind': 'ValidatingAdmissionPolicyBinding',
+                    'metadata': {
+                        'name': 'safe-upgrades.gateway.networking.k8s.io',
+                        'annotations': annotations,
+                    },
+                    'spec': {'validationActions': ['Deny']},
+                },
+            ]
+        )
+        if partial:
+            items.pop(0)
+        return json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': items})
+
+    def cilium_workload_json(self, *, partial: bool = False) -> str:
+        items: list[dict[str, object]] = [
+            {
+                'apiVersion': 'apps/v1',
+                'kind': 'DaemonSet',
+                'metadata': {
+                    'name': 'cilium',
+                    'namespace': 'kube-system',
+                    'labels': {
+                        'k8s-app': 'cilium',
+                        'app.kubernetes.io/name': 'cilium-agent',
+                        'app.kubernetes.io/part-of': 'cilium',
+                        'helm.sh/chart': 'cilium-1.20.0',
+                    },
+                },
+                'spec': {
+                    'template': {
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': 'cilium-agent',
+                                    'image': self.cilium_image,
+                                }
+                            ]
+                        }
+                    }
+                },
+                'status': {
+                    'desiredNumberScheduled': 1,
+                    'numberReady': 1,
+                    'numberAvailable': 1,
+                    'numberUnavailable': 0,
+                },
+            },
+            {
+                'apiVersion': 'apps/v1',
+                'kind': 'Deployment',
+                'metadata': {
+                    'name': 'cilium-operator',
+                    'namespace': 'kube-system',
+                    'labels': {
+                        'io.cilium/app': 'operator',
+                        'name': 'cilium-operator',
+                        'app.kubernetes.io/name': 'cilium-operator',
+                        'app.kubernetes.io/part-of': 'cilium',
+                        'helm.sh/chart': 'cilium-1.20.0',
+                    },
+                },
+                'spec': {
+                    'replicas': 1,
+                    'template': {
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': 'cilium-operator',
+                                    'image': self.operator_image,
+                                }
+                            ]
+                        }
+                    },
+                },
+                'status': {
+                    'replicas': 1,
+                    'updatedReplicas': 1,
+                    'readyReplicas': 1,
+                    'availableReplicas': 1,
+                    'unavailableReplicas': 0,
+                },
+            },
+        ]
+        if partial:
+            items[0]['status']['numberReady'] = 0  # type: ignore[index]
+        return json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': items})
+
+    def envoy_daemonset_json(self, *, ready: bool = True) -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'apps/v1',
+                'kind': 'DaemonSet',
+                'metadata': {
+                    'name': 'cilium-envoy',
+                    'namespace': 'kube-system',
+                    'labels': {
+                        'k8s-app': 'cilium-envoy',
+                        'name': 'cilium-envoy',
+                        'app.kubernetes.io/name': 'cilium-envoy',
+                        'app.kubernetes.io/part-of': 'cilium',
+                        'helm.sh/chart': 'cilium-1.20.0',
+                    },
+                },
+                'spec': {
+                    'template': {
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': 'cilium-envoy',
+                                    'image': self.envoy_image,
+                                }
+                            ]
+                        }
+                    }
+                },
+                'status': {
+                    'desiredNumberScheduled': 1,
+                    'numberReady': 1 if ready else 0,
+                    'numberAvailable': 1 if ready else 0,
+                    'numberUnavailable': 0 if ready else 1,
+                },
+            }
+        )
+
+    def envoy_pods_json(self, *, ready: bool = True) -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'v1',
+                'kind': 'List',
+                'items': [
+                    {
+                        'apiVersion': 'v1',
+                        'kind': 'Pod',
+                        'metadata': {
+                            'name': 'cilium-envoy-fixture',
+                            'namespace': 'kube-system',
+                            'labels': {
+                                'k8s-app': 'cilium-envoy',
+                                'name': 'cilium-envoy',
+                                'app.kubernetes.io/name': 'cilium-envoy',
+                                'app.kubernetes.io/part-of': 'cilium',
+                                'helm.sh/chart': 'cilium-1.20.0',
+                                'controller-revision-hash': 'fixture-hash',
+                            },
+                        },
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': 'cilium-envoy',
+                                    'image': self.envoy_image,
+                                }
+                            ]
+                        },
+                        'status': {
+                            'phase': 'Running' if ready else 'Pending',
+                            'conditions': [
+                                {
+                                    'type': 'Ready',
+                                    'status': 'True' if ready else 'False',
+                                }
+                            ],
+                            'containerStatuses': [{'ready': ready}],
+                        },
+                    }
+                ],
+            }
+        )
+
+    @staticmethod
+    def cilium_config_json() -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'v1',
+                'kind': 'ConfigMap',
+                'metadata': {
+                    'name': 'cilium-config',
+                    'namespace': 'kube-system',
+                },
+                'data': {
+                    'kube-proxy-replacement': 'true',
+                    'enable-gateway-api': 'true',
+                    'ipam': 'kubernetes',
+                    'cgroup-root': '/sys/fs/cgroup',
+                },
+            }
+        )
+
+    def helm_secret_json(self, *, extra: bool = False) -> str:
+        items: list[dict[str, object]] = [
+            {
+                'apiVersion': 'v1',
+                'kind': 'Secret',
+                'metadata': {
+                    'name': 'sh.helm.release.v1.cilium.v1',
+                    'namespace': 'kube-system',
+                    'labels': {
+                            'owner': 'helm',
+                            'name': 'cilium',
+                            'status': 'deployed',
+                            'version': '1',
+                            'modifiedAt': '1786320001',
+                    },
+                },
+                'type': 'helm.sh/release.v1',
+                'data': {'release': 'SECRET_HELM_RELEASE_PAYLOAD'},
+            }
+        ]
+        if extra:
+            items.append(
+                {
+                    'apiVersion': 'v1',
+                    'kind': 'Secret',
+                    'metadata': {
+                        'name': 'sh.helm.release.v1.unknown.v1',
+                        'namespace': 'default',
+                        'labels': {
+                            'owner': 'helm', 'name': 'unknown',
+                            'status': 'deployed', 'version': '1',
+                        },
+                    },
+                    'type': 'helm.sh/release.v1',
+                }
+            )
+        return json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': items})
+
+    def make_environment(self) -> tuple[dict[str, str], Path, Path, Path]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        home = directory / 'home'
+        fake_bin = directory / 'bin'
+        command_log = directory / 'commands.log'
+        staging = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+        for path in (
+            host / 'root/dev-infra-evidence',
+            host / 'etc/kubernetes',
+            host / 'usr/bin',
+            host / 'usr/sbin',
+            host / 'usr/local/bin',
+            host / 'usr/local/sbin',
+            staging,
+            fake_bin,
+            home,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        (host / 'root').chmod(0o700)
+        (host / 'root/dev-infra-artifacts').chmod(0o700)
+        staging.chmod(0o700)
+        (host / 'usr').chmod(0o755)
+        (host / 'usr/local').chmod(0o755)
+        (host / 'usr/local/bin').chmod(0o755)
+
+        helm_archive = staging / 'helm-v3.21.0-linux-amd64.tar.gz'
+        gateway_manifest = staging / 'standard-install.yaml'
+        chart = staging / 'cilium-1.20.0.tgz'
+        helm_archive.write_bytes(self.helm_archive())
+        gateway_manifest.write_text('gateway v1.6.1 fixture\n', encoding='utf-8')
+        chart.write_text('cilium 1.20.0 fixture\n', encoding='utf-8')
+        for artifact in (helm_archive, gateway_manifest, chart):
+            artifact.chmod(0o600)
+
+        values = directory / 'values.yaml'
+        values.write_bytes((ROOT / 'bootstrap/cilium/values.yaml').read_bytes())
+        values.chmod(0o644)
+        admin_conf = host / 'etc/kubernetes/admin.conf'
+        admin_conf.write_text(self.canary + '\n', encoding='utf-8')
+        admin_conf.chmod(0o600)
+
+        gateway_marker = directory / 'gateway-exact'
+        release_marker = directory / 'release-exact'
+        cilium_marker = directory / 'cilium-exact'
+        gateway_exact = directory / 'gateway-exact.json'
+        gateway_partial = directory / 'gateway-partial.json'
+        cilium_exact = directory / 'cilium-exact.json'
+        cilium_partial = directory / 'cilium-partial.json'
+        secret_exact = directory / 'helm-secret-exact.json'
+        secret_extra = directory / 'helm-secret-extra.json'
+        gateway_exact.write_text(self.gateway_bundle_json(), encoding='utf-8')
+        gateway_partial.write_text(
+            self.gateway_bundle_json(partial=True), encoding='utf-8'
+        )
+        cilium_exact.write_text(self.cilium_workload_json(), encoding='utf-8')
+        cilium_partial.write_text(
+            self.cilium_workload_json(partial=True), encoding='utf-8'
+        )
+        secret_exact.write_text(self.helm_secret_json(), encoding='utf-8')
+        secret_extra.write_text(self.helm_secret_json(extra=True), encoding='utf-8')
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'sha256sum',
+            '''
+            #!/bin/sh
+            path=$1
+            case "${path##*/}" in
+              helm-v3.21.0-linux-amd64.tar.gz)
+                key=helm
+                digest=0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36
+                ;;
+              standard-install.yaml)
+                key=gateway
+                digest=24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73
+                ;;
+              cilium-1.20.0.tgz)
+                key=chart
+                digest=c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883
+                ;;
+              values.yaml)
+                key=values
+                digest=105ca75fdefc07a32a1b944ad749baf0e66b2b2437dbe0ab995c323f71cdd887
+                ;;
+              *) exec /usr/bin/shasum -a 256 "$path" ;;
+            esac
+            if [ "${FAKE_DIGEST_DRIFT:-}" = "$key" ]; then
+              digest=0000000000000000000000000000000000000000000000000000000000000000
+            fi
+            if [ "$(/bin/cat "$path")" = raced ] || [ "$(/bin/cat "$path")" = malicious ]; then
+              digest=0000000000000000000000000000000000000000000000000000000000000000
+            fi
+            printf '%s  %s\n' "$digest" "$path"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'dpkg-query',
+            '''
+            #!/bin/sh
+            [ "$1" = -S ] && [ "$2" = /usr/bin/kubectl ] || exit 1
+            printf 'kubectl: /usr/bin/kubectl\n'
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'dpkg',
+            '''
+            #!/bin/sh
+            [ "$1" = --verify ] && [ "$2" = kubectl ] || exit 64
+            [ "${FAKE_KUBECTL_VERIFY_DRIFT:-0}" != 1 ] || printf '??5?????? /usr/bin/kubectl\n'
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sync',
+            '''
+            #!/bin/sh
+            [ "${FAKE_SYNC_FAIL:-0}" != 1 ] || exit 1
+            case "${FAKE_HELM_TEMP_RACE:-}" in
+              symlink)
+                /bin/rm -f -- "$1"
+                /bin/ln -s "$FAKE_HELM_OUTSIDE" "$1"
+                ;;
+              mode) chmod 0666 "$1" ;;
+              bytes)
+                printf '#!/bin/sh\nexit 0\n' >"$1"
+                chmod 0755 "$1"
+                ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'rm',
+            '''
+            #!/bin/bash
+            target=${!#}
+            if [[ "${FAKE_HELM_TEMP_RM_FAIL:-0}" == 1 &&
+                  "${target##*/}" == .helm.tmp.* ]]; then
+              exit 1
+            fi
+            exec /bin/rm "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'ln',
+            '''
+            #!/bin/sh
+            target=${!#}
+            if [ -n "${FAKE_LN_RACE_TARGET:-}" ] && [ "$target" = "$FAKE_LN_RACE_TARGET" ]; then
+              printf 'raced\n' >"$target"
+              chmod 0755 "$target"
+            fi
+            exec /bin/ln "$@"
+            ''',
+        )
+        self.write_executable(
+            host / 'usr/bin/kubectl',
+            '''
+            #!/usr/bin/python3 -B
+            import os
+            from pathlib import Path
+            import sys
+
+            args = sys.argv[1:]
+            with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
+                log.write('kubectl ' + ' '.join(args) + '\\n')
+            sys.stderr.write(os.environ['FAKE_CANARY'] + '\\n')
+            if (
+                os.environ.get('FAKE_SIMULATE_CLIENT_CACHE', '0') == '1'
+                and '--cache-dir=/dev/null' not in args
+            ):
+                cache = Path(os.environ['HOME']) / '.kube/cache/kubectl-write'
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text('cache\\n', encoding='utf-8')
+            hostile_kuberc = (
+                (Path(os.environ['HOME']) / '.kube/kuberc').exists()
+                and os.environ.get('KUBECTL_KUBERC') != 'false'
+                and os.environ.get('FAKE_HOSTILE_KUBERC_MODE', '')
+            )
+            if len(args) < 2 or args[0] != '--kubeconfig':
+                raise SystemExit(64)
+            try:
+                supplied = Path(args[1]).read_text(encoding='utf-8')
+            except OSError:
+                raise SystemExit(64)
+            if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+                raise SystemExit(64)
+            prefix = ['--kubeconfig', args[1]]
+            safe_prefix = prefix + ['--cache-dir=/dev/null']
+            if args[:3] == safe_prefix:
+                command = args[3:]
+            elif args[:2] == prefix:
+                command = args[2:]
+            else:
+                raise SystemExit(64)
+            if hostile_kuberc:
+                with open(
+                    os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8'
+                ) as log:
+                    log.write(
+                        'kuberc-injected '
+                        + os.environ['FAKE_HOSTILE_KUBERC_MODE'] + '\\n'
+                    )
+                if os.environ['FAKE_HOSTILE_KUBERC_MODE'] == 'query':
+                    raise SystemExit(64)
+                if 'apply' in command:
+                    raise SystemExit(0)
+
+            if command == [
+                'config', 'view', '--raw', '--merge=false', '--output=json',
+            ]:
+                if os.environ.get('FAKE_ADMIN_VIEW_FAIL', '0') == '1':
+                    raise SystemExit(1)
+                if os.environ.get('FAKE_ADMIN_SOURCE_RACE', '0') == '1':
+                    Path(os.environ['FAKE_ADMIN_CONF']).write_text(
+                        'raced-admin-config\\n', encoding='utf-8'
+                    )
+                sys.stdout.write(os.environ['FAKE_ADMIN_VIEW_JSON'])
+                raise SystemExit(0)
+
+            if command == [
+                'config', 'view', '--minify',
+                '--output=jsonpath={.clusters[0].cluster.server}',
+            ]:
+                counter = Path(os.environ['FAKE_API_COUNTER'])
+                count = (
+                    int(counter.read_text(encoding='utf-8')) + 1
+                    if counter.exists() else 1
+                )
+                counter.write_text(str(count), encoding='utf-8')
+                if (
+                    os.environ.get('FAKE_PRE_GATEWAY_INPUT_RACE', '')
+                    and count == 3
+                ):
+                    Path(os.environ['FAKE_GATEWAY_MANIFEST']).write_text(
+                        'malicious\\n', encoding='utf-8'
+                    )
+                sys.stdout.write(
+                    os.environ.get(
+                        'FAKE_API_ENDPOINT', 'https://10.93.1.27:6443'
+                    )
+                )
+                raise SystemExit(0)
+
+            kube_proxy = {
+                ('--namespace', 'kube-system', 'get', 'daemonset', 'kube-proxy', '--ignore-not-found', '--output=name'):
+                    os.environ.get('FAKE_KUBE_PROXY_DAEMONSET', ''),
+                ('--namespace', 'kube-system', 'get', 'pods', '--selector', 'k8s-app=kube-proxy', '--output=name'):
+                    os.environ.get('FAKE_KUBE_PROXY_PODS', ''),
+                ('--namespace', 'kube-system', 'get', 'configmap', 'kube-proxy', '--ignore-not-found', '--output=name'):
+                    os.environ.get('FAKE_KUBE_PROXY_CONFIGMAP', ''),
+            }
+            key = tuple(command)
+            if key in kube_proxy:
+                query_failure = os.environ.get('FAKE_KUBE_PROXY_QUERY_FAIL', '')
+                if query_failure and query_failure in ' '.join(command):
+                    raise SystemExit(1)
+                if key[3:5] == ('configmap', 'kube-proxy'):
+                    counter = Path(os.environ['FAKE_KUBE_PROXY_COUNTER'])
+                    count = int(counter.read_text(encoding='utf-8')) + 1 if counter.exists() else 1
+                    counter.write_text(str(count), encoding='utf-8')
+                    if count == int(os.environ.get('FAKE_PRE_HELM_RACE_COUNT', '0')):
+                        race = os.environ.get('FAKE_PRE_HELM_RACE', '')
+                        if race == 'helm':
+                            Path(os.environ['FAKE_HELM_BINARY']).write_text(
+                                '#!/bin/sh\\nprintf "malicious-helm-executed\\n" >>"$FAKE_COMMAND_LOG"\\nexit 0\\n',
+                                encoding='utf-8',
+                            )
+                            Path(os.environ['FAKE_HELM_BINARY']).chmod(0o755)
+                        elif race == 'release':
+                            Path(os.environ['FAKE_RELEASE_MARKER']).touch()
+                            Path(os.environ['FAKE_CILIUM_MARKER']).touch()
+                if Path(os.environ['FAKE_KUBE_PROXY_MARKER']).exists():
+                    sys.stdout.write('daemonset.apps/kube-proxy\\n')
+                else:
+                    sys.stdout.write(kube_proxy[key])
+                raise SystemExit(0)
+
+            if command in (
+                ['get', 'secrets', '--all-namespaces', '--selector', 'owner=helm', '--output=json'],
+                ['get', 'secrets,configmaps', '--all-namespaces', '--selector', 'owner=helm', '--output=json'],
+            ):
+                state = os.environ.get('FAKE_HELM_SECRET_STATE', '')
+                if state == 'failure':
+                    raise SystemExit(1)
+                if state == 'extra':
+                    path = os.environ['FAKE_SECRET_EXTRA_JSON']
+                elif Path(os.environ['FAKE_RELEASE_MARKER']).exists():
+                    path = os.environ['FAKE_SECRET_EXACT_JSON']
+                else:
+                    print('{"apiVersion":"v1","kind":"List","items":[]}')
+                    raise SystemExit(0)
+                sys.stdout.write(Path(path).read_text(encoding='utf-8'))
+                raise SystemExit(0)
+
+            unscoped_bundle_get = [
+                'get',
+                'customresourcedefinitions.apiextensions.k8s.io,validatingadmissionpolicies.admissionregistration.k8s.io,validatingadmissionpolicybindings.admissionregistration.k8s.io',
+                '--output=json',
+            ]
+            gateway_names = [
+                'backendtlspolicies.gateway.networking.k8s.io',
+                'gatewayclasses.gateway.networking.k8s.io',
+                'gateways.gateway.networking.k8s.io',
+                'grpcroutes.gateway.networking.k8s.io',
+                'httproutes.gateway.networking.k8s.io',
+                'listenersets.gateway.networking.k8s.io',
+                'referencegrants.gateway.networking.k8s.io',
+                'tcproutes.gateway.networking.k8s.io',
+                'tlsroutes.gateway.networking.k8s.io',
+                'udproutes.gateway.networking.k8s.io',
+            ]
+            scoped_bundle_get = ['get']
+            scoped_bundle_get.extend(
+                'customresourcedefinition.apiextensions.k8s.io/' + name
+                for name in gateway_names
+            )
+            scoped_bundle_get.extend([
+                'validatingadmissionpolicy.admissionregistration.k8s.io/safe-upgrades.gateway.networking.k8s.io',
+                'validatingadmissionpolicybinding.admissionregistration.k8s.io/safe-upgrades.gateway.networking.k8s.io',
+                '--ignore-not-found', '--output=json',
+            ])
+            if command in (unscoped_bundle_get, scoped_bundle_get):
+                if (
+                    command == unscoped_bundle_get
+                    and os.environ.get('FAKE_REQUIRE_SCOPED_GATEWAY', '0') == '1'
+                ):
+                    raise SystemExit(64)
+                state = os.environ.get('FAKE_GATEWAY_STATE', '')
+                if state == 'failure':
+                    raise SystemExit(1)
+                if state == 'partial':
+                    path = os.environ['FAKE_GATEWAY_PARTIAL_JSON']
+                elif Path(os.environ['FAKE_GATEWAY_MARKER']).exists():
+                    path = os.environ['FAKE_GATEWAY_EXACT_JSON']
+                else:
+                    print('{"apiVersion":"v1","kind":"List","items":[]}')
+                    raise SystemExit(0)
+                sys.stdout.write(Path(path).read_text(encoding='utf-8'))
+                raise SystemExit(0)
+
+            diff_prefix = [
+                'diff', '--server-side=true',
+                '--field-manager=engineering-platform-bootstrap',
+                '--filename',
+            ]
+            if len(command) == 5 and command[:4] == diff_prefix:
+                state = os.environ.get('FAKE_GATEWAY_STATE', '')
+                if state == 'failure':
+                    raise SystemExit(2)
+                raise SystemExit(0 if Path(os.environ['FAKE_GATEWAY_MARKER']).exists() else 1)
+
+            apply_prefix = [
+                'apply', '--server-side=true',
+                '--field-manager=engineering-platform-bootstrap',
+                '--filename',
+            ]
+            if len(command) == 5 and command[:4] == apply_prefix:
+                if os.environ.get('FAKE_GATEWAY_APPLY_FAIL', '0') == '1':
+                    raise SystemExit(1)
+                if Path(command[4]).read_text(encoding='utf-8') == 'malicious\\n':
+                    with open(
+                        os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8'
+                    ) as log:
+                        log.write('malicious-gateway-consumed\\n')
+                Path(os.environ['FAKE_GATEWAY_MARKER']).touch()
+                race = os.environ.get('FAKE_RACE_AFTER_GATEWAY', '')
+                if race == 'chart':
+                    Path(os.environ['FAKE_CILIUM_CHART']).write_text('raced\\n', encoding='utf-8')
+                elif race == 'values':
+                    Path(os.environ['FAKE_VALUES_FILE']).write_text('raced\\n', encoding='utf-8')
+                elif race == 'kube-proxy':
+                    Path(os.environ['FAKE_KUBE_PROXY_MARKER']).touch()
+                raise SystemExit(0)
+
+            workloads = [
+                '--namespace', 'kube-system', 'get',
+                'daemonset/cilium', 'deployment/cilium-operator', '--output=json',
+            ]
+            safe_workloads = [
+                '--namespace', 'kube-system', 'get',
+                'daemonset/cilium', 'deployment/cilium-operator',
+                '--ignore-not-found', '--output=json',
+            ]
+            if command in (workloads, safe_workloads):
+                if (
+                    command == workloads
+                    and os.environ.get('FAKE_REQUIRE_IGNORE_NOT_FOUND', '0') == '1'
+                    and not Path(os.environ['FAKE_CILIUM_MARKER']).exists()
+                ):
+                    raise SystemExit(1)
+                state = os.environ.get('FAKE_CILIUM_STATE', '')
+                if state == 'failure':
+                    raise SystemExit(1)
+                if state == 'partial':
+                    path = os.environ['FAKE_CILIUM_PARTIAL_JSON']
+                elif Path(os.environ['FAKE_CILIUM_MARKER']).exists():
+                    path = os.environ['FAKE_CILIUM_EXACT_JSON']
+                else:
+                    print('{"apiVersion":"v1","kind":"List","items":[]}')
+                    raise SystemExit(0)
+                sys.stdout.write(Path(path).read_text(encoding='utf-8'))
+                raise SystemExit(0)
+
+            managed_cilium_objects = {
+                (
+                    '--namespace', 'kube-system', 'get',
+                    'daemonset/cilium-envoy', '--ignore-not-found',
+                    '--output=json',
+                ): 'FAKE_ENVOY_DAEMONSET_JSON',
+                (
+                    '--namespace', 'kube-system', 'get', 'pods',
+                    '--selector', 'k8s-app=cilium-envoy', '--output=json',
+                ): 'FAKE_ENVOY_PODS_JSON',
+                (
+                    '--namespace', 'kube-system', 'get',
+                    'configmap/cilium-config', '--ignore-not-found',
+                    '--output=json',
+                ): 'FAKE_CILIUM_CONFIG_JSON',
+            }
+            if tuple(command) in managed_cilium_objects:
+                if os.environ.get('FAKE_CILIUM_MANAGED_QUERY_FAIL', '') in command:
+                    raise SystemExit(1)
+                if not Path(os.environ['FAKE_CILIUM_MARKER']).exists():
+                    if command[3] == 'pods':
+                        print('{"apiVersion":"v1","kind":"List","items":[]}')
+                    raise SystemExit(0)
+                sys.stdout.write(os.environ[managed_cilium_objects[tuple(command)]])
+                raise SystemExit(0)
+            raise SystemExit(64)
+            ''',
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'HOME': str(home),
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_VALUES_FILE': str(values),
+                'FAKE_COMMAND_LOG': str(command_log),
+                'FAKE_CANARY': self.canary,
+                'FAKE_HELM_VALUES_JSON': json.dumps(
+                    self.desired_values_object
+                ),
+                'FAKE_ADMIN_CONF': str(admin_conf),
+                'FAKE_ADMIN_CONF_CONTENT': self.canary + '\n',
+                'FAKE_ADMIN_VIEW_JSON': json.dumps(self.admin_config_object()),
+                'FAKE_GATEWAY_MANIFEST': str(gateway_manifest),
+                'FAKE_CILIUM_CHART': str(chart),
+                'FAKE_VALUES_FILE': str(values),
+                'FAKE_GATEWAY_MARKER': str(gateway_marker),
+                'FAKE_RELEASE_MARKER': str(release_marker),
+                'FAKE_CILIUM_MARKER': str(cilium_marker),
+                'FAKE_KUBE_PROXY_MARKER': str(directory / 'kube-proxy-present'),
+                'FAKE_KUBE_PROXY_COUNTER': str(directory / 'kube-proxy-count'),
+                'FAKE_API_COUNTER': str(directory / 'api-count'),
+                'FAKE_HELM_BINARY': str(host / 'usr/local/bin/helm'),
+                'FAKE_HELM_OUTSIDE': str(directory / 'helm-outside'),
+                'FAKE_GATEWAY_EXACT_JSON': str(gateway_exact),
+                'FAKE_GATEWAY_PARTIAL_JSON': str(gateway_partial),
+                'FAKE_CILIUM_EXACT_JSON': str(cilium_exact),
+                'FAKE_CILIUM_PARTIAL_JSON': str(cilium_partial),
+                'FAKE_ENVOY_DAEMONSET_JSON': self.envoy_daemonset_json(),
+                'FAKE_ENVOY_PODS_JSON': self.envoy_pods_json(),
+                'FAKE_CILIUM_CONFIG_JSON': self.cilium_config_json(),
+                'FAKE_SECRET_EXACT_JSON': str(secret_exact),
+                'FAKE_SECRET_EXTRA_JSON': str(secret_extra),
+            }
+        )
+        for variable in (
+            'APT_CONFIG', 'KUBECONFIG', 'GNUPGHOME', 'HELM_NAMESPACE',
+            'HELM_DRIVER', 'HELM_KUBECONTEXT', 'HELM_CONFIG_HOME',
+            'HELM_CACHE_HOME', 'HELM_DATA_HOME', 'DPKG_ADMINDIR',
+            'DPKG_ROOT', 'DPKG_FORCE', 'DPKG_FRONTEND_LOCKED',
+            'KUBECACHEDIR', 'TAR_OPTIONS', 'BASH_ENV', 'ENV',
+            'OPENSSL_CONF', 'OPENSSL_MODULES', 'PYTHONPATH', 'PYTHONHOME',
+            'PYTHONPYCACHEPREFIX', 'PYTHONDONTWRITEBYTECODE',
+        ):
+            environment.pop(variable, None)
+        return environment, host, command_log, values
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str = '--check'
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', '-p', str(INSTALL_CILIUM), mode], env=environment
+        )
+
+    def install_helm_contract(self, host: Path) -> None:
+        archive = host / (
+            'root/dev-infra-artifacts/pcs-2026-08-10.1/'
+            'helm-v3.21.0-linux-amd64.tar.gz'
+        )
+        with tarfile.open(archive, mode='r:gz') as source:
+            member = source.extractfile('linux-amd64/helm')
+            assert member is not None
+            payload = member.read()
+        self.write_executable(host / 'usr/local/bin/helm', payload)
+
+    def install_full_cluster_contract(
+        self, environment: dict[str, str], host: Path
+    ) -> None:
+        self.install_helm_contract(host)
+        Path(environment['FAKE_GATEWAY_MARKER']).touch()
+        Path(environment['FAKE_RELEASE_MARKER']).touch()
+        Path(environment['FAKE_CILIUM_MARKER']).touch()
+
+    def test_check_is_zero_write_for_clean_apply_required_state(self) -> None:
+        environment, host, command_log, _ = self.make_environment()
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+        self.assertIn('NEXT=60-install-cilium.sh --apply', result.stdout)
+        self.assertFalse((host / 'usr/local/bin/helm').exists())
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')),
+            [],
+        )
+        if command_log.exists():
+            commands = command_log.read_text(encoding='utf-8')
+            self.assertNotIn(' apply ', commands)
+            self.assertNotIn('helm --kubeconfig', commands)
+
+    def test_rejects_staged_digest_or_values_contract_drift(self) -> None:
+        for drift in ('helm', 'gateway', 'chart', 'values'):
+            with self.subTest(drift=drift):
+                environment, host, command_log, _ = self.make_environment()
+                environment['FAKE_DIGEST_DRIFT'] = drift
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+                self.assertFalse((host / 'usr/local/bin/helm').exists())
+                self.assertFalse(command_log.exists())
+
+    def test_rejects_hostile_helm_archive_contract(self) -> None:
+        for mutation in (
+            'absent', 'duplicate', 'target-symlink', 'nonexec',
+            'traversal', 'unrelated-link',
+        ):
+            with self.subTest(mutation=mutation):
+                environment, host, command_log, _ = self.make_environment()
+                archive = (
+                    host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+                    / 'helm-v3.21.0-linux-amd64.tar.gz'
+                )
+                archive.write_bytes(self.hostile_helm_archive(mutation))
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn(
+                    'RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout
+                )
+                self.assertFalse((host / 'usr/local/bin/helm').exists())
+                if command_log.exists():
+                    commands = command_log.read_text(encoding='utf-8')
+                    self.assertNotIn(' apply ', commands)
+                    self.assertNotIn(' install ', commands)
+
+        for mutation in ('mode', 'symlink', 'kube-proxy-disabled'):
+            with self.subTest(mutation=mutation):
+                environment, host, command_log, values = self.make_environment()
+                if mutation == 'mode':
+                    values.chmod(0o666)
+                elif mutation == 'symlink':
+                    target = values.with_name('values-target.yaml')
+                    target.write_bytes(values.read_bytes())
+                    values.unlink()
+                    values.symlink_to(target)
+                else:
+                    values.write_text(
+                        values.read_text(encoding='utf-8').replace(
+                            'kubeProxyReplacement: true',
+                            'kubeProxyReplacement: false',
+                        ),
+                        encoding='utf-8',
+                    )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((host / 'usr/local/bin/helm').exists())
+                self.assertFalse(command_log.exists())
+
+    def test_rejects_kube_proxy_unknown_release_or_partial_state(self) -> None:
+        cases = (
+            'kube-proxy', 'unknown-release', 'gateway-partial',
+            'gateway-annotation-extra', 'cilium-partial',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, command_log, _ = self.make_environment()
+                if case == 'kube-proxy':
+                    environment['FAKE_KUBE_PROXY_DAEMONSET'] = (
+                        'daemonset.apps/kube-proxy\n'
+                    )
+                elif case == 'unknown-release':
+                    environment['FAKE_HELM_SECRET_STATE'] = 'extra'
+                elif case == 'gateway-partial':
+                    environment['FAKE_GATEWAY_STATE'] = 'partial'
+                elif case == 'gateway-annotation-extra':
+                    Path(environment['FAKE_GATEWAY_MARKER']).touch()
+                    gateway = Path(environment['FAKE_GATEWAY_EXACT_JSON'])
+                    payload = json.loads(gateway.read_text(encoding='utf-8'))
+                    payload['items'][0]['metadata']['annotations'][
+                        'unapproved.example.invalid/annotation'
+                    ] = 'value'
+                    gateway.write_text(json.dumps(payload), encoding='utf-8')
+                else:
+                    self.install_full_cluster_contract(environment, host)
+                    environment['FAKE_CILIUM_STATE'] = 'partial'
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' install ', commands)
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_rejects_invalid_official_helm_storage_labels(self) -> None:
+        for mutation in (
+            'missing-modified-at', 'created-at-only',
+            'invalid-modified-at', 'extra-label',
+        ):
+            with self.subTest(mutation=mutation):
+                environment, host, command_log, _ = self.make_environment()
+                self.install_full_cluster_contract(environment, host)
+                secret = Path(environment['FAKE_SECRET_EXACT_JSON'])
+                payload = json.loads(secret.read_text(encoding='utf-8'))
+                labels = payload['items'][0]['metadata']['labels']
+                if mutation == 'missing-modified-at':
+                    labels.pop('modifiedAt')
+                elif mutation == 'created-at-only':
+                    labels.pop('modifiedAt')
+                    labels['createdAt'] = '1786320000'
+                elif mutation == 'invalid-modified-at':
+                    labels['modifiedAt'] = 'not-a-timestamp'
+                else:
+                    labels['unapproved'] = 'value'
+                secret.write_text(json.dumps(payload), encoding='utf-8')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+    def test_apply_uses_only_fixed_staged_inputs_and_safe_argv(self) -> None:
+        environment, host, command_log, values = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_INSTALLED', result.stdout)
+        self.assertIn('NEXT=90-verify.sh --check', result.stdout)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        staging = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+        gateway_apply = next(line for line in commands if ' apply ' in line)
+        helm_install = next(line for line in commands if ' install cilium ' in line)
+        gateway_argv = gateway_apply.split()
+        helm_argv = helm_install.split()
+        self.assertEqual(
+            gateway_argv[:2] + gateway_argv[3:8],
+            [
+                'kubectl', '--kubeconfig', '--cache-dir=/dev/null', 'apply',
+                '--server-side=true',
+                '--field-manager=engineering-platform-bootstrap', '--filename',
+            ],
+        )
+        self.assertTrue(gateway_argv[2].startswith('/dev/fd/'))
+        gateway_snapshot = Path(gateway_argv[8])
+        self.assertEqual(gateway_snapshot.name, 'standard-install.yaml')
+        snapshot_dir = gateway_snapshot.parent
+        self.assertEqual(snapshot_dir.parent, host / 'root')
+        self.assertTrue(snapshot_dir.name.startswith('.cilium-inputs.'))
+        self.assertEqual(helm_argv[:2], ['helm', '--kubeconfig'])
+        self.assertTrue(helm_argv[2].startswith('/dev/fd/'))
+        self.assertEqual(helm_argv[3:5], ['install', 'cilium'])
+        self.assertEqual(Path(helm_argv[5]).parent, snapshot_dir)
+        self.assertEqual(Path(helm_argv[5]).name, 'cilium-1.20.0.tgz')
+        self.assertEqual(
+            helm_argv[6:9], ['--namespace', 'kube-system', '--values']
+        )
+        self.assertEqual(Path(helm_argv[9]).parent, snapshot_dir)
+        self.assertEqual(Path(helm_argv[9]).name, 'values.yaml')
+        self.assertEqual(helm_argv[10:], ['--atomic', '--timeout', '10m0s'])
+        self.assertLess(commands.index(gateway_apply), commands.index(helm_install))
+        mutation_commands = [
+            line for line in commands
+            if ' apply ' in line or ' install ' in line
+        ]
+        self.assertEqual(mutation_commands, [gateway_apply, helm_install])
+        self.assertNotIn(str(staging), '\n'.join(mutation_commands))
+        self.assertNotIn(str(values), '\n'.join(mutation_commands))
+        for forbidden in (
+            '--set', ' repo ', ' upgrade ', ' dependency ',
+            'https://', '--reuse-values', '--reset-values',
+        ):
+            self.assertNotIn(forbidden, '\n'.join(commands))
+        evidence = list(
+            (host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')
+        )
+        self.assertEqual(len(evidence), 1)
+        all_output = result.stdout + result.stderr + evidence[0].read_text(
+            encoding='utf-8'
+        )
+        self.assertNotIn(self.canary, all_output)
+        self.assertNotIn('kubeconfig', all_output.lower())
+
+    def test_apply_resumes_gateway_only_then_check_is_idempotent(self) -> None:
+        environment, host, command_log, _ = self.make_environment()
+        Path(environment['FAKE_GATEWAY_MARKER']).touch()
+
+        apply_result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(apply_result.returncode, 0, apply_result.stderr)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn(' apply ', commands)
+        self.assertIn('helm --kubeconfig', commands)
+        command_log.unlink()
+
+        check_result = self.run_stage(environment)
+
+        self.assertEqual(check_result.returncode, 0, check_result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', check_result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn(' apply ', commands)
+        self.assertNotIn(' install ', commands)
+        self.assertTrue((host / 'usr/local/bin/helm').is_file())
+
+    def test_helm_publication_rejects_unknown_shadow_and_race(self) -> None:
+        for mutation in ('unknown', 'shadow', 'race'):
+            with self.subTest(mutation=mutation):
+                environment, host, command_log, _ = self.make_environment()
+                helm = host / 'usr/local/bin/helm'
+                if mutation == 'unknown':
+                    self.write_executable(helm, '#!/bin/sh\nprintf unknown\\n\n')
+                elif mutation == 'shadow':
+                    self.write_executable(
+                        host / 'usr/bin/helm', '#!/bin/sh\nprintf shadow\\n\n'
+                    )
+                else:
+                    environment['FAKE_LN_RACE_TARGET'] = str(helm)
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                if mutation == 'unknown':
+                    self.assertIn('unknown', helm.read_text(encoding='utf-8'))
+                if command_log.exists():
+                    self.assertNotIn(
+                        ' apply ', command_log.read_text(encoding='utf-8')
+                    )
+
+    def test_helm_publication_rejects_post_sync_temporary_races(self) -> None:
+        for mutation in ('symlink', 'mode', 'bytes'):
+            with self.subTest(mutation=mutation):
+                environment, host, command_log, _ = self.make_environment()
+                outside = Path(environment['FAKE_HELM_OUTSIDE'])
+                outside.write_text('outside-sentinel\n', encoding='utf-8')
+                outside.chmod(0o600)
+                before = outside.read_bytes()
+                environment['FAKE_HELM_TEMP_RACE'] = mutation
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertFalse((host / 'usr/local/bin/helm').exists())
+                self.assertEqual(outside.read_bytes(), before)
+                self.assertEqual(
+                    list((host / 'usr/local/bin').glob('.helm.tmp.*')),
+                    [],
+                )
+                if command_log.exists():
+                    commands = command_log.read_text(encoding='utf-8')
+                    self.assertNotIn(' apply ', commands)
+                    self.assertNotIn(' install ', commands)
+
+    def test_helm_publication_stops_if_temporary_unlink_fails(self) -> None:
+        environment, host, _, _ = self.make_environment()
+        environment['FAKE_HELM_TEMP_RM_FAIL'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertNotIn('PASS_CILIUM_INSTALLED', result.stdout)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')),
+            [],
+        )
+
+    def test_apply_regates_inputs_and_cluster_after_gateway_mutation(self) -> None:
+        for race, expected_code in (
+            ('chart', 20), ('values', 20), ('kube-proxy', 30)
+        ):
+            with self.subTest(race=race):
+                environment, _, command_log, _ = self.make_environment()
+                environment['FAKE_RACE_AFTER_GATEWAY'] = race
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, expected_code, result.stderr)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+    def test_apply_consumes_only_private_snapshots_across_input_races(self) -> None:
+        for race in ('gateway', 'chart', 'values'):
+            with self.subTest(race=race):
+                environment, host, command_log, values = self.make_environment()
+                if race == 'gateway':
+                    environment['FAKE_PRE_GATEWAY_INPUT_RACE'] = '1'
+                else:
+                    environment['FAKE_INPUT_RACE_AT_CONSUMER'] = race
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn('malicious-gateway-consumed', commands)
+                self.assertNotIn('malicious-helm-input-consumed', commands)
+                if race == 'gateway':
+                    self.assertNotIn(' apply ', commands)
+                else:
+                    install = next(
+                        line for line in commands.splitlines()
+                        if ' install cilium ' in line
+                    )
+                    self.assertNotIn(
+                        str(
+                            host
+                            / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+                            / 'cilium-1.20.0.tgz'
+                        ),
+                        install,
+                    )
+                    self.assertNotIn(str(values), install)
+                self.assertEqual(
+                    list((host / 'root').glob('.cilium-inputs.*')),
+                    [],
+                )
+
+    def test_success_requires_safe_snapshot_cleanup_before_evidence(self) -> None:
+        environment, host, _, _ = self.make_environment()
+        environment['FAKE_SNAPSHOT_UNKNOWN_ENTRY'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertNotIn('PASS_CILIUM_INSTALLED', result.stdout)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')),
+            [],
+        )
+        snapshots = list((host / 'root').glob('.cilium-inputs.*'))
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            (snapshots[0] / 'unapproved').read_text(encoding='utf-8'),
+            'preserve-me\n',
+        )
+
+    def test_rejects_relevant_environment_overrides_before_lookup(self) -> None:
+        for variable in (
+            'KUBECONFIG', 'HELM_NAMESPACE', 'HELM_DRIVER',
+            'DPKG_ADMINDIR', 'DPKG_ROOT', 'DPKG_FORCE',
+            'DPKG_FRONTEND_LOCKED', 'KUBECACHEDIR',
+            'KUBECTL_EXTERNAL_DIFF', 'KUBECTL_KUBERC',
+            'KUBECTL_UNAPPROVED', 'TAR_OPTIONS', 'BASH_ENV', 'ENV',
+            'OPENSSL_CONF', 'OPENSSL_MODULES', 'PYTHONPATH', 'PYTHONHOME',
+            'PYTHONPYCACHEPREFIX', 'PYTHONDONTWRITEBYTECODE',
+        ):
+            for value in ('', '/tmp/unapproved'):
+                with self.subTest(variable=variable, value=value):
+                    environment, _, command_log, _ = self.make_environment()
+                    environment[variable] = value
+
+                    result = self.run_stage(environment)
+
+                    self.assertEqual(result.returncode, 10, result.stderr)
+                    self.assertIn(
+                        'REASON=untrusted-environment-override', result.stderr
+                    )
+                    self.assertFalse(command_log.exists())
+
+    def test_uses_isolated_python_from_hostile_working_directory(self) -> None:
+        environment, _, _, _ = self.make_environment()
+        hostile = self.temporary_directory() / 'hostile-cwd'
+        hostile.mkdir()
+        import_marker = hostile / 'python-imported'
+        (hostile / 'json.py').write_text(
+            'from pathlib import Path\n'
+            f'Path({str(import_marker)!r}).write_text("executed\\n")\n'
+            'raise RuntimeError("hostile json module")\n',
+            encoding='utf-8',
+        )
+
+        result = subprocess.run(
+            ['/bin/bash', '-p', str(INSTALL_CILIUM), '--check'],
+            cwd=hostile,
+            env=environment,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(import_marker.exists())
+
+    def test_uses_fixed_tar_outside_path(self) -> None:
+        environment, _, _, _ = self.make_environment()
+        tar_marker = self.temporary_directory() / 'tar-executed'
+        fake_bin = Path(environment['PATH'].split(':', 1)[0])
+        self.write_executable(
+            fake_bin / 'tar',
+            '#!/bin/sh\n'
+            'case "$*" in\n'
+            f'  *helm-v3.21.0*) printf executed >{tar_marker}; exit 99 ;;\n'
+            '  *) exec /usr/bin/tar "$@" ;;\n'
+            'esac\n',
+        )
+
+        result = subprocess.run(
+            ['/bin/bash', '-p', str(INSTALL_CILIUM), '--apply'],
+            env=environment,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(tar_marker.exists())
+
+    def test_rejects_unsafe_admin_config_or_source_race(self) -> None:
+        for case in (
+            'exec', 'auth-provider', 'proxy-url', 'insecure-tls',
+            'extra-cluster', 'wrong-context', 'query-failure', 'source-race',
+        ):
+            with self.subTest(case=case):
+                environment, _, command_log, _ = self.make_environment()
+                payload = self.admin_config_object()
+                cluster = payload['clusters'][0]['cluster']
+                user = payload['users'][0]['user']
+                if case == 'exec':
+                    user['exec'] = {'command': self.canary}
+                elif case == 'auth-provider':
+                    user['auth-provider'] = {'name': self.canary}
+                elif case == 'proxy-url':
+                    cluster['proxy-url'] = 'https://127.0.0.1:1'
+                elif case == 'insecure-tls':
+                    cluster['insecure-skip-tls-verify'] = True
+                elif case == 'extra-cluster':
+                    payload['clusters'].append(payload['clusters'][0].copy())
+                elif case == 'wrong-context':
+                    payload['current-context'] = 'unapproved'
+                elif case == 'query-failure':
+                    environment['FAKE_ADMIN_VIEW_FAIL'] = '1'
+                else:
+                    environment['FAKE_ADMIN_SOURCE_RACE'] = '1'
+                environment['FAKE_ADMIN_VIEW_JSON'] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertNotIn(self.canary, result.stdout + result.stderr)
+                if command_log.exists():
+                    commands = command_log.read_text(encoding='utf-8')
+                    self.assertNotIn(' apply ', commands)
+                    self.assertNotIn(' install ', commands)
+
+    def test_all_cluster_clients_use_validated_in_memory_admin_config(self) -> None:
+        environment, host, command_log, _ = self.make_environment()
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        self.assertTrue(any(
+            'config view --raw --merge=false --output=json' in line
+            for line in commands
+        ))
+        cluster_clients = [
+            line for line in commands
+            if line.startswith('kubectl ') or (
+                line.startswith('helm ') and ' version --short' not in line
+            )
+        ]
+        self.assertTrue(cluster_clients)
+        for line in cluster_clients:
+            self.assertIn(' --kubeconfig /dev/fd/', line)
+            self.assertNotIn(str(host / 'etc/kubernetes/admin.conf'), line)
+
+    def test_fresh_workload_query_uses_ignore_not_found(self) -> None:
+        environment, _, command_log, _ = self.make_environment()
+        environment['FAKE_REQUIRE_IGNORE_NOT_FOUND'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+        self.assertIn(
+            'get daemonset/cilium deployment/cilium-operator '
+            '--ignore-not-found --output=json',
+            command_log.read_text(encoding='utf-8'),
+        )
+
+    def test_gateway_query_is_scoped_to_exact_bundle_objects(self) -> None:
+        environment, _, command_log, _ = self.make_environment()
+        environment['FAKE_REQUIRE_SCOPED_GATEWAY'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(
+            'customresourcedefinition.apiextensions.k8s.io/'
+            'backendtlspolicies.gateway.networking.k8s.io',
+            commands,
+        )
+        self.assertIn(
+            'validatingadmissionpolicybinding.admissionregistration.k8s.io/'
+            'safe-upgrades.gateway.networking.k8s.io --ignore-not-found',
+            commands,
+        )
+        self.assertNotIn(
+            'customresourcedefinitions.apiextensions.k8s.io,',
+            commands,
+        )
+
+    def test_check_has_no_host_or_client_cache_writes(self) -> None:
+        environment, host, _, _ = self.make_environment()
+        self.install_full_cluster_contract(environment, host)
+        environment['FAKE_SIMULATE_CLIENT_CACHE'] = '1'
+        home = Path(environment['HOME'])
+        (home / '.kube').mkdir(mode=0o700)
+        (home / '.kube/kuberc').write_text(
+            'defaults:\n- command: get\n  options:\n'
+            '    selector: hidden=true\n',
+            encoding='utf-8',
+        )
+        environment['FAKE_HOSTILE_KUBERC_MODE'] = 'query'
+        before_host = self.tree_snapshot(host)
+        before_home = self.tree_snapshot(home)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertEqual(self.tree_snapshot(host), before_host)
+        self.assertEqual(self.tree_snapshot(home), before_home)
+
+    def test_rejects_helm_kube_environment_and_api_endpoint_drift(self) -> None:
+        for value in ('', 'https://127.0.0.1:6443'):
+            with self.subTest(helm_env=value):
+                environment, _, command_log, _ = self.make_environment()
+                environment['HELM_KUBEAPISERVER'] = value
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertFalse(command_log.exists())
+
+        environment, _, command_log, _ = self.make_environment()
+        environment['FAKE_API_ENDPOINT'] = 'https://127.0.0.1:6443'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        if command_log.exists():
+            commands = command_log.read_text(encoding='utf-8')
+            self.assertNotIn(' apply ', commands)
+            self.assertNotIn(' install ', commands)
+
+    def test_apply_disables_hostile_home_kuberc_defaults(self) -> None:
+        for mode in ('query', 'apply'):
+            with self.subTest(mode=mode):
+                environment, _, command_log, _ = self.make_environment()
+                home = Path(environment['HOME'])
+                (home / '.kube').mkdir(mode=0o700)
+                (home / '.kube/kuberc').write_text(
+                    'defaults:\n- command: apply\n  options:\n'
+                    '    dry-run: server\n',
+                    encoding='utf-8',
+                )
+                environment['FAKE_HOSTILE_KUBERC_MODE'] = mode
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(
+                    'kuberc-injected',
+                    command_log.read_text(encoding='utf-8'),
+                )
+
+    def test_apply_regates_helm_and_cluster_immediately_before_install(self) -> None:
+        for race in ('helm', 'release'):
+            with self.subTest(race=race):
+                environment, _, command_log, _ = self.make_environment()
+                Path(environment['FAKE_GATEWAY_MARKER']).touch()
+                environment['FAKE_PRE_HELM_RACE'] = race
+                environment['FAKE_PRE_HELM_RACE_COUNT'] = '3'
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn('malicious-helm-executed', commands)
+                self.assertNotIn(' install cilium ', commands)
+
+    def test_rejects_invalid_helm_list_contract(self) -> None:
+        base = {
+            'name': 'cilium',
+            'namespace': 'kube-system',
+            'revision': '1',
+            'updated': '2026-08-10 00:00:00.000000000 +0000 UTC',
+            'status': 'deployed',
+            'chart': 'cilium-1.20.0',
+            'app_version': '1.20.0',
+        }
+        for mutation in ('revision-type', 'updated-empty', 'extra-field'):
+            with self.subTest(mutation=mutation):
+                environment, host, command_log, _ = self.make_environment()
+                self.install_full_cluster_contract(environment, host)
+                release = dict(base)
+                if mutation == 'revision-type':
+                    release['revision'] = 1
+                elif mutation == 'updated-empty':
+                    release['updated'] = ''
+                else:
+                    release['unapproved'] = 'value'
+                environment['FAKE_HELM_LIST_JSON'] = json.dumps([release])
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+    def test_rejects_official_cilium_workload_identity_drift(self) -> None:
+        for component, key in (
+            ('agent', 'app.kubernetes.io/name'),
+            ('operator', 'io.cilium/app'),
+        ):
+            with self.subTest(component=component):
+                environment, host, command_log, _ = self.make_environment()
+                self.install_full_cluster_contract(environment, host)
+                workload = Path(environment['FAKE_CILIUM_EXACT_JSON'])
+                payload = json.loads(workload.read_text(encoding='utf-8'))
+                for item in payload['items']:
+                    item['metadata']['labels'][
+                        'app.kubernetes.io/version'
+                    ] = '1.20.0'
+                index = 0 if component == 'agent' else 1
+                payload['items'][index]['metadata']['labels'][key] = 'drift'
+                workload.write_text(json.dumps(payload), encoding='utf-8')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+    def test_accepts_digest_pinned_values(self) -> None:
+        environment, _, _, values = self.make_environment()
+        values.write_text(self.desired_values, encoding='utf-8')
+
+        pinned_result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(pinned_result.returncode, 0, pinned_result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_INSTALLED', pinned_result.stdout)
+
+    def test_rejects_unpinned_cilium_workload_images(self) -> None:
+        for component in ('agent', 'operator'):
+            with self.subTest(component=component):
+                environment, host, command_log, _ = self.make_environment()
+                self.install_full_cluster_contract(environment, host)
+                workload = Path(environment['FAKE_CILIUM_EXACT_JSON'])
+                payload = json.loads(workload.read_text(encoding='utf-8'))
+                index = 0 if component == 'agent' else 1
+                payload['items'][index]['spec']['template']['spec'][
+                    'containers'
+                ][0]['image'] = (
+                    'quay.io/cilium/cilium:v1.20.0'
+                    if component == 'agent'
+                    else 'quay.io/cilium/operator-generic:v1.20.0'
+                )
+                workload.write_text(json.dumps(payload), encoding='utf-8')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+    def test_requires_exact_envoy_dataplane_and_cilium_config(self) -> None:
+        cases = (
+            ('envoy-daemonset-label', 'FAKE_ENVOY_DAEMONSET_JSON'),
+            ('envoy-daemonset-image', 'FAKE_ENVOY_DAEMONSET_JSON'),
+            ('envoy-daemonset-not-ready', 'FAKE_ENVOY_DAEMONSET_JSON'),
+            ('envoy-pod-label', 'FAKE_ENVOY_PODS_JSON'),
+            ('envoy-pod-image', 'FAKE_ENVOY_PODS_JSON'),
+            ('envoy-pod-not-ready', 'FAKE_ENVOY_PODS_JSON'),
+            ('cilium-config-missing', 'FAKE_CILIUM_CONFIG_JSON'),
+            ('cilium-config-drift', 'FAKE_CILIUM_CONFIG_JSON'),
+            ('query-failure', ''),
+        )
+        for case, variable in cases:
+            with self.subTest(case=case):
+                environment, host, command_log, _ = self.make_environment()
+                self.install_full_cluster_contract(environment, host)
+                if case == 'query-failure':
+                    environment['FAKE_CILIUM_MANAGED_QUERY_FAIL'] = (
+                        'daemonset/cilium-envoy'
+                    )
+                else:
+                    payload = json.loads(environment[variable])
+                    item = (
+                        payload['items'][0]
+                        if variable == 'FAKE_ENVOY_PODS_JSON'
+                        else payload
+                    )
+                    if case.endswith('-label'):
+                        item['metadata']['labels']['helm.sh/chart'] = 'drift'
+                    elif case.endswith('-image'):
+                        containers = (
+                            item['spec']['containers']
+                            if variable == 'FAKE_ENVOY_PODS_JSON'
+                            else item['spec']['template']['spec']['containers']
+                        )
+                        containers[0]['image'] = 'quay.io/cilium/cilium-envoy:mutable'
+                    elif case == 'envoy-daemonset-not-ready':
+                        item['status']['numberReady'] = 0
+                    elif case == 'envoy-pod-not-ready':
+                        item['status']['conditions'][0]['status'] = 'False'
+                    elif case == 'cilium-config-missing':
+                        del payload['data']['enable-gateway-api']
+                    elif case == 'cilium-config-drift':
+                        payload['data']['cgroup-root'] = '/unapproved'
+                    environment[variable] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+    def test_queries_exact_deployed_helm_user_values(self) -> None:
+        environment, host, command_log, _ = self.make_environment()
+        self.install_full_cluster_contract(environment, host)
+
+        exact_result = self.run_stage(environment)
+
+        self.assertEqual(exact_result.returncode, 0, exact_result.stderr)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(
+            ' get values cilium --namespace kube-system --revision 1 '
+            '--output json\n',
+            commands,
+        )
+        self.assertNotIn(' get values cilium --all', commands)
+
+    def test_rejects_deployed_helm_user_values_drift(self) -> None:
+        for case in (
+            'missing', 'extra', 'wrong-type', 'wrong-value', 'duplicate-key',
+            'nan', 'malformed', 'empty', 'query-failure',
+        ):
+            with self.subTest(case=case):
+                environment, host, command_log, _ = self.make_environment()
+                self.install_full_cluster_contract(environment, host)
+                payload = json.loads(json.dumps(self.desired_values_object))
+                if case == 'missing':
+                    del payload['operator']['image']['genericDigest']
+                elif case == 'extra':
+                    payload['unapproved'] = self.canary
+                elif case == 'wrong-type':
+                    payload['k8sServicePort'] = '6443'
+                elif case == 'wrong-value':
+                    payload['k8sServiceHost'] = '10.93.1.28'
+                raw = json.dumps(payload)
+                if case == 'duplicate-key':
+                    raw = raw.replace(
+                        '"kubeProxyReplacement": true',
+                        '"kubeProxyReplacement": true, '
+                        '"kubeProxyReplacement": true',
+                        1,
+                    )
+                elif case == 'nan':
+                    raw = raw.replace('"k8sServicePort": 6443', '"k8sServicePort": NaN')
+                elif case == 'malformed':
+                    raw = '{'
+                elif case == 'empty':
+                    raw = ''
+                elif case == 'query-failure':
+                    environment['FAKE_HELM_VALUES_FAIL'] = '1'
+                environment['FAKE_HELM_VALUES_JSON'] = raw
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertNotIn(self.canary, result.stdout + result.stderr)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn(' apply ', commands)
+                self.assertNotIn(' install ', commands)
+
+
+class FinalVerifyTest(BootstrapTestCase):
+    canary = 'SECRET_CANARY_FINAL_VERIFY_DO_NOT_LOG'
+    endpoint = 'unix:///run/containerd/containerd.sock'
+    gateway_names = CiliumInstallTest.gateway_names
+    cilium_image = CiliumInstallTest.cilium_image
+    operator_image = CiliumInstallTest.operator_image
+    envoy_image = CiliumInstallTest.envoy_image
+    desired_values_object = CiliumInstallTest.desired_values_object
+    cni_records = (
+        ('LICENSE', '644', '11357', 'b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1'),
+        ('README.md', '644', '2343', '43c32d29316a4a9fe23af500917bd89e51d6a84fa0dcbfcc75b5fbd834c3145a'),
+        ('bandwidth', '755', '5042926', '01c59cee777ade0608361d94bf3bfe01bda82bc8da276d8be917e225aa660639'),
+        ('bridge', '755', '5698763', '3553f5e8f47ed62aec728ab6f7444f6bf1624f916769852c6deb52cd216e22ba'),
+        ('dhcp', '755', '13725422', 'bf0552ff2ef54fbd8846b21ffe149f4de63dcd98d86d6b91de5e0bd94473870d'),
+        ('dummy', '755', '5251069', '88f9c9d018681a2b806db2c33184a0a4a532773cb71a60e975a9bf2f017199f6'),
+        ('firewall', '755', '5702145', 'ecbd112d77192a125e85ab1fa4ded6cfaf4e9732172e072ee248caa81eba7aed'),
+        ('host-device', '755', '5159967', 'a891bd77c5e25b6c4dfa65c8b78cf7f0a00be5ba5d5bbeccd902c08d7f0ea7f3'),
+        ('host-local', '755', '4350778', 'ac5ff19b1120bd1d58203b20d45165f244691fcf9776ba55d6dd1747f043c90f'),
+        ('ipvlan', '755', '5274322', '40ceded59770a0f28e7a45a0ed5f8c49044e786bc728f34d6c9de7bc5d3fb660'),
+        ('loopback', '755', '4302030', '02956bdd03b9b71693b3efd72afce88384e4472b644a1c6410fe817f618c1a83'),
+        ('macvlan', '755', '5307111', '33d2730d229dea786c56465a1a96db84ca27b3d5ac552bbc9aa5cdc942622814'),
+        ('portmap', '755', '5108385', '10cc11a28d9c16465889eb59968be76cf04fa884939edf70c27b722cec2c0156'),
+        ('ptp', '755', '5475470', '1cbbce28e96accfef5fe6021762a55ad2b114705f410b8837361a201df6c0b03'),
+        ('sbr', '755', '4525826', 'bb886c24182afbad535f158b585524b08a9f1cf0618679987d6b0e11ebf50bb5'),
+        ('static', '755', '3776708', '7bf980bedb303f6d314239413fd4aca5479a9affcd38509057ae203b0da67058'),
+        ('tap', '755', '5453308', 'ebff11573fa4ed5793cc08776b8811a3c0f44705b2b530fd5014e6bf69275c1a'),
+        ('tuning', '755', '4389084', '4659e9129d8c669c21c932cd778dc1ac17a717d100768ea23242883401cbb536'),
+        ('vlan', '755', '5267679', '5f6973d15ad2b0d44d1dc0e59982ed05e34e4709630ecd367f766202f9034ac8'),
+        ('vrf', '755', '4685012', '3f3363182c4777bd0d3ead028147f9ecebd60bb32f2d47b7c181877a00ae049b'),
+    )
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def helm_member(self) -> bytes:
+        return textwrap.dedent(
+            '''
+            #!/usr/bin/python3 -B
+            import os
+            from pathlib import Path
+            import sys
+
+            args = sys.argv[1:]
+            with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
+                log.write('helm ' + ' '.join(args) + '\\n')
+            sys.stderr.write(os.environ['FAKE_CANARY'] + '\\n')
+            if (
+                os.environ.get('FAKE_SIMULATE_CLIENT_CACHE', '0') == '1'
+                and os.environ.get('KUBECACHEDIR') != '/dev/null'
+            ):
+                cache = Path(os.environ['HOME']) / '.kube/cache/helm-write'
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text('cache\\n', encoding='utf-8')
+            if args == ['version', '--short']:
+                print(os.environ.get('FAKE_HELM_VERSION', 'v3.21.0+gfixture'))
+                raise SystemExit(0)
+            if len(args) < 2 or args[0] != '--kubeconfig':
+                raise SystemExit(64)
+            try:
+                supplied = Path(args[1]).read_text(encoding='utf-8')
+            except OSError:
+                raise SystemExit(64)
+            if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+                raise SystemExit(64)
+            expected = [
+                '--kubeconfig', args[1],
+                'list', '--all-namespaces', '--all', '--output', 'json',
+            ]
+            if args == expected:
+                if os.environ.get('FAKE_HELM_LIST_FAIL', '0') == '1':
+                    raise SystemExit(1)
+                print(os.environ['FAKE_HELM_LIST_JSON'])
+                raise SystemExit(0)
+            values = [
+                '--kubeconfig', args[1],
+                'get', 'values', 'cilium', '--namespace', 'kube-system',
+                '--revision', '1', '--output', 'json',
+            ]
+            if args == values:
+                if os.environ.get('FAKE_HELM_VALUES_FAIL', '0') == '1':
+                    raise SystemExit(1)
+                sys.stdout.write(os.environ['FAKE_HELM_VALUES_JSON'])
+                raise SystemExit(0)
+            raise SystemExit(64)
+            '''
+        ).lstrip().encode()
+
+    def helm_archive(self, member: bytes) -> bytes:
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            entry = tarfile.TarInfo('linux-amd64/helm')
+            entry.mode = 0o755
+            entry.size = len(member)
+            archive.addfile(entry, io.BytesIO(member))
+        return stream.getvalue()
+
+    def helm_list_json(self, **overrides: object) -> str:
+        release: dict[str, object] = {
+            'name': 'cilium',
+            'namespace': 'kube-system',
+            'revision': '1',
+            'updated': '2026-08-10 00:00:00.000000000 +0000 UTC',
+            'status': 'deployed',
+            'chart': 'cilium-1.20.0',
+            'app_version': '1.20.0',
+        }
+        release.update(overrides)
+        return json.dumps([release])
+
+    def gateway_bundle_json(self, *, partial: bool = False) -> str:
+        annotations = {
+            'gateway.networking.k8s.io/bundle-version': 'v1.6.1',
+            'gateway.networking.k8s.io/channel': 'standard',
+        }
+        crd_annotations = {
+            'api-approved.kubernetes.io': (
+                'https://github.com/kubernetes-sigs/gateway-api/pull/4530'
+            ),
+            **annotations,
+        }
+        items: list[dict[str, object]] = [
+            {
+                'apiVersion': 'apiextensions.k8s.io/v1',
+                'kind': 'CustomResourceDefinition',
+                'metadata': {
+                    'name': name,
+                    'annotations': dict(crd_annotations),
+                },
+            }
+            for name in self.gateway_names
+        ]
+        items.extend(
+            [
+                {
+                    'apiVersion': 'admissionregistration.k8s.io/v1',
+                    'kind': 'ValidatingAdmissionPolicy',
+                    'metadata': {
+                        'name': 'safe-upgrades.gateway.networking.k8s.io',
+                        'annotations': dict(annotations),
+                    },
+                    'status': {'typeChecking': {'expressionWarnings': []}},
+                },
+                {
+                    'apiVersion': 'admissionregistration.k8s.io/v1',
+                    'kind': 'ValidatingAdmissionPolicyBinding',
+                    'metadata': {
+                        'name': 'safe-upgrades.gateway.networking.k8s.io',
+                        'annotations': dict(annotations),
+                    },
+                    'spec': {'validationActions': ['Deny']},
+                },
+            ]
+        )
+        if partial:
+            items.pop(0)
+        return json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': items})
+
+    def release_json(self) -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'v1',
+                'kind': 'List',
+                'items': [
+                    {
+                        'apiVersion': 'v1',
+                        'kind': 'Secret',
+                        'metadata': {
+                            'name': 'sh.helm.release.v1.cilium.v1',
+                            'namespace': 'kube-system',
+                            'labels': {
+                                'owner': 'helm',
+                                'name': 'cilium',
+                                'status': 'deployed',
+                                'version': '1',
+                                'modifiedAt': '1786320001',
+                            },
+                        },
+                        'type': 'helm.sh/release.v1',
+                        'data': {'release': 'SECRET_HELM_RELEASE_PAYLOAD'},
+                    }
+                ],
+            }
+        )
+
+    def cilium_daemonset_json(self, *, ready: bool = True) -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'apps/v1',
+                'kind': 'DaemonSet',
+                'metadata': {
+                    'name': 'cilium',
+                    'namespace': 'kube-system',
+                    'labels': {
+                        'k8s-app': 'cilium',
+                        'app.kubernetes.io/name': 'cilium-agent',
+                        'app.kubernetes.io/part-of': 'cilium',
+                        'helm.sh/chart': 'cilium-1.20.0',
+                    },
+                },
+                'spec': {
+                    'template': {
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': 'cilium-agent',
+                                    'image': self.cilium_image,
+                                }
+                            ]
+                        }
+                    }
+                },
+                'status': {
+                    'desiredNumberScheduled': 1,
+                    'numberReady': 1 if ready else 0,
+                    'numberAvailable': 1 if ready else 0,
+                    'numberUnavailable': 0 if ready else 1,
+                },
+            }
+        )
+
+    def pod_list_json(self, name: str, *, ready: bool = True) -> str:
+        labels = (
+            {
+                'k8s-app': 'cilium',
+                'app.kubernetes.io/name': 'cilium-agent',
+                'app.kubernetes.io/part-of': 'cilium',
+                'helm.sh/chart': 'cilium-1.20.0',
+                'controller-revision-hash': 'fixture-hash',
+            }
+            if name == 'cilium-fixture'
+            else {
+                'io.cilium/app': 'operator',
+                'name': 'cilium-operator',
+                'app.kubernetes.io/name': 'cilium-operator',
+                'app.kubernetes.io/part-of': 'cilium',
+                'helm.sh/chart': 'cilium-1.20.0',
+                'pod-template-hash': 'fixture-hash',
+            }
+        )
+        return json.dumps(
+            {
+                'apiVersion': 'v1',
+                'kind': 'List',
+                'items': [
+                    {
+                        'apiVersion': 'v1',
+                        'kind': 'Pod',
+                        'metadata': {
+                            'name': name,
+                            'namespace': 'kube-system',
+                            'labels': labels,
+                        },
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': (
+                                        'cilium-agent'
+                                        if name == 'cilium-fixture'
+                                        else 'cilium-operator'
+                                    ),
+                                    'image': (
+                                        self.cilium_image
+                                        if name == 'cilium-fixture'
+                                        else self.operator_image
+                                    ),
+                                }
+                            ]
+                        },
+                        'status': {
+                            'phase': 'Running' if ready else 'Pending',
+                            'conditions': [
+                                {
+                                    'type': 'Ready',
+                                    'status': 'True' if ready else 'False',
+                                }
+                            ],
+                            'containerStatuses': [{'ready': ready}],
+                        },
+                    }
+                ],
+            }
+        )
+
+    def operator_json(self, *, ready: bool = True) -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'apps/v1',
+                'kind': 'Deployment',
+                'metadata': {
+                    'name': 'cilium-operator',
+                    'namespace': 'kube-system',
+                    'labels': {
+                        'io.cilium/app': 'operator',
+                        'name': 'cilium-operator',
+                        'app.kubernetes.io/name': 'cilium-operator',
+                        'app.kubernetes.io/part-of': 'cilium',
+                        'helm.sh/chart': 'cilium-1.20.0',
+                    },
+                },
+                'spec': {
+                    'replicas': 1,
+                    'template': {
+                        'spec': {
+                            'containers': [
+                                {
+                                    'name': 'cilium-operator',
+                                    'image': self.operator_image,
+                                }
+                            ]
+                        }
+                    },
+                },
+                'status': {
+                    'replicas': 1,
+                    'updatedReplicas': 1,
+                    'readyReplicas': 1 if ready else 0,
+                    'availableReplicas': 1 if ready else 0,
+                    'unavailableReplicas': 0 if ready else 1,
+                },
+            }
+        )
+
+    def envoy_daemonset_json(self, *, ready: bool = True) -> str:
+        return CiliumInstallTest.envoy_daemonset_json(self, ready=ready)
+
+    def envoy_pods_json(self, *, ready: bool = True) -> str:
+        return CiliumInstallTest.envoy_pods_json(self, ready=ready)
+
+    @staticmethod
+    def cilium_config_json() -> str:
+        return CiliumInstallTest.cilium_config_json()
+
+    def node_json(self, *, ready: bool = True, ip: str = '10.93.1.27') -> str:
+        return json.dumps(
+            {
+                'apiVersion': 'v1',
+                'kind': 'List',
+                'items': [
+                    {
+                        'apiVersion': 'v1',
+                        'kind': 'Node',
+                        'metadata': {'name': 'retail-test-workflow'},
+                        'status': {
+                            'conditions': [
+                                {
+                                    'type': 'Ready',
+                                    'status': 'True' if ready else 'False',
+                                }
+                            ],
+                            'addresses': [
+                                {'type': 'InternalIP', 'address': ip},
+                                {'type': 'Hostname', 'address': 'retail-test-workflow'},
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+
+    def cri_json(
+        self, *, ready: object = True, network_ready: object = True
+    ) -> str:
+        return json.dumps(
+            {
+                'status': {
+                    'conditions': [
+                        {'type': 'RuntimeReady', 'status': ready},
+                        {'type': 'NetworkReady', 'status': network_ready},
+                    ]
+                },
+                'config': {
+                    'containerd': {
+                        'defaultRuntimeName': 'runc',
+                        'runtimes': {
+                            'runc': {
+                                'runtimeType': 'io.containerd.runc.v2',
+                                'options': {'SystemdCgroup': True},
+                            }
+                        },
+                    }
+                },
+            }
+        )
+
+    def csr_json(self, **overrides: object) -> str:
+        spec: dict[str, object] = {
+            'signerName': 'kubernetes.io/kubelet-serving',
+            'username': 'system:node:retail-test-workflow',
+            'usages': ['server auth', 'digital signature', 'key encipherment'],
+            'request': 'ZmFrZS1jc3ItcmVxdWVzdA==',
+        }
+        spec.update(overrides)
+        return json.dumps(
+            {
+                'apiVersion': 'certificates.k8s.io/v1',
+                'kind': 'CertificateSigningRequestList',
+                'items': [
+                    {
+                        'apiVersion': 'certificates.k8s.io/v1',
+                        'kind': 'CertificateSigningRequest',
+                        'metadata': {
+                            'name': 'csr-serving-fixture',
+                            'creationTimestamp': '2026-08-10T00:00:00Z',
+                        },
+                        'spec': spec,
+                        'status': {
+                            'certificate': 'SECRET_CERTIFICATE_CANARY',
+                            'conditions': [{'reason': 'SECRET_CONDITION_CANARY'}],
+                        },
+                    }
+                ],
+            }
+        )
+
+    def make_environment(self) -> tuple[dict[str, str], Path, Path]:
+        directory = self.temporary_directory()
+        host = directory / 'host'
+        home = directory / 'home'
+        fake_bin = directory / 'bin'
+        command_log = directory / 'commands.log'
+        staging = host / 'root/dev-infra-artifacts/pcs-2026-08-10.1'
+        for path in (
+            host / 'root/dev-infra-evidence', host / 'etc/kubernetes',
+            host / 'usr/bin', host / 'usr/sbin', host / 'usr/local/bin',
+            host / 'usr/local/sbin', host / 'usr/local/lib/systemd/system',
+            host / 'etc/containerd', host / 'var/lib/containerd',
+            host / 'run/containerd', host / 'opt/cni/bin', staging, fake_bin,
+            home,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        for path, mode in (
+            (host / 'root', 0o700),
+            (host / 'root/dev-infra-artifacts', 0o700),
+            (staging, 0o700),
+            (host / 'usr', 0o755),
+            (host / 'usr/local', 0o755),
+            (host / 'usr/local/bin', 0o755),
+            (host / 'opt', 0o755),
+            (host / 'opt/cni', 0o755),
+            (host / 'opt/cni/bin', 0o755),
+            (host / 'var/lib/containerd', 0o700),
+            (host / 'run/containerd', 0o711),
+        ):
+            path.chmod(mode)
+
+        helm_member = self.helm_member()
+        helm_archive = staging / 'helm-v3.21.0-linux-amd64.tar.gz'
+        helm_archive.write_bytes(self.helm_archive(helm_member))
+        helm_archive.chmod(0o600)
+        helm_binary = host / 'usr/local/bin/helm'
+        helm_binary.write_bytes(helm_member)
+        helm_binary.chmod(0o755)
+        gateway_manifest = staging / 'standard-install.yaml'
+        gateway_manifest.write_text('gateway v1.6.1 fixture\n', encoding='utf-8')
+        gateway_manifest.chmod(0o600)
+        admin_conf = host / 'etc/kubernetes/admin.conf'
+        admin_conf.write_text(self.canary + '\n', encoding='utf-8')
+        admin_conf.chmod(0o600)
+        swap_file = host / 'swap.img'
+        swap_file.write_text('swap fixture\n', encoding='utf-8')
+        swap_file.chmod(0o600)
+
+        cni_manifest = directory / 'cni-manifest.tsv'
+        cni_manifest.write_text(
+            ''.join('\t'.join(record) + '\n' for record in self.cni_records),
+            encoding='utf-8',
+        )
+        for name, mode, _, _ in self.cni_records:
+            target = host / 'opt/cni/bin' / name
+            target.write_text(name + '\n', encoding='utf-8')
+            target.chmod(int(mode, 8))
+
+        runtime_targets = (
+            (
+                host / 'usr/local/bin/containerd',
+                ContainerdInstallTest.containerd_version,
+                0o755,
+            ),
+            (
+                host / 'usr/local/bin/ctr',
+                ContainerdInstallTest.ctr_binary,
+                0o755,
+            ),
+            (
+                host / 'usr/local/bin/containerd-shim-runc-v2',
+                ContainerdInstallTest.shim_binary,
+                0o755,
+            ),
+            (
+                host / 'usr/local/sbin/runc',
+                ContainerdInstallTest.runc_binary,
+                0o755,
+            ),
+            (
+                host / 'etc/containerd/config.toml',
+                (ROOT / 'bootstrap/containerd/config.toml').read_bytes(),
+                0o644,
+            ),
+            (
+                host / 'usr/local/lib/systemd/system/containerd.service',
+                (ROOT / 'bootstrap/containerd/containerd.service').read_bytes(),
+                0o644,
+            ),
+        )
+        for target, content, mode in runtime_targets:
+            target.write_bytes(content)
+            target.chmod(mode)
+        cri_socket = host / 'run/containerd/containerd.sock'
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(cri_socket))
+        listener.close()
+        cri_socket.chmod(0o660)
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'systemctl',
+            '''
+            #!/bin/sh
+            printf 'systemctl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            case "$1" in
+              show)
+                [ "$*" = "show --all --property=LoadState --property=FragmentPath --property=DropInPaths containerd.service" ] || exit 64
+                if [ "${FAKE_CONTAINERD_UNIT_STATE:-loaded}" = missing ]; then
+                  printf 'LoadState=not-found\nFragmentPath=\nDropInPaths=\n'
+                else
+                  printf 'LoadState=loaded\nFragmentPath=%s\nDropInPaths=\n' "$FAKE_CONTAINERD_UNIT"
+                fi
+                ;;
+              is-enabled)
+                [ "${FAKE_CONTAINERD_SERVICE_ENABLED:-1}" = 1 ]
+                ;;
+              is-active)
+                [ "${FAKE_CONTAINERD_SERVICE_ACTIVE:-1}" = 1 ] && printf 'active\n'
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'dpkg-query',
+            '''
+            #!/bin/sh
+            if [ -n "${FAKE_RESTORE_CRICTL_SOURCE:-}" ]; then
+              /bin/cp "$FAKE_RESTORE_CRICTL_SOURCE" "$FAKE_RESTORE_CRICTL_TARGET"
+              chmod 0755 "$FAKE_RESTORE_CRICTL_TARGET"
+              unset FAKE_RESTORE_CRICTL_SOURCE
+            fi
+            if [ "$1" = -W ]; then
+              for package in kubeadm kubectl kubelet kubernetes-cni; do
+                version=1.36.3-1.1
+                [ "$package" != kubernetes-cni ] || version=1.9.1-1.1
+                [ "${FAKE_PACKAGE_DRIFT:-}" != "$package" ] || version=0.0.0-0
+                printf '%s\\tamd64\\thold\\tinstalled\\t%s\\n' "$package" "$version"
+              done
+              [ "${FAKE_EXTRA_HOLD:-0}" != 1 ] || printf 'unapproved\\tamd64\\thold\\tinstalled\\t1\\n'
+              exit 0
+            fi
+            [ "$1" = -S ] || exit 64
+            logical=$2
+            case "$logical" in
+              /usr/bin/kubeadm) package=kubeadm ;;
+              /usr/bin/kubectl) package=kubectl ;;
+              /usr/bin/kubelet) package=kubelet ;;
+              /opt/cni/bin/*) package=kubernetes-cni ;;
+              *) exit 1 ;;
+            esac
+            [ "${FAKE_OWNER_DRIFT:-}" != "$logical" ] || package=unapproved
+            printf '%s: %s\\n' "$package" "$logical"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'dpkg',
+            '''
+            #!/bin/sh
+            [ "$1" = --verify ] || exit 64
+            case "$2" in kubeadm|kubectl|kubelet|kubernetes-cni) ;; *) exit 64 ;; esac
+            [ "${FAKE_VERIFY_DRIFT:-}" != "$2" ] || printf '??5?????? /unapproved\\n'
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sha256sum',
+            '''
+            #!/bin/sh
+            if [ "$#" -eq 0 ]; then
+              exec /usr/bin/shasum -a 256
+            fi
+            path=$1
+            if [ "${path##*/}" = helm-v3.21.0-linux-amd64.tar.gz ]; then
+              digest=0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36
+              [ "${FAKE_HELM_ARCHIVE_DIGEST_DRIFT:-0}" != 1 ] || digest=0000000000000000000000000000000000000000000000000000000000000000
+            elif [ "${path##*/}" = standard-install.yaml ]; then
+              digest=24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73
+            else
+              digest=$(awk -F '\\t' -v name="${path##*/}" '$1 == name {print $4}' "$FAKE_CNI_MANIFEST")
+            fi
+            [ -n "$digest" ] || exec /usr/bin/shasum -a 256 "$path"
+            [ "${FAKE_CNI_DIGEST_DRIFT:-}" != "${path##*/}" ] || digest=0000000000000000000000000000000000000000000000000000000000000000
+            printf '%s  %s\\n' "$digest" "$path"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'stat',
+            '''
+            #!/bin/sh
+            if [ "$1" = -c ] && [ "$2" = %s ] && [ "${3#${FAKE_CNI_ROOT}/}" != "$3" ]; then
+              size=$(awk -F '\\t' -v name="${3##*/}" '$1 == name {print $3}' "$FAKE_CNI_MANIFEST")
+              [ -n "$size" ] || exit 1
+              printf '%s\\n' "$size"
+              exit 0
+            fi
+            exec /usr/bin/stat "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'swapon',
+            '''
+            #!/bin/sh
+            [ "$*" = "--show --noheadings --bytes --output NAME,SIZE" ] || exit 64
+            [ "${FAKE_SWAP_FAIL:-0}" != 1 ] || exit 1
+            if [ "${FAKE_SWAP_OUTPUT+x}" = x ]; then
+              printf '%s\\n' "$FAKE_SWAP_OUTPUT"
+            else
+              printf '/swap.img 4200000000\\n'
+            fi
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'openssl',
+            '''
+            #!/bin/sh
+            printf 'openssl %s\\n' "$*" >>"$FAKE_COMMAND_LOG"
+            /bin/cat >/dev/null
+            [ "${FAKE_OPENSSL_FAIL:-0}" != 1 ] || exit 1
+            printf 'Certificate Request:\\n'
+            printf '    X509v3 Subject Alternative Name:\\n'
+            printf '        %s\\n' "${FAKE_CSR_SAN:-DNS:retail-test-workflow, IP Address:10.93.1.27}"
+            ''',
+        )
+        self.write_executable(
+            host / 'usr/bin/openssl',
+            (fake_bin / 'openssl').read_text(encoding='utf-8'),
+        )
+        self.write_executable(
+            host / 'usr/bin/kubeadm',
+            '''
+            #!/bin/sh
+            printf 'kubeadm %s\\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "$*" = "version -o short" ] || exit 64
+            printf '%s\\n' "${FAKE_KUBEADM_VERSION:-v1.36.3}"
+            ''',
+        )
+        self.write_executable(
+            host / 'usr/bin/kubelet',
+            '''
+            #!/bin/sh
+            printf 'kubelet %s\\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "$*" = --version ] || exit 64
+            printf '%s\\n' "${FAKE_KUBELET_VERSION:-Kubernetes v1.36.3}"
+            ''',
+        )
+        self.write_executable(
+            host / 'usr/local/bin/crictl',
+            '''
+            #!/bin/sh
+            printf 'crictl %s\\n' "$*" >>"$FAKE_COMMAND_LOG"
+            printf '%s\\n' "$FAKE_CANARY" >&2
+            case "$*" in
+              --version) printf '%s\\n' "${FAKE_CRICTL_VERSION:-crictl version v1.36.0}" ;;
+              "--runtime-endpoint unix:///run/containerd/containerd.sock --image-endpoint unix:///run/containerd/containerd.sock info --output json")
+                [ "${FAKE_CRICTL_FAIL:-0}" != 1 ] || exit 1
+                printf '%s\\n' "$FAKE_CRI_JSON"
+                ;;
+              *) exit 64 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            host / 'usr/bin/kubectl',
+            '''
+            #!/usr/bin/python3 -B
+            import os
+            from pathlib import Path
+            import sys
+
+            args = sys.argv[1:]
+            with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
+                log.write('kubectl ' + ' '.join(args) + '\\n')
+            sys.stderr.write(os.environ['FAKE_CANARY'] + '\\n')
+            if (
+                os.environ.get('FAKE_SIMULATE_CLIENT_CACHE', '0') == '1'
+                and '--cache-dir=/dev/null' not in args
+            ):
+                cache = Path(os.environ['HOME']) / '.kube/cache/kubectl-write'
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text('cache\\n', encoding='utf-8')
+            hostile_kuberc = (
+                (Path(os.environ['HOME']) / '.kube/kuberc').exists()
+                and os.environ.get('KUBECTL_KUBERC') != 'false'
+                and os.environ.get('FAKE_HOSTILE_KUBERC_MODE', '')
+            )
+            if len(args) < 2 or args[0] != '--kubeconfig':
+                raise SystemExit(64)
+            try:
+                supplied = Path(args[1]).read_text(encoding='utf-8')
+            except OSError:
+                raise SystemExit(64)
+            if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+                raise SystemExit(64)
+            prefix = ['--kubeconfig', args[1]]
+            safe_prefix = prefix + ['--cache-dir=/dev/null']
+            if args[:3] == safe_prefix:
+                command = args[3:]
+            elif args[:2] == prefix:
+                command = args[2:]
+            else:
+                raise SystemExit(64)
+            if hostile_kuberc:
+                with open(
+                    os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8'
+                ) as log:
+                    log.write('kuberc-injected query\\n')
+                raise SystemExit(64)
+
+            if command == [
+                'config', 'view', '--raw', '--merge=false', '--output=json',
+            ]:
+                if os.environ.get('FAKE_ADMIN_VIEW_FAIL', '0') == '1':
+                    raise SystemExit(1)
+                if os.environ.get('FAKE_ADMIN_SOURCE_RACE', '0') == '1':
+                    Path(os.environ['FAKE_ADMIN_CONF']).write_text(
+                        'raced-admin-config\\n', encoding='utf-8'
+                    )
+                sys.stdout.write(os.environ['FAKE_ADMIN_VIEW_JSON'])
+                raise SystemExit(0)
+
+            gateway_names = [
+                'backendtlspolicies.gateway.networking.k8s.io',
+                'gatewayclasses.gateway.networking.k8s.io',
+                'gateways.gateway.networking.k8s.io',
+                'grpcroutes.gateway.networking.k8s.io',
+                'httproutes.gateway.networking.k8s.io',
+                'listenersets.gateway.networking.k8s.io',
+                'referencegrants.gateway.networking.k8s.io',
+                'tcproutes.gateway.networking.k8s.io',
+                'tlsroutes.gateway.networking.k8s.io',
+                'udproutes.gateway.networking.k8s.io',
+            ]
+            scoped_gateway = ['get']
+            scoped_gateway.extend(
+                'customresourcedefinition.apiextensions.k8s.io/' + name
+                for name in gateway_names
+            )
+            scoped_gateway.extend([
+                'validatingadmissionpolicy.admissionregistration.k8s.io/safe-upgrades.gateway.networking.k8s.io',
+                'validatingadmissionpolicybinding.admissionregistration.k8s.io/safe-upgrades.gateway.networking.k8s.io',
+                '--ignore-not-found', '--output=json',
+            ])
+            unscoped_gateway = (
+                'get',
+                'customresourcedefinitions.apiextensions.k8s.io,validatingadmissionpolicies.admissionregistration.k8s.io,validatingadmissionpolicybindings.admissionregistration.k8s.io',
+                '--output=json',
+            )
+
+            routes = {
+                ('version', '--client=true', '--output=json'): ('version', 'FAKE_KUBECTL_VERSION_JSON'),
+                ('config', 'view', '--minify', '--output=jsonpath={.clusters[0].cluster.server}'): ('endpoint', 'FAKE_API_ENDPOINT'),
+                ('get', '--raw=/readyz'): ('readyz', 'FAKE_API_READYZ'),
+                ('get', 'secrets', '--all-namespaces', '--selector', 'owner=helm', '--output=json'): ('legacy-releases', 'FAKE_LEGACY_RELEASE_JSON'),
+                ('get', 'secrets,configmaps', '--all-namespaces', '--selector', 'owner=helm', '--output=json'): ('releases', 'FAKE_RELEASE_JSON'),
+                ('get', 'customresourcedefinitions.apiextensions.k8s.io,validatingadmissionpolicies.admissionregistration.k8s.io,validatingadmissionpolicybindings.admissionregistration.k8s.io', '--output=json'): ('gateway', 'FAKE_GATEWAY_JSON'),
+                ('--namespace', 'kube-system', 'get', 'daemonset/cilium', '--output=json'): ('cilium-daemonset', 'FAKE_CILIUM_DAEMONSET_JSON'),
+                ('--namespace', 'kube-system', 'get', 'pods', '--selector', 'k8s-app=cilium', '--output=json'): ('cilium-pods', 'FAKE_CILIUM_PODS_JSON'),
+                ('--namespace', 'kube-system', 'get', 'deployment/cilium-operator', '--output=json'): ('operator', 'FAKE_OPERATOR_JSON'),
+                ('--namespace', 'kube-system', 'get', 'pods', '--selector', 'name=cilium-operator', '--output=json'): ('operator-pods', 'FAKE_OPERATOR_PODS_JSON'),
+                ('--namespace', 'kube-system', 'get', 'daemonset/cilium-envoy', '--output=json'): ('envoy-daemonset', 'FAKE_ENVOY_DAEMONSET_JSON'),
+                ('--namespace', 'kube-system', 'get', 'pods', '--selector', 'k8s-app=cilium-envoy', '--output=json'): ('envoy-pods', 'FAKE_ENVOY_PODS_JSON'),
+                ('--namespace', 'kube-system', 'get', 'configmap/cilium-config', '--output=json'): ('cilium-config', 'FAKE_CILIUM_CONFIG_JSON'),
+                ('get', 'nodes', '--output=json'): ('nodes', 'FAKE_NODE_JSON'),
+                ('get', '--raw=/api/v1/nodes/retail-test-workflow/proxy/configz'): ('configz', 'FAKE_CONFIGZ_JSON'),
+                ('get', 'certificatesigningrequests.certificates.k8s.io', '--output=json'): ('csr', 'FAKE_CSR_JSON'),
+            }
+            kube_proxy = {
+                ('--namespace', 'kube-system', 'get', 'daemonset', 'kube-proxy', '--ignore-not-found', '--output=name'): ('kube-proxy-daemonset', 'FAKE_KUBE_PROXY_DAEMONSET'),
+                ('--namespace', 'kube-system', 'get', 'pods', '--selector', 'k8s-app=kube-proxy', '--output=name'): ('kube-proxy-pods', 'FAKE_KUBE_PROXY_PODS'),
+                ('--namespace', 'kube-system', 'get', 'configmap', 'kube-proxy', '--ignore-not-found', '--output=name'): ('kube-proxy-configmap', 'FAKE_KUBE_PROXY_CONFIGMAP'),
+            }
+            key = tuple(command)
+            if (
+                key == unscoped_gateway
+                and os.environ.get('FAKE_REQUIRE_SCOPED_GATEWAY', '0') == '1'
+            ):
+                raise SystemExit(64)
+            if key == tuple(scoped_gateway):
+                if os.environ.get('FAKE_KUBECTL_FAIL', '') == 'gateway':
+                    raise SystemExit(1)
+                sys.stdout.write(os.environ['FAKE_GATEWAY_JSON'])
+                raise SystemExit(0)
+            if key in kube_proxy:
+                route, variable = kube_proxy[key]
+                if os.environ.get('FAKE_KUBECTL_FAIL', '') == route:
+                    raise SystemExit(1)
+                sys.stdout.write(os.environ.get(variable, ''))
+                raise SystemExit(0)
+            diff = (
+                'diff', '--server-side=true',
+                '--field-manager=engineering-platform-bootstrap',
+                '--filename', os.environ['FAKE_GATEWAY_MANIFEST'],
+            )
+            if key == diff:
+                if os.environ.get('FAKE_KUBECTL_FAIL', '') == 'gateway-diff':
+                    raise SystemExit(2)
+                raise SystemExit(int(os.environ.get('FAKE_GATEWAY_DIFF_EXIT', '0')))
+            if key not in routes:
+                raise SystemExit(64)
+            route, variable = routes[key]
+            if os.environ.get('FAKE_KUBECTL_FAIL', '') == route:
+                raise SystemExit(1)
+            sys.stdout.write(os.environ[variable])
+            raise SystemExit(0)
+            ''',
+        )
+        containerd_archive = ContainerdInstallTest.archive_bytes(
+            self,
+            [
+                (
+                    'bin/containerd',
+                    (host / 'usr/local/bin/containerd').read_bytes(),
+                ),
+                ('bin/ctr', (host / 'usr/local/bin/ctr').read_bytes()),
+                (
+                    'bin/containerd-shim-runc-v2',
+                    (host / 'usr/local/bin/containerd-shim-runc-v2').read_bytes(),
+                ),
+            ],
+        )
+        crictl_archive = ContainerdInstallTest.archive_bytes(
+            self,
+            [('crictl', (host / 'usr/local/bin/crictl').read_bytes())],
+        )
+        cilium_chart = b'cilium chart v1.20.0 fixture\n'
+        artifact_specs = (
+            (
+                'containerd', '2.3.1',
+                'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz',
+                containerd_archive, '/usr/local/bin', None,
+            ),
+            (
+                'runc', '1.3.6',
+                'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64',
+                (host / 'usr/local/sbin/runc').read_bytes(),
+                '/usr/local/sbin/runc', None,
+            ),
+            (
+                'crictl', '1.36.0',
+                'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz',
+                crictl_archive, '/usr/local/bin/crictl', None,
+            ),
+            (
+                'helm', '3.21.0',
+                'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz',
+                helm_archive.read_bytes(), '/usr/local/bin/helm',
+                '0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36',
+            ),
+            (
+                'gateway-api', '1.6.1',
+                'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml',
+                gateway_manifest.read_bytes(),
+                'kubernetes://gateway-api/standard',
+                '24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73',
+            ),
+            (
+                'cilium-chart', '1.20.0',
+                'https://helm.cilium.io/cilium-1.20.0.tgz',
+                cilium_chart, 'kubernetes://kube-system/cilium', None,
+            ),
+        )
+        lock_lines = []
+        for name, version, url, content, target, digest_override in artifact_specs:
+            artifact = staging / Path(url).name
+            artifact.write_bytes(content)
+            artifact.chmod(0o600)
+            digest = digest_override or hashlib.sha256(content).hexdigest()
+            lock_lines.append('\t'.join((name, version, url, digest, target)))
+        lock = directory / 'artifacts.lock.tsv'
+        approved_lock = directory / 'approved-artifacts.lock.tsv'
+        lock_content = '\n'.join(lock_lines) + '\n'
+        lock.write_text(lock_content, encoding='utf-8')
+        approved_lock.write_text(lock_content, encoding='utf-8')
+        crictl_backup = directory / 'crictl.backup'
+        crictl_backup.write_bytes((host / 'usr/local/bin/crictl').read_bytes())
+        crictl_backup.chmod(0o600)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'HOME': str(home),
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_LOCK_FILE': str(lock),
+                'BOOTSTRAP_TEST_APPROVED_LOCK_FILE': str(approved_lock),
+                'FAKE_COMMAND_LOG': str(command_log),
+                'FAKE_CANARY': self.canary,
+                'FAKE_CONTAINERD_UNIT': str(
+                    host / 'usr/local/lib/systemd/system/containerd.service'
+                ),
+                'FAKE_CRICTL_BACKUP': str(crictl_backup),
+                'FAKE_RESTORE_CRICTL_TARGET': str(
+                    host / 'usr/local/bin/crictl'
+                ),
+                'FAKE_ADMIN_CONF': str(admin_conf),
+                'FAKE_ADMIN_CONF_CONTENT': self.canary + '\n',
+                'FAKE_ADMIN_VIEW_JSON': json.dumps(self.admin_config_object()),
+                'FAKE_HELM_LIST_JSON': self.helm_list_json(),
+                'FAKE_HELM_VALUES_JSON': json.dumps(
+                    self.desired_values_object
+                ),
+                'FAKE_GATEWAY_MANIFEST': str(gateway_manifest),
+                'FAKE_CNI_MANIFEST': str(cni_manifest),
+                'FAKE_CNI_ROOT': str(host / 'opt/cni/bin'),
+                'FAKE_CRI_JSON': self.cri_json(),
+                'FAKE_KUBECTL_VERSION_JSON': json.dumps(
+                    {
+                        'clientVersion': {
+                            'major': '1',
+                            'minor': '36',
+                            'gitVersion': 'v1.36.3',
+                            'gitCommit': 'fixture-commit',
+                            'gitTreeState': 'clean',
+                            'buildDate': '2026-08-10T00:00:00Z',
+                            'goVersion': 'go1.25.0',
+                            'compiler': 'gc',
+                            'platform': 'linux/amd64',
+                        },
+                        'kustomizeVersion': 'v5.7.1',
+                    }
+                ),
+                'FAKE_API_ENDPOINT': 'https://10.93.1.27:6443',
+                'FAKE_API_READYZ': 'ok\n',
+                'FAKE_LEGACY_RELEASE_JSON': json.dumps(
+                    {
+                        'apiVersion': 'v1',
+                        'kind': 'List',
+                        'items': [
+                            {
+                                'apiVersion': 'v1',
+                                'kind': 'Secret',
+                                'metadata': {
+                                    'name': 'sh.helm.release.v1.cilium.v1',
+                                    'namespace': 'kube-system',
+                                    'labels': {
+                                        'owner': 'helm',
+                                        'name': 'cilium',
+                                        'status': 'deployed',
+                                        'version': '1',
+                                    },
+                                },
+                                'type': 'helm.sh/release.v1',
+                            }
+                        ],
+                    }
+                ),
+                'FAKE_RELEASE_JSON': self.release_json(),
+                'FAKE_GATEWAY_JSON': self.gateway_bundle_json(),
+                'FAKE_CILIUM_DAEMONSET_JSON': self.cilium_daemonset_json(),
+                'FAKE_CILIUM_PODS_JSON': self.pod_list_json('cilium-fixture'),
+                'FAKE_OPERATOR_JSON': self.operator_json(),
+                'FAKE_OPERATOR_PODS_JSON': self.pod_list_json('cilium-operator-fixture'),
+                'FAKE_ENVOY_DAEMONSET_JSON': self.envoy_daemonset_json(),
+                'FAKE_ENVOY_PODS_JSON': self.envoy_pods_json(),
+                'FAKE_CILIUM_CONFIG_JSON': self.cilium_config_json(),
+                'FAKE_NODE_JSON': self.node_json(),
+                'FAKE_CONFIGZ_JSON': json.dumps(
+                    {
+                        'kubeletconfig': {
+                            'failSwapOn': False,
+                            'memorySwap': {'swapBehavior': 'NoSwap'},
+                        }
+                    }
+                ),
+                'FAKE_CSR_JSON': self.csr_json(),
+            }
+        )
+        for variable in (
+            'APT_CONFIG', 'KUBECONFIG', 'GNUPGHOME', 'HELM_NAMESPACE',
+            'HELM_DRIVER', 'HELM_KUBECONTEXT', 'HELM_CONFIG_HOME',
+            'HELM_CACHE_HOME', 'HELM_DATA_HOME', 'DPKG_ADMINDIR',
+            'DPKG_ROOT', 'DPKG_FORCE', 'DPKG_FRONTEND_LOCKED',
+            'CONTAINER_RUNTIME_ENDPOINT', 'IMAGE_SERVICE_ENDPOINT',
+            'KUBECACHEDIR', 'KUBECTL_EXTERNAL_DIFF', 'KUBECTL_KUBERC',
+            'KUBECTL_UNAPPROVED', 'TAR_OPTIONS', 'BASH_ENV', 'ENV',
+            'OPENSSL_CONF', 'OPENSSL_MODULES', 'PYTHONPATH', 'PYTHONHOME',
+            'PYTHONPYCACHEPREFIX', 'PYTHONDONTWRITEBYTECODE',
+        ):
+            environment.pop(variable, None)
+        return environment, host, command_log
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str = '--check'
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            ['/bin/bash', '-p', str(FINAL_VERIFY), mode], env=environment
+        )
+
+    def assert_stops_without_evidence(
+        self, result: subprocess.CompletedProcess[str], host: Path
+    ) -> None:
+        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+        self.assertNotIn('PASS_BOOTSTRAP_VERIFIED', result.stdout)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('14-verify-*.txt')),
+            [],
+        )
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_check_succeeds_read_only_with_allowlisted_evidence(self) -> None:
+        environment, host, command_log = self.make_environment()
+        environment['FAKE_SIMULATE_CLIENT_CACHE'] = '1'
+        home = Path(environment['HOME'])
+        (home / '.kube').mkdir(mode=0o700)
+        (home / '.kube/kuberc').write_text(
+            'defaults:\n- command: get\n  options:\n'
+            '    server: https://127.0.0.1:2\n'
+            '    selector: hidden=true\n',
+            encoding='utf-8',
+        )
+        environment['FAKE_HOSTILE_KUBERC_MODE'] = 'query'
+        evidence_dir = host / 'root/dev-infra-evidence'
+        before_host = self.tree_snapshot(host)
+        before_home = self.tree_snapshot(home)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
+        self.assertIn('NEXT=NONE', result.stdout)
+        self.assertIn('CSR_COUNT=1', result.stdout)
+        self.assertIn('CSR_NAME=csr-serving-fixture', result.stdout)
+        self.assertIn(
+            'CSR_SAN=DNS:retail-test-workflow,IP:10.93.1.27', result.stdout
+        )
+        evidence = list((host / 'root/dev-infra-evidence').glob('14-verify-*.txt'))
+        self.assertEqual(len(evidence), 1)
+        evidence_stat = evidence[0].lstat()
+        self.assertTrue(evidence[0].is_file())
+        self.assertFalse(evidence[0].is_symlink())
+        self.assertEqual(evidence_stat.st_mode & 0o7777, 0o600)
+        self.assertEqual(evidence_stat.st_uid, os.geteuid())
+        self.assertEqual(evidence_stat.st_gid, os.getegid())
+        all_output = result.stdout + result.stderr + evidence[0].read_text(
+            encoding='utf-8'
+        )
+        for forbidden in (
+            self.canary, 'SECRET_CERTIFICATE_CANARY',
+            'SECRET_CONDITION_CANARY', 'ZmFrZS1jc3ItcmVxdWVzdA==',
+            'client-certificate-data', 'kubeconfig', 'private key',
+        ):
+            self.assertNotIn(forbidden, all_output)
+        commands = command_log.read_text(encoding='utf-8')
+        command_lines = commands.splitlines()
+        self.assertIn(
+            f'crictl --runtime-endpoint {self.endpoint} '
+            f'--image-endpoint {self.endpoint} info --output json', commands
+        )
+        self.assertIn(
+            'systemctl show --all --property=LoadState '
+            '--property=FragmentPath --property=DropInPaths '
+            'containerd.service',
+            commands,
+        )
+        self.assertIn('ctr plugins ls', commands)
+        self.assertTrue(any(
+            line.startswith('kubectl --kubeconfig /dev/fd/') and
+            ' --cache-dir=/dev/null diff --server-side=true '
+            '--field-manager=engineering-platform-bootstrap ' in line
+            for line in command_lines
+        ))
+        self.assertTrue(any(
+            line.startswith('helm --kubeconfig /dev/fd/') and
+            line.endswith(' list --all-namespaces --all --output json')
+            for line in command_lines
+        ))
+        for forbidden in (' apply ', ' install ', ' patch ', ' delete '):
+            self.assertNotIn(forbidden, commands)
+        after_host = self.tree_snapshot(host)
+        expected_host = dict(before_host)
+        evidence_relative = str(evidence[0].relative_to(host))
+        expected_host[evidence_relative] = after_host[evidence_relative]
+        self.assertEqual(after_host, expected_host)
+        self.assertEqual(self.tree_snapshot(home), before_home)
+
+    def test_requires_exact_post_init_containerd_gate_transcript(self) -> None:
+        for case in ('service-inactive', 'binary-drift', 'pass-check'):
+            with self.subTest(case=case):
+                environment, host, command_log = self.make_environment()
+                if case == 'service-inactive':
+                    environment['FAKE_CONTAINERD_SERVICE_ACTIVE'] = '0'
+                elif case == 'binary-drift':
+                    target = host / 'usr/local/bin/containerd'
+                    target.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+                    target.chmod(0o755)
+                elif case == 'pass-check':
+                    for logical in (
+                        'usr/local/bin/containerd',
+                        'usr/local/bin/ctr',
+                        'usr/local/bin/containerd-shim-runc-v2',
+                        'usr/local/sbin/runc',
+                        'usr/local/bin/crictl',
+                        'etc/containerd/config.toml',
+                        'usr/local/lib/systemd/system/containerd.service',
+                        'run/containerd/containerd.sock',
+                    ):
+                        (host / logical).unlink()
+                    environment.update(
+                        {
+                            'FAKE_CONTAINERD_UNIT_STATE': 'missing',
+                            'FAKE_CONTAINERD_SERVICE_ENABLED': '0',
+                            'FAKE_CONTAINERD_SERVICE_ACTIVE': '0',
+                            'FAKE_RESTORE_CRICTL_SOURCE': environment[
+                                'FAKE_CRICTL_BACKUP'
+                            ],
+                        }
+                    )
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+                if command_log.exists():
+                    commands = command_log.read_text(encoding='utf-8')
+                    self.assertNotIn('kubectl ', commands)
+                    if case != 'binary-drift':
+                        self.assertIn('systemctl ', commands)
+
+    def test_queries_exact_deployed_helm_user_values(self) -> None:
+        environment, host, command_log = self.make_environment()
+
+        exact_result = self.run_stage(environment)
+
+        self.assertEqual(exact_result.returncode, 0, exact_result.stderr)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(
+            ' get values cilium --namespace kube-system --revision 1 '
+            '--output json\n',
+            commands,
+        )
+        self.assertNotIn(' get values cilium --all', commands)
+
+    def test_rejects_deployed_helm_user_values_drift(self) -> None:
+        for case in (
+            'missing', 'extra', 'wrong-type', 'wrong-value', 'duplicate-key',
+            'nan', 'malformed', 'empty', 'query-failure',
+        ):
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                payload = json.loads(json.dumps(self.desired_values_object))
+                if case == 'missing':
+                    del payload['operator']['image']['genericDigest']
+                elif case == 'extra':
+                    payload['unapproved'] = self.canary
+                elif case == 'wrong-type':
+                    payload['k8sServicePort'] = '6443'
+                elif case == 'wrong-value':
+                    payload['k8sServiceHost'] = '10.93.1.28'
+                raw = json.dumps(payload)
+                if case == 'duplicate-key':
+                    raw = raw.replace(
+                        '"kubeProxyReplacement": true',
+                        '"kubeProxyReplacement": true, '
+                        '"kubeProxyReplacement": true',
+                        1,
+                    )
+                elif case == 'nan':
+                    raw = raw.replace('"k8sServicePort": 6443', '"k8sServicePort": NaN')
+                elif case == 'malformed':
+                    raw = '{'
+                elif case == 'empty':
+                    raw = ''
+                elif case == 'query-failure':
+                    environment['FAKE_HELM_VALUES_FAIL'] = '1'
+                environment['FAKE_HELM_VALUES_JSON'] = raw
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+                self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_rejects_unpinned_cilium_controller_and_pod_images(self) -> None:
+        cases = (
+            ('FAKE_CILIUM_DAEMONSET_JSON', None),
+            ('FAKE_CILIUM_PODS_JSON', 0),
+            ('FAKE_OPERATOR_JSON', None),
+            ('FAKE_OPERATOR_PODS_JSON', 0),
+        )
+        for variable, list_index in cases:
+            with self.subTest(variable=variable):
+                environment, host, _ = self.make_environment()
+                payload = json.loads(environment[variable])
+                item = (
+                    payload['items'][list_index]
+                    if list_index is not None
+                    else payload
+                )
+                containers = (
+                    item['spec']['containers']
+                    if list_index is not None
+                    else item['spec']['template']['spec']['containers']
+                )
+                containers[0]['image'] = (
+                    'quay.io/cilium/cilium:v1.20.0'
+                    if 'CILIUM' in variable
+                    else 'quay.io/cilium/operator-generic:v1.20.0'
+                )
+                environment[variable] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+
+    def test_requires_exact_envoy_dataplane_and_cilium_config(self) -> None:
+        cases = (
+            ('envoy-daemonset-label', 'FAKE_ENVOY_DAEMONSET_JSON'),
+            ('envoy-daemonset-image', 'FAKE_ENVOY_DAEMONSET_JSON'),
+            ('envoy-daemonset-not-ready', 'FAKE_ENVOY_DAEMONSET_JSON'),
+            ('envoy-pod-label', 'FAKE_ENVOY_PODS_JSON'),
+            ('envoy-pod-image', 'FAKE_ENVOY_PODS_JSON'),
+            ('envoy-pod-not-ready', 'FAKE_ENVOY_PODS_JSON'),
+            ('cilium-config-missing', 'FAKE_CILIUM_CONFIG_JSON'),
+            ('cilium-config-drift', 'FAKE_CILIUM_CONFIG_JSON'),
+            ('query-failure', ''),
+        )
+        for case, variable in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'query-failure':
+                    environment['FAKE_KUBECTL_FAIL'] = 'envoy-daemonset'
+                else:
+                    payload = json.loads(environment[variable])
+                    item = (
+                        payload['items'][0]
+                        if variable == 'FAKE_ENVOY_PODS_JSON'
+                        else payload
+                    )
+                    if case.endswith('-label'):
+                        item['metadata']['labels']['helm.sh/chart'] = 'drift'
+                    elif case.endswith('-image'):
+                        containers = (
+                            item['spec']['containers']
+                            if variable == 'FAKE_ENVOY_PODS_JSON'
+                            else item['spec']['template']['spec']['containers']
+                        )
+                        containers[0]['image'] = 'quay.io/cilium/cilium-envoy:mutable'
+                    elif case == 'envoy-daemonset-not-ready':
+                        item['status']['numberReady'] = 0
+                    elif case == 'envoy-pod-not-ready':
+                        item['status']['conditions'][0]['status'] = 'False'
+                    elif case == 'cilium-config-missing':
+                        del payload['data']['enable-gateway-api']
+                    elif case == 'cilium-config-drift':
+                        payload['data']['cgroup-root'] = '/unapproved'
+                    environment[variable] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+
+    def test_rejects_apply_invalid_mode_and_environment_before_lookup(self) -> None:
+        for mode in ('--apply', '--force'):
+            with self.subTest(mode=mode):
+                environment, host, command_log = self.make_environment()
+                result = self.run_stage(environment, mode)
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertFalse(command_log.exists())
+                self.assertEqual(
+                    list((host / 'root/dev-infra-evidence').glob('14-verify-*.txt')),
+                    [],
+                )
+        for variable in (
+            'KUBECONFIG', 'APT_CONFIG', 'HELM_NAMESPACE', 'DPKG_ADMINDIR',
+            'CONTAINER_RUNTIME_ENDPOINT', 'KUBECACHEDIR',
+            'KUBECTL_EXTERNAL_DIFF', 'KUBECTL_KUBERC',
+            'KUBECTL_UNAPPROVED', 'HELM_KUBEAPISERVER', 'TAR_OPTIONS',
+            'BASH_ENV', 'ENV', 'OPENSSL_CONF', 'OPENSSL_MODULES',
+            'PYTHONPATH', 'PYTHONHOME', 'PYTHONPYCACHEPREFIX',
+            'PYTHONDONTWRITEBYTECODE',
+        ):
+            for value in ('', '/tmp/unapproved'):
+                with self.subTest(variable=variable, value=value):
+                    environment, host, command_log = self.make_environment()
+                    environment[variable] = value
+                    result = self.run_stage(environment)
+                    self.assertEqual(result.returncode, 10, result.stderr)
+                    self.assertFalse(command_log.exists())
+                    self.assertEqual(
+                        list(
+                            (host / 'root/dev-infra-evidence').glob(
+                                '14-verify-*.txt'
+                            )
+                        ),
+                        [],
+                    )
+
+    def test_uses_isolated_python_from_hostile_working_directory(self) -> None:
+        environment, _, _ = self.make_environment()
+        hostile = self.temporary_directory() / 'hostile-cwd'
+        hostile.mkdir()
+        import_marker = hostile / 'python-imported'
+        (hostile / 'json.py').write_text(
+            'from pathlib import Path\n'
+            f'Path({str(import_marker)!r}).write_text("executed\\n")\n'
+            'raise RuntimeError("hostile json module")\n',
+            encoding='utf-8',
+        )
+
+        result = subprocess.run(
+            ['/bin/bash', '-p', str(FINAL_VERIFY), '--check'],
+            cwd=hostile,
+            env=environment,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(import_marker.exists())
+
+    def test_uses_fixed_tar_outside_path(self) -> None:
+        environment, _, _ = self.make_environment()
+        tar_marker = self.temporary_directory() / 'tar-executed'
+        fake_bin = Path(environment['PATH'].split(':', 1)[0])
+        self.write_executable(
+            fake_bin / 'tar',
+            '#!/bin/sh\n'
+            'case "$*" in\n'
+            f'  *helm-v3.21.0*) printf executed >{tar_marker}; exit 99 ;;\n'
+            '  *) exec /usr/bin/tar "$@" ;;\n'
+            'esac\n',
+        )
+
+        result = subprocess.run(
+            ['/bin/bash', '-p', str(FINAL_VERIFY), '--check'],
+            env=environment,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(tar_marker.exists())
+
+    def test_uses_fixed_openssl_outside_path(self) -> None:
+        environment, host, _ = self.make_environment()
+        fake_bin = Path(environment['PATH'].split(':', 1)[0])
+        approved_openssl = host / 'usr/bin/openssl'
+        approved_openssl.write_bytes((fake_bin / 'openssl').read_bytes())
+        approved_openssl.chmod(0o755)
+        marker = self.temporary_directory() / 'path-openssl-executed'
+        self.write_executable(
+            fake_bin / 'openssl',
+            f'#!/bin/sh\nprintf executed >{marker}\nexit 99\n',
+        )
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_rejects_unsafe_admin_config_or_source_race(self) -> None:
+        for case in (
+            'exec', 'auth-provider', 'proxy-url', 'insecure-tls',
+            'extra-cluster', 'wrong-context', 'query-failure', 'source-race',
+        ):
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                payload = self.admin_config_object()
+                cluster = payload['clusters'][0]['cluster']
+                user = payload['users'][0]['user']
+                if case == 'exec':
+                    user['exec'] = {'command': self.canary}
+                elif case == 'auth-provider':
+                    user['auth-provider'] = {'name': self.canary}
+                elif case == 'proxy-url':
+                    cluster['proxy-url'] = 'https://127.0.0.1:1'
+                elif case == 'insecure-tls':
+                    cluster['insecure-skip-tls-verify'] = True
+                elif case == 'extra-cluster':
+                    payload['clusters'].append(payload['clusters'][0].copy())
+                elif case == 'wrong-context':
+                    payload['current-context'] = 'unapproved'
+                elif case == 'query-failure':
+                    environment['FAKE_ADMIN_VIEW_FAIL'] = '1'
+                else:
+                    environment['FAKE_ADMIN_SOURCE_RACE'] = '1'
+                environment['FAKE_ADMIN_VIEW_JSON'] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+
+    def test_all_cluster_clients_use_validated_in_memory_admin_config(self) -> None:
+        environment, host, command_log = self.make_environment()
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        self.assertTrue(any(
+            'config view --raw --merge=false --output=json' in line
+            for line in commands
+        ))
+        cluster_clients = [
+            line for line in commands
+            if line.startswith('kubectl ') or (
+                line.startswith('helm ') and ' version --short' not in line
+            )
+        ]
+        self.assertTrue(cluster_clients)
+        for line in cluster_clients:
+            self.assertIn(' --kubeconfig /dev/fd/', line)
+            self.assertNotIn(str(host / 'etc/kubernetes/admin.conf'), line)
+
+    def test_containerd_gate_uses_privileged_child_bash(self) -> None:
+        script = FINAL_VERIFY.read_text(encoding='utf-8')
+
+        self.assertIn(
+            "BASH_ENV='' ENV='' PYTHONDONTWRITEBYTECODE=1 "
+            "\\\n      /bin/bash -p "
+            '"${script_dir}/30-install-containerd.sh"',
+            script,
+        )
+
+    def test_rejects_package_hold_binary_or_cni_drift(self) -> None:
+        for package in ('kubeadm', 'kubectl', 'kubelet', 'kubernetes-cni'):
+            with self.subTest(package=package):
+                environment, host, _ = self.make_environment()
+                environment['FAKE_PACKAGE_DRIFT'] = package
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+        cases = ('extra-hold', 'verify', 'binary-mode', 'binary-owner', 'cni-extra', 'cni-digest')
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'extra-hold':
+                    environment['FAKE_EXTRA_HOLD'] = '1'
+                elif case == 'verify':
+                    environment['FAKE_VERIFY_DRIFT'] = 'kubectl'
+                elif case == 'binary-mode':
+                    (host / 'usr/bin/kubeadm').chmod(0o775)
+                elif case == 'binary-owner':
+                    environment['FAKE_OWNER_DRIFT'] = '/usr/bin/kubelet'
+                elif case == 'cni-extra':
+                    (host / 'opt/cni/bin/unapproved').write_text(
+                        'unapproved\n', encoding='utf-8'
+                    )
+                else:
+                    environment['FAKE_CNI_DIGEST_DRIFT'] = 'bridge'
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+
+    def test_rejects_cri_version_or_api_endpoint_health_drift(self) -> None:
+        cases = (
+            'cri', 'network', 'kubeadm-version', 'kubectl-version',
+            'kubelet-version', 'endpoint', 'readyz',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'cri':
+                    environment['FAKE_CRI_JSON'] = self.cri_json(ready=False)
+                elif case == 'network':
+                    environment['FAKE_CRI_JSON'] = self.cri_json(
+                        network_ready=False
+                    )
+                elif case == 'kubeadm-version':
+                    environment['FAKE_KUBEADM_VERSION'] = 'v1.35.0'
+                elif case == 'kubectl-version':
+                    environment['FAKE_KUBECTL_VERSION_JSON'] = json.dumps(
+                        {'clientVersion': {'gitVersion': 'v1.35.0'}}
+                    )
+                elif case == 'kubelet-version':
+                    environment['FAKE_KUBELET_VERSION'] = 'Kubernetes v1.35.0'
+                elif case == 'endpoint':
+                    environment['FAKE_API_ENDPOINT'] = 'https://127.0.0.1:6443'
+                else:
+                    environment['FAKE_API_READYZ'] = 'not-ready\n'
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+
+    def test_rejects_helm_provenance_list_or_storage_drift(self) -> None:
+        cases = (
+            'binary', 'shadow', 'archive-digest', 'version', 'list-failure',
+            'chart', 'app-version', 'revision-type', 'updated-empty',
+            'extra-release', 'storage-missing-modified-at',
+            'storage-created-at-only', 'storage-modified-at',
+            'storage-release-data',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, command_log = self.make_environment()
+                if case == 'binary':
+                    (host / 'usr/local/bin/helm').write_text(
+                        '#!/bin/sh\nexit 0\n', encoding='utf-8'
+                    )
+                elif case == 'shadow':
+                    self.write_executable(
+                        host / 'usr/bin/helm', '#!/bin/sh\nexit 0\n'
+                    )
+                elif case == 'archive-digest':
+                    environment['FAKE_HELM_ARCHIVE_DIGEST_DRIFT'] = '1'
+                elif case == 'version':
+                    environment['FAKE_HELM_VERSION'] = 'v3.20.0+gfixture'
+                elif case == 'list-failure':
+                    environment['FAKE_HELM_LIST_FAIL'] = '1'
+                elif case == 'chart':
+                    environment['FAKE_HELM_LIST_JSON'] = self.helm_list_json(
+                        chart='cilium-1.19.0'
+                    )
+                elif case == 'app-version':
+                    environment['FAKE_HELM_LIST_JSON'] = self.helm_list_json(
+                        app_version='1.19.0'
+                    )
+                elif case == 'revision-type':
+                    environment['FAKE_HELM_LIST_JSON'] = self.helm_list_json(
+                        revision=1
+                    )
+                elif case == 'updated-empty':
+                    environment['FAKE_HELM_LIST_JSON'] = self.helm_list_json(
+                        updated=''
+                    )
+                elif case == 'extra-release':
+                    payload = json.loads(self.helm_list_json())
+                    payload.append(dict(payload[0], name='unknown'))
+                    environment['FAKE_HELM_LIST_JSON'] = json.dumps(payload)
+                else:
+                    payload = json.loads(environment['FAKE_RELEASE_JSON'])
+                    item = payload['items'][0]
+                    if case == 'storage-missing-modified-at':
+                        item['metadata']['labels'].pop('modifiedAt')
+                    elif case == 'storage-created-at-only':
+                        item['metadata']['labels'].pop('modifiedAt')
+                        item['metadata']['labels']['createdAt'] = '1786320000'
+                    elif case == 'storage-modified-at':
+                        item['metadata']['labels']['modifiedAt'] = 'invalid'
+                    else:
+                        item['data']['release'] = ''
+                    environment['FAKE_RELEASE_JSON'] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+                if command_log.exists():
+                    self.assertNotIn(
+                        self.canary,
+                        command_log.read_text(encoding='utf-8'),
+                    )
+
+    def test_rejects_every_kube_proxy_object_or_query_failure(self) -> None:
+        cases = (
+            ('FAKE_KUBE_PROXY_DAEMONSET', 'daemonset.apps/kube-proxy\n'),
+            ('FAKE_KUBE_PROXY_PODS', 'pod/kube-proxy-fixture\n'),
+            ('FAKE_KUBE_PROXY_CONFIGMAP', 'configmap/kube-proxy\n'),
+        )
+        for variable, value in cases:
+            with self.subTest(variable=variable):
+                environment, host, _ = self.make_environment()
+                environment[variable] = value
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+        for route in (
+            'kube-proxy-daemonset', 'kube-proxy-pods',
+            'kube-proxy-configmap',
+        ):
+            with self.subTest(route=route):
+                environment, host, _ = self.make_environment()
+                environment['FAKE_KUBECTL_FAIL'] = route
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+
+    def test_rejects_unhealthy_cilium_operator_or_unknown_release(self) -> None:
+        cases = ('daemonset', 'cilium-pods', 'operator', 'operator-pods', 'release')
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'daemonset':
+                    environment['FAKE_CILIUM_DAEMONSET_JSON'] = (
+                        self.cilium_daemonset_json(ready=False)
+                    )
+                elif case == 'cilium-pods':
+                    environment['FAKE_CILIUM_PODS_JSON'] = self.pod_list_json(
+                        'cilium-fixture', ready=False
+                    )
+                elif case == 'operator':
+                    environment['FAKE_OPERATOR_JSON'] = self.operator_json(
+                        ready=False
+                    )
+                elif case == 'operator-pods':
+                    environment['FAKE_OPERATOR_PODS_JSON'] = self.pod_list_json(
+                        'cilium-operator-fixture', ready=False
+                    )
+                else:
+                    payload = json.loads(environment['FAKE_RELEASE_JSON'])
+                    payload['items'][0]['metadata']['labels']['name'] = 'unknown'
+                    environment['FAKE_RELEASE_JSON'] = json.dumps(payload)
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+
+    def test_rejects_official_cilium_object_and_pod_identity_drift(self) -> None:
+        cases = (
+            ('FAKE_CILIUM_DAEMONSET_JSON', None, 'app.kubernetes.io/name'),
+            ('FAKE_CILIUM_PODS_JSON', 0, 'app.kubernetes.io/name'),
+            ('FAKE_OPERATOR_JSON', None, 'io.cilium/app'),
+            ('FAKE_OPERATOR_PODS_JSON', 0, 'app.kubernetes.io/part-of'),
+        )
+        for variable, list_index, key in cases:
+            with self.subTest(variable=variable, key=key):
+                environment, host, _ = self.make_environment()
+                for payload_variable in (
+                    'FAKE_CILIUM_DAEMONSET_JSON', 'FAKE_CILIUM_PODS_JSON',
+                    'FAKE_OPERATOR_JSON', 'FAKE_OPERATOR_PODS_JSON',
+                ):
+                    payload = json.loads(environment[payload_variable])
+                    items = payload.get('items')
+                    item = items[0] if isinstance(items, list) else payload
+                    item['metadata']['labels'][
+                        'app.kubernetes.io/version'
+                    ] = '1.20.0'
+                    environment[payload_variable] = json.dumps(payload)
+                payload = json.loads(environment[variable])
+                item = (
+                    payload['items'][list_index]
+                    if list_index is not None
+                    else payload
+                )
+                item['metadata']['labels'][key] = 'drift'
+                environment[variable] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+
+    def test_rejects_gateway_bundle_or_server_side_diff_drift(self) -> None:
+        for case in ('partial', 'annotation', 'annotation-extra', 'diff', 'query'):
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'partial':
+                    environment['FAKE_GATEWAY_JSON'] = self.gateway_bundle_json(
+                        partial=True
+                    )
+                elif case == 'annotation':
+                    payload = json.loads(environment['FAKE_GATEWAY_JSON'])
+                    payload['items'][0]['metadata']['annotations'][
+                        'gateway.networking.k8s.io/bundle-version'
+                    ] = 'v1.5.0'
+                    environment['FAKE_GATEWAY_JSON'] = json.dumps(payload)
+                elif case == 'annotation-extra':
+                    payload = json.loads(environment['FAKE_GATEWAY_JSON'])
+                    payload['items'][0]['metadata']['annotations'][
+                        'unapproved.example.invalid/annotation'
+                    ] = 'value'
+                    environment['FAKE_GATEWAY_JSON'] = json.dumps(payload)
+                elif case == 'diff':
+                    environment['FAKE_GATEWAY_DIFF_EXIT'] = '1'
+                else:
+                    environment['FAKE_KUBECTL_FAIL'] = 'gateway-diff'
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+
+    def test_gateway_query_is_scoped_to_pinned_objects(self) -> None:
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_REQUIRE_SCOPED_GATEWAY'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(
+            'customresourcedefinition.apiextensions.k8s.io/'
+            'backendtlspolicies.gateway.networking.k8s.io',
+            commands,
+        )
+        self.assertNotIn(
+            'customresourcedefinitions.apiextensions.k8s.io,',
+            commands,
+        )
+
+    def test_rejects_node_swap_or_kubelet_configz_drift(self) -> None:
+        for case in (
+            'node-not-ready', 'node-ip', 'swap-off', 'swap-extra',
+            'swap-size', 'fail-swap-on', 'limited-swap',
+        ):
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'node-not-ready':
+                    environment['FAKE_NODE_JSON'] = self.node_json(ready=False)
+                elif case == 'node-ip':
+                    environment['FAKE_NODE_JSON'] = self.node_json(ip='10.93.1.99')
+                elif case == 'swap-off':
+                    environment['FAKE_SWAP_OUTPUT'] = ''
+                elif case == 'swap-extra':
+                    environment['FAKE_SWAP_OUTPUT'] = (
+                        '/swap.img 4200000000\n/dev/other 1000000'
+                    )
+                elif case == 'swap-size':
+                    environment['FAKE_SWAP_OUTPUT'] = '/swap.img 3999999999'
+                elif case == 'fail-swap-on':
+                    environment['FAKE_CONFIGZ_JSON'] = json.dumps(
+                        {
+                            'kubeletconfig': {
+                                'failSwapOn': True,
+                                'memorySwap': {'swapBehavior': 'NoSwap'},
+                            }
+                        }
+                    )
+                else:
+                    environment['FAKE_CONFIGZ_JSON'] = json.dumps(
+                        {
+                            'kubeletconfig': {
+                                'failSwapOn': False,
+                                'memorySwap': {'swapBehavior': 'LimitedSwap'},
+                            }
+                        }
+                    )
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+
+    def test_csr_summary_is_strict_and_never_leaks_request_or_certificate(self) -> None:
+        for case in ('requester', 'usages', 'san', 'malformed'):
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                if case == 'requester':
+                    environment['FAKE_CSR_JSON'] = self.csr_json(
+                        username='system:node:other'
+                    )
+                elif case == 'usages':
+                    environment['FAKE_CSR_JSON'] = self.csr_json(
+                        usages=['server auth']
+                    )
+                elif case == 'san':
+                    environment['FAKE_CSR_SAN'] = (
+                        'DNS:retail-test-workflow, IP Address:10.93.1.99'
+                    )
+                else:
+                    environment['FAKE_CSR_JSON'] = '{not-json'
+                result = self.run_stage(environment)
+                self.assert_stops_without_evidence(result, host)
+                self.assertNotIn(
+                    'ZmFrZS1jc3ItcmVxdWVzdA==', result.stdout + result.stderr
+                )
+                self.assertNotIn(
+                    'SECRET_CERTIFICATE_CANARY', result.stdout + result.stderr
+                )
+
+        environment, _, _ = self.make_environment()
+        environment['FAKE_CSR_JSON'] = json.dumps(
+            {
+                'apiVersion': 'certificates.k8s.io/v1',
+                'kind': 'CertificateSigningRequestList',
+                'items': [],
+            }
+        )
+        result = self.run_stage(environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('CSR_COUNT=0', result.stdout)
+
+    def test_script_has_no_mutation_or_prior_package_stage_escape_hatches(self) -> None:
+        self.assertTrue(FINAL_VERIFY.exists(), '90-verify.sh entry is missing')
+        script = FINAL_VERIFY.read_text(encoding='utf-8')
+        for forbidden in (
+            '40-install-kubernetes.sh', 'kubectl apply', 'kubectl patch',
+            'kubectl delete', 'helm install', 'kubeadm reset', 'set -x',
+            '--raw=true',
+        ):
+            self.assertNotIn(forbidden, script)
 
 
 if __name__ == '__main__':

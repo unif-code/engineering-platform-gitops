@@ -13,8 +13,15 @@ gatewayAPI:
 hubble:
   enabled: false
 
+image:
+  digest: sha256:383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93
+  useDigest: true
+
 ipam:
   mode: kubernetes
 
 operator:
+  image:
+    genericDigest: sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3
+    useDigest: true
   replicas: 1
