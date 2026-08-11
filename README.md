@@ -33,8 +33,15 @@ DEV-002 使用完整功能的单用户 Kubernetes Profile：83Gi 稳态 PVC、10
 
 ## 本地校验
 
+本地需要 `kubectl`、Python 3 + `PyYAML==6.0.3` 与 `shellcheck`。统一入口只运行
+unittest、GitOps manifest 合同校验和 Bash 静态检查，不会调用任何 bootstrap
+`--apply`：
+
 ```bash
 ./scripts/validate.sh
 ```
+
+服务器 bootstrap 必须按 `runbook/01-bootstrap.md` 的 07～14 阶段执行；每次只先执行
+该阶段的 `--check`，提交完整回执并获得明确批准后，才能执行对应的 `--apply`。
 
 运行态证据只有在对应 `runbook/` 已回填真实命令输出、PCS digest 与验收结果后才成立；清单可渲染不等于环境已部署。

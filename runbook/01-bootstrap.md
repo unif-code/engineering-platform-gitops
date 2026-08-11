@@ -9,6 +9,27 @@
 服务器标识：`retail-test-workflow`
 GitOps commit / PR：  
 
+## 第一版分阶段执行合同
+
+本节是服务器 bootstrap 的唯一执行顺序。每轮只执行一条【运维】命令，并回填完整
+命令、stdout/stderr、退出码、`RESULT`、`REASON`、`NEXT`、证据路径与 SHA-256；
+agent 审核回执前不得执行下一条。不得把 Secret、Token、私钥或 kubeconfig 回填到仓库。
+
+| 阶段 | 入口 | 首次模式 | 通过结果 | 运行证据 |
+| --- | --- | --- | --- | --- |
+| 07 | `00-preflight.sh` | 仅 `--check` | `PASS_PREFLIGHT` | `/root/dev-infra-evidence/07-preflight-*.txt` |
+| 08 | `10-stage-artifacts.sh` | `--check` 后批准 `--apply` | `PASS_ARTIFACTS_STAGED` 或 `ALREADY_COMPLIANT` | 终端回执及 `/root/dev-infra-artifacts/pcs-2026-08-10.1` 摘要清单 |
+| 09 | `20-prepare-kernel.sh` | `--check` 后批准 `--apply` | `PASS_KERNEL_PREPARED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/09-prepare-kernel-*.txt` |
+| 10 | `30-install-containerd.sh` | `--check` 后批准 `--apply` | `PASS_CONTAINERD_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/10-containerd-*.txt` |
+| 11 | `40-install-kubernetes.sh` | `--check` 后批准 `--apply` | `PASS_KUBERNETES_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/11-kubernetes-*.txt` |
+| 12 | `50-kubeadm-init.sh` | `--check` 后批准 `--apply` | `PASS_KUBEADM_INITIALIZED` | `/root/dev-infra-evidence/12-kubeadm-*.txt` |
+| 13 | `60-install-cilium.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/13-cilium-*.txt` |
+| 14 | `90-verify.sh` | 仅 `--check` | `PASS_BOOTSTRAP_VERIFIED` | `/root/dev-infra-evidence/14-verify-*.txt` |
+
+固定退出码：`0` 表示当前阶段按输出判定完成或需要获批 APPLY；`10` 为前置条件失败，
+`20` 为供应链不匹配，`30` 为未知/漂移状态，`40` 为 APPLY 失败，`50` 为部署后
+验证失败。任何非零退出码都必须停止。
+
 ## 旧 Docker/containerd 审计与清退决定
 
 | 证据 | 回执 |

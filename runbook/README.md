@@ -6,6 +6,12 @@
 
 所有标记为【运维】的命令只能由获准人员在目标服务器执行。执行前记录 Git commit，执行后保留 UTC 时间、完整命令、关键 stdout/stderr、退出码与判定；Secret 值、Token、私钥、kubeconfig 不得写入本目录。
 
+bootstrap 使用固定的 07～14 顺序：`07 preflight`、`08 artifact staging`、
+`09 kernel`、`10 containerd`、`11 Kubernetes packages`、`12 kubeadm`、
+`13 Cilium`、`14 final verify`。除只读的 07 与 14 外，每一阶段都必须先执行
+`--check` 并停止；只有回执审核通过后，下一条【运维】命令才可以使用 `--apply`。
+任一 `RESULT=STOP_*` 或非零退出码都会终止当前验收链，不得跳过或把后续阶段标为通过。
+
 | 文件 | 证据 |
 | --- | --- |
 | `00-server-baseline.md` | 服务器容量、架构、OS、时间与 Swap 基线 |

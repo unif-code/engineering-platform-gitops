@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -186,6 +188,7 @@ class BootstrapContractTest(unittest.TestCase):
 
         self.assert_contract_fails(root)
 
+
     def test_artifact_lock_accepts_six_records_without_cni_archive(self) -> None:
         """捕获 validator 继续要求 Task 5 拥有 CNI archive 的缺陷。"""
         root = self.copy_bootstrap_root()
@@ -289,6 +292,95 @@ class BootstrapContractTest(unittest.TestCase):
         )
 
         self.assert_contract_fails(root)
+
+
+class ValidateEntrypointTest(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        scripts = self.root / 'scripts'
+        scripts.mkdir()
+        shutil.copy2(validator.ROOT / 'scripts' / 'validate.sh', scripts)
+
+        self.command_log = self.root / 'commands.log'
+        self.fake_bin = self.root / 'bin'
+        self.fake_bin.mkdir()
+        self.write_fake(
+            'python3',
+            '''#!/bin/bash
+set -eu
+{
+  printf 'python3'
+  printf '\\t%s' "$@"
+  printf '\\n'
+} >>"$VALIDATE_COMMAND_LOG"
+case " $* " in
+  *" -m unittest discover "*) exit "${FAKE_UNITTEST_EXIT:-0}" ;;
+esac
+exit 0
+''',
+        )
+        self.write_fake(
+            'shellcheck',
+            '''#!/bin/bash
+set -eu
+{
+  printf 'shellcheck'
+  printf '\\t%s' "$@"
+  printf '\\n'
+} >>"$VALIDATE_COMMAND_LOG"
+exit "${FAKE_SHELLCHECK_EXIT:-0}"
+''',
+        )
+        self.write_fake('kubectl', '#!/bin/bash\nexit 0\n')
+
+    def write_fake(self, name: str, content: str) -> None:
+        path = self.fake_bin / name
+        path.write_text(content, encoding='utf-8')
+        path.chmod(0o755)
+
+    def run_validate(
+        self, *, unittest_exit: int = 0, shellcheck_exit: int = 0
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'FAKE_UNITTEST_EXIT': str(unittest_exit),
+                'FAKE_SHELLCHECK_EXIT': str(shellcheck_exit),
+                'PATH': f'{self.fake_bin}:/usr/bin:/bin',
+                'PYTHONDONTWRITEBYTECODE': '1',
+                'VALIDATE_COMMAND_LOG': str(self.command_log),
+            }
+        )
+        return subprocess.run(
+            ['/bin/bash', str(self.root / 'scripts' / 'validate.sh')],
+            cwd=self.root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def read_command_log(self) -> str:
+        return self.command_log.read_text(encoding='utf-8')
+
+    def test_unittest_failure_stops_validation_without_apply(self) -> None:
+        result = self.run_validate(unittest_exit=23)
+
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        command_log = self.read_command_log()
+        self.assertIn('-m\tunittest\tdiscover', command_log)
+        self.assertNotIn('shellcheck', command_log)
+        self.assertNotIn('--apply', command_log)
+
+    def test_shellcheck_failure_stops_validation_without_apply(self) -> None:
+        result = self.run_validate(shellcheck_exit=24)
+
+        self.assertEqual(result.returncode, 24, result.stdout + result.stderr)
+        command_log = self.read_command_log()
+        self.assertIn('shellcheck\t', command_log)
+        self.assertNotIn('--apply', command_log)
 
 
 if __name__ == '__main__':
