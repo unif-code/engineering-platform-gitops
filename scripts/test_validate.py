@@ -404,6 +404,36 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
 
 
 class ValidationCatalogTest(unittest.TestCase):
+    def test_github_workflow_has_dynamic_full_gate(self) -> None:
+        """捕获 CI 未执行完整动态分片验证或未聚合其结果的缺陷。"""
+        workflow_path = validator.ROOT / '.github/workflows/validate.yml'
+        self.assertTrue(workflow_path.is_file())
+        document = yaml.load(
+            workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader
+        )
+        self.assertEqual(document['permissions'], {'contents': 'read'})
+        self.assertEqual(document['on']['push']['branches'], ['main'])
+        self.assertEqual(document['on']['pull_request']['branches'], ['main'])
+        self.assertIn('workflow_dispatch', document['on'])
+        self.assertEqual(
+            set(document['jobs']), {'plan', 'tests', 'static', 'validation-gate'}
+        )
+        self.assertEqual(
+            set(document['jobs']['validation-gate']['needs']),
+            {'plan', 'tests', 'static'},
+        )
+        for job in document['jobs'].values():
+            self.assertEqual(job['runs-on'], 'ubuntu-24.04')
+        self.assertEqual(document['jobs']['tests']['strategy']['fail-fast'], 'false')
+        self.assertEqual(document['jobs']['tests']['timeout-minutes'], '45')
+        workflow_text = workflow_path.read_text(encoding='utf-8')
+        self.assertIn('fromJSON(needs.plan.outputs.matrix)', workflow_text)
+        self.assertIn(
+            'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
+            workflow_text,
+        )
+        self.assertNotRegex(workflow_text, r'uses:\s+[^\s]+@(main|master|v\d+)\s*$')
+
     def test_catalog_covers_every_concrete_test_case_once(self) -> None:
         import validation_catalog
 

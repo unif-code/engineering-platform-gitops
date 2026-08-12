@@ -1,0 +1,93 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Python validation dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/validation-venv"
+          "$RUNNER_TEMP/validation-venv/bin/python" -m pip install \
+            --disable-pip-version-check PyYAML==6.0.3
+          echo "$RUNNER_TEMP/validation-venv/bin" >>"$GITHUB_PATH"
+      - name: Validate validation catalog
+        run: python3 scripts/run_validation.py --validate-catalog
+      - id: matrix
+        run: echo "matrix=$(python3 scripts/run_validation.py --matrix)" >>"$GITHUB_OUTPUT"
+
+  tests:
+    needs: plan
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Python validation dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/validation-venv"
+          "$RUNNER_TEMP/validation-venv/bin/python" -m pip install \
+            --disable-pip-version-check PyYAML==6.0.3
+          echo "$RUNNER_TEMP/validation-venv/bin" >>"$GITHUB_PATH"
+      - run: python3 scripts/run_validation.py --shard "${{ matrix.shard }}"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install static validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck=0.9.0-1
+          test "$(shellcheck --version | awk '/^version:/ {print $2}')" = 0.9.0
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/kubectl" \
+            https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl
+          printf '%s  %s\n' \
+            ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336 \
+            "$RUNNER_TEMP/kubectl" | sha256sum --check --status
+          install -d "$RUNNER_TEMP/bin"
+          install -m 0755 "$RUNNER_TEMP/kubectl" "$RUNNER_TEMP/bin/kubectl"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+      - run: ./scripts/validate-static.sh
+
+  validation-gate:
+    if: ${{ always() }}
+    needs: [plan, tests, static]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every validation job
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          STATIC_RESULT: ${{ needs.static.result }}
+        run: |
+          test "$PLAN_RESULT" = success
+          test "$TESTS_RESULT" = success
+          test "$STATIC_RESULT" = success
