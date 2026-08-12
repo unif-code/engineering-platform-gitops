@@ -49,7 +49,7 @@ if ! open_evidence 07-preflight "$evidence_dir"; then
   exit "$EXIT_UNKNOWN_STATE"
 fi
 
-for required_command in awk cmp date dpkg-query grep hostname id ip python3 ss stat swapon systemctl tr uname; do
+for required_command in awk cmp date dpkg-query grep hostname id ip python3 readlink ss stat swapon systemctl tr uname; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -67,7 +67,16 @@ fi
 log_evidence "HOSTNAME=${actual_hostname}"
 
 os_release=$(host_path /etc/os-release)
-if [[ ! -f "$os_release" || -L "$os_release" ]]; then
+canonical_os_release=$(host_path /usr/lib/os-release)
+if [[ -L "$os_release" ]]; then
+  os_release_link=$(readlink -- "$os_release" 2>/dev/null) ||
+    complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
+  if [[ "$os_release_link" != ../usr/lib/os-release ||
+        ! -f "$canonical_os_release" || -L "$canonical_os_release" ]]; then
+    complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
+  fi
+  os_release=$canonical_os_release
+elif [[ ! -f "$os_release" ]]; then
   complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
 fi
 os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")

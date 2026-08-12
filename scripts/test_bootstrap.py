@@ -376,6 +376,34 @@ class PreflightTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 10)
         self.assertIn('RESULT=STOP_HOST_IDENTITY', result.stdout)
 
+    def test_accepts_canonical_ubuntu_os_release_symlink(self) -> None:
+        environment, host = self.make_environment()
+        canonical = host / 'usr/lib/os-release'
+        canonical.parent.mkdir(parents=True)
+        (host / 'etc/os-release').replace(canonical)
+        (host / 'etc/os-release').symlink_to('../usr/lib/os-release')
+
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+
+    def test_rejects_noncanonical_os_release_symlink(self) -> None:
+        environment, host = self.make_environment()
+        unapproved = host / 'tmp/os-release'
+        unapproved.parent.mkdir(parents=True)
+        (host / 'etc/os-release').replace(unapproved)
+        (host / 'etc/os-release').symlink_to('../tmp/os-release')
+
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 10)
+        self.assertIn('REASON=os-release-missing', result.stdout)
+
     def test_stops_on_cleanup_evidence_digest_drift(self) -> None:
         result, _ = self.run_preflight(FAKE_CLEANUP_SHA='0' * 64)
 
