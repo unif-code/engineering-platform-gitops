@@ -301,7 +301,14 @@ class ValidateEntrypointTest(unittest.TestCase):
         self.root = Path(directory.name)
         scripts = self.root / 'scripts'
         scripts.mkdir()
-        shutil.copy2(validator.ROOT / 'scripts' / 'validate.sh', scripts)
+        for entrypoint in (
+            'validation_catalog.py',
+            'run_validation.py',
+            'validate-static.sh',
+            'validate-fast.sh',
+            'validate.sh',
+        ):
+            shutil.copy2(validator.ROOT / 'scripts' / entrypoint, scripts)
 
         self.command_log = self.root / 'commands.log'
         self.fake_bin = self.root / 'bin'
@@ -316,7 +323,7 @@ set -eu
   printf '\\n'
 } >>"$VALIDATE_COMMAND_LOG"
 case " $* " in
-  *" -m unittest discover "*) exit "${FAKE_UNITTEST_EXIT:-0}" ;;
+  *"run_validation.py --profile "*) exit "${FAKE_RUNNER_EXIT:-0}" ;;
 esac
 exit 0
 ''',
@@ -341,12 +348,16 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
         path.chmod(0o755)
 
     def run_validate(
-        self, *, unittest_exit: int = 0, shellcheck_exit: int = 0
+        self,
+        entrypoint: str = 'validate.sh',
+        *,
+        runner_exit: int = 0,
+        shellcheck_exit: int = 0,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(
             {
-                'FAKE_UNITTEST_EXIT': str(unittest_exit),
+                'FAKE_RUNNER_EXIT': str(runner_exit),
                 'FAKE_SHELLCHECK_EXIT': str(shellcheck_exit),
                 'PATH': f'{self.fake_bin}:/usr/bin:/bin',
                 'PYTHONDONTWRITEBYTECODE': '1',
@@ -354,7 +365,7 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
             }
         )
         return subprocess.run(
-            ['/bin/bash', str(self.root / 'scripts' / 'validate.sh')],
+            ['/bin/bash', str(self.root / 'scripts' / entrypoint)],
             cwd=self.root,
             env=environment,
             text=True,
@@ -365,12 +376,12 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
     def read_command_log(self) -> str:
         return self.command_log.read_text(encoding='utf-8')
 
-    def test_unittest_failure_stops_validation_without_apply(self) -> None:
-        result = self.run_validate(unittest_exit=23)
+    def test_runner_failure_stops_validation_without_apply(self) -> None:
+        result = self.run_validate(runner_exit=23)
 
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         command_log = self.read_command_log()
-        self.assertIn('-m\tunittest\tdiscover', command_log)
+        self.assertIn('run_validation.py\t--profile\tfull', command_log)
         self.assertNotIn('shellcheck', command_log)
         self.assertNotIn('--apply', command_log)
 
@@ -379,8 +390,58 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
 
         self.assertEqual(result.returncode, 24, result.stdout + result.stderr)
         command_log = self.read_command_log()
+        self.assertIn('run_validation.py\t--profile\tfull', command_log)
         self.assertIn('shellcheck\t', command_log)
         self.assertNotIn('--apply', command_log)
+
+    def test_fast_entrypoint_runs_fast_profile_without_apply(self) -> None:
+        result = self.run_validate('validate-fast.sh')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        command_log = self.read_command_log()
+        self.assertIn('run_validation.py\t--profile\tfast', command_log)
+        self.assertNotIn('--apply', command_log)
+
+
+class ValidationCatalogTest(unittest.TestCase):
+    def test_catalog_covers_every_concrete_test_case_once(self) -> None:
+        import validation_catalog
+
+        validation_catalog.validate_catalog()
+
+    def test_fast_profile_excludes_heavy_bootstrap_classes(self) -> None:
+        import validation_catalog
+
+        selectors = set(validation_catalog.selectors_for_profile('fast'))
+        heavy = {
+            'test_bootstrap.ArtifactStageTest',
+            'test_bootstrap.KernelStageTest',
+            'test_bootstrap.ContainerdInstallTest',
+            'test_bootstrap.KubernetesInstallTest',
+            'test_bootstrap.KubeadmInitTest',
+            'test_bootstrap.CiliumInstallTest',
+            'test_bootstrap.FinalVerifyTest',
+        }
+        self.assertTrue(selectors)
+        self.assertTrue(selectors.isdisjoint(heavy))
+
+    def test_catalog_rejects_missing_and_duplicate_selectors(self) -> None:
+        import validation_catalog
+        from unittest import mock
+
+        missing = dict(validation_catalog.SHARDS)
+        missing['contracts'] = missing['contracts'][1:]
+        with mock.patch.object(validation_catalog, 'SHARDS', missing):
+            with self.assertRaisesRegex(ValueError, 'missing'):
+                validation_catalog.validate_catalog()
+
+        duplicate = dict(validation_catalog.SHARDS)
+        duplicate['artifacts'] = (
+            *duplicate['artifacts'], duplicate['contracts'][0]
+        )
+        with mock.patch.object(validation_catalog, 'SHARDS', duplicate):
+            with self.assertRaisesRegex(ValueError, 'duplicate'):
+                validation_catalog.validate_catalog()
 
 
 if __name__ == '__main__':
