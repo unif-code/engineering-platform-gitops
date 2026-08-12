@@ -557,7 +557,7 @@ git commit -m "ci(validation): shard full bootstrap tests"
 - Modify: `scripts/test_bootstrap.py:4373-5298`
 
 **Interfaces:**
-- Produces: `root_is_safe_directory(path) -> boolean`、`root_is_missing_or_safe_empty(path) -> boolean`。
+- Produces: `root_is_safe_directory(path, expected_mode) -> boolean`、`root_is_missing_or_safe_empty(path) -> boolean`。
 - Produces: `initialization_state() -> FRESH | CANDIDATE | UNKNOWN` on stdout。
 - Produces: `initialized_control_plane_gate(result: str, code: int) -> exit via complete on drift`。
 - Changes: `50-kubeadm-init.sh --check|--apply` on exact initialized host returns `ALREADY_COMPLIANT` with reason `control-plane-initialized` and no new evidence。
@@ -653,8 +653,9 @@ Expected: FAIL；旧实现把已生成 `/etc/kubernetes`、`/var/lib/etcd` 判�
 
 ```bash
 root_is_safe_directory() {
-  local root=$1
-  [[ -d "$root" && ! -L "$root" && "$(path_mode "$root")" == 755 ]] &&
+  local root=$1 expected_mode=$2
+  [[ -d "$root" && ! -L "$root" &&
+     "$(path_mode "$root")" == "$expected_mode" ]] &&
     owned_by_expected "$root"
 }
 
@@ -663,7 +664,7 @@ root_is_missing_or_safe_empty() {
   if [[ ! -e "$root" && ! -L "$root" ]]; then
     return 0
   fi
-  root_is_safe_directory "$root" || return 1
+  root_is_safe_directory "$root" 755 || return 1
   first_entry=$(find "$root" -mindepth 1 -print -quit 2>/dev/null) || return 1
   [[ -z "$first_entry" ]]
 }
@@ -684,8 +685,8 @@ initialization_state() {
     printf 'FRESH\n'
     return 0
   fi
-  if root_is_safe_directory "$kubernetes_root" &&
-     root_is_safe_directory "$etcd_root" &&
+  if root_is_safe_directory "$kubernetes_root" 755 &&
+     root_is_safe_directory "$etcd_root" 700 &&
      [[ -f "${kubernetes_root}/admin.conf" &&
         -d "${kubernetes_root}/manifests" &&
         -d "${etcd_root}/member" && -n "$listener" ]]; then
@@ -696,7 +697,7 @@ initialization_state() {
 }
 ```
 
-`root_is_missing_or_safe_empty` 的任何读取失败都会使状态落入 UNKNOWN；broken symlink 也属于 UNKNOWN。
+`root_is_missing_or_safe_empty` 的任何读取失败都会使状态落入 UNKNOWN；broken symlink 也属于 UNKNOWN。fresh 安全空目录保持 `0755`；精确已初始化状态要求 `/etc/kubernetes=0755`、`/var/lib/etcd=0700`。fake kubeadm 成功创建 `member` 后也必须把 fake `/var/lib/etcd` 设为 `0700`，使 fixture 与生产合同一致。
 
 - [ ] **Step 4: 抽取并复用 initialized control-plane Gate**
 
@@ -863,6 +864,7 @@ BOOTSTRAP_ORCHESTRATOR_TEST_LOCK_FILE=str(self.lock_file)
 ```
 
 生产模式必须拒绝所有 `BOOTSTRAP_ORCHESTRATOR_TEST_*`。
+测试模式只能在 `EUID != 0` 时启用，且注入的 stage directory、state directory 与 lock path 必须是 absolute、non-symlink、当前 uid 所有的临时路径；这个 seam 仅用于 fixture，不能放宽生产 `--apply` 的 root Gate。
 
 - [ ] **Step 2: 写核心 RED cases**
 
@@ -1074,7 +1076,7 @@ record_stage_summary() {
 
 - [ ] **Step 5: 实现 check/apply state machine 与 lock**
 
-生产 lock path 固定 `/run/lock/engineering-platform-bootstrap.lock`。APPLY 前执行：
+生产 lock path 固定 `/run/lock/engineering-platform-bootstrap.lock`。生产 APPLY 前执行：
 
 ```bash
 [[ "$EUID" -eq 0 ]] || stop_orchestrator not-root 10
@@ -1085,6 +1087,8 @@ record_stage_summary() {
 exec 9>"$lock_file"
 flock -n 9 || stop_orchestrator concurrent-run 30
 ```
+
+仅当上述严格 test mode 合同成立时，fixture 才可以在非 root 进程中用临时 lock path 执行 `--apply`；生产模式不得绕过 `EUID == 0`。
 
 状态机使用以下明确分支：
 
