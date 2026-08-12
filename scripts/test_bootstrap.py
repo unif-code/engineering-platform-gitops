@@ -404,6 +404,28 @@ class PreflightTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 10)
         self.assertIn('REASON=os-release-missing', result.stdout)
 
+    def test_uses_swapon_show_columns_for_exact_swap_layout(self) -> None:
+        environment, _ = self.make_environment()
+        fake_bin = Path(environment['PATH'].split(':', 1)[0])
+        self.write_executable(
+            fake_bin / 'swapon',
+            '''
+            #!/bin/sh
+            if [ "$*" = "--show=NAME,SIZE --noheadings --raw --bytes" ]; then
+              printf '/swap.img 4106219520\n'
+            else
+              printf '/swap.img file 4106219520 0 -2 fixture-uuid\n'
+            fi
+            ''',
+        )
+
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+
     def test_stops_on_cleanup_evidence_digest_drift(self) -> None:
         result, _ = self.run_preflight(FAKE_CLEANUP_SHA='0' * 64)
 
