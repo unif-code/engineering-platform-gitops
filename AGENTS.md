@@ -16,4 +16,5 @@
 - 禁止提交 Secret、Token、私钥、kubeconfig 或密码库导出内容。
 - Image、Chart 与 Manifest 必须固定版本或 digest，禁止 `latest` 与浮动 tag。
 - 【运维】命令必须先给出完整命令并等待服务器回执；证据不得记录敏感值。
-- 提交前运行 `./scripts/validate.sh`，并保持线性历史与 Conventional Commits。
+- 本地提交前运行受影响的 focused tests 和 `./scripts/validate-fast.sh`；普通 push 后必须等待 GitHub `validation-gate` 全部通过，才可继续服务器部署或验收。
+- `./scripts/validate.sh` 保留为人工完整顺序验证入口，不再要求每次本地提交运行；提交历史保持线性并使用 Conventional Commits。

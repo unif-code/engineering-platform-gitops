@@ -97,6 +97,45 @@ class RepositoryProfileContractTest(unittest.TestCase):
     def test_single_user_storage_contract(self) -> None:
         validate_single_user_storage()
 
+    def test_validation_and_orchestrator_are_documented(self) -> None:
+        agents = (validator.ROOT / 'AGENTS.md').read_text(encoding='utf-8')
+        readme = (validator.ROOT / 'README.md').read_text(encoding='utf-8')
+        runbook = (validator.ROOT / 'runbook/01-bootstrap.md').read_text(
+            encoding='utf-8'
+        )
+
+        self.assertIn('./scripts/validate-fast.sh', agents)
+        self.assertIn('focused tests', agents)
+        self.assertIn('validation-gate', agents)
+        self.assertIn('./scripts/validate.sh', agents)
+        self.assertIn('人工完整', agents)
+        self.assertNotIn('提交前运行 `./scripts/validate.sh`', agents)
+
+        self.assertIn('./scripts/validate-fast.sh', readme)
+        self.assertIn('./scripts/validate.sh', readme)
+        self.assertIn('validation-gate', readme)
+        self.assertIn('direct-main', readme)
+        self.assertIn('fix-forward', readme)
+        self.assertIn('force push', readme)
+
+        self.assertIn('bootstrap-all.sh --check', runbook)
+        self.assertIn('bootstrap-all.sh --apply', runbook)
+        self.assertIn('只读', runbook)
+        self.assertIn('第一个需要 APPLY', runbook)
+        self.assertIn('ALREADY_COMPLIANT', runbook)
+        self.assertIn('post-check', runbook)
+        self.assertIn('progress file', runbook)
+        self.assertIn('真实主机状态', runbook)
+        self.assertIn('`00`～`30`', runbook)
+        self.assertIn('stage `40`', runbook)
+        self.assertIn('诊断和人工应急入口', runbook)
+        self.assertIn(
+            '`PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT`',
+            runbook,
+        )
+        self.assertIn('完整命令', runbook)
+        self.assertIn('回执', runbook)
+
 
 class ActiveRootIsolationTest(unittest.TestCase):
     def make_root(self, resources: list[str]) -> Path:

@@ -9,11 +9,38 @@
 服务器标识：`retail-test-workflow`
 GitOps commit / PR：  
 
-## 第一版分阶段执行合同
+## 可恢复的一次性执行合同
 
-本节是服务器 bootstrap 的唯一执行顺序。每轮只执行一条【运维】命令，并回填完整
+每轮只执行一条【运维】命令，并回填完整
 命令、stdout/stderr、退出码、`RESULT`、`REASON`、`NEXT`、证据路径与 SHA-256；
 agent 审核回执前不得执行下一条。不得把 Secret、Token、私钥或 kubeconfig 回填到仓库。
+
+### 正常路径
+
+先执行只读检查并等待服务器回执：
+
+```bash
+./scripts/bootstrap/bootstrap-all.sh --check
+```
+
+`--check` 全程只读，在第一个需要 APPLY 的 stage 停止，不执行任何 APPLY。审核完整回执并
+明确批准 mutation 后，另行执行：
+
+```bash
+./scripts/bootstrap/bootstrap-all.sh --apply
+```
+
+`--apply` 会先检查每个 stage，跳过返回 `ALREADY_COMPLIANT` 的 stage，仅对需要变更的
+stage 执行 apply，并要求 apply 后的 post-check 回到 compliant；否则立即停止。运行失败后，
+重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，不读取或维护 progress file。
+
+当前暂停中的服务器已完成 stage `00`～`30`。GitHub `validation-gate` 成功后重跑
+orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，并从 stage `40` 继续。
+
+### 单阶段诊断和人工应急入口
+
+下表保留为诊断和人工应急入口，不是正常 bootstrap 路径。使用任一单独 stage 时仍须每次
+先提供一条完整命令并等待服务器回执；agent 审核前不得执行下一次 mutation。
 
 | 阶段 | 入口 | 首次模式 | 通过结果 | 运行证据 |
 | --- | --- | --- | --- | --- |
@@ -22,7 +49,7 @@ agent 审核回执前不得执行下一条。不得把 Secret、Token、私钥�
 | 09 | `20-prepare-kernel.sh` | `--check` 后批准 `--apply` | `PASS_KERNEL_PREPARED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/09-prepare-kernel-*.txt` |
 | 10 | `30-install-containerd.sh` | `--check` 后批准 `--apply` | `PASS_CONTAINERD_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/10-containerd-*.txt` |
 | 11 | `40-install-kubernetes.sh` | `--check` 后批准 `--apply` | `PASS_KUBERNETES_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/11-kubernetes-*.txt` |
-| 12 | `50-kubeadm-init.sh` | `--check` 后批准 `--apply` | `PASS_KUBEADM_INITIALIZED` | `/root/dev-infra-evidence/12-kubeadm-*.txt` |
+| 12 | `50-kubeadm-init.sh` | `--check` 后批准 `--apply` | `PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/12-kubeadm-*.txt` |
 | 13 | `60-install-cilium.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/13-cilium-*.txt` |
 | 14 | `90-verify.sh` | 仅 `--check` | `PASS_BOOTSTRAP_VERIFIED` | `/root/dev-infra-evidence/14-verify-*.txt` |
 

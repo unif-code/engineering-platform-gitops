@@ -33,15 +33,21 @@ DEV-002 使用完整功能的单用户 Kubernetes Profile：83Gi 稳态 PVC、10
 
 ## 本地校验
 
-本地需要 `kubectl`、Python 3 + `PyYAML==6.0.3` 与 `shellcheck`。统一入口只运行
+本地需要 `kubectl`、Python 3 + `PyYAML==6.0.3` 与 `shellcheck`。两个入口都只运行
 unittest、GitOps manifest 合同校验和 Bash 静态检查，不会调用任何 bootstrap
 `--apply`：
 
 ```bash
-./scripts/validate.sh
+./scripts/validate-fast.sh  # 本地提交前运行，目标不超过 2 分钟
+./scripts/validate.sh       # 可选的人工 full sequential diagnostic
 ```
 
-服务器 bootstrap 必须按 `runbook/01-bootstrap.md` 的 07～14 阶段执行；每次只先执行
-该阶段的 `--check`，提交完整回执并获得明确批准后，才能执行对应的 `--apply`。
+GitHub `validation-gate` 是完整 suite 的权威部署门禁；普通 push 后必须等待该门禁成功，
+才能继续服务器部署或验收。当前 direct-main 批次是用户明确批准的例外；门禁失败时只允许
+新增 fix-forward commit，禁止 force push 或改写历史。
+
+服务器 bootstrap 默认使用 `runbook/01-bootstrap.md` 中的可恢复 orchestrator；单独 stage
+只作为诊断和人工应急入口。每次服务器操作仍须先提供一条完整命令，提交完整回执并获得
+明确批准后，才能执行下一次 mutation。
 
 运行态证据只有在对应 `runbook/` 已回填真实命令输出、PCS digest 与验收结果后才成立；清单可渲染不等于环境已部署。
