@@ -365,17 +365,16 @@ candidate_is_exact() {
 
 bound_packages_index() {
   local apt_config=$1 lists_dir output line_count line
-  local identifier uri suite component architecture filename extra mode
+  local identifier uri filename extra mode
   lists_dir="${apt_workspace}/lists"
   # APT 自己展开 indextargets 的占位符，shell 不应展开。
   # shellcheck disable=SC2016
-  output=$(APT_CONFIG="$apt_config" apt-get indextargets --format '$(IDENTIFIER)|$(URI)|$(SUITE)|$(COMPONENT)|$(ARCHITECTURE)|$(FILENAME)' 2>/dev/null) || return 1
+  output=$(APT_CONFIG="$apt_config" apt-get indextargets --format '$(IDENTIFIER)|$(URI)|$(FILENAME)' 2>/dev/null) || return 1
   line_count=$(awk 'NF {count++} END {print count+0}' <<<"$output") || return 1
   [[ "$line_count" == 1 ]] || return 1
   line=$(awk 'NF {print}' <<<"$output") || return 1
-  IFS='|' read -r identifier uri suite component architecture filename extra <<<"$line"
+  IFS='|' read -r identifier uri filename extra <<<"$line"
   [[ -z "$extra" && "$identifier" == Packages && "$uri" == "${REPOSITORY_URL}Packages" ]] || return 1
-  [[ "$suite" == / && -z "$component" && "$architecture" == amd64 ]] || return 1
   [[ "${filename%/*}" == "$lists_dir" && -f "$filename" && ! -L "$filename" ]] || return 1
   mode=$(path_mode "$filename") || return 1
   [[ "$mode" == 600 || "$mode" == 644 ]] || return 1

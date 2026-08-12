@@ -3125,10 +3125,28 @@ class KubernetesInstallTest(BootstrapTestCase):
               *' indextargets '*)
                 [ -n "$config" ] || exit 72
                 lists=$(awk -F '"' '$1 == "Dir::State::lists " {print $2}' "$config")
-                printf 'Packages|https://pkgs.k8s.io/core:/stable:/v1.36/deb/Packages|/||amd64|%s/kubernetes_Packages\n' "$lists"
+                case " $* " in
+                  *'$(SUITE)'*)
+                    if [ "${FAKE_FLAT_INDEX_METADATA:-0}" = 1 ]; then
+                      printf 'Packages|https://pkgs.k8s.io/core:/stable:/v1.36/deb/Packages|$(SUITE)|$(COMPONENT)|$(ARCHITECTURE)|%s/kubernetes_Packages\n' "$lists"
+                    else
+                      printf 'Packages|https://pkgs.k8s.io/core:/stable:/v1.36/deb/Packages|/||amd64|%s/kubernetes_Packages\n' "$lists"
+                    fi
+                    ;;
+                  *)
+                    printf 'Packages|https://pkgs.k8s.io/core:/stable:/v1.36/deb/Packages|%s/kubernetes_Packages\n' "$lists"
+                    ;;
+                esac
                 if [ "${FAKE_SECOND_INDEX:-0}" = 1 ]; then
                   /bin/cp "$FAKE_PACKAGES_INDEX" "$lists/evil_Packages"
-                  printf 'Packages|https://evil.invalid/Packages|stable|main|amd64|%s/evil_Packages\n' "$lists"
+                  case " $* " in
+                    *'$(SUITE)'*)
+                      printf 'Packages|https://evil.invalid/Packages|stable|main|amd64|%s/evil_Packages\n' "$lists"
+                      ;;
+                    *)
+                      printf 'Packages|https://evil.invalid/Packages|%s/evil_Packages\n' "$lists"
+                      ;;
+                  esac
                 fi
                 ;;
               *' download '*)
@@ -4087,6 +4105,15 @@ kubernetes-cni'
         self.assertIn(' APT_CONFIG=', commands)
         self.assertNotIn(' -c ', commands)
         self.assertNotIn(' download ', commands)
+
+    def test_apply_accepts_real_flat_repository_indextarget_shape(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_FLAT_INDEX_METADATA'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', result.stdout)
 
     def test_apply_uses_fail_on_any_update_error(self) -> None:
         environment, _, command_log = self.make_environment()
