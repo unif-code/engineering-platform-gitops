@@ -23,6 +23,7 @@ SHARDS = {
         'test_bootstrap.CidrCheckTest',
         'test_bootstrap.PreflightTest',
         'test_bootstrap.BootstrapEntrySecurityTest',
+        'test_bootstrap.BootstrapOrchestratorTest',
     ),
     'artifacts': ('test_bootstrap.ArtifactStageTest',),
     'kernel': ('test_bootstrap.KernelStageTest',),

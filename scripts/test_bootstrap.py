@@ -24,6 +24,7 @@ INSTALL_KUBERNETES = ROOT / 'scripts/bootstrap/40-install-kubernetes.sh'
 KUBEADM_INIT = ROOT / 'scripts/bootstrap/50-kubeadm-init.sh'
 INSTALL_CILIUM = ROOT / 'scripts/bootstrap/60-install-cilium.sh'
 FINAL_VERIFY = ROOT / 'scripts/bootstrap/90-verify.sh'
+BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -1008,6 +1009,428 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 self.assertFalse(command_log.exists())
 
 
+class BootstrapOrchestratorTest(BootstrapTestCase):
+    commit = '0123456789abcdef0123456789abcdef01234567'
+    canary = 'SECRET_CANARY_ORCHESTRATOR_DO_NOT_LOG'
+    stage_names = {
+        '00': '00-preflight.sh',
+        '10': '10-stage-artifacts.sh',
+        '20': '20-prepare-kernel.sh',
+        '30': '30-install-containerd.sh',
+        '40': '40-install-kubernetes.sh',
+        '50': '50-kubeadm-init.sh',
+        '60': '60-install-cilium.sh',
+        '90': '90-verify.sh',
+    }
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def setUp(self) -> None:
+        self.fixture_root = self.temporary_directory().resolve()
+        self.stage_dir = self.fixture_root / 'stages'
+        self.state_dir = self.fixture_root / 'state'
+        self.fake_bin = self.fixture_root / 'bin'
+        for directory in (self.stage_dir, self.state_dir, self.fake_bin):
+            directory.mkdir()
+            directory.chmod(0o700)
+        self.command_log = self.fixture_root / 'commands.log'
+        self.lock_file = self.fixture_root / 'bootstrap.lock'
+        self.command_log.write_text('', encoding='utf-8')
+        self.lock_file.touch(mode=0o600)
+        self.write_fake_stages()
+        self.write_fake_commands()
+
+        self.base_environment = os.environ.copy()
+        for name in tuple(self.base_environment):
+            if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_'):
+                del self.base_environment[name]
+        self.base_environment.update(
+            {
+                'PATH': f'{self.fake_bin}:/usr/bin:/bin',
+                'BOOTSTRAP_ORCHESTRATOR_TEST_MODE': '1',
+                'BOOTSTRAP_ORCHESTRATOR_TEST_STAGE_DIR': str(self.stage_dir),
+                'BOOTSTRAP_ORCHESTRATOR_TEST_LOCK_FILE': str(self.lock_file),
+                'ORCHESTRATOR_STATE_DIR': str(self.state_dir),
+                'FAKE_COMMAND_LOG': str(self.command_log),
+                'FAKE_GIT_COMMIT': self.commit,
+            }
+        )
+        self.environment = self.base_environment.copy()
+
+    def write_fake_stages(self) -> None:
+        source = r'''
+            #!/bin/sh
+            stage=${0##*/}
+            stage=${stage%%-*}
+            [ "$#" -eq 1 ] || exit 10
+            case "$1" in
+              --check) mode=CHECK ;;
+              --apply) mode=APPLY ;;
+              *) exit 10 ;;
+            esac
+            printf '%s %s\n' "$stage" "$1" >>"$FAKE_COMMAND_LOG"
+
+            if [ -n "${FAKE_STAGE_STOP:-}" ] &&
+               [ "${FAKE_STAGE_STOP%%:*}" = "$stage" ]; then
+              exit "${FAKE_STAGE_STOP#*:}"
+            fi
+
+            case "$stage" in
+              00)
+                result=PASS_PREFLIGHT
+                reason=preflight-ready
+                ;;
+              90)
+                result=PASS_BOOTSTRAP_VERIFIED
+                reason=verification-ready
+                ;;
+              10)
+                check_result=PASS_ARTIFACTS_CHECK
+                apply_result=PASS_ARTIFACTS_STAGED
+                ;;
+              20)
+                check_result=PASS_KERNEL_CHECK
+                apply_result=PASS_KERNEL_PREPARED
+                ;;
+              30)
+                check_result=PASS_CONTAINERD_CHECK
+                apply_result=PASS_CONTAINERD_INSTALLED
+                ;;
+              40)
+                check_result=PASS_KUBERNETES_CHECK
+                apply_result=PASS_KUBERNETES_INSTALLED
+                ;;
+              50)
+                check_result=PASS_KUBEADM_CHECK
+                apply_result=PASS_KUBEADM_INITIALIZED
+                ;;
+              60)
+                check_result=PASS_CILIUM_CHECK
+                apply_result=PASS_CILIUM_INSTALLED
+                ;;
+              *) exit 30 ;;
+            esac
+
+            case "$stage" in
+              00|90) ;;
+              *)
+                if [ "$1" = --check ]; then
+                  if [ -f "$ORCHESTRATOR_STATE_DIR/$stage" ] &&
+                     [ "${FAKE_POSTCHECK_STALE:-}" != "$stage" ]; then
+                    result=ALREADY_COMPLIANT
+                    reason=stage-ready
+                  else
+                    result=$check_result
+                    reason=apply-required
+                  fi
+                else
+                  : >"$ORCHESTRATOR_STATE_DIR/$stage"
+                  result=$apply_result
+                  reason=stage-ready
+                fi
+                ;;
+            esac
+
+            evidence=NONE
+            sha256=NONE
+            exit_code=0
+            next=${FAKE_STAGE_NEXT:-NONE}
+            malformed=${FAKE_STAGE_MALFORMED:-}
+            if [ "${malformed%%:*}" = "$stage" ]; then
+              case "${malformed#*:}" in
+                exit-mismatch) exit_code=10 ;;
+                unknown-result) result=UNAPPROVED_RESULT ;;
+                result-canary) result=$FAKE_STAGE_CANARY ;;
+                unsafe-evidence)
+                  evidence="/tmp/$FAKE_STAGE_CANARY"
+                  evidence=$(printf '%s\033' "$evidence")
+                  ;;
+                unsafe-sha) sha256=ABCDEF ;;
+              esac
+            fi
+            printf 'PHASE=%s\nMODE=%s\nRESULT=%s\nREASON=%s\nEVIDENCE=%s\nEXIT_CODE=%s\nNEXT=%s\nSHA256=%s\n' \
+              "$stage" "$mode" "$result" "$reason" "$evidence" \
+              "$exit_code" "$next" "$sha256"
+            if [ "$malformed" = "$stage:duplicate-result" ]; then
+              printf 'RESULT=%s\n' "$result"
+            fi
+            if [ "$malformed" = "$stage:duplicate-exit" ]; then
+              printf 'EXIT_CODE=10\n'
+            fi
+        '''
+        for name in self.stage_names.values():
+            self.write_executable(self.stage_dir / name, source)
+
+    def write_fake_commands(self) -> None:
+        self.write_executable(
+            self.fake_bin / 'git',
+            r'''
+            #!/bin/sh
+            if [ "$1" = -C ]; then
+              shift 2
+            fi
+            case "$*" in
+              'rev-parse HEAD')
+                printf '%s\n' "${FAKE_GIT_COMMIT:-}"
+                ;;
+              'branch --show-current')
+                printf '%s\n' "${FAKE_GIT_BRANCH:-main}"
+                ;;
+              'status --porcelain=v1 --untracked-files=all')
+                [ "${FAKE_GIT_STATUS_FAIL:-0}" != 1 ] || exit 2
+                [ "${FAKE_GIT_DIRTY:-0}" != 1 ] || printf ' M fixture\n'
+                ;;
+              *) exit 2 ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            self.fake_bin / 'flock',
+            r'''
+            #!/bin/sh
+            [ "$*" = '-n 9' ] || exit 2
+            [ "${FAKE_FLOCK_FAIL:-0}" != 1 ]
+            ''',
+        )
+
+    def reset_fixture(self) -> None:
+        for path in self.state_dir.iterdir():
+            path.unlink()
+        self.command_log.write_text('', encoding='utf-8')
+        self.environment = self.base_environment.copy()
+
+    def run_orchestrator(
+        self, *arguments: str, environment: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertTrue(
+            BOOTSTRAP_ALL.exists(), 'bootstrap-all.sh entry is missing'
+        )
+        return self.run_command(
+            ['/bin/bash', '-p', str(BOOTSTRAP_ALL), *arguments],
+            env=environment if environment is not None else self.environment,
+        )
+
+    def test_check_stops_read_only_at_first_apply_required_stage(self) -> None:
+        result = self.run_orchestrator('--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_CHECK', result.stdout)
+        self.assertIn('NEXT_STAGE=10', result.stdout)
+        self.assertEqual(list(self.state_dir.iterdir()), [])
+
+    def test_apply_resumes_at_40_and_reaches_final_verify(self) -> None:
+        for stage in ('10', '20', '30'):
+            (self.state_dir / stage).touch()
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_ALL', result.stdout)
+        log = self.command_log.read_text(encoding='utf-8')
+        self.assertNotIn('10 --apply', log)
+        self.assertNotIn('20 --apply', log)
+        self.assertNotIn('30 --apply', log)
+        self.assertIn('40 --apply', log)
+        self.assertIn('90 --check', log)
+
+    def test_nonzero_stage_exit_is_preserved(self) -> None:
+        self.environment['FAKE_STAGE_STOP'] = '40:20'
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 20)
+
+    def test_zero_exit_with_malformed_result_stops_unknown(self) -> None:
+        self.environment['FAKE_STAGE_MALFORMED'] = '40:duplicate-result'
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 30)
+        self.assertIn('RESULT=STOP_ORCHESTRATOR', result.stdout)
+
+    def test_structured_output_and_postcheck_fail_closed(self) -> None:
+        cases = (
+            ('FAKE_POSTCHECK_STALE', '40', 'post-apply-check-not-compliant'),
+            ('FAKE_STAGE_MALFORMED', '40:exit-mismatch', 'invalid-stage-output'),
+            ('FAKE_STAGE_MALFORMED', '40:unknown-result', 'invalid-stage-result'),
+            ('FAKE_STAGE_MALFORMED', '40:unsafe-sha', 'invalid-stage-output'),
+            ('FAKE_STAGE_MALFORMED', '40:duplicate-exit', 'invalid-stage-output'),
+        )
+        for variable, value, reason in cases:
+            with self.subTest(variable=variable, value=value):
+                self.reset_fixture()
+                self.environment[variable] = value
+
+                result = self.run_orchestrator('--apply')
+
+                self.assertEqual(result.returncode, 30)
+                self.assertIn('RESULT=STOP_ORCHESTRATOR', result.stdout)
+                self.assertIn(f'REASON={reason}', result.stdout)
+
+    def test_apply_requires_main_clean_repo_and_exclusive_lock(self) -> None:
+        cases = (
+            ('FAKE_GIT_BRANCH', 'feature', 'current-branch-not-main'),
+            ('FAKE_GIT_DIRTY', '1', 'worktree-not-clean'),
+            ('FAKE_FLOCK_FAIL', '1', 'concurrent-run'),
+        )
+        for variable, value, reason in cases:
+            with self.subTest(variable=variable):
+                self.reset_fixture()
+                self.environment[variable] = value
+
+                result = self.run_orchestrator('--apply')
+
+                self.assertEqual(result.returncode, 30)
+                self.assertIn(f'REASON={reason}', result.stdout)
+
+    def test_check_all_complete_reaches_final_verify(self) -> None:
+        for stage in ('10', '20', '30', '40', '50', '60'):
+            (self.state_dir / stage).touch()
+
+        result = self.run_orchestrator('--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_ALL_CHECK', result.stdout)
+        self.assertIn(
+            '90 --check', self.command_log.read_text(encoding='utf-8')
+        )
+
+    def test_summary_is_structured_and_does_not_leak_untrusted_next(self) -> None:
+        self.environment['FAKE_STAGE_NEXT'] = self.canary
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'GIT_COMMIT={self.commit}', result.stdout)
+        self.assertIn('STAGE_40_RESULT=PASS_KUBERNETES_INSTALLED', result.stdout)
+        self.assertIn('STAGE_40_EVIDENCE=NONE', result.stdout)
+        self.assertIn('STAGE_40_SHA256=NONE', result.stdout)
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_unsafe_evidence_stops_without_leaking_control_data(self) -> None:
+        self.environment.update(
+            {
+                'FAKE_STAGE_MALFORMED': '40:unsafe-evidence',
+                'FAKE_STAGE_CANARY': self.canary,
+            }
+        )
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 30)
+        self.assertIn('REASON=invalid-stage-output', result.stdout)
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+        self.assertNotIn('\x1b', result.stdout + result.stderr)
+
+    def test_rejects_invalid_cli_and_production_test_override(self) -> None:
+        for arguments in ((), ('--force',), ('--check', '--apply')):
+            with self.subTest(arguments=arguments):
+                result = self.run_orchestrator(*arguments)
+                self.assertEqual(result.returncode, 10)
+
+        environment = os.environ.copy()
+        environment['BOOTSTRAP_ORCHESTRATOR_TEST_STAGE_DIR'] = str(
+            self.stage_dir
+        )
+        result = self.run_orchestrator('--check', environment=environment)
+        self.assertEqual(result.returncode, 10)
+        self.assertIn('REASON=test-override-in-production', result.stderr)
+
+    def test_test_mode_rejects_unsafe_injected_paths(self) -> None:
+        unsafe_stage_dir = self.fixture_root / 'unsafe-stages'
+        unsafe_stage_dir.symlink_to(self.stage_dir, target_is_directory=True)
+        unsafe_state_dir = self.fixture_root / 'unsafe-state'
+        unsafe_state_dir.symlink_to(self.state_dir, target_is_directory=True)
+        unsafe_lock = self.fixture_root / 'unsafe.lock'
+        unsafe_lock.symlink_to(self.lock_file)
+        cases = (
+            ('BOOTSTRAP_ORCHESTRATOR_TEST_STAGE_DIR', str(unsafe_stage_dir)),
+            ('ORCHESTRATOR_STATE_DIR', str(unsafe_state_dir)),
+            ('BOOTSTRAP_ORCHESTRATOR_TEST_LOCK_FILE', str(unsafe_lock)),
+        )
+        for variable, value in cases:
+            with self.subTest(variable=variable):
+                environment = self.base_environment.copy()
+                environment[variable] = value
+
+                result = self.run_orchestrator(
+                    '--check', environment=environment
+                )
+
+                self.assertEqual(result.returncode, 10)
+                self.assertIn('REASON=unsafe-test-path', result.stdout)
+
+    def test_production_apply_requires_actual_root(self) -> None:
+        self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
+        environment = os.environ.copy()
+        for name in tuple(environment):
+            if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_'):
+                del environment[name]
+
+        result = self.run_orchestrator('--apply', environment=environment)
+
+        self.assertEqual(result.returncode, 10)
+        self.assertIn('REASON=not-root', result.stdout)
+
+    def test_test_path_checks_ignore_caller_stat_binary(self) -> None:
+        self.state_dir.chmod(0o777)
+        self.write_executable(
+            self.fake_bin / 'stat',
+            f'''#!/bin/sh
+            case "$2" in
+              %u) printf '{os.geteuid()}\\n' ;;
+              %Lp|%a) printf '700\\n' ;;
+              *) exit 2 ;;
+            esac
+            ''',
+        )
+
+        result = self.run_orchestrator('--check')
+
+        self.assertEqual(result.returncode, 10)
+        self.assertIn('REASON=unsafe-test-path', result.stdout)
+
+    def test_git_status_failure_cannot_be_treated_as_clean(self) -> None:
+        self.environment['FAKE_GIT_STATUS_FAIL'] = '1'
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 30)
+        self.assertIn('REASON=worktree-state-unreadable', result.stdout)
+
+    def test_invalid_result_canary_is_not_recorded_in_summary(self) -> None:
+        self.environment.update(
+            {
+                'FAKE_STAGE_MALFORMED': '40:result-canary',
+                'FAKE_STAGE_CANARY': self.canary,
+            }
+        )
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 30)
+        self.assertIn('REASON=invalid-stage-result', result.stdout)
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_test_mode_rejects_unsafe_repository_path(self) -> None:
+        unsafe_repo = self.fixture_root / 'unsafe-repo'
+        copied_entry = unsafe_repo / 'scripts/bootstrap/bootstrap-all.sh'
+        copied_entry.parent.mkdir(parents=True)
+        copied_entry.write_bytes(BOOTSTRAP_ALL.read_bytes())
+        copied_entry.chmod(0o755)
+        unsafe_repo.chmod(0o777)
+
+        result = self.run_command(
+            ['/bin/bash', '-p', str(copied_entry), '--check'],
+            env=self.environment,
+        )
+
+        self.assertEqual(result.returncode, 10)
+        self.assertIn('REASON=unsafe-repository-path', result.stdout)
+
+
 class ArtifactStageTest(BootstrapTestCase):
     approved_digests = {
         'containerd': '628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054',
@@ -1270,6 +1693,90 @@ class ArtifactStageTest(BootstrapTestCase):
                     member.size = len(content)
                     archive.addfile(member, io.BytesIO(content))
         return stream.getvalue()
+
+    def assert_structured_terminal(
+        self,
+        output: str,
+        *,
+        mode: str,
+        result: str,
+        reason: str,
+        next_step: str,
+    ) -> None:
+        expected = {
+            'PHASE': 'stage-artifacts',
+            'MODE': mode,
+            'RESULT': result,
+            'REASON': reason,
+            'EVIDENCE': 'NONE',
+            'EXIT_CODE': '0',
+            'NEXT': next_step,
+            'SHA256': 'NONE',
+        }
+        lines = output.splitlines()
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    [line for line in lines if line.startswith(f'{key}=')],
+                    [f'{key}={value}'],
+                )
+
+    def test_compliant_check_has_one_structured_terminal_result(self) -> None:
+        environment, _, _, _ = self.compliant_environment()
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_structured_terminal(
+            result.stdout,
+            mode='CHECK',
+            result='ALREADY_COMPLIANT',
+            reason='artifacts-ready',
+            next_step='20-prepare-kernel.sh --check',
+        )
+
+    def test_apply_required_check_has_one_structured_terminal_result(self) -> None:
+        environment, _, _, _ = self.make_environment(b'ignored\n')
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_structured_terminal(
+            result.stdout,
+            mode='CHECK',
+            result='PASS_ARTIFACTS_CHECK',
+            reason='apply-required',
+            next_step='10-stage-artifacts.sh --apply',
+        )
+
+    def test_successful_apply_separates_artifact_and_terminal_digests(self) -> None:
+        environment, _, _, _ = self.make_environment(b'ignored\n')
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_structured_terminal(
+            result.stdout,
+            mode='APPLY',
+            result='PASS_ARTIFACTS_STAGED',
+            reason='artifacts-staged',
+            next_step='20-prepare-kernel.sh --check',
+        )
+        lines = result.stdout.splitlines()
+        self.assertEqual(
+            len(
+                [
+                    line
+                    for line in lines
+                    if line.startswith('ARTIFACT_SHA256=')
+                ]
+            ),
+            6,
+        )
+        self.assertEqual(
+            [line for line in lines if line.startswith('SHA256=')],
+            ['SHA256=NONE'],
+        )
 
     def test_check_does_not_create_staging_directory(self) -> None:
         environment, _, _, curl_log = self.make_environment(b'runc fixture\n')

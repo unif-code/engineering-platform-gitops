@@ -11,6 +11,7 @@ source "${script_dir}/lib/common.sh"
 readonly ARTIFACT_SET=pcs-2026-08-10.1
 readonly MINIMUM_AVAILABLE_KIB=1048576
 readonly APPROVED_RECORD_COUNT=6
+readonly PHASE=stage-artifacts
 
 host_path() {
   local absolute=$1
@@ -25,7 +26,13 @@ complete() {
   local result=$1
   local reason=$2
   local code=$3
-  printf 'RESULT=%s\nREASON=%s\n' "$result" "$reason"
+  local next=${4:-NONE}
+  # MODE 由公共 parse_mode helper 间接赋值。
+  # shellcheck disable=SC2153
+  printf 'PHASE=%s\nMODE=%s\nRESULT=%s\nREASON=%s\n' \
+    "$PHASE" "$MODE" "$result" "$reason"
+  printf 'EVIDENCE=NONE\nEXIT_CODE=%s\nNEXT=%s\nSHA256=NONE\n' \
+    "$code" "$next"
   exit "$code"
 }
 
@@ -274,15 +281,15 @@ if [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
 fi
 
 if [[ "$all_compliant" == true ]]; then
-  printf 'RESULT=ALREADY_COMPLIANT\n'
-  exit 0
+  complete ALREADY_COMPLIANT artifacts-ready 0 \
+    '20-prepare-kernel.sh --check'
 fi
 
 # parse_mode 在公共库中赋值。
 # shellcheck disable=SC2153
 if [[ "$MODE" == CHECK ]]; then
-  printf 'RESULT=PASS_ARTIFACTS_CHECK\n'
-  exit 0
+  complete PASS_ARTIFACTS_CHECK apply-required 0 \
+    '10-stage-artifacts.sh --apply'
 fi
 
 if [[ -e "$artifact_root" || -L "$artifact_root" ]]; then
@@ -330,7 +337,9 @@ for index in "${!names[@]}"; do
   fi
   rm -f -- "$temporary"
   size=$(wc -c <"$target_path") || complete STOP_VERIFY_FAILED "artifact-size-unreadable-${basenames[index]}" "$EXIT_VERIFY_FAILED"
-  printf 'URL=%s\nFILE=%s\nSIZE=%s\nSHA256=%s\n' "${urls[index]}" "${basenames[index]}" "$size" "$actual_digest"
+  printf 'URL=%s\nFILE=%s\nSIZE=%s\nARTIFACT_SHA256=%s\n' \
+    "${urls[index]}" "${basenames[index]}" "$size" "$actual_digest"
 done
 
-printf 'RESULT=PASS_ARTIFACTS_STAGED\n'
+complete PASS_ARTIFACTS_STAGED artifacts-staged 0 \
+  '20-prepare-kernel.sh --check'
