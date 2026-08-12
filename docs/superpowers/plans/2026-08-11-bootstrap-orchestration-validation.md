@@ -819,6 +819,7 @@ git commit -m "feat(bootstrap): make kubeadm init resumable"
 
 **Files:**
 - Create: `scripts/bootstrap/bootstrap-all.sh`
+- Modify: `scripts/bootstrap/10-stage-artifacts.sh`
 - Modify: `scripts/test_bootstrap.py` (new `BootstrapOrchestratorTest`)
 - Modify: `scripts/validation_catalog.py` (`contracts` shard)
 
@@ -832,6 +833,35 @@ git commit -m "feat(bootstrap): make kubeadm init resumable"
 - Produces helpers: `stage_path(stage) -> absolute path`、`check_result_is_complete(stage,result) -> bool`、`check_result_requires_apply(stage,result) -> bool`、`apply_result_is_success(stage,result) -> bool`。
 - Produces terminal helpers: `finish_orchestrator(result,reason,code,next_stage)` and `stop_orchestrator(reason,code)`。
 - Produces per-stage summary fields: `STAGE_<NN>_RESULT`、`STAGE_<NN>_EVIDENCE`、`STAGE_<NN>_SHA256`。
+
+**Approved scope correction:** 真实 stage 10 原实现的 exit-0 路径只输出 `RESULT`，APPLY 还会为每个 artifact 重复输出 `SHA256`，与 orchestrator 的唯一 terminal field 合同冲突。用户批准在本 Task 内先标准化 stage 10，禁止在 orchestrator parser 中增加 stage-specific 例外。
+
+- [ ] **Step 0: 用 TDD 标准化 stage 10 structured terminal output**
+
+在 `ArtifactStageTest` 新增 load-bearing tests，对 `ALREADY_COMPLIANT`、`PASS_ARTIFACTS_CHECK`、`PASS_ARTIFACTS_STAGED` 三个 exit-0 路径断言：
+
+```text
+PHASE=stage-artifacts
+MODE=CHECK|APPLY
+RESULT=<exact result>
+REASON=<non-empty allowlisted reason>
+EVIDENCE=NONE
+EXIT_CODE=0
+NEXT=<exact next step>
+SHA256=NONE
+```
+
+上述八个 terminal keys 各且仅出现一次。APPLY 的六个 artifact 明细将 `SHA256=<digest>` 改为 `ARTIFACT_SHA256=<digest>`；测试必须断言六个 `ARTIFACT_SHA256` 并且仅有一个 terminal `SHA256=NONE`。先运行新 tests 取得 RED：旧实现因缺 terminal fields 且重复 `SHA256` 失败，fixture 不得有 setup error。
+
+`10-stage-artifacts.sh` 的 `complete` 统一输出上述结构，error 路径使用 `NEXT=NONE`。三个成功路径使用：
+
+```text
+ALREADY_COMPLIANT / artifacts-ready / 20-prepare-kernel.sh --check
+PASS_ARTIFACTS_CHECK / apply-required / 10-stage-artifacts.sh --apply
+PASS_ARTIFACTS_STAGED / artifacts-staged / 20-prepare-kernel.sh --check
+```
+
+完成 stage 10 的 focused `ArtifactStageTest` GREEN、ShellCheck 与 diff check 后，再继续 orchestrator RED/GREEN。
 
 - [ ] **Step 1: 写 fake-stage RED test harness**
 
@@ -1153,6 +1183,7 @@ Expected: orchestrator tests `OK`；catalog exit `0`；ShellCheck 无 diagnostic
 ```bash
 git add \
   scripts/bootstrap/bootstrap-all.sh \
+  scripts/bootstrap/10-stage-artifacts.sh \
   scripts/test_bootstrap.py \
   scripts/validation_catalog.py
 git diff --cached --check
