@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -88,6 +89,99 @@ class ProfileValidationTest(unittest.TestCase):
 
 
 class RepositoryProfileContractTest(unittest.TestCase):
+    def assert_documentation_contract(
+        self,
+        agents: str,
+        readme: str,
+        runbook: str,
+        labels: tuple[str, ...] | None = None,
+    ) -> None:
+        documents = {
+            'agents': ' '.join(agents.split()),
+            'readme': ' '.join(readme.split()),
+            'runbook': ' '.join(runbook.split()),
+        }
+        contracts = {
+            'local-pre-commit': (
+                'agents',
+                r'本地提交前运行受影响的 focused tests 和 '
+                r'`\./scripts/validate-fast\.sh`',
+            ),
+            'push-gate-before-deployment': (
+                'agents',
+                r'普通 push 后必须等待 GitHub `validation-gate` 全部通过，'
+                r'才可继续服务器部署或验收',
+            ),
+            'manual-full-not-per-commit': (
+                'agents',
+                r'`\./scripts/validate\.sh` 保留为人工完整顺序验证入口，'
+                r'不再要求每次本地提交运行',
+            ),
+            'readme-local-fast-manual-full': (
+                'readme',
+                r'\./scripts/validate-fast\.sh\s+# 本地提交前运行，目标不超过 '
+                r'2 分钟\s+\./scripts/validate\.sh\s+# 可选的人工 full '
+                r'sequential diagnostic',
+            ),
+            'readme-validation-layers': (
+                'readme',
+                r'`validation-gate` 是完整 suite 的权威部署门禁；'
+                r'普通 push 后必须等待该门禁成功，\s*'
+                r'才能继续服务器部署或验收',
+            ),
+            'direct-main-fix-forward': (
+                'readme',
+                r'当前 direct-main 批次是用户明确批准的例外；门禁失败时只允许\s*'
+                r'新增 fix-forward commit，禁止 force push 或改写历史',
+            ),
+            'orchestrator-normal-commands': (
+                'runbook',
+                r'### 正常路径 .*\./scripts/bootstrap/bootstrap-all\.sh '
+                r'--check .*\./scripts/bootstrap/bootstrap-all\.sh --apply',
+            ),
+            'check-read-only-stop-first-apply-required': (
+                'runbook',
+                r'`--check` 全程只读，在第一个需要 APPLY 的 stage 停止，'
+                r'不执行任何 APPLY',
+            ),
+            'apply-check-skip-post-check': (
+                'runbook',
+                r'`--apply` 会先检查每个 stage，跳过返回 '
+                r'`ALREADY_COMPLIANT` 的 stage，仅对需要变更的 stage 执行 '
+                r'apply，并要求 apply 后的 post-check 回到 compliant',
+            ),
+            'resume-real-state-no-progress-file': (
+                'runbook',
+                r'重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，'
+                r'不读取或维护 progress file',
+            ),
+            'current-server-resumes-at-40-after-gate': (
+                'runbook',
+                r'当前暂停中的服务器已完成 stage `00`～`30`。GitHub '
+                r'`validation-gate` 成功后重跑 orchestrator，它必须依据各 stage 的'
+                r'检查结果跳过这些已完成 stage，并从 stage `40` 继续',
+            ),
+            'individual-stages-emergency-only': (
+                'runbook',
+                r'下表保留为诊断和人工应急入口，不是正常 bootstrap 路径',
+            ),
+            'stage-50-success-alternatives': (
+                'runbook',
+                r'\| 12 \| `50-kubeadm-init\.sh` \| `--check` 后批准 '
+                r'`--apply` \| `PASS_KUBEADM_INITIALIZED` 或 '
+                r'`ALREADY_COMPLIANT` \|',
+            ),
+        }
+
+        selected = labels if labels is not None else tuple(contracts)
+        for label in selected:
+            document_name, pattern = contracts[label]
+            self.assertRegex(
+                documents[document_name],
+                re.compile(pattern),
+                label,
+            )
+
     def test_metrics_server_contract(self) -> None:
         validate_metrics_server()
 
@@ -104,37 +198,122 @@ class RepositoryProfileContractTest(unittest.TestCase):
             encoding='utf-8'
         )
 
-        self.assertIn('./scripts/validate-fast.sh', agents)
-        self.assertIn('focused tests', agents)
-        self.assertIn('validation-gate', agents)
-        self.assertIn('./scripts/validate.sh', agents)
-        self.assertIn('人工完整', agents)
-        self.assertNotIn('提交前运行 `./scripts/validate.sh`', agents)
+        self.assert_documentation_contract(agents, readme, runbook)
 
-        self.assertIn('./scripts/validate-fast.sh', readme)
-        self.assertIn('./scripts/validate.sh', readme)
-        self.assertIn('validation-gate', readme)
-        self.assertIn('direct-main', readme)
-        self.assertIn('fix-forward', readme)
-        self.assertIn('force push', readme)
-
-        self.assertIn('bootstrap-all.sh --check', runbook)
-        self.assertIn('bootstrap-all.sh --apply', runbook)
-        self.assertIn('只读', runbook)
-        self.assertIn('第一个需要 APPLY', runbook)
-        self.assertIn('ALREADY_COMPLIANT', runbook)
-        self.assertIn('post-check', runbook)
-        self.assertIn('progress file', runbook)
-        self.assertIn('真实主机状态', runbook)
-        self.assertIn('`00`～`30`', runbook)
-        self.assertIn('stage `40`', runbook)
-        self.assertIn('诊断和人工应急入口', runbook)
-        self.assertIn(
-            '`PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT`',
-            runbook,
+    def test_validation_contract_rejects_reversed_governance(self) -> None:
+        agents = (validator.ROOT / 'AGENTS.md').read_text(encoding='utf-8')
+        readme = (validator.ROOT / 'README.md').read_text(encoding='utf-8')
+        runbook = (validator.ROOT / 'runbook/01-bootstrap.md').read_text(
+            encoding='utf-8'
         )
-        self.assertIn('完整命令', runbook)
-        self.assertIn('回执', runbook)
+
+        mutations = {
+            'local-pre-commit': (
+                agents,
+                '本地提交前运行受影响的 focused tests 和 '
+                '`./scripts/validate-fast.sh`',
+                '本地提交后才运行受影响的 focused tests 和 '
+                '`./scripts/validate-fast.sh`',
+            ),
+            'push-gate-before-deployment': (
+                agents,
+                '普通 push 后必须等待 GitHub `validation-gate` 全部通过，'
+                '才可继续服务器部署或验收',
+                '普通 push 后无需等待 GitHub `validation-gate` 全部通过，'
+                '即可继续服务器部署或验收',
+            ),
+        }
+
+        self.assertTrue(
+            hasattr(self, 'assert_documentation_contract'),
+            'strict documentation contract helper is required',
+        )
+        for label, (document, old, new) in mutations.items():
+            with self.subTest(contract=label):
+                self.assertEqual(document.count(old), 1)
+                for mutation, replacement in (
+                    ('reversed', new),
+                    ('deleted', ''),
+                ):
+                    with self.subTest(contract=label, mutation=mutation):
+                        mutated_agents = document.replace(old, replacement, 1)
+                        with self.assertRaisesRegex(AssertionError, label):
+                            self.assert_documentation_contract(
+                                mutated_agents,
+                                readme,
+                                runbook,
+                                (label,),
+                            )
+
+    def test_orchestrator_contract_rejects_reversed_semantics(self) -> None:
+        agents = (validator.ROOT / 'AGENTS.md').read_text(encoding='utf-8')
+        readme = (validator.ROOT / 'README.md').read_text(encoding='utf-8')
+        runbook = (validator.ROOT / 'runbook/01-bootstrap.md').read_text(
+            encoding='utf-8'
+        )
+
+        mutations = {
+            'check-read-only-stop-first-apply-required': (
+                '`--check` 全程只读，在第一个需要 APPLY 的 stage 停止，'
+                '不执行任何 APPLY',
+                '`--check` 不是只读，不在第一个需要 APPLY 的 stage 停止，'
+                '允许执行 APPLY',
+            ),
+            'apply-check-skip-post-check': (
+                '`--apply` 会先检查每个 stage，跳过返回 '
+                '`ALREADY_COMPLIANT` 的 stage，仅对需要变更的\n'
+                'stage 执行 apply，并要求 apply 后的 post-check 回到 compliant',
+                '`--apply` 不会先检查每个 stage，也不跳过返回 '
+                '`ALREADY_COMPLIANT` 的 stage，可对不需要变更的\n'
+                'stage 执行 apply，且不要求 apply 后的 post-check 回到 compliant',
+            ),
+            'resume-real-state-no-progress-file': (
+                '重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，'
+                '不读取或维护 progress file',
+                '不重跑同一条命令也可恢复：orchestrator 不根据真实主机状态重建进度，'
+                '而是读取 progress file',
+            ),
+            'current-server-resumes-at-40-after-gate': (
+                '当前暂停中的服务器已完成 stage `00`～`30`。GitHub '
+                '`validation-gate` 成功后重跑\n'
+                'orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，'
+                '并从 stage `40` 继续',
+                '当前暂停中的服务器尚未完成 stage `00`～`30`。GitHub '
+                '`validation-gate` 成功前重跑\n'
+                'orchestrator，它必须从 stage `00` 继续，不能从 stage `40` 继续',
+            ),
+            'individual-stages-emergency-only': (
+                '下表保留为诊断和人工应急入口，不是正常 bootstrap 路径',
+                '下表不是诊断和人工应急入口，而是正常 bootstrap 路径',
+            ),
+            'stage-50-success-alternatives': (
+                '| 12 | `50-kubeadm-init.sh` | `--check` 后批准 `--apply` | '
+                '`PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT` |',
+                '| 12 | `50-kubeadm-init.sh` | `--check` 后批准 `--apply` | '
+                '不是 `PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT` |',
+            ),
+        }
+
+        self.assertTrue(
+            hasattr(self, 'assert_documentation_contract'),
+            'strict documentation contract helper is required',
+        )
+        for label, (old, new) in mutations.items():
+            with self.subTest(contract=label):
+                self.assertEqual(runbook.count(old), 1)
+                for mutation, replacement in (
+                    ('reversed', new),
+                    ('deleted', ''),
+                ):
+                    with self.subTest(contract=label, mutation=mutation):
+                        mutated_runbook = runbook.replace(old, replacement, 1)
+                        with self.assertRaisesRegex(AssertionError, label):
+                            self.assert_documentation_contract(
+                                agents,
+                                readme,
+                                mutated_runbook,
+                                (label,),
+                            )
 
 
 class ActiveRootIsolationTest(unittest.TestCase):
