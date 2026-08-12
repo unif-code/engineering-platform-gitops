@@ -118,8 +118,11 @@ initialization_state() {
   if root_is_safe_directory "$kubernetes_root" 755 &&
      root_is_safe_directory "$etcd_root" 700 &&
      [[ -f "${kubernetes_root}/admin.conf" &&
+        ! -L "${kubernetes_root}/admin.conf" &&
         -d "${kubernetes_root}/manifests" &&
-        -d "${etcd_root}/member" ]]; then
+        ! -L "${kubernetes_root}/manifests" &&
+        -d "${etcd_root}/member" &&
+        ! -L "${etcd_root}/member" ]]; then
     printf 'CANDIDATE\n'
     return 0
   fi
@@ -374,6 +377,9 @@ initialized_control_plane_gate() {
     complete "$failure_result" admin-conf-metadata-drift "$failure_code" NONE
   fi
   manifest_dir=$(host_path /etc/kubernetes/manifests)
+  root_is_safe_directory "$manifest_dir" 700 ||
+    complete "$failure_result" static-manifest-directory-metadata-drift \
+      "$failure_code" NONE
   actual_manifests=$(find "$manifest_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's#.*/##' | sort) ||
     complete "$failure_result" static-manifest-state-unreadable "$failure_code" NONE
   expected_manifests=$'etcd.yaml\nkube-apiserver.yaml\nkube-controller-manager.yaml\nkube-scheduler.yaml'

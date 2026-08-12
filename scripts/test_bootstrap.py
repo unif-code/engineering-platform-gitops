@@ -4534,6 +4534,7 @@ class KubeadmInitTest(BootstrapTestCase):
                 fi
                 printf '%s\n' "$FAKE_CANARY token certificate-key kubeconfig"
                 mkdir -p "$FAKE_HOST_ROOT/etc/kubernetes/manifests" "$FAKE_HOST_ROOT/etc/kubernetes/pki"
+                chmod 0700 "$FAKE_HOST_ROOT/etc/kubernetes/manifests"
                 printf 'kubeconfig\n' >"$FAKE_HOST_ROOT/etc/kubernetes/admin.conf"
                 chmod 0600 "$FAKE_HOST_ROOT/etc/kubernetes/admin.conf"
                 for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
@@ -4744,9 +4745,38 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertIn('RESULT=ALREADY_COMPLIANT', repeated.stdout)
         self.assertNotIn('kubeadm init', command_log.read_text(encoding='utf-8'))
 
+    def test_initialized_marker_live_symlinks_are_untrusted_footprint(self) -> None:
+        for case in ('admin-conf', 'manifests', 'etcd-member'):
+            with self.subTest(case=case):
+                environment, host, command_log = self.make_environment()
+                applied = self.run_stage(environment, '--apply')
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                marker = {
+                    'admin-conf': host / 'etc/kubernetes/admin.conf',
+                    'manifests': host / 'etc/kubernetes/manifests',
+                    'etcd-member': host / 'var/lib/etcd/member',
+                }[case]
+                outside = host.parent / f'outside-{case}'
+                marker.rename(outside)
+                marker.symlink_to(
+                    outside, target_is_directory=case != 'admin-conf'
+                )
+                evidence_dir = host / 'root/dev-infra-evidence'
+                evidence_before = sorted(evidence_dir.iterdir())
+                command_log.write_text('', encoding='utf-8')
+
+                checked = self.run_stage(environment, '--check')
+
+                self.assertEqual(checked.returncode, 30, checked.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', checked.stdout)
+                self.assertNotIn('RESULT=ALREADY_COMPLIANT', checked.stdout)
+                self.assertEqual(sorted(evidence_dir.iterdir()), evidence_before)
+                self.assertEqual(command_log.read_text(encoding='utf-8'), '')
+
     def test_initialized_candidate_drift_stops_unknown(self) -> None:
         for case in (
-            'listener', 'listener-query', 'manifest', 'runtime', 'kube-proxy'
+            'listener', 'listener-query', 'manifest', 'manifest-dir-mode',
+            'manifest-dir-owner', 'runtime', 'kube-proxy'
         ):
             with self.subTest(case=case):
                 environment, host, command_log = self.make_environment()
@@ -4761,6 +4791,12 @@ class KubeadmInitTest(BootstrapTestCase):
                     unknown = host / 'etc/kubernetes/manifests/unknown.yaml'
                     unknown.write_text('unknown\n', encoding='utf-8')
                     unknown.chmod(0o600)
+                elif case == 'manifest-dir-mode':
+                    (host / 'etc/kubernetes/manifests').chmod(0o755)
+                elif case == 'manifest-dir-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(
+                        host / 'etc/kubernetes/manifests'
+                    )
                 elif case == 'runtime':
                     payload = json.loads(environment['FAKE_CRICTL_JSON'])
                     payload['containers'].pop()
