@@ -422,6 +422,22 @@ class ValidationCatalogTest(unittest.TestCase):
             set(document['jobs']['validation-gate']['needs']),
             {'plan', 'tests', 'static'},
         )
+        gate = document['jobs']['validation-gate']
+        self.assertIn('if', gate)
+        self.assertEqual(gate['if'], '${{ always() }}')
+        gate_environment = gate['steps'][0]['env']
+        self.assertEqual(
+            gate_environment,
+            {
+                'PLAN_RESULT': '${{ needs.plan.result }}',
+                'TESTS_RESULT': '${{ needs.tests.result }}',
+                'STATIC_RESULT': '${{ needs.static.result }}',
+            },
+        )
+        gate_command = gate['steps'][0]['run']
+        self.assertIn('test "$PLAN_RESULT" = success', gate_command)
+        self.assertIn('test "$TESTS_RESULT" = success', gate_command)
+        self.assertIn('test "$STATIC_RESULT" = success', gate_command)
         for job in document['jobs'].values():
             self.assertEqual(job['runs-on'], 'ubuntu-24.04')
         self.assertEqual(document['jobs']['tests']['strategy']['fail-fast'], 'false')
@@ -433,6 +449,30 @@ class ValidationCatalogTest(unittest.TestCase):
             workflow_text,
         )
         self.assertNotRegex(workflow_text, r'uses:\s+[^\s]+@(main|master|v\d+)\s*$')
+
+    def test_static_workflow_pins_python_validation_dependency(self) -> None:
+        """捕获 static 验证依赖 runner 预装 PyYAML 的缺陷。"""
+        workflow_path = validator.ROOT / '.github/workflows/validate.yml'
+        document = yaml.load(
+            workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader
+        )
+        static_steps = document['jobs']['static']['steps']
+        python_steps = [
+            step
+            for step in static_steps
+            if step.get('name') == 'Install Python validation dependency'
+        ]
+        self.assertEqual(len(python_steps), 1)
+        install_command = python_steps[0]['run']
+
+        self.assertIn(
+            'python3 -m venv "$RUNNER_TEMP/validation-venv"', install_command
+        )
+        self.assertIn('PyYAML==6.0.3', install_command)
+        self.assertIn(
+            'echo "$RUNNER_TEMP/validation-venv/bin" >>"$GITHUB_PATH"',
+            install_command,
+        )
 
     def test_catalog_covers_every_concrete_test_case_once(self) -> None:
         import validation_catalog
