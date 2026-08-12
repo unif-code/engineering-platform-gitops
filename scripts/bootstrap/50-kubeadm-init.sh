@@ -93,22 +93,45 @@ run_stage_gate() {
   [[ "$captured" == "${expected}"$'\n__EXIT_CODE__=0' ]]
 }
 
-initialization_state_gate() {
-  local root listener first_entry
-  for root in "$(host_path /etc/kubernetes)" "$(host_path /var/lib/etcd)"; do
-    if [[ ! -e "$root" && ! -L "$root" ]]; then
-      continue
+root_is_safe_directory() {
+  local root=$1 expected_mode=$2
+  [[ -d "$root" && ! -L "$root" &&
+     "$(path_mode "$root")" == "$expected_mode" ]] &&
+    owned_by_expected "$root"
+}
+
+root_is_missing_or_safe_empty() {
+  local root=$1 first_entry
+  if [[ ! -e "$root" && ! -L "$root" ]]; then
+    return 0
+  fi
+  root_is_safe_directory "$root" 755 || return 1
+  first_entry=$(find "$root" -mindepth 1 -print -quit 2>/dev/null) || return 1
+  [[ -z "$first_entry" ]]
+}
+
+initialization_state() {
+  local kubernetes_root etcd_root listener
+  kubernetes_root=$(host_path /etc/kubernetes)
+  etcd_root=$(host_path /var/lib/etcd)
+
+  if root_is_safe_directory "$kubernetes_root" 755 &&
+     root_is_safe_directory "$etcd_root" 700 &&
+     [[ -f "${kubernetes_root}/admin.conf" &&
+        -d "${kubernetes_root}/manifests" &&
+        -d "${etcd_root}/member" ]]; then
+    printf 'CANDIDATE\n'
+    return 0
+  fi
+  if root_is_missing_or_safe_empty "$kubernetes_root" &&
+     root_is_missing_or_safe_empty "$etcd_root"; then
+    listener=$(ss -H -ltn 'sport = :6443' 2>/dev/null) || return "$EXIT_PRECONDITION"
+    if [[ -z "$listener" ]]; then
+      printf 'FRESH\n'
+      return 0
     fi
-    if [[ -L "$root" || ! -d "$root" || "$(path_mode "$root")" != 755 ]] || ! owned_by_expected "$root"; then
-      complete STOP_ALREADY_INITIALIZED initialized-state-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
-    fi
-    first_entry=$(find "$root" -mindepth 1 -print -quit 2>/dev/null) ||
-      complete STOP_ALREADY_INITIALIZED initialized-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
-    [[ -z "$first_entry" ]] || complete STOP_ALREADY_INITIALIZED initialized-or-partial-state-present "$EXIT_UNKNOWN_STATE" NONE
-  done
-  listener=$(ss -H -ltn 'sport = :6443' 2>/dev/null) ||
-    complete STOP_PRECONDITION apiserver-listener-state-unreadable "$EXIT_PRECONDITION" NONE
-  [[ -z "$listener" ]] || complete STOP_ALREADY_INITIALIZED apiserver-port-listener-present "$EXIT_UNKNOWN_STATE" NONE
+  fi
+  printf 'UNKNOWN\n'
 }
 
 kubelet_pre_init_inputs_gate() {
@@ -263,13 +286,23 @@ create_config_snapshot() {
   config_file_is_safe "$config_snapshot" 600 || return "$EXIT_UNKNOWN_STATE"
 }
 
-pre_init_gates() {
-  initialization_state_gate
+fresh_pre_init_gates() {
+  local current_state
+  current_state=$(initialization_state) ||
+    complete STOP_PRECONDITION initialized-state-unreadable \
+      "$EXIT_PRECONDITION" NONE
+  [[ "$current_state" == FRESH ]] ||
+    complete STOP_ALREADY_INITIALIZED initialized-or-partial-state-present \
+      "$EXIT_UNKNOWN_STATE" NONE
   kubelet_pre_init_inputs_gate
   managed_kubernetes_clients_gate
-  config_file_is_safe "$config_source" 644 || complete STOP_PRECONDITION kubeadm-config-contract-drift "$EXIT_PRECONDITION" NONE
+  config_file_is_safe "$config_source" 644 ||
+    complete STOP_PRECONDITION kubeadm-config-contract-drift \
+      "$EXIT_PRECONDITION" NONE
   if [[ -n "$config_snapshot" ]]; then
-    config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+    config_file_is_safe "$config_snapshot" 600 ||
+      complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift \
+        "$EXIT_UNKNOWN_STATE" NONE
   fi
   host_and_dependency_gates
 }
@@ -318,6 +351,90 @@ kubectl_query_is_empty() {
   [[ "$captured" == '__EXIT_CODE__=0' ]]
 }
 
+initialized_control_plane_gate() {
+  local failure_result=$1 failure_code=$2 listener
+
+  managed_kubernetes_clients_gate
+  host_and_dependency_gates
+  config_file_is_safe "$config_source" 644 ||
+    complete "$failure_result" kubeadm-config-contract-drift \
+      "$failure_code" NONE
+
+  listener=$(ss -H -ltn 'sport = :6443' 2>/dev/null) ||
+    complete "$failure_result" apiserver-listener-state-unreadable \
+      "$failure_code" NONE
+  [[ -n "$listener" ]] ||
+    complete "$failure_result" apiserver-listener-missing \
+      "$failure_code" NONE
+
+  admin_conf=$(host_path /etc/kubernetes/admin.conf)
+  etcd_member=$(host_path /var/lib/etcd/member)
+
+  if [[ ! -f "$admin_conf" || -L "$admin_conf" || "$(path_mode "$admin_conf")" != 600 ]] || ! owned_by_expected "$admin_conf"; then
+    complete "$failure_result" admin-conf-metadata-drift "$failure_code" NONE
+  fi
+  manifest_dir=$(host_path /etc/kubernetes/manifests)
+  actual_manifests=$(find "$manifest_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's#.*/##' | sort) ||
+    complete "$failure_result" static-manifest-state-unreadable "$failure_code" NONE
+  expected_manifests=$'etcd.yaml\nkube-apiserver.yaml\nkube-controller-manager.yaml\nkube-scheduler.yaml'
+  [[ "$actual_manifests" == "$expected_manifests" ]] ||
+    complete "$failure_result" static-manifest-set-drift "$failure_code" NONE
+  for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+    manifest="${manifest_dir}/${component}.yaml"
+    if [[ ! -f "$manifest" || -L "$manifest" || "$(path_mode "$manifest")" != 600 ]] || ! owned_by_expected "$manifest"; then
+      complete "$failure_result" "manifest-metadata-drift-${component}" "$failure_code" NONE
+    fi
+  done
+  [[ -d "$etcd_member" && ! -L "$etcd_member" ]] ||
+    complete "$failure_result" etcd-member-missing "$failure_code" NONE
+  [[ "$(systemctl is-active kubelet.service 2>/dev/null)" == active ]] ||
+    complete "$failure_result" kubelet-inactive "$failure_code" NONE
+
+  crictl_binary=$(host_path /usr/local/bin/crictl)
+  for binary in "$crictl_binary" "$kubectl_binary"; do
+    [[ -f "$binary" && ! -L "$binary" && -x "$binary" && "$(path_mode "$binary")" == 755 ]] ||
+      complete "$failure_result" post-init-client-unsafe "$failure_code" NONE
+    owned_by_expected "$binary" ||
+      complete "$failure_result" post-init-client-owner-drift "$failure_code" NONE
+  done
+  runtime_endpoint=unix:///run/containerd/containerd.sock
+  set +e
+  control_plane_output=$("$crictl_binary" \
+    --runtime-endpoint "$runtime_endpoint" \
+    --image-endpoint "$runtime_endpoint" \
+    ps --state Running --output json 2>/dev/null)
+  crictl_exit=$?
+  set -e
+  (( crictl_exit == 0 )) ||
+    complete "$failure_result" control-plane-runtime-query-failed "$failure_code" NONE
+  if ! printf '%s' "$control_plane_output" | control_plane_json_is_exact; then
+    complete "$failure_result" control-plane-runtime-set-drift "$failure_code" NONE
+  fi
+
+  kubectl_query_is_empty get daemonset kube-proxy --ignore-not-found --output=name ||
+    complete "$failure_result" kube-proxy-daemonset-present-or-unreadable "$failure_code" NONE
+  kubectl_query_is_empty get pods --selector k8s-app=kube-proxy --output=name ||
+    complete "$failure_result" kube-proxy-pods-present-or-unreadable "$failure_code" NONE
+  kubectl_query_is_empty get configmap kube-proxy --ignore-not-found --output=name ||
+    complete "$failure_result" kube-proxy-configmap-present-or-unreadable "$failure_code" NONE
+
+  certificate=$(host_path /etc/kubernetes/pki/apiserver.crt)
+  [[ -f "$certificate" && ! -L "$certificate" ]] ||
+    complete "$failure_result" apiserver-certificate-missing "$failure_code" NONE
+  openssl x509 -checkend 0 -noout -in "$certificate" >/dev/null 2>&1 ||
+    complete "$failure_result" apiserver-certificate-expired "$failure_code" NONE
+  certificate_output=$(openssl x509 -in "$certificate" -noout -subject -ext subjectAltName -enddate 2>/dev/null) ||
+    complete "$failure_result" apiserver-certificate-unreadable "$failure_code" NONE
+  certificate_subject=$(printf '%s\n' "$certificate_output" | sed -n 's/^subject=//p')
+  certificate_expiry=$(printf '%s\n' "$certificate_output" | sed -n 's/^notAfter=//p')
+  [[ -n "$certificate_subject" && "$certificate_subject" != *$'\n'* ]] ||
+    complete "$failure_result" certificate-subject-invalid "$failure_code" NONE
+  [[ -n "$certificate_expiry" && "$certificate_expiry" != *$'\n'* ]] ||
+    complete "$failure_result" certificate-expiry-invalid "$failure_code" NONE
+  grep -Fq 'IP Address:10.93.1.27' <<<"$certificate_output" ||
+    complete "$failure_result" certificate-san-missing "$failure_code" NONE
+}
+
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
 for required_command in awk date dpkg dpkg-query find grep hostname id install ip mktemp openssl python3 rm sed sha256sum sort ss stat swapon sync systemctl tr uname; do
@@ -347,7 +464,22 @@ if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
     complete STOP_PRECONDITION test-config-unsafe "$EXIT_PRECONDITION" NONE
 fi
 
-pre_init_gates
+state=$(initialization_state) ||
+  complete STOP_PRECONDITION initialized-state-unreadable "$EXIT_PRECONDITION" NONE
+case "$state" in
+  FRESH)
+    fresh_pre_init_gates
+    ;;
+  CANDIDATE)
+    initialized_control_plane_gate STOP_UNKNOWN_STATE "$EXIT_UNKNOWN_STATE"
+    complete ALREADY_COMPLIANT control-plane-initialized 0 \
+      '60-install-cilium.sh --check'
+    ;;
+  UNKNOWN)
+    complete STOP_ALREADY_INITIALIZED initialized-or-partial-state-present \
+      "$EXIT_UNKNOWN_STATE" NONE
+    ;;
+esac
 
 # MODE 由公共 parse_mode helper 赋值。
 # shellcheck disable=SC2153
@@ -367,74 +499,18 @@ config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubead
 if ! "$kubeadm_binary" config validate --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-config-validation-failed "$EXIT_APPLY_FAILED" NONE
 fi
-pre_init_gates
+fresh_pre_init_gates
 config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
 if ! "$kubeadm_binary" init phase preflight --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-phase-preflight-failed "$EXIT_APPLY_FAILED" NONE
 fi
-pre_init_gates
+fresh_pre_init_gates
 config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
 if ! "$kubeadm_binary" init --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-init-failed "$EXIT_APPLY_FAILED" NONE
 fi
 config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
-managed_kubernetes_clients_gate
-
-admin_conf=$(host_path /etc/kubernetes/admin.conf)
-etcd_member=$(host_path /var/lib/etcd/member)
-
-if [[ ! -f "$admin_conf" || -L "$admin_conf" || "$(path_mode "$admin_conf")" != 600 ]] || ! owned_by_expected "$admin_conf"; then
-  complete STOP_VERIFY_FAILED admin-conf-metadata-drift "$EXIT_VERIFY_FAILED" NONE
-fi
-manifest_dir=$(host_path /etc/kubernetes/manifests)
-actual_manifests=$(find "$manifest_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's#.*/##' | sort) || complete STOP_VERIFY_FAILED static-manifest-state-unreadable "$EXIT_VERIFY_FAILED" NONE
-expected_manifests=$'etcd.yaml\nkube-apiserver.yaml\nkube-controller-manager.yaml\nkube-scheduler.yaml'
-[[ "$actual_manifests" == "$expected_manifests" ]] || complete STOP_VERIFY_FAILED static-manifest-set-drift "$EXIT_VERIFY_FAILED" NONE
-for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
-  manifest="${manifest_dir}/${component}.yaml"
-  if [[ ! -f "$manifest" || -L "$manifest" || "$(path_mode "$manifest")" != 600 ]] || ! owned_by_expected "$manifest"; then
-    complete STOP_VERIFY_FAILED "manifest-metadata-drift-${component}" "$EXIT_VERIFY_FAILED" NONE
-  fi
-done
-[[ -d "$etcd_member" && ! -L "$etcd_member" ]] || complete STOP_VERIFY_FAILED etcd-member-missing "$EXIT_VERIFY_FAILED" NONE
-[[ "$(systemctl is-active kubelet.service 2>/dev/null)" == active ]] || complete STOP_VERIFY_FAILED kubelet-inactive "$EXIT_VERIFY_FAILED" NONE
-
-crictl_binary=$(host_path /usr/local/bin/crictl)
-for binary in "$crictl_binary" "$kubectl_binary"; do
-  [[ -f "$binary" && ! -L "$binary" && -x "$binary" && "$(path_mode "$binary")" == 755 ]] ||
-    complete STOP_VERIFY_FAILED post-init-client-unsafe "$EXIT_VERIFY_FAILED" NONE
-  owned_by_expected "$binary" || complete STOP_VERIFY_FAILED post-init-client-owner-drift "$EXIT_VERIFY_FAILED" NONE
-done
-runtime_endpoint=unix:///run/containerd/containerd.sock
-set +e
-control_plane_output=$("$crictl_binary" \
-  --runtime-endpoint "$runtime_endpoint" \
-  --image-endpoint "$runtime_endpoint" \
-  ps --state Running --output json 2>/dev/null)
-crictl_exit=$?
-set -e
-(( crictl_exit == 0 )) || complete STOP_VERIFY_FAILED control-plane-runtime-query-failed "$EXIT_VERIFY_FAILED" NONE
-if ! printf '%s' "$control_plane_output" | control_plane_json_is_exact; then
-  complete STOP_VERIFY_FAILED control-plane-runtime-set-drift "$EXIT_VERIFY_FAILED" NONE
-fi
-
-kubectl_query_is_empty get daemonset kube-proxy --ignore-not-found --output=name ||
-  complete STOP_VERIFY_FAILED kube-proxy-daemonset-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
-kubectl_query_is_empty get pods --selector k8s-app=kube-proxy --output=name ||
-  complete STOP_VERIFY_FAILED kube-proxy-pods-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
-kubectl_query_is_empty get configmap kube-proxy --ignore-not-found --output=name ||
-  complete STOP_VERIFY_FAILED kube-proxy-configmap-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
-
-certificate=$(host_path /etc/kubernetes/pki/apiserver.crt)
-[[ -f "$certificate" && ! -L "$certificate" ]] || complete STOP_VERIFY_FAILED apiserver-certificate-missing "$EXIT_VERIFY_FAILED" NONE
-openssl x509 -checkend 0 -noout -in "$certificate" >/dev/null 2>&1 ||
-  complete STOP_VERIFY_FAILED apiserver-certificate-expired "$EXIT_VERIFY_FAILED" NONE
-certificate_output=$(openssl x509 -in "$certificate" -noout -subject -ext subjectAltName -enddate 2>/dev/null) || complete STOP_VERIFY_FAILED apiserver-certificate-unreadable "$EXIT_VERIFY_FAILED" NONE
-certificate_subject=$(printf '%s\n' "$certificate_output" | sed -n 's/^subject=//p')
-certificate_expiry=$(printf '%s\n' "$certificate_output" | sed -n 's/^notAfter=//p')
-[[ -n "$certificate_subject" && "$certificate_subject" != *$'\n'* ]] || complete STOP_VERIFY_FAILED certificate-subject-invalid "$EXIT_VERIFY_FAILED" NONE
-[[ -n "$certificate_expiry" && "$certificate_expiry" != *$'\n'* ]] || complete STOP_VERIFY_FAILED certificate-expiry-invalid "$EXIT_VERIFY_FAILED" NONE
-grep -Fq 'IP Address:10.93.1.27' <<<"$certificate_output" || complete STOP_VERIFY_FAILED certificate-san-missing "$EXIT_VERIFY_FAILED" NONE
+initialized_control_plane_gate STOP_VERIFY_FAILED "$EXIT_VERIFY_FAILED"
 
 evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 12-kubeadm "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
