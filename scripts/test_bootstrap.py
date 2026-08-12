@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tarfile
@@ -243,13 +244,33 @@ class PreflightTest(BootstrapTestCase):
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
         path.chmod(0o755)
 
-    def make_environment(self) -> tuple[dict[str, str], Path]:
+    def make_environment(
+        self, *, ambient_support_path: str | None = None
+    ) -> tuple[dict[str, str], Path]:
         directory = self.temporary_directory()
         host = directory / 'host'
         fake_bin = directory / 'bin'
+        support_bin = directory / 'support-bin'
         (host / 'etc').mkdir(parents=True)
         (host / 'root/dev-infra-evidence').mkdir(parents=True)
         fake_bin.mkdir()
+        support_bin.mkdir()
+        support_path = ambient_support_path or os.environ.get('PATH', os.defpath)
+        for command in (
+            'awk',
+            'chmod',
+            'cmp',
+            'date',
+            'dirname',
+            'grep',
+            'python3',
+            'readlink',
+            'tr',
+        ):
+            source = shutil.which(command, path=support_path)
+            if source is None:
+                self.fail(f'fixture support command missing: {command}')
+            (support_bin / command).symlink_to(Path(source).resolve())
         (host / 'etc/os-release').write_text(
             'ID=ubuntu\nVERSION_ID="24.04"\n', encoding='utf-8'
         )
@@ -363,7 +384,7 @@ class PreflightTest(BootstrapTestCase):
         environment = os.environ.copy()
         environment.update(
             {
-                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'PATH': os.pathsep.join((str(fake_bin), str(support_bin))),
                 'BOOTSTRAP_TEST_MODE': '1',
                 'BOOTSTRAP_TEST_ROOT': str(host),
             }
@@ -456,7 +477,7 @@ class PreflightTest(BootstrapTestCase):
     def test_fake_cleanup_digest_precedes_system_sha256sum(self) -> None:
         """捕获 Linux 优先选择 sha256sum 时绕过批准 digest fixture 的缺陷。"""
         environment, _ = self.make_environment()
-        fake_bin = Path(environment['PATH'].split(':', 1)[0])
+        fake_bin, support_bin = map(Path, environment['PATH'].split(os.pathsep))
         system_bin = fake_bin.parent / 'system-bin'
         system_bin.mkdir()
         self.write_executable(
@@ -466,7 +487,9 @@ class PreflightTest(BootstrapTestCase):
             printf '%064d  %s\n' 0 "$1"
             ''',
         )
-        environment['PATH'] = f'{fake_bin}:{system_bin}:/usr/bin:/bin'
+        environment['PATH'] = os.pathsep.join(
+            (str(fake_bin), str(system_bin), str(support_bin))
+        )
 
         result = self.run_command(
             ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
@@ -474,6 +497,37 @@ class PreflightTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+
+    def test_ambient_containerd_is_excluded_from_fixture_path(self) -> None:
+        ambient_bin = self.temporary_directory() / 'ambient-bin'
+        ambient_bin.mkdir()
+        self.write_executable(ambient_bin / 'containerd', '#!/bin/sh\nexit 0\n')
+        ambient_support_path = os.pathsep.join(
+            (str(ambient_bin), os.environ.get('PATH', os.defpath))
+        )
+
+        environment, _ = self.make_environment(
+            ambient_support_path=ambient_support_path
+        )
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+
+    def test_containerd_inside_fixture_path_still_stops(self) -> None:
+        environment, _ = self.make_environment()
+        fake_bin = Path(environment['PATH'].split(os.pathsep, 1)[0])
+        self.write_executable(fake_bin / 'containerd', '#!/bin/sh\nexit 0\n')
+
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
+        self.assertIn('RESULT=STOP_OLD_RUNTIME', result.stdout)
+        self.assertIn('REASON=unexpected-binary-containerd', result.stdout)
 
     def test_stops_on_local_cidr_overlap(self) -> None:
         result, _ = self.run_preflight(
