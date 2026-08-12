@@ -1036,9 +1036,11 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
             directory.mkdir()
             directory.chmod(0o700)
         self.command_log = self.fixture_root / 'commands.log'
-        self.lock_file = self.fixture_root / 'bootstrap.lock'
+        self.lock_dir = self.fixture_root / 'lock'
+        self.lock_dir.mkdir(mode=0o777)
+        self.lock_dir.chmod(0o1777)
+        self.lock_file = self.lock_dir / 'bootstrap.lock'
         self.command_log.write_text('', encoding='utf-8')
-        self.lock_file.touch(mode=0o600)
         self.write_fake_stages()
         self.write_fake_commands()
 
@@ -1074,6 +1076,8 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
             if [ -n "${FAKE_STAGE_STOP:-}" ] &&
                [ "${FAKE_STAGE_STOP%%:*}" = "$stage" ]; then
+              printf '%s\n' "${FAKE_STAGE_STDOUT_MARKER:-stage-stop-stdout}"
+              printf '%s\n' "${FAKE_STAGE_STDERR_MARKER:-stage-stop-stderr}" >&2
               exit "${FAKE_STAGE_STOP#*:}"
             fi
 
@@ -1191,6 +1195,12 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
             r'''
             #!/bin/sh
             [ "$*" = '-n 9' ] || exit 2
+            if [ "${FAKE_LOCK_RACE:-0}" = 1 ]; then
+              rm -f -- "$BOOTSTRAP_ORCHESTRATOR_TEST_LOCK_FILE"
+              ln -s "$FAKE_LOCK_RACE_TARGET" \
+                "$BOOTSTRAP_ORCHESTRATOR_TEST_LOCK_FILE"
+              printf 'fd-nine-locked\n' >&9
+            fi
             [ "${FAKE_FLOCK_FAIL:-0}" != 1 ]
             ''',
         )
@@ -1211,6 +1221,49 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
             ['/bin/bash', '-p', str(BOOTSTRAP_ALL), *arguments],
             env=environment if environment is not None else self.environment,
         )
+
+    def run_orchestrator_direct(
+        self, *arguments: str, environment: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertTrue(
+            BOOTSTRAP_ALL.exists(), 'bootstrap-all.sh entry is missing'
+        )
+        return self.run_command(
+            [str(BOOTSTRAP_ALL), *arguments],
+            env=environment if environment is not None else self.environment,
+        )
+
+    def test_direct_entry_ignores_path_bash_and_bash_env(self) -> None:
+        fake_bash_marker = self.fixture_root / 'fake-bash-ran'
+        bash_env_marker = self.fixture_root / 'bash-env-ran'
+        bash_env = self.fixture_root / 'caller-bash-env.sh'
+        bash_env.write_text(
+            ': >"$FAKE_BASH_ENV_MARKER"\n', encoding='utf-8'
+        )
+        self.write_executable(
+            self.fake_bin / 'bash',
+            '''#!/bin/sh
+            : >"$FAKE_BASH_MARKER"
+            exec /bin/bash "$@"
+            ''',
+        )
+        environment = self.environment.copy()
+        environment.update(
+            {
+                'BASH_ENV': str(bash_env),
+                'FAKE_BASH_MARKER': str(fake_bash_marker),
+                'FAKE_BASH_ENV_MARKER': str(bash_env_marker),
+            }
+        )
+
+        result = self.run_orchestrator_direct(
+            '--check', environment=environment
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_CHECK', result.stdout)
+        self.assertFalse(fake_bash_marker.exists())
+        self.assertFalse(bash_env_marker.exists())
 
     def test_check_stops_read_only_at_first_apply_required_stage(self) -> None:
         result = self.run_orchestrator('--check')
@@ -1237,10 +1290,16 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
     def test_nonzero_stage_exit_is_preserved(self) -> None:
         self.environment['FAKE_STAGE_STOP'] = '40:20'
+        self.environment['FAKE_STAGE_STDOUT_MARKER'] = 'stage-40-stdout-stop'
+        self.environment['FAKE_STAGE_STDERR_MARKER'] = 'stage-40-stderr-stop'
 
         result = self.run_orchestrator('--apply')
 
         self.assertEqual(result.returncode, 20)
+        diagnostics = result.stdout + result.stderr
+        self.assertIn('stage-40-stdout-stop', diagnostics)
+        self.assertIn('stage-40-stderr-stop', diagnostics)
+        self.assertNotIn('STAGE_40_', diagnostics)
 
     def test_zero_exit_with_malformed_result_stops_unknown(self) -> None:
         self.environment['FAKE_STAGE_MALFORMED'] = '40:duplicate-result'
@@ -1284,6 +1343,57 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
                 self.assertEqual(result.returncode, 30)
                 self.assertIn(f'REASON={reason}', result.stdout)
+
+    def test_apply_accepts_sticky_lock_parent_and_atomically_creates_target(
+        self,
+    ) -> None:
+        self.assertFalse(self.lock_file.exists())
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.lock_file.is_symlink())
+        self.assertTrue(self.lock_file.is_file())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o7777, 0o600)
+
+    def test_apply_rejects_symlink_or_unsafe_lock_target(self) -> None:
+        unsafe_target = self.fixture_root / 'unsafe-lock-target'
+        unsafe_target.write_text('preserve\n', encoding='utf-8')
+        cases = ('symlink', 'writable')
+        for case in cases:
+            with self.subTest(case=case):
+                self.reset_fixture()
+                if self.lock_file.exists() or self.lock_file.is_symlink():
+                    self.lock_file.unlink()
+                if case == 'symlink':
+                    self.lock_file.symlink_to(unsafe_target)
+                else:
+                    self.lock_file.touch(mode=0o600)
+                    self.lock_file.chmod(0o666)
+
+                result = self.run_orchestrator('--apply')
+
+                self.assertIn(result.returncode, (10, 30))
+                self.assertIn('REASON=unsafe-lock-target', result.stdout)
+                self.assertEqual(
+                    unsafe_target.read_text(encoding='utf-8'), 'preserve\n'
+                )
+
+    def test_lock_target_swap_cannot_redirect_open_file_descriptor(self) -> None:
+        race_target = self.fixture_root / 'race-lock-target'
+        race_target.write_text('preserve\n', encoding='utf-8')
+        self.environment.update(
+            {
+                'FAKE_LOCK_RACE': '1',
+                'FAKE_LOCK_RACE_TARGET': str(race_target),
+            }
+        )
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(race_target.read_text(encoding='utf-8'), 'preserve\n')
+        self.assertTrue(self.lock_file.is_symlink())
 
     def test_check_all_complete_reaches_final_verify(self) -> None:
         for stage in ('10', '20', '30', '40', '50', '60'):
@@ -1366,13 +1476,39 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
         environment = os.environ.copy()
         for name in tuple(environment):
-            if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_'):
+            if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_') or name.startswith('GIT_'):
                 del environment[name]
 
         result = self.run_orchestrator('--apply', environment=environment)
 
         self.assertEqual(result.returncode, 10)
         self.assertIn('REASON=not-root', result.stdout)
+
+    def test_production_rejects_every_caller_git_environment_variable(
+        self,
+    ) -> None:
+        cases = (
+            ('GIT_DIR', ''),
+            ('GIT_WORK_TREE', str(self.fixture_root)),
+            ('GIT_CONFIG_COUNT', '0'),
+            ('GIT_OBJECT_DIRECTORY', str(self.fixture_root)),
+        )
+        for variable, value in cases:
+            with self.subTest(variable=variable, value=value):
+                environment = os.environ.copy()
+                for name in tuple(environment):
+                    if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_') or name.startswith('GIT_'):
+                        del environment[name]
+                environment[variable] = value
+
+                result = self.run_orchestrator(
+                    '--check', environment=environment
+                )
+
+                self.assertEqual(result.returncode, 10)
+                self.assertIn(
+                    'REASON=untrusted-git-environment', result.stderr
+                )
 
     def test_test_path_checks_ignore_caller_stat_binary(self) -> None:
         self.state_dir.chmod(0o777)
