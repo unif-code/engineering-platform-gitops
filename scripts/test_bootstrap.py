@@ -1528,6 +1528,67 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 10)
         self.assertIn('REASON=unsafe-test-path', result.stdout)
 
+    def test_gnu_stat_fallback_discards_failed_probe_stdout(self) -> None:
+        fake_stat = self.fixture_root / 'gnu-stat'
+        self.write_executable(
+            fake_stat,
+            r'''
+            #!/usr/bin/python3
+            import os
+            import stat
+            import sys
+
+            if len(sys.argv) != 4:
+                raise SystemExit(2)
+            option, field, path = sys.argv[1:]
+            contaminated = os.environ['FAKE_STAT_CONTAMINATE']
+            if option == '-f' and (
+                (field == '%u' and contaminated == 'owner')
+                or (field == '%Lp' and contaminated == 'mode')
+            ):
+                print('gnu-stat-filesystem-report')
+                raise SystemExit(1)
+
+            path_stat = os.stat(path)
+            mode = stat.S_IMODE(path_stat.st_mode)
+            values = {
+                ('-f', '%u'): str(path_stat.st_uid),
+                ('-f', '%Lp'): f'{mode:o}',
+                ('-f', '%Mp%Lp'): f'{mode:04o}',
+                ('-c', '%u'): str(path_stat.st_uid),
+                ('-c', '%a'): f'{mode:o}',
+            }
+            try:
+                print(values[(option, field)])
+            except KeyError:
+                raise SystemExit(2)
+            ''',
+        )
+        compat_repo = self.fixture_root / 'compat-repo'
+        compat_bootstrap_dir = compat_repo / 'scripts' / 'bootstrap'
+        compat_bootstrap_dir.mkdir(parents=True)
+        compat_bootstrap = compat_bootstrap_dir / 'bootstrap-all.sh'
+        source = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        self.assertIn('/usr/bin/stat', source)
+        self.write_executable(
+            compat_bootstrap, source.replace('/usr/bin/stat', str(fake_stat))
+        )
+
+        for contaminated_probe in ('owner', 'mode'):
+            with self.subTest(contaminated_probe=contaminated_probe):
+                environment = self.base_environment.copy()
+                environment['FAKE_STAT_CONTAMINATE'] = contaminated_probe
+
+                result = self.run_command(
+                    ['/bin/bash', '-p', str(compat_bootstrap), '--check'],
+                    env=environment,
+                )
+
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn('RESULT=PASS_BOOTSTRAP_CHECK', result.stdout)
+
     def test_git_status_failure_cannot_be_treated_as_clean(self) -> None:
         self.environment['FAKE_GIT_STATUS_FAIL'] = '1'
 

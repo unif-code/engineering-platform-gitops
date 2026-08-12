@@ -58,13 +58,29 @@ stop_orchestrator() {
 }
 
 path_owner_uid() {
-  /usr/bin/stat -f '%u' "$1" 2>/dev/null ||
-    /usr/bin/stat -c '%u' "$1" 2>/dev/null
+  local owner
+
+  owner=$(/usr/bin/stat -f '%u' "$1" 2>/dev/null) || owner=
+  if [[ "$owner" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$owner"
+    return 0
+  fi
+  owner=$(/usr/bin/stat -c '%u' "$1" 2>/dev/null) || return 1
+  [[ "$owner" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$owner"
 }
 
 path_mode() {
-  /usr/bin/stat -f '%Lp' "$1" 2>/dev/null ||
-    /usr/bin/stat -c '%a' "$1" 2>/dev/null
+  local mode
+
+  mode=$(/usr/bin/stat -f '%Lp' "$1" 2>/dev/null) || mode=
+  if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  mode=$(/usr/bin/stat -c '%a' "$1" 2>/dev/null) || return 1
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  printf '%s\n' "$mode"
 }
 
 lock_parent_mode() {
