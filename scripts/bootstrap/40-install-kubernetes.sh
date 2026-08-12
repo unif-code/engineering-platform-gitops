@@ -638,7 +638,7 @@ apt_config=
 gpg_workspace=
 
 # trap 在 APT workspace 创建后间接调用该清理函数。
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup_apt_workspace() {
   local download_parent
   [[ -n "$apt_workspace" ]] || return 0
@@ -649,7 +649,7 @@ cleanup_apt_workspace() {
 }
 
 # trap 在 GnuPG workspace 创建后间接调用该清理函数。
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup_gpg_workspace() {
   local parent
   [[ -n "$gpg_workspace" ]] || return 0
@@ -661,7 +661,7 @@ cleanup_gpg_workspace() {
 }
 
 # trap 间接调用。
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup_temporary_workspaces() {
   cleanup_apt_workspace || true
   cleanup_gpg_workspace || true

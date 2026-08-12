@@ -164,6 +164,10 @@ atomic_publish_content() {
     return "$EXIT_UNKNOWN_STATE"
   fi
   if ! mv -n "$temporary" "$target"; then
+    if [[ -e "$target" || -L "$target" ]]; then
+      rm -f -- "$temporary"
+      return "$EXIT_UNKNOWN_STATE"
+    fi
     rm -f -- "$temporary"
     return "$EXIT_APPLY_FAILED"
   fi

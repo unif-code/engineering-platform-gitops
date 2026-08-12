@@ -261,7 +261,7 @@ config_snapshot_dir=
 config_snapshot=
 
 # trap 间接调用；仅清理受验证的私有 snapshot 目录。
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup_config_snapshot() {
   local parent
   [[ -n "$config_snapshot_dir" ]] || return 0

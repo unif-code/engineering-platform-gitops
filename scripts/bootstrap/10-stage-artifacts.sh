@@ -196,8 +196,13 @@ private_directory() {
   local mode
 
   [[ -d "$directory" && ! -L "$directory" ]] || return 1
-  mode=$(stat -f '%Lp' "$directory" 2>/dev/null || stat -c '%a' "$directory" 2>/dev/null) || return 1
-  [[ "$mode" == 700 ]]
+  if mode=$(stat -f '%Lp' "$directory" 2>/dev/null); then
+    :
+  else
+    mode=$(stat -c '%a' "$directory" 2>/dev/null) || return 1
+  fi
+  [[ "$mode" =~ ^0?[0-7]{3}$ ]] || return 1
+  [[ "$mode" == 700 || "$mode" == 0700 ]]
 }
 
 parse_mode "$@" || exit "$?"

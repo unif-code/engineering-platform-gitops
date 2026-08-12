@@ -332,10 +332,30 @@ class PreflightTest(BootstrapTestCase):
             #!/bin/sh
             case "$*" in
               *06-host-workflow-cleanup*)
-                eval "last=\\${{${{#}}}}"
+                last=
+                for last do :; done
                 printf '%s  %s\n' "${{FAKE_CLEANUP_SHA:-{self.cleanup_digest}}}" "$last"
                 ;;
               *) exec /usr/bin/shasum "$@" ;;
+            esac
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'sha256sum',
+            f'''
+            #!/bin/sh
+            case "$*" in
+              *06-host-workflow-cleanup*)
+                last=
+                for last do :; done
+                printf '%s  %s\n' "${{FAKE_CLEANUP_SHA:-{self.cleanup_digest}}}" "$last"
+                ;;
+              *)
+                if [ -x /usr/bin/sha256sum ]; then
+                  exec /usr/bin/sha256sum "$@"
+                fi
+                exec /usr/bin/shasum -a 256 "$@"
+                ;;
             esac
             ''',
         )
@@ -433,6 +453,28 @@ class PreflightTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 10)
         self.assertIn('RESULT=STOP_CLEANUP_EVIDENCE', result.stdout)
 
+    def test_fake_cleanup_digest_precedes_system_sha256sum(self) -> None:
+        """捕获 Linux 优先选择 sha256sum 时绕过批准 digest fixture 的缺陷。"""
+        environment, _ = self.make_environment()
+        fake_bin = Path(environment['PATH'].split(':', 1)[0])
+        system_bin = fake_bin.parent / 'system-bin'
+        system_bin.mkdir()
+        self.write_executable(
+            system_bin / 'sha256sum',
+            '''
+            #!/bin/sh
+            printf '%064d  %s\n' 0 "$1"
+            ''',
+        )
+        environment['PATH'] = f'{fake_bin}:{system_bin}:/usr/bin:/bin'
+
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+
     def test_stops_on_local_cidr_overlap(self) -> None:
         result, _ = self.run_preflight(
             FAKE_IP_ROUTES='172.21.8.0/24 dev ens160 scope link'
@@ -518,7 +560,10 @@ class KernelStageTest(BootstrapTestCase):
             printf 'mv %s\n' "$*" >>"$FAKE_COMMAND_LOG"
             if [ "${FAKE_MV_RACE_TARGET:-}" = "${3:-}" ]; then
               printf 'concurrent\n' >"$FAKE_MV_RACE_TARGET"
+              [ "${FAKE_MV_RACE_RC:-0}" = 0 ] && exit 0
+              exit "$FAKE_MV_RACE_RC"
             fi
+            [ "${FAKE_MV_FAIL_TARGET:-}" != "${3:-}" ] || exit 1
             exec /bin/mv "$@"
             ''',
         )
@@ -791,16 +836,37 @@ class KernelStageTest(BootstrapTestCase):
 
     def test_apply_never_overwrites_target_that_appears_during_publish(self) -> None:
         """捕获发布竞态覆盖并发创建目标的缺陷。"""
+        for conflict_rc in ('0', '1'):
+            with self.subTest(conflict_rc=conflict_rc):
+                environment, host, _ = self.make_environment()
+                target = self.modules_file(host)
+                environment.update(
+                    {
+                        'FAKE_MV_RACE_TARGET': str(target),
+                        'FAKE_MV_RACE_RC': conflict_rc,
+                    }
+                )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertEqual(
+                    target.read_text(encoding='utf-8'), 'concurrent\n'
+                )
+                self.assertFalse(self.sysctl_file(host).exists())
+
+    def test_apply_keeps_non_conflict_mv_failure_as_apply_failed(self) -> None:
+        """捕获把没有并发目标的 mv I/O 失败误分类为 UNKNOWN 的缺陷。"""
         environment, host, _ = self.make_environment()
         target = self.modules_file(host)
-        environment['FAKE_MV_RACE_TARGET'] = str(target)
+        environment['FAKE_MV_FAIL_TARGET'] = str(target)
 
         result = self.run_stage(environment, '--apply')
 
-        self.assertEqual(result.returncode, 30, result.stderr)
-        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
-        self.assertEqual(target.read_text(encoding='utf-8'), 'concurrent\n')
-        self.assertFalse(self.sysctl_file(host).exists())
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertFalse(target.exists())
 
     def test_check_rejects_kernel_parent_and_file_owner_drift(self) -> None:
         """捕获忽略 kernel 受管 parent/file uid:gid 漂移的缺陷。"""
@@ -1717,6 +1783,26 @@ class ArtifactStageTest(BootstrapTestCase):
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
         self.write_executable(
+            fake_bin / 'stat',
+            '''
+            #!/usr/bin/python3
+            import os
+            import stat
+            import sys
+
+            if len(sys.argv) != 4:
+                raise SystemExit(64)
+            option, field, path = sys.argv[1:]
+            if option == '-f' and field == '%Lp':
+                if os.environ.get('FAKE_STAT_CONTAMINATE_BSD') == '1':
+                    print('failed-bsd-probe-garbage')
+                    raise SystemExit(1)
+            elif option != '-c' or field != '%a':
+                raise SystemExit(64)
+            print(f'{stat.S_IMODE(os.stat(path).st_mode):o}')
+            ''',
+        )
+        self.write_executable(
             fake_bin / 'sha256sum',
             '''
             #!/bin/sh
@@ -2284,6 +2370,16 @@ class ArtifactStageTest(BootstrapTestCase):
         self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
         self.assertEqual(staging.stat().st_mode & 0o777, 0o755)
 
+    def test_check_discards_failed_bsd_stat_stdout_before_gnu_mode(self) -> None:
+        """捕获失败 BSD probe 的 stdout 污染 GNU mode 结果的缺陷。"""
+        environment, _, _, _ = self.compliant_environment()
+        environment['FAKE_STAT_CONTAMINATE_BSD'] = '1'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+
     def test_apply_rejects_existing_artifact_root_mode_drift(self) -> None:
         environment, host, _, _ = self.compliant_environment()
         artifact_root = host / 'root/dev-infra-artifacts'
@@ -2625,13 +2721,15 @@ esac
             '''
             #!/bin/sh
             printf 'mv %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            eval "last=\${${#}}"
             if [ -n "${FAKE_MV_RACE_TARGET:-}" ]; then
-              eval "last=\${${#}}"
               if [ "$last" = "$FAKE_MV_RACE_TARGET" ]; then
                 printf 'concurrent\n' >"$last"
+                [ "${FAKE_MV_RACE_RC:-0}" = 0 ] && exit 0
+                exit "$FAKE_MV_RACE_RC"
               fi
             fi
-            eval "last=\${${#}}"
+            [ "${FAKE_MV_FAIL_TARGET:-}" != "$last" ] || exit 1
             /bin/mv "$@" || exit
             if [ "${FAKE_PHASE_RACE_PHASE:-}" = pre-publish ] && [ "$last" = "${FAKE_PHASE_RACE_AFTER_MV:-}" ]; then
               : >"$FAKE_PHASE_RACE_OWNER_MARKER"
@@ -3192,13 +3290,32 @@ esac
         self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
         self.assertTrue(all(not path.exists() for path in self.managed_targets(host).values()))
 
+        for conflict_rc in ('0', '1'):
+            with self.subTest(conflict_rc=conflict_rc):
+                environment, host, _, _ = self.make_environment()
+                target = self.managed_targets(host)['containerd']
+                environment.update(
+                    {
+                        'FAKE_MV_RACE_TARGET': str(target),
+                        'FAKE_MV_RACE_RC': conflict_rc,
+                    }
+                )
+                result = self.run_stage(environment, '--apply')
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertEqual(target.read_bytes(), b'concurrent\n')
+
+    def test_apply_keeps_non_conflict_mv_failure_as_apply_failed(self) -> None:
+        """捕获把没有并发目标的 mv I/O 失败误分类为 UNKNOWN 的缺陷。"""
         environment, host, _, _ = self.make_environment()
         target = self.managed_targets(host)['containerd']
-        environment['FAKE_MV_RACE_TARGET'] = str(target)
+        environment['FAKE_MV_FAIL_TARGET'] = str(target)
+
         result = self.run_stage(environment, '--apply')
-        self.assertEqual(result.returncode, 30, result.stderr)
-        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
-        self.assertEqual(target.read_bytes(), b'concurrent\n')
+
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertFalse(target.exists())
 
     def test_check_exact_install_is_idempotent_without_service_restart(self) -> None:
         """捕获精确已安装状态仍重写文件、reload、enable 或 restart 的缺陷。"""
@@ -3602,7 +3719,9 @@ class KubernetesInstallTest(BootstrapTestCase):
             fake_bin / 'stat',
             '''
             #!/bin/sh
-            if [ "${!#}" = "${FAKE_STAT_OWNER_DRIFT:-}" ]; then
+            last=
+            for last do :; done
+            if [ "$last" = "${FAKE_STAT_OWNER_DRIFT:-}" ]; then
               case "$*" in
                 *'%u:%g'*) printf '999:999\n'; exit 0 ;;
               esac
@@ -3642,7 +3761,9 @@ class KubernetesInstallTest(BootstrapTestCase):
                 printf 'approved-keyring\n' >"$output"
                 ;;
               *' --show-keys '*)
-                case "$(tail -c +1 "${!#}")" in
+                last=
+                for last do :; done
+                case "$(tail -c +1 "$last")" in
                   approved-keyring*|official-release-key*) fingerprint=${FAKE_KEY_FINGERPRINT:?} ;;
                   *) fingerprint=0000000000000000000000000000000000000000 ;;
                 esac
@@ -3977,7 +4098,8 @@ kubernetes-cni'
               done
               exit 0
             fi
-            package=${!#}
+            package=
+            for package do :; done
             case "$1" in
               -S)
                 [ -f "$FAKE_PACKAGES_INSTALLED" ] || [ "${FAKE_INSTALLED_STATE:-}" = exact ] || exit 1
@@ -4183,6 +4305,30 @@ kubernetes-cni'
         return self.run_command(
             ['/bin/bash', str(INSTALL_KUBERNETES), mode], env=environment
         )
+
+    def test_fake_stat_extracts_last_argument_under_posix_shell(self) -> None:
+        """捕获 /bin/sh fixture 使用 Bash 间接位置参数扩展的缺陷。"""
+        environment, host, _ = self.make_environment()
+        fake_stat = Path(environment['PATH'].split(':', 1)[0]) / 'stat'
+        target = host / 'etc/os-release'
+        target.write_text('fixture\n', encoding='utf-8')
+        environment['FAKE_STAT_OWNER_DRIFT'] = str(target)
+        posix_shell = next(
+            (
+                str(path)
+                for path in (Path('/bin/dash'), Path('/usr/bin/dash'))
+                if path.exists()
+            ),
+            '/bin/sh',
+        )
+
+        result = self.run_command(
+            [posix_shell, str(fake_stat), '-c', '%u:%g', str(target)],
+            env=environment,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '999:999\n')
 
     def install_repository_contract(self, host: Path) -> None:
         (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').write_text(
@@ -5154,7 +5300,9 @@ class KubeadmInitTest(BootstrapTestCase):
         self.write_executable(
             fake_bin / 'stat',
             '''#!/bin/sh
-            if [ "${!#}" = "${FAKE_STAT_OWNER_DRIFT:-}" ]; then
+            last=
+            for last do :; done
+            if [ "$last" = "${FAKE_STAT_OWNER_DRIFT:-}" ]; then
               case "$*" in *'%u:%g'*) printf '999:999\n'; exit 0 ;; esac
             fi
             if [ "$*" = "-fc %T $FAKE_HOST_ROOT/sys/fs/cgroup" ]; then
@@ -6752,7 +6900,8 @@ operator:
             fake_bin / 'ln',
             '''
             #!/bin/sh
-            target=${!#}
+            target=
+            for target do :; done
             if [ -n "${FAKE_LN_RACE_TARGET:-}" ] && [ "$target" = "$FAKE_LN_RACE_TARGET" ]; then
               printf 'raced\n' >"$target"
               chmod 0755 "$target"
@@ -7094,6 +7243,31 @@ operator:
         return self.run_command(
             ['/bin/bash', '-p', str(INSTALL_CILIUM), mode], env=environment
         )
+
+    def test_fake_ln_extracts_last_argument_under_posix_shell(self) -> None:
+        """捕获 /bin/sh fixture 在并发目标注入前因 ${!#} 退出的缺陷。"""
+        environment, host, _, _ = self.make_environment()
+        fake_ln = Path(environment['PATH'].split(':', 1)[0]) / 'ln'
+        source = host / 'ln-source'
+        target = host / 'ln-target'
+        source.write_text('source\n', encoding='utf-8')
+        environment['FAKE_LN_RACE_TARGET'] = str(target)
+        posix_shell = next(
+            (
+                str(path)
+                for path in (Path('/bin/dash'), Path('/usr/bin/dash'))
+                if path.exists()
+            ),
+            '/bin/sh',
+        )
+
+        result = self.run_command(
+            [posix_shell, str(fake_ln), str(source), str(target)],
+            env=environment,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target.read_text(encoding='utf-8'), 'raced\n')
 
     def install_helm_contract(self, host: Path) -> None:
         archive = host / (
