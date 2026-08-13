@@ -516,10 +516,36 @@ class PreflightTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
 
-    def test_containerd_inside_fixture_path_still_stops(self) -> None:
-        environment, _ = self.make_environment()
+    def test_stage30_owned_runtime_footprint_does_not_fail_preflight(self) -> None:
+        environment, host = self.make_environment()
         fake_bin = Path(environment['PATH'].split(os.pathsep, 1)[0])
         self.write_executable(fake_bin / 'containerd', '#!/bin/sh\nexit 0\n')
+        self.write_executable(fake_bin / 'runc', '#!/bin/sh\nexit 0\n')
+        for path in ('etc/containerd', 'opt/containerd', 'var/lib/containerd'):
+            (host / path).mkdir(parents=True)
+        self.write_executable(
+            fake_bin / 'systemctl',
+            '''
+            #!/bin/sh
+            case "$1" in
+              is-active) printf 'active\n' ;;
+              list-unit-files) printf 'containerd.service enabled\n' ;;
+              *) exit 2 ;;
+            esac
+            ''',
+        )
+
+        result = self.run_command(
+            ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+
+    def test_legacy_runtime_conflicts_still_fail_preflight(self) -> None:
+        environment, _ = self.make_environment()
+        fake_bin = Path(environment['PATH'].split(os.pathsep, 1)[0])
+        self.write_executable(fake_bin / 'docker', '#!/bin/sh\nexit 0\n')
 
         result = self.run_command(
             ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
@@ -527,7 +553,7 @@ class PreflightTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
         self.assertIn('RESULT=STOP_OLD_RUNTIME', result.stdout)
-        self.assertIn('REASON=unexpected-binary-containerd', result.stdout)
+        self.assertIn('REASON=unexpected-binary-docker', result.stdout)
 
     def test_stops_on_local_cidr_overlap(self) -> None:
         result, _ = self.run_preflight(

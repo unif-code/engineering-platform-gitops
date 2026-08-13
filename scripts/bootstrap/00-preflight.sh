@@ -140,7 +140,7 @@ if [[ "$cleanup_digest" != "$CLEANUP_EVIDENCE_SHA256" ]]; then
 fi
 log_evidence "CLEANUP_EVIDENCE_SHA256=${cleanup_digest}"
 
-for binary in caddy containerd docker dockerd node npm npx pnpm runc; do
+for binary in caddy docker dockerd node npm npx pnpm; do
   if command -v "$binary" >/dev/null 2>&1; then
     complete STOP_OLD_RUNTIME "unexpected-binary-${binary}" "$EXIT_UNKNOWN_STATE" NONE
   fi
@@ -152,15 +152,15 @@ for package in caddy containerd.io docker-ce docker-ce-cli docker-buildx-plugin 
   fi
 done
 
-for path in /data/workflow /etc/caddy /etc/containerd /etc/docker /opt/containerd /usr/local/lib/node-v24.18.0 /var/lib/containerd /var/lib/docker; do
+for path in /data/workflow /etc/caddy /etc/docker /usr/local/lib/node-v24.18.0 /var/lib/docker; do
   resolved=$(host_path "$path")
   if [[ -e "$resolved" || -L "$resolved" ]]; then
     complete STOP_OLD_RUNTIME "unexpected-path-${path}" "$EXIT_UNKNOWN_STATE" NONE
   fi
 done
 
-unit_files=$(systemctl list-unit-files caddy.service containerd.service docker.service docker.socket 2>/dev/null || true)
-if printf '%s\n' "$unit_files" | grep -Eq '^(caddy|containerd|docker)\.(service|socket)[[:space:]]'; then
+unit_files=$(systemctl list-unit-files caddy.service docker.service docker.socket 2>/dev/null || true)
+if printf '%s\n' "$unit_files" | grep -Eq '^(caddy|docker)\.(service|socket)[[:space:]]'; then
   complete STOP_OLD_RUNTIME unexpected-old-unit "$EXIT_UNKNOWN_STATE" NONE
 fi
 
