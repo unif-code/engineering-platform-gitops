@@ -497,6 +497,44 @@ downloaded_debs_are_exact() {
   done
 }
 
+apt_archive_directory_safe() {
+  local archives_dir="${apt_workspace}/archives"
+  [[ -d "$archives_dir" && ! -L "$archives_dir" && "$(path_mode "$archives_dir")" == 700 ]] || return 1
+  owned_by_expected "$archives_dir"
+}
+
+cached_debs_are_exact() {
+  local package archive expected_digest actual_digest
+  local archives_dir="${apt_workspace}/archives"
+  apt_archive_directory_safe || return 1
+  download_directory_exact "$archives_dir" "${deb_basenames[@]}" || return 1
+  for package in "${PACKAGES[@]}"; do
+    archive="${archives_dir}/${package}_$(package_version "$package")_amd64.deb"
+    [[ -f "$archive" && ! -L "$archive" && "$(path_mode "$archive")" == 600 ]] || return 1
+    owned_by_expected "$archive" || return 1
+    [[ "$(path_size "$archive")" == "$(package_size "$package")" ]] || return 1
+    expected_digest=$(package_sha256 "$package") || return 1
+    actual_digest=$(sha256_file "$archive") || return 1
+    [[ "$actual_digest" == "$expected_digest" ]] || return 1
+  done
+}
+
+publish_verified_deb_to_cache() {
+  local source=$1 basename=$2 target
+  local archives_dir="${apt_workspace}/archives"
+  apt_archive_directory_safe || return "$EXIT_UNKNOWN_STATE"
+  target="${archives_dir}/${basename}"
+  [[ ! -e "$target" && ! -L "$target" ]] || return "$EXIT_UNKNOWN_STATE"
+  chmod 0600 "$source" || return "$EXIT_APPLY_FAILED"
+  sync "$source" || return "$EXIT_APPLY_FAILED"
+  [[ -f "$source" && ! -L "$source" && "$(path_mode "$source")" == 600 ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$source" || return "$EXIT_UNKNOWN_STATE"
+  ln "$source" "$target" 2>/dev/null || return "$EXIT_UNKNOWN_STATE"
+  apt_archive_directory_safe || return "$EXIT_UNKNOWN_STATE"
+  [[ -f "$target" && ! -L "$target" && "$(path_mode "$target")" == 600 ]] || return "$EXIT_UNKNOWN_STATE"
+  owned_by_expected "$target" || return "$EXIT_UNKNOWN_STATE"
+}
+
 deb_dependency_contract_is_exact() {
   local deb=$1 package=$2 field value expected_depends
   expected_depends=$(package_depends "$package" dpkg-deb) || return 1
@@ -911,7 +949,7 @@ if [[ "$(path_mode "$download_dir")" != 700 ]] || ! owned_by_expected "$download
   complete STOP_UNKNOWN_STATE download-directory-unsafe "$EXIT_UNKNOWN_STATE" NONE
 fi
 download_directory_exact "$download_dir" || complete STOP_UNKNOWN_STATE download-directory-not-empty "$EXIT_UNKNOWN_STATE" NONE
-declare -a debs=() deb_basenames=()
+declare -a debs=() deb_basenames=() package_selections=()
 for package in "${PACKAGES[@]}"; do
   version=$(package_version "$package")
   expected_filename=$(package_filename "$package")
@@ -971,9 +1009,28 @@ for package in "${PACKAGES[@]}"; do
     complete STOP_SUPPLY_CHAIN_MISMATCH "deb-dependency-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
   }
   debs+=("$deb")
+  package_selections+=("${package}=${version}")
 done
 
-simulation_output=$(LC_ALL=C APT_CONFIG="$apt_config" apt-get -s install --no-install-recommends --no-download "${debs[@]}" 2>&1) || {
+download_directory_exact "${apt_workspace}/archives" || {
+  rm -r -- "$download_dir"
+  complete STOP_UNKNOWN_STATE apt-archives-cache-not-empty "$EXIT_UNKNOWN_STATE" NONE
+}
+for deb_basename in "${deb_basenames[@]}"; do
+  publish_result=0
+  publish_verified_deb_to_cache "${download_dir}/${deb_basename}" "$deb_basename" || publish_result=$?
+  (( publish_result == 0 )) || {
+    rm -r -- "$download_dir"
+    (( publish_result == EXIT_APPLY_FAILED )) && complete STOP_APPLY_FAILED apt-archive-publish-failed "$EXIT_APPLY_FAILED" NONE
+    complete STOP_UNKNOWN_STATE apt-archive-publish-raced "$EXIT_UNKNOWN_STATE" NONE
+  }
+done
+cached_debs_are_exact || {
+  rm -r -- "$download_dir"
+  complete STOP_SUPPLY_CHAIN_MISMATCH apt-archives-cache-invalid "$EXIT_SUPPLY_CHAIN" NONE
+}
+
+simulation_output=$(LC_ALL=C APT_CONFIG="$apt_config" apt-get -s install --no-install-recommends --no-download "${package_selections[@]}" 2>&1) || {
   rm -r -- "$download_dir"
   complete STOP_APPLY_FAILED local-deb-simulation-failed "$EXIT_APPLY_FAILED" NONE
 }
@@ -981,7 +1038,7 @@ simulation_transaction_is_exact <<<"$simulation_output" || {
   rm -r -- "$download_dir"
   complete STOP_SUPPLY_CHAIN_MISMATCH local-deb-transaction-drift "$EXIT_SUPPLY_CHAIN" NONE
 }
-download_directory_exact "${apt_workspace}/archives" || {
+cached_debs_are_exact || {
   rm -r -- "$download_dir"
   complete STOP_SUPPLY_CHAIN_MISMATCH apt-archives-cache-raced "$EXIT_SUPPLY_CHAIN" NONE
 }
@@ -1005,7 +1062,11 @@ downloaded_debs_are_exact || {
   rm -r -- "$download_dir"
   complete STOP_SUPPLY_CHAIN_MISMATCH downloaded-deb-raced "$EXIT_SUPPLY_CHAIN" NONE
 }
-APT_CONFIG="$apt_config" apt-get install -y --no-install-recommends --no-download "${debs[@]}" >/dev/null 2>&1 || {
+cached_debs_are_exact || {
+  rm -r -- "$download_dir"
+  complete STOP_SUPPLY_CHAIN_MISMATCH apt-archives-cache-raced "$EXIT_SUPPLY_CHAIN" NONE
+}
+APT_CONFIG="$apt_config" apt-get install -y --no-install-recommends --no-download "${package_selections[@]}" >/dev/null 2>&1 || {
   rm -r -- "$download_dir"
   complete STOP_APPLY_FAILED local-deb-install-failed "$EXIT_APPLY_FAILED" NONE
 }

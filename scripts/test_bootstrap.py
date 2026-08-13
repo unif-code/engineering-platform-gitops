@@ -3958,7 +3958,6 @@ class KubernetesInstallTest(BootstrapTestCase):
             [ -f "$source" ] && [ ! -L "$source" ] || exit 1
             [ "$(cat "$source")" = 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' ] || exit 1
             [ -d "$lists" ] && [ -f "$status" ] && [ -d "${extended%/*}" ] && [ -d "$archives" ] || exit 1
-            [ -z "$(find "$archives" -mindepth 1 -maxdepth 1 -print -quit)" ] || exit 1
             ''',
         )
         self.write_executable(
@@ -4050,6 +4049,37 @@ class KubernetesInstallTest(BootstrapTestCase):
             #!/bin/sh
             printf 'apt-get %s APT_CONFIG=%s\n' "$*" "${APT_CONFIG:-}" >>"$FAKE_COMMAND_LOG"
             config=${APT_CONFIG:-}
+            exact_cached_transaction() {
+              [ -n "$config" ] || return 1
+              case " $* " in *' --no-download '*) ;; *) return 1 ;; esac
+              archives=$(awk -F '"' '$1 == "Dir::Cache::archives " {print $2}' "$config") || return 1
+              [ -d "$archives" ] && [ ! -L "$archives" ] || return 1
+              actual=$(find "$archives" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's#.*/##' | sort) || return 1
+              expected=$(printf '%s\n' \
+                kubeadm_1.36.3-1.1_amd64.deb \
+                kubectl_1.36.3-1.1_amd64.deb \
+                kubelet_1.36.3-1.1_amd64.deb \
+                kubernetes-cni_1.9.1-1.1_amd64.deb | sort)
+              [ "$actual" = "$expected" ] || return 1
+              for archive in $archives/*.deb; do
+                [ -f "$archive" ] && [ ! -L "$archive" ] || return 1
+              done
+              kubeadm_seen=0
+              kubectl_seen=0
+              kubelet_seen=0
+              cni_seen=0
+              for argument in "$@"; do
+                case "$argument" in
+                  kubeadm=1.36.3-1.1) kubeadm_seen=$((kubeadm_seen + 1)) ;;
+                  kubectl=1.36.3-1.1) kubectl_seen=$((kubectl_seen + 1)) ;;
+                  kubelet=1.36.3-1.1) kubelet_seen=$((kubelet_seen + 1)) ;;
+                  kubernetes-cni=1.9.1-1.1) cni_seen=$((cni_seen + 1)) ;;
+                  *.deb|kubeadm|kubectl|kubelet|kubernetes-cni) return 1 ;;
+                esac
+              done
+              [ "$kubeadm_seen" = 1 ] && [ "$kubectl_seen" = 1 ] && \
+                [ "$kubelet_seen" = 1 ] && [ "$cni_seen" = 1 ]
+            }
             if [ "${FAKE_REQUIRE_ISOLATED_APT:-0}" = 1 ]; then
               [ -n "$config" ] || exit 71
               case " $* " in *' -c '*) exit 71 ;; esac
@@ -4175,6 +4205,7 @@ class KubernetesInstallTest(BootstrapTestCase):
                 [ "${FAKE_DOWNLOAD_EXTRA:-0}" != 1 ] || printf 'extra\n' >unexpected.deb
                 ;;
               *' -s install '*)
+                exact_cached_transaction "$@" || exit 73
                 printf 'Inst kubeadm (1.36.3-1.1 official [%s])\n' "${FAKE_SIMULATION_ARCH:-amd64}"
                 printf 'Inst kubectl (1.36.3-1.1 official [amd64])\n'
                 printf 'Inst kubelet (1.36.3-1.1 official [amd64])\n'
@@ -4202,8 +4233,7 @@ class KubernetesInstallTest(BootstrapTestCase):
                 fi
                 ;;
               *' install '*)
-                case " $* " in *' --no-download '*) ;; *) exit 68 ;; esac
-                [ "$(printf '%s\n' "$*" | grep -o '\.deb' | wc -l | tr -d ' ')" = 4 ] || exit 69
+                exact_cached_transaction "$@" || exit 73
                 case " $* " in *cri-tools*) exit 70 ;; esac
                 : >"$FAKE_PACKAGES_INSTALLED"
                 "$FAKE_CNI_INSTALL_HELPER"
@@ -5405,8 +5435,16 @@ kubernetes-cni'
             if line.startswith('apt-get ') and ' install ' in line and ' -s ' in line
         )
         self.assertIn('--no-download', install_command)
-        self.assertEqual(install_command.count('.deb'), 4)
+        self.assertNotIn('.deb', install_command)
         self.assertNotIn('cri-tools', install_command)
+        for selection in (
+            'kubeadm=1.36.3-1.1',
+            'kubectl=1.36.3-1.1',
+            'kubelet=1.36.3-1.1',
+            'kubernetes-cni=1.9.1-1.1',
+        ):
+            self.assertEqual(simulation_command.count(selection), 1)
+            self.assertEqual(install_command.count(selection), 1)
         self.assertEqual(
             simulation_command.replace(' -s install ', ' install ', 1),
             install_command.replace(' install -y ', ' install ', 1),
