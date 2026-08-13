@@ -3721,6 +3721,10 @@ class KubernetesInstallTest(BootstrapTestCase):
     release_key_digest = (
         '7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d'
     )
+    kubelet_default_sha256 = (
+        '2737f011e1fc6995aeeb6a2071e268e37b1437481bbdb205f5075939f40d7ae7'
+    )
+    kubelet_default_md5 = '9ba5cd2e9a1e368fa51e13f1dd6a5ec1'
     package_metadata = {
         'kubeadm': (
             'amd64/kubeadm_1.36.3-1.1_amd64.deb',
@@ -3849,6 +3853,13 @@ class KubernetesInstallTest(BootstrapTestCase):
             #!/bin/sh
             last=
             for last do :; done
+            if [ -f "${FAKE_KUBELET_DEFAULT_DRIFTED:-/nonexistent}" ] && \
+               [ "${FAKE_KUBELET_DEFAULT_POST_MD5_DRIFT:-}" = owner ] && \
+               [ "$last" = "$FAKE_HOST_ROOT/etc/default/kubelet" ]; then
+              case "$*" in
+                *'%u:%g'*) printf '999:999\n'; exit 0 ;;
+              esac
+            fi
             if [ "$last" = "${FAKE_STAT_OWNER_DRIFT:-}" ]; then
               case "$*" in
                 *'%u:%g'*) printf '999:999\n'; exit 0 ;;
@@ -4299,6 +4310,22 @@ class KubernetesInstallTest(BootstrapTestCase):
             fake_bin / 'dpkg-query',
             '''
             #!/bin/sh
+            if [ "$#" = 3 ] && [ "$1" = -W ] && [ "$2" = '-f=${Conffiles}' ] && [ "$3" = kubelet ]; then
+              printf 'dpkg-query %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+              [ "${FAKE_KUBELET_CONFFILES_QUERY_FAIL:-0}" != 1 ] || exit 1
+              case "${FAKE_KUBELET_CONFFILES_SHAPE:-exact}" in
+                exact) printf ' /etc/default/kubelet 9ba5cd2e9a1e368fa51e13f1dd6a5ec1\n' ;;
+                missing) printf '' ;;
+                duplicate)
+                  printf ' /etc/default/kubelet 9ba5cd2e9a1e368fa51e13f1dd6a5ec1\n'
+                  printf ' /etc/default/kubelet 9ba5cd2e9a1e368fa51e13f1dd6a5ec1\n'
+                  ;;
+                malformed) printf ' /etc/default/kubelet not-a-digest extra\n' ;;
+                digest-drift) printf ' /etc/default/kubelet 00000000000000000000000000000000\n' ;;
+                *) exit 64 ;;
+              esac
+              exit 0
+            fi
             if [ "$#" = 2 ] && [ "$1" = -W ]; then
               case "$2" in
                 *'${Package}'*'${Architecture}'*'${db:Status-Want}'*) ;;
@@ -4352,6 +4379,27 @@ kubernetes-cni'
                   /usr/bin/kubeadm) owner=kubeadm ;;
                   /usr/bin/kubectl) owner=kubectl ;;
                   /usr/bin/kubelet) owner=kubelet ;;
+                  /etc/default/kubelet)
+                    case "${FAKE_KUBELET_DEFAULT_OWNER_SHAPE:-exact}" in
+                      exact) owner=kubelet ;;
+                      fail) exit 1 ;;
+                      other) owner=unapproved ;;
+                      duplicate)
+                        printf 'kubelet: /etc/default/kubelet\n'
+                        printf 'kubelet: /etc/default/kubelet\n'
+                        exit 0
+                        ;;
+                      no-final-newline)
+                        printf 'kubelet: /etc/default/kubelet'
+                        exit 0
+                        ;;
+                      trailing-blank)
+                        printf 'kubelet: /etc/default/kubelet\n\n'
+                        exit 0
+                        ;;
+                      *) exit 64 ;;
+                    esac
+                    ;;
                   /opt/cni/bin/*) owner=kubernetes-cni ;;
                   *) exit 1 ;;
                 esac
@@ -4502,9 +4550,35 @@ kubernetes-cni'
             ''',
         )
         self.write_executable(
+            fake_bin / 'md5sum',
+            '''
+            #!/bin/sh
+            [ "$#" = 1 ] && [ "$1" = "$FAKE_HOST_ROOT/etc/default/kubelet" ] || exit 64
+            [ "${FAKE_KUBELET_DEFAULT_MD5_FAIL:-0}" != 1 ] || exit 1
+            digest=9ba5cd2e9a1e368fa51e13f1dd6a5ec1
+            [ "${FAKE_KUBELET_DEFAULT_MD5_DRIFT:-0}" != 1 ] || digest=00000000000000000000000000000000
+            case "${FAKE_KUBELET_DEFAULT_POST_MD5_DRIFT:-none}" in
+              none) ;;
+              mode) /bin/chmod 0666 "$1" ;;
+              owner) : >"$FAKE_KUBELET_DEFAULT_DRIFTED" ;;
+              size) printf 'KUBELET_EXTRA_ARGS=\n\n' >"$1" ;;
+              bytes) printf 'XUBELET_EXTRA_ARGS=\n' >"$1" ;;
+              *) exit 64 ;;
+            esac
+            printf '%s  %s\n' "$digest" "$1"
+            ''',
+        )
+        self.write_executable(
             fake_bin / 'sha256sum',
             '''
             #!/bin/sh
+            if [ "${1##*/}" = kubelet ]; then
+              case "$1" in
+                */etc/default/kubelet)
+                  [ "${FAKE_KUBELET_DEFAULT_SHA256_FAIL:-0}" != 1 ] || exit 1
+                  ;;
+              esac
+            fi
             case "${1##*/}" in
               kubeadm_*) digest=7225b4b7928de8bb9b7a69b75524c2df1a6f78fcbb40724f7e5b49926119c2af ;;
               kubectl_*) digest=22c1bbcecfdee50ad013ab7ab9e90ea9d3aaa01d3ac38ac578534976f856c330 ;;
@@ -4577,6 +4651,11 @@ kubernetes-cni'
             printf 'FragmentPath=%s\n' "${FAKE_KUBELET_FRAGMENT_PATH:-/usr/lib/systemd/system/kubelet.service}"
             printf 'DropInPaths=%s\n' "${FAKE_KUBELET_DROPIN_PATHS-/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf}"
             case " $* " in *' --property=Result '*) printf 'Result=%s\n' "$result" ;; esac
+            if [ ! -f "$FAKE_KUBELET_SHOW_DRIFTED" ] && \
+               [ "${FAKE_KUBELET_DEFAULT_POST_SHOW_DRIFT:-none}" = bytes ]; then
+              printf 'XUBELET_EXTRA_ARGS=\n' >"$FAKE_HOST_ROOT/etc/default/kubelet"
+              : >"$FAKE_KUBELET_SHOW_DRIFTED"
+            fi
             ''',
         )
 
@@ -4595,6 +4674,12 @@ kubernetes-cni'
                 'FAKE_HOLD_ENUM_COUNT': str(directory / 'hold-enumeration-count'),
                 'FAKE_CNI_INSTALL_HELPER': str(fake_bin / 'install-cni-fixture'),
                 'FAKE_KUBELET_RESTARTED': str(directory / 'kubelet-restarted'),
+                'FAKE_KUBELET_DEFAULT_DRIFTED': str(
+                    directory / 'kubelet-default-drifted'
+                ),
+                'FAKE_KUBELET_SHOW_DRIFTED': str(
+                    directory / 'kubelet-show-drifted'
+                ),
                 'FAKE_CNI_MANIFEST': str(cni_manifest),
                 'FAKE_CNI_ROOT': str(host / 'opt/cni/bin'),
                 'FAKE_PACKAGES_INDEX': str(packages_index),
@@ -4691,6 +4776,13 @@ kubernetes-cni'
             path.touch()
             os.truncate(path, size)
             path.chmod(mode)
+
+    def install_official_kubelet_default_conffile(self, host: Path) -> Path:
+        target = host / 'etc/default/kubelet'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'KUBELET_EXTRA_ARGS=\n')
+        target.chmod(0o644)
+        return target
 
     def test_check_is_zero_write_on_clean_host(self) -> None:
         environment, host, command_log = self.make_environment()
@@ -4963,6 +5055,7 @@ kubernetes-cni'
         commands_after_apply = command_log.read_text(encoding='utf-8')
         self.assertEqual(commands_after_apply.count('systemctl restart kubelet.service'), 1)
         self.assertNotIn('apt-get ', commands_after_apply)
+        self.assertNotIn('apt-mark hold', commands_after_apply)
 
         repeated = self.run_stage(environment, '--apply')
 
@@ -4973,6 +5066,211 @@ kubernetes-cni'
                 'systemctl restart kubelet.service'
             ),
             1,
+        )
+        self.assertNotIn(
+            'apt-mark hold', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_accepts_unmodified_official_kubelet_default_conffile(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        self.install_official_kubelet_default_conffile(host)
+        environment['FAKE_KUBELET_ACTIVE_STATE'] = 'inactive'
+        environment['FAKE_KUBELET_SUB_STATE'] = 'dead'
+        environment['FAKE_KUBELET_RESULT'] = 'success'
+
+        check = self.run_stage(environment)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_CHECK', check.stdout)
+        self.assertIn('REASON=apply-required', check.stdout)
+        self.assertNotIn(
+            'systemctl restart', command_log.read_text(encoding='utf-8')
+        )
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('11-kubernetes-*.txt')),
+            [],
+        )
+
+        apply = self.run_stage(environment, '--apply')
+        self.assertEqual(apply.returncode, 0, apply.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', apply.stdout)
+        commands_after_apply = command_log.read_text(encoding='utf-8')
+        self.assertEqual(
+            commands_after_apply.count('systemctl restart kubelet.service'),
+            1,
+        )
+        self.assertNotIn('apt-get ', commands_after_apply)
+        self.assertNotIn('apt-mark hold', commands_after_apply)
+
+        repeated = self.run_stage(environment, '--apply')
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', repeated.stdout)
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8').count(
+                'systemctl restart kubelet.service'
+            ),
+            1,
+        )
+        self.assertNotIn(
+            'apt-mark hold', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_rejects_kubelet_default_conffile_provenance_drift(self) -> None:
+        cases = (
+            ('directory', {}),
+            ('symlink', {}),
+            ('mode', {}),
+            ('owner', {'FAKE_STAT_OWNER_DRIFT': 'TARGET'}),
+            ('content-argument', {}),
+            ('content-comment', {}),
+            ('content-whitespace', {}),
+            ('content-extra-newline', {}),
+            ('ownership-query-fail', {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'fail'}),
+            ('ownership-other', {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'other'}),
+            (
+                'ownership-duplicate',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'duplicate'},
+            ),
+            (
+                'ownership-no-final-newline',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'no-final-newline'},
+            ),
+            (
+                'ownership-trailing-blank',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'trailing-blank'},
+            ),
+            ('conffile-query-fail', {'FAKE_KUBELET_CONFFILES_QUERY_FAIL': '1'}),
+            ('conffile-missing', {'FAKE_KUBELET_CONFFILES_SHAPE': 'missing'}),
+            (
+                'conffile-duplicate',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'duplicate'},
+            ),
+            (
+                'conffile-malformed',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'malformed'},
+            ),
+            (
+                'conffile-digest',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'digest-drift'},
+            ),
+            ('md5-command-fail', {'FAKE_KUBELET_DEFAULT_MD5_FAIL': '1'}),
+            ('md5-drift', {'FAKE_KUBELET_DEFAULT_MD5_DRIFT': '1'}),
+            (
+                'sha256-command-fail',
+                {'FAKE_KUBELET_DEFAULT_SHA256_FAIL': '1'},
+            ),
+        )
+        content_mutations = {
+            'content-argument': b'KUBELET_EXTRA_ARGS=--config=/tmp/evil\n',
+            'content-comment': b'# package default\nKUBELET_EXTRA_ARGS=\n',
+            'content-whitespace': b'KUBELET_EXTRA_ARGS= \n',
+            'content-extra-newline': b'KUBELET_EXTRA_ARGS=\n\n',
+        }
+        for drift, overrides in cases:
+            with self.subTest(drift=drift):
+                environment, host, command_log = self.make_environment()
+                self.install_repository_contract(host)
+                environment['FAKE_INSTALLED_STATE'] = 'exact'
+                Path(environment['FAKE_PACKAGES_HELD']).touch()
+                self.install_cni_contract(host)
+                default_file = self.install_official_kubelet_default_conffile(host)
+                environment.update(
+                    {
+                        key: str(default_file) if value == 'TARGET' else value
+                        for key, value in overrides.items()
+                    }
+                )
+                if drift == 'directory':
+                    default_file.unlink()
+                    default_file.mkdir()
+                elif drift == 'symlink':
+                    outside = host.parent / 'outside-default-kubelet'
+                    outside.write_bytes(b'KUBELET_EXTRA_ARGS=\n')
+                    outside.chmod(0o644)
+                    default_file.unlink()
+                    default_file.symlink_to(outside)
+                elif drift == 'mode':
+                    default_file.chmod(0o666)
+                elif drift in content_mutations:
+                    default_file.write_bytes(content_mutations[drift])
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 50, result.stderr)
+                self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+                commands = (
+                    command_log.read_text(encoding='utf-8')
+                    if command_log.exists()
+                    else ''
+                )
+                self.assertNotIn('systemctl restart', commands)
+                self.assertNotIn('apt-get ', commands)
+                self.assertNotIn('apt-mark hold', commands)
+                self.assertEqual(
+                    list(
+                        (host / 'root/dev-infra-evidence').glob(
+                            '11-kubernetes-*.txt'
+                        )
+                    ),
+                    [],
+                )
+
+    def test_rejects_kubelet_default_conffile_drift_during_validation(
+        self,
+    ) -> None:
+        for drift in ('mode', 'owner', 'size', 'bytes'):
+            with self.subTest(drift=drift):
+                environment, host, command_log = self.make_environment()
+                self.install_repository_contract(host)
+                environment['FAKE_INSTALLED_STATE'] = 'exact'
+                Path(environment['FAKE_PACKAGES_HELD']).touch()
+                self.install_cni_contract(host)
+                self.install_official_kubelet_default_conffile(host)
+                environment['FAKE_KUBELET_DEFAULT_POST_MD5_DRIFT'] = drift
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 50, result.stderr)
+                self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertNotIn('systemctl restart', commands)
+                self.assertNotIn('apt-get ', commands)
+                self.assertNotIn('apt-mark hold', commands)
+                self.assertEqual(
+                    list(
+                        (host / 'root/dev-infra-evidence').glob(
+                            '11-kubernetes-*.txt'
+                        )
+                    ),
+                    [],
+                )
+
+    def test_rechecks_installed_payload_before_kubelet_restart(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        self.install_official_kubelet_default_conffile(host)
+        environment['FAKE_KUBELET_ACTIVE_STATE'] = 'inactive'
+        environment['FAKE_KUBELET_SUB_STATE'] = 'dead'
+        environment['FAKE_KUBELET_RESULT'] = 'success'
+        environment['FAKE_KUBELET_DEFAULT_POST_SHOW_DRIFT'] = 'bytes'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertEqual(commands.count('systemctl restart kubelet.service'), 0)
+        self.assertNotIn('apt-get ', commands)
+        self.assertNotIn('apt-mark hold', commands)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('11-kubernetes-*.txt')),
+            [],
         )
 
     def test_fresh_install_explicitly_starts_kubelet(self) -> None:

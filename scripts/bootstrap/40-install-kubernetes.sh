@@ -43,6 +43,10 @@ readonly RELEASE_KEY_FINGERPRINT=DE15B14486CD377B9E876E1A234654DA9A296436
 readonly SOURCE_CONTENT='deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /'
 readonly -a PACKAGES=(kubeadm kubectl kubelet kubernetes-cni)
 readonly -a BASE_DEPENDENCIES=(iptables mount util-linux libc6)
+readonly KUBELET_DEFAULT_CONTENT='KUBELET_EXTRA_ARGS='
+readonly KUBELET_DEFAULT_SIZE=20
+readonly KUBELET_DEFAULT_SHA256=2737f011e1fc6995aeeb6a2071e268e37b1437481bbdb205f5075939f40d7ae7
+readonly KUBELET_DEFAULT_MD5=9ba5cd2e9a1e368fa51e13f1dd6a5ec1
 
 host_path() {
   local absolute=$1
@@ -130,15 +134,46 @@ kubelet_generated_state_is_pristine() {
   done
 }
 
+kubelet_registered_default_md5() {
+  local conffiles
+  conffiles=$(dpkg-query -W -f='${Conffiles}' kubelet 2>/dev/null) || return 1
+  awk '
+    NF == 0 {next}
+    $1 != "/etc/default/kubelet" {next}
+    NF != 2 || $2 !~ /^[0-9a-f]{32}$/ || seen++ {exit 1}
+    {digest=$2}
+    END {
+      if (seen != 1) exit 1
+      print digest
+    }
+  ' <<<"$conffiles"
+}
+
 kubelet_operator_override_is_pristine() {
-  local default_file
+  local default_file size actual_sha256 ownership registered_md5 actual_md5
+  local ownership_sentinel=__KUBELET_DEFAULT_OWNERSHIP_END__
   default_file=$(host_path /etc/default/kubelet)
   if [[ ! -e "$default_file" && ! -L "$default_file" ]]; then
     return 0
   fi
   [[ -f "$default_file" && ! -L "$default_file" && "$(path_mode "$default_file")" == 644 ]] || return 1
   owned_by_expected "$default_file" || return 1
-  [[ "$(path_size "$default_file")" == 0 ]]
+  size=$(path_size "$default_file") || return 1
+  [[ "$size" == 0 ]] && return 0
+  [[ "$size" == "$KUBELET_DEFAULT_SIZE" ]] || return 1
+  [[ "$(cat "$default_file")" == "$KUBELET_DEFAULT_CONTENT" ]] || return 1
+  actual_sha256=$(sha256_file "$default_file") || return 1
+  [[ "$actual_sha256" == "$KUBELET_DEFAULT_SHA256" ]] || return 1
+  ownership=$(dpkg-query -S /etc/default/kubelet 2>/dev/null && printf '%s' "$ownership_sentinel") || return 1
+  [[ "$ownership" == $'kubelet: /etc/default/kubelet\n'"$ownership_sentinel" ]] || return 1
+  registered_md5=$(kubelet_registered_default_md5) || return 1
+  [[ "$registered_md5" == "$KUBELET_DEFAULT_MD5" ]] || return 1
+  actual_md5=$(md5sum "$default_file" 2>/dev/null) || return 1
+  [[ "$actual_md5" == "${registered_md5}  ${default_file}" ]] || return 1
+  [[ -f "$default_file" && ! -L "$default_file" && "$(path_mode "$default_file")" == 644 ]] || return 1
+  owned_by_expected "$default_file" || return 1
+  [[ "$(path_size "$default_file")" == "$KUBELET_DEFAULT_SIZE" ]] || return 1
+  [[ "$(sha256_file "$default_file")" == "$KUBELET_DEFAULT_SHA256" ]]
 }
 
 kubelet_mutable_inputs_are_pristine() {
@@ -763,7 +798,11 @@ kubelet_unit_state() {
 
 restart_kubelet_and_verify() {
   local verification_result=0
+  verify_installed_package_payload_state || verification_result=$?
+  (( verification_result != 2 )) || return 3
+  (( verification_result == 0 )) || return 2
   systemctl restart kubelet.service >/dev/null 2>&1 || return 1
+  verification_result=0
   verify_installed_package_state || verification_result=$?
   (( verification_result != 2 )) || return 3
   (( verification_result == 0 )) || return 2
@@ -906,7 +945,7 @@ download_directory_exact() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln mkdir mktemp readlink rm sed sort stat sync systemctl tr wc; do
+for required_command in apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln md5sum mkdir mktemp readlink rm sed sort stat sync systemctl tr wc; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then

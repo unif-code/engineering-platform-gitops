@@ -6,3 +6,4 @@
 *.secret.yml
 kubeconfig
 artifacts/
+.worktrees/
