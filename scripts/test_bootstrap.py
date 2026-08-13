@@ -3998,8 +3998,16 @@ class KubernetesInstallTest(BootstrapTestCase):
                 fi
                 candidate=${FAKE_CANDIDATE_VERSION:-$default_candidate}
                 printf '%s:\n  Installed: (none)\n  Candidate: %s\n' "$2" "$candidate"
-                printf '  Version table:\n *** %s 100\n' "$candidate"
-                printf '        100 https://pkgs.k8s.io/core:/stable:/v1.36/deb  Packages\n'
+                printf '  Version table:\n'
+                if [ "${FAKE_POLICY_MULTIVERSION:-0}" = 1 ] && [ "$2" != kubernetes-cni ]; then
+                  for version in "$candidate" 1.36.3-1.1 1.36.2-2.1 1.36.1-1.1; do
+                    printf '     %s 500\n' "$version"
+                    printf '        500 https://pkgs.k8s.io/core:/stable:/v1.36/deb  Packages\n'
+                  done
+                else
+                  printf ' *** %s 100\n' "$candidate"
+                  printf '        100 https://pkgs.k8s.io/core:/stable:/v1.36/deb  Packages\n'
+                fi
                 ;;
               show)
                 package=${3%%=*}
@@ -4055,6 +4063,39 @@ class KubernetesInstallTest(BootstrapTestCase):
                   lists=$(awk -F '"' '$1 == "Dir::State::lists " {print $2}' "$config")
                   [ -d "$lists" ] || exit 72
                   /bin/cp "$FAKE_PACKAGES_INDEX" "$lists/kubernetes_Packages"
+                  if [ "${FAKE_INDEX_NEWER_VERSION:-0}" = 1 ]; then
+                    {
+                      printf '\n'
+                      printf 'Package: kubeadm\n'
+                      printf 'Version: 1.36.4-1.1\n'
+                      printf 'Architecture: amd64\n'
+                      printf 'Filename: amd64/kubeadm_1.36.4-1.1_amd64.deb\n'
+                      printf 'Size: 1\n'
+                      printf 'SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n'
+                      printf 'Depends: cri-tools (>= 1.30.0)\n'
+                    } >>"$lists/kubernetes_Packages"
+                  fi
+                  if [ -n "${FAKE_INDEX_MISSING:-}" ]; then
+                    case "$FAKE_INDEX_MISSING" in
+                      kubernetes-cni) missing_version=1.9.1-1.1 ;;
+                      kubeadm|kubectl|kubelet) missing_version=1.36.3-1.1 ;;
+                      *) exit 72 ;;
+                    esac
+                    awk -v package="$FAKE_INDEX_MISSING" -v version="$missing_version" '
+                      BEGIN {RS=""; FS="\n"; ORS="\n\n"}
+                      {
+                        stanza_package=""
+                        stanza_version=""
+                        for (i=1; i<=NF; i++) {
+                          if ($i ~ /^Package: /) stanza_package=substr($i, 10)
+                          if ($i ~ /^Version: /) stanza_version=substr($i, 10)
+                        }
+                        if (stanza_package == package && stanza_version == version) next
+                        print
+                      }
+                    ' "$lists/kubernetes_Packages" >"$lists/kubernetes_Packages.missing"
+                    /bin/mv "$lists/kubernetes_Packages.missing" "$lists/kubernetes_Packages"
+                  fi
                   if [ -n "${FAKE_INDEX_DIGEST_DRIFT:-}" ]; then
                     awk -v package="$FAKE_INDEX_DIGEST_DRIFT" '
                       BEGIN {RS=""; ORS="\n\n"}
@@ -4103,17 +4144,31 @@ class KubernetesInstallTest(BootstrapTestCase):
                 fi
                 ;;
               *' download '*)
-                package=
+                request=
+                request_count=0
                 for argument in "$@"; do
-                  case "$argument" in kube*=*) package=${argument%%=*} ;; esac
+                  case "$argument" in
+                    kubeadm|kubectl|kubelet|kubernetes-cni|kubeadm=*|kubectl=*|kubelet=*|kubernetes-cni=*)
+                      request=$argument
+                      request_count=$((request_count + 1))
+                      ;;
+                  esac
                 done
-                [ -n "$package" ] || exit 64
+                [ "$request_count" = 1 ] || exit 64
                 [ -f "$FAKE_APT_UPDATED" ] || exit 65
-                case "$package" in
-                  kubeadm) version=1.36.3-1.1; size=12558824 ;;
-                  kubectl) version=1.36.3-1.1; size=11766348 ;;
-                  kubelet) version=1.36.3-1.1; size=13386608 ;;
-                  kubernetes-cni) version=1.9.1-1.1; size=38991216 ;;
+                case "$request" in
+                  kubeadm=1.36.3-1.1)
+                    package=kubeadm; version=1.36.3-1.1; size=12558824
+                    ;;
+                  kubectl=1.36.3-1.1)
+                    package=kubectl; version=1.36.3-1.1; size=11766348
+                    ;;
+                  kubelet=1.36.3-1.1)
+                    package=kubelet; version=1.36.3-1.1; size=13386608
+                    ;;
+                  kubernetes-cni=1.9.1-1.1)
+                    package=kubernetes-cni; version=1.9.1-1.1; size=38991216
+                    ;;
                   *) exit 64 ;;
                 esac
                 /usr/bin/python3 -c 'import os,sys; p=sys.argv[1]; open(p,"wb").close(); os.truncate(p,int(sys.argv[2]))' "${package}_${version}_amd64.deb" "$size"
@@ -4458,6 +4513,33 @@ kubernetes-cni'
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '999:999\n')
 
+    def test_fake_apt_download_rejects_unpinned_or_extra_package_requests(
+        self,
+    ) -> None:
+        """捕获 fake download 忽略额外裸包名而让版本 pin mutation 逃逸。"""
+        environment, host, _ = self.make_environment()
+        environment['FAKE_REQUIRE_ISOLATED_APT'] = '0'
+        Path(environment['FAKE_APT_UPDATED']).touch()
+        cases = (
+            ('kubeadm',),
+            ('kubeadm=1.36.2-1.1',),
+            ('kubeadm=1.36.3-1.1', 'kubectl'),
+            ('kubeadm=1.36.3-1.1', 'kubectl=1.36.3-1.1'),
+        )
+
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ['apt-get', 'download', *arguments],
+                    cwd=host,
+                    env=environment,
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
     def install_repository_contract(self, host: Path) -> None:
         (host / 'etc/apt/keyrings/kubernetes-apt-keyring.gpg').write_text(
             'approved-keyring\n', encoding='utf-8'
@@ -4658,9 +4740,39 @@ kubernetes-cni'
                 )
                 self.assertEqual(list(outside.iterdir()), [])
 
-    def test_rejects_candidate_installed_and_hold_drift(self) -> None:
+    def test_apply_ignores_candidate_and_uses_only_locked_artifacts(self) -> None:
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_POLICY_MULTIVERSION'] = '1'
+        environment['FAKE_INDEX_NEWER_VERSION'] = '1'
+        environment['FAKE_CANDIDATE_VERSION'] = '1.36.4-1.1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('apt-cache policy', commands)
+        for request in (
+            'kubeadm=1.36.3-1.1',
+            'kubectl=1.36.3-1.1',
+            'kubelet=1.36.3-1.1',
+            'kubernetes-cni=1.9.1-1.1',
+        ):
+            matching_downloads = [
+                line
+                for line in commands.splitlines()
+                if line.startswith('apt-get ')
+                and ' download ' in line
+                and request in line
+            ]
+            self.assertEqual(len(matching_downloads), 1, commands)
+
+    def test_rejects_installed_and_hold_drift(self) -> None:
         cases = {
-            'candidate': {'FAKE_CANDIDATE_VERSION': '1.36.2-1.1'},
             'installed': {'FAKE_INSTALLED_STATE': 'drift'},
             'partial': {'FAKE_INSTALLED_STATE': 'partial'},
             'hold': {'FAKE_HOLDS': 'kubeadm'},
@@ -4671,8 +4783,7 @@ kubernetes-cni'
                 self.install_repository_contract(host)
                 environment.update(overrides)
 
-                arguments = ('--apply',) if case == 'candidate' else ()
-                result = self.run_stage(environment, *arguments)
+                result = self.run_stage(environment)
 
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
@@ -5109,8 +5220,11 @@ kubernetes-cni'
                 self.assertEqual(result.returncode, 20, result.stderr)
                 self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
 
-    def test_apply_rejects_duplicate_index_stanza_and_extra_download(self) -> None:
+    def test_apply_rejects_missing_or_duplicate_index_stanza_and_extra_download(
+        self,
+    ) -> None:
         cases = (
+            {'FAKE_INDEX_MISSING': 'kubeadm'},
             {'FAKE_INDEX_DUPLICATE': 'kubeadm'},
             {'FAKE_DOWNLOAD_EXTRA': '1'},
         )

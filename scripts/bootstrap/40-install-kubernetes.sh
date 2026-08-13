@@ -362,16 +362,6 @@ base_dependencies_are_exact() {
   done
 }
 
-candidate_is_exact() {
-  local package=$1 apt_config=$2 expected output candidate repo_count
-  expected=$(package_version "$package")
-  output=$(APT_CONFIG="$apt_config" apt-cache policy "$package" 2>/dev/null) || return 1
-  candidate=$(awk '/^[[:space:]]*Candidate:/ {print $2; count++} END {exit count != 1}' <<<"$output") || return 1
-  [[ "$candidate" == "$expected" ]] || return 1
-  repo_count=$(grep -Fc "${REPOSITORY_URL%/}" <<<"$output")
-  [[ "$repo_count" == 1 ]]
-}
-
 bound_packages_index() {
   local apt_config=$1 lists_dir output line_count line
   local identifier uri filename extra mode
@@ -760,7 +750,7 @@ download_directory_exact() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in apt-cache apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln mkdir mktemp rm sed sort stat sync systemctl tr wc; do
+for required_command in apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln mkdir mktemp rm sed sort stat sync systemctl tr wc; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -904,9 +894,6 @@ effective_apt_config=$(APT_CONFIG="$apt_config" apt-config dump 2>/dev/null) || 
 effective_apt_configuration_is_safe "$effective_apt_config" || complete STOP_UNKNOWN_STATE effective-apt-config-unsafe "$EXIT_UNKNOWN_STATE" NONE
 APT_CONFIG="$apt_config" apt-get -o APT::Update::Error-Mode=any update >/dev/null 2>&1 || complete STOP_APPLY_FAILED apt-update-failed "$EXIT_APPLY_FAILED" NONE
 packages_index=$(bound_packages_index "$apt_config") || complete STOP_SUPPLY_CHAIN_MISMATCH packages-index-provenance-invalid "$EXIT_SUPPLY_CHAIN" NONE
-for package in "${PACKAGES[@]}"; do
-  candidate_is_exact "$package" "$apt_config" || complete STOP_UNKNOWN_STATE "candidate-drift-${package}" "$EXIT_UNKNOWN_STATE" NONE
-done
 
 download_parent=$(host_path /var/tmp)
 download_parent_safe "$download_parent" || complete STOP_UNKNOWN_STATE download-parent-unsafe "$EXIT_UNKNOWN_STATE" NONE

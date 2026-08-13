@@ -219,7 +219,7 @@ Run:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" \
   python3 -m unittest -v \
   test_bootstrap.KubernetesInstallTest.test_apply_accepts_real_flat_repository_indextarget_shape \
-  test_bootstrap.KubernetesInstallTest.test_apply_rejects_duplicate_index_stanza_and_extra_download \
+  test_bootstrap.KubernetesInstallTest.test_apply_rejects_missing_or_duplicate_index_stanza_and_extra_download \
   test_bootstrap.KubernetesInstallTest.test_apply_rejects_second_packages_indextarget \
   test_bootstrap.KubernetesInstallTest.test_apply_rejects_deb_metadata_and_signed_index_digest_drift \
   test_bootstrap.KubernetesInstallTest.test_apply_rejects_non_exact_simulated_transaction
