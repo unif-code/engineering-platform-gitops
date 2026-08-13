@@ -4872,10 +4872,6 @@ kubernetes-cni'
         for case in cases:
             with self.subTest(case=case):
                 environment, host, command_log = self.make_environment()
-                self.install_repository_contract(host)
-                environment['FAKE_INSTALLED_STATE'] = 'exact'
-                Path(environment['FAKE_PACKAGES_HELD']).touch()
-                self.install_cni_contract(host)
                 kubelet_root = host / 'var/lib/kubelet'
                 default_file = host / 'etc/default/kubelet'
                 if case == 'root-symlink':
@@ -4929,6 +4925,64 @@ kubernetes-cni'
                 )
                 self.assertNotIn('apt-get ', commands)
                 self.assertNotIn('apt-mark hold', commands)
+
+    def test_fresh_install_rejects_preexisting_kubeadm_generated_state(self) -> None:
+        environment, host, command_log = self.make_environment()
+        kubelet_root = host / 'var/lib/kubelet'
+        kubelet_root.mkdir(parents=True)
+        (kubelet_root / 'config.yaml').write_text('stale\n', encoding='utf-8')
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('REASON=kubelet-pre-init-inputs-not-pristine', result.stdout)
+        commands = (
+            command_log.read_text(encoding='utf-8') if command_log.exists() else ''
+        )
+        self.assertNotIn('apt-get ', commands)
+
+    def test_exact_packages_allow_kubeadm_owned_generated_state(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        kubelet_root = host / 'var/lib/kubelet'
+        kubelet_root.mkdir(parents=True, mode=0o700)
+        for name in ('config.yaml', 'instance-config.yaml', 'kubeadm-flags.env'):
+            (kubelet_root / name).write_text(
+                f'kubeadm-generated-{name}\n', encoding='utf-8'
+            )
+        (kubelet_root / 'pki').mkdir()
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('apt-get ', commands)
+        self.assertNotIn('apt-mark hold', commands)
+
+    def test_exact_packages_still_reject_kubelet_operator_override(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        default_file = host / 'etc/default/kubelet'
+        default_file.parent.mkdir(parents=True, exist_ok=True)
+        default_file.write_text(
+            'KUBELET_EXTRA_ARGS=--config=/tmp/unapproved\n', encoding='utf-8'
+        )
+        default_file.chmod(0o644)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('apt-get ', commands)
+        self.assertNotIn('apt-mark hold', commands)
 
     def test_allows_secure_kubelet_root_and_empty_operator_override(self) -> None:
         environment, host, _ = self.make_environment()

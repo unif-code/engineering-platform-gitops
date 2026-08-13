@@ -110,10 +110,9 @@ cni_path_chain_safe() {
   [[ "$bin_state" == MISSING || "$bin_state" == COMPLIANT ]] || return 1
 }
 
-kubelet_mutable_inputs_are_pristine() {
-  local kubelet_root default_file root_mode first_entry sensitive_path
+kubelet_generated_state_is_pristine() {
+  local kubelet_root root_mode first_entry sensitive_path
   kubelet_root=$(host_path /var/lib/kubelet)
-  default_file=$(host_path /etc/default/kubelet)
   if [[ -e "$kubelet_root" || -L "$kubelet_root" ]]; then
     [[ -d "$kubelet_root" && ! -L "$kubelet_root" ]] || return 1
     owned_by_expected "$kubelet_root" || return 1
@@ -129,12 +128,22 @@ kubelet_mutable_inputs_are_pristine() {
     "${kubelet_root}/pki"; do
     [[ ! -e "$sensitive_path" && ! -L "$sensitive_path" ]] || return 1
   done
+}
+
+kubelet_operator_override_is_pristine() {
+  local default_file
+  default_file=$(host_path /etc/default/kubelet)
   if [[ ! -e "$default_file" && ! -L "$default_file" ]]; then
     return 0
   fi
   [[ -f "$default_file" && ! -L "$default_file" && "$(path_mode "$default_file")" == 644 ]] || return 1
   owned_by_expected "$default_file" || return 1
   [[ "$(path_size "$default_file")" == 0 ]]
+}
+
+kubelet_mutable_inputs_are_pristine() {
+  kubelet_generated_state_is_pristine &&
+    kubelet_operator_override_is_pristine
 }
 
 kubernetes_shadow_paths_absent() {
@@ -570,13 +579,13 @@ all_holds_from_loaded_state() {
   ' <<<"$HOLDS_RAW" | sort
 }
 
-verify_installed_state() {
+verify_installed_package_state() {
   verify_package_selection_and_holds || return "$?"
   kubernetes_shadow_paths_absent || return 1
   managed_kubernetes_binaries_are_exact || return 1
   [[ "$(cni_directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]] || return 1
   kubelet_pre_init_state_is_expected || return 1
-  kubelet_mutable_inputs_are_pristine
+  kubelet_operator_override_is_pristine
 }
 
 verify_package_selection_and_holds() {
@@ -760,8 +769,6 @@ fi
 
 cni_path_chain_safe || complete STOP_UNKNOWN_STATE cni-path-chain-unsafe "$EXIT_UNKNOWN_STATE" NONE
 kubernetes_shadow_paths_absent || complete STOP_UNKNOWN_STATE kubernetes-binary-shadow-present "$EXIT_UNKNOWN_STATE" NONE
-kubelet_mutable_inputs_are_pristine || complete STOP_UNKNOWN_STATE kubelet-pre-init-inputs-not-pristine "$EXIT_UNKNOWN_STATE" NONE
-
 base_dependencies_are_exact || complete STOP_UNKNOWN_STATE base-dependency-contract-drift "$EXIT_UNKNOWN_STATE" NONE
 if dpkg-query -W -f='${Status}\t${Version}\t${Architecture}\n' cri-tools >/dev/null 2>&1; then
   complete STOP_UNKNOWN_STATE cri-tools-package-forbidden "$EXIT_UNKNOWN_STATE" NONE
@@ -820,11 +827,12 @@ if (( installed_count != 0 )) &&
 fi
 cni_state=$(cni_directory_state "$(host_path /opt/cni/bin)")
 if (( installed_count == 0 )); then
+  kubelet_mutable_inputs_are_pristine || complete STOP_UNKNOWN_STATE kubelet-pre-init-inputs-not-pristine "$EXIT_UNKNOWN_STATE" NONE
   [[ "$cni_state" == MISSING ]] || complete STOP_UNKNOWN_STATE preexisting-cni-directory "$EXIT_UNKNOWN_STATE" NONE
 else
   [[ "$source_contract" == COMPLIANT && "$hold_count" == "${#PACKAGES[@]}" && "$cni_state" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE partial-kubernetes-contract "$EXIT_UNKNOWN_STATE" NONE
   verification_result=0
-  verify_installed_state || verification_result=$?
+  verify_installed_package_state || verification_result=$?
   (( verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
   (( verification_result == 0 )) || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
   complete ALREADY_COMPLIANT kubernetes-packages-ready 0 '50-kubeadm-init.sh --check'
@@ -1020,7 +1028,7 @@ cni_path_chain_safe || {
 }
 rm -r -- "$download_dir"
 verification_result=0
-verify_installed_state || verification_result=$?
+verify_installed_package_state || verification_result=$?
 (( verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
 (( verification_result == 0 )) || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
 if dpkg-query -W -f='${Status}\n' cri-tools >/dev/null 2>&1; then
