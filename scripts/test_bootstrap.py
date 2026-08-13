@@ -4369,6 +4369,7 @@ kubernetes-cni'
             fake_bin / 'dpkg-deb',
             '''
             #!/bin/sh
+            printf 'dpkg-deb %s\n' "$*" >>"$FAKE_COMMAND_LOG"
             file=$2
             package=${file##*/}
             package=${package%%_*}
@@ -4382,8 +4383,15 @@ kubernetes-cni'
                 Architecture) value=amd64 ;;
                 Depends)
                   if [ "$package" = kubelet ]; then
-                    value='iptables (>= 1.4.21),kubernetes-cni (>= 1.2.0),mount,util-linux,libc6'
-                    [ "${FAKE_DEB_DEPENDS_DRIFT:-}" != kubelet ] || value="$value,cri-tools"
+                    value='iptables (>= 1.4.21), kubernetes-cni (>= 1.2.0), mount, util-linux, libc6'
+                    case "${FAKE_DEB_DEPENDS_DRIFT:-none}" in
+                      none) ;;
+                      extra) value="$value, cri-tools" ;;
+                      missing) value='iptables (>= 1.4.21), kubernetes-cni (>= 1.2.0), mount, util-linux' ;;
+                      version) value='iptables (>= 1.4.21), kubernetes-cni (>= 1.1.0), mount, util-linux, libc6' ;;
+                      order) value='kubernetes-cni (>= 1.2.0), iptables (>= 1.4.21), mount, util-linux, libc6' ;;
+                      *) exit 64 ;;
+                    esac
                   else
                     value=
                   fi
@@ -4423,7 +4431,11 @@ kubernetes-cni'
                 ;;
             esac
             if [ -n "${FAKE_RELEASE_KEY_DIGEST_DRIFT:-}" ] && [ "${1##*/}" != "${1##*.armored.}" ]; then digest=$(printf '0%.0s' $(seq 1 64)); fi
-            if [ -n "${FAKE_DEB_DIGEST_DRIFT:-}" ] && [ "${1##*/}" = "${1##*.deb}" ]; then :; elif [ -n "${FAKE_DEB_DIGEST_DRIFT:-}" ]; then digest=$(printf '0%.0s' $(seq 1 64)); fi
+            case "${1##*/}" in
+              "${FAKE_DEB_DIGEST_DRIFT:-__no_deb__}"_*.deb)
+                digest=$(printf '0%.0s' $(seq 1 64))
+                ;;
+            esac
             [ "${FAKE_CNI_FILE_DIGEST_DRIFT:-}" != "${1##*/}" ] || digest=$(printf '0%.0s' $(seq 1 64))
             printf '%s  %s\n' "$digest" "$1"
             ''',
@@ -5164,7 +5176,7 @@ kubernetes-cni'
     def test_apply_rejects_deb_metadata_and_signed_index_digest_drift(self) -> None:
         cases = (
             {'FAKE_DEB_PACKAGE_DRIFT': '1'},
-            {'FAKE_DEB_DIGEST_DRIFT': '1'},
+            {'FAKE_DEB_DIGEST_DRIFT': 'kubeadm'},
             {'FAKE_INDEX_DIGEST_DRIFT': 'kubectl'},
         )
         for overrides in cases:
@@ -5177,22 +5189,45 @@ kubernetes-cni'
                 self.assertEqual(result.returncode, 20, result.stderr)
                 self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
 
-    def test_apply_rejects_downloaded_deb_dependency_drift(self) -> None:
+    def test_apply_verifies_deb_digest_before_metadata_parser(self) -> None:
         environment, _, command_log = self.make_environment()
-        environment['FAKE_DEB_DEPENDS_DRIFT'] = 'kubelet'
+        environment['FAKE_DEB_DIGEST_DRIFT'] = 'kubeadm'
 
         result = self.run_stage(environment, '--apply')
 
         self.assertEqual(result.returncode, 20, result.stderr)
-        self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+        self.assertIn('REASON=deb-digest-drift-kubeadm', result.stdout)
         commands = command_log.read_text(encoding='utf-8')
-        self.assertFalse(
-            any(
-                line.startswith('apt-get ') and ' install ' in line
-                for line in commands.splitlines()
-            )
-        )
-        self.assertNotIn('apt-mark hold', commands)
+        self.assertNotIn('dpkg-deb ', commands)
+        self.assertNotIn('apt-get install', commands)
+
+    def test_apply_accepts_official_dpkg_dependency_serialization(self) -> None:
+        environment, _, _ = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', result.stdout)
+
+    def test_apply_rejects_downloaded_deb_dependency_drift(self) -> None:
+        for mutation in ('extra', 'missing', 'version', 'order'):
+            with self.subTest(mutation=mutation):
+                environment, _, command_log = self.make_environment()
+                environment['FAKE_DEB_DEPENDS_DRIFT'] = mutation
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 20, result.stderr)
+                self.assertIn('RESULT=STOP_SUPPLY_CHAIN_MISMATCH', result.stdout)
+                self.assertIn('REASON=deb-dependency-drift-kubelet', result.stdout)
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertFalse(
+                    any(
+                        line.startswith('apt-get ') and ' install ' in line
+                        for line in commands.splitlines()
+                    )
+                )
+                self.assertNotIn('apt-mark hold', commands)
 
     def test_apply_rejects_release_key_digest_or_fingerprint_drift(self) -> None:
         cases = (

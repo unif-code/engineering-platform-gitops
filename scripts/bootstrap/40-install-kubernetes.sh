@@ -210,8 +210,17 @@ package_filename() {
 }
 
 package_depends() {
-  case "$1" in
-    kubelet) printf 'iptables (>= 1.4.21),kubernetes-cni (>= 1.2.0),mount,util-linux,libc6\n' ;;
+  local package=$1 representation=$2 separator
+  case "$representation" in
+    packages-index) separator=',' ;;
+    dpkg-deb) separator=', ' ;;
+    *) return 1 ;;
+  esac
+  case "$package" in
+    kubelet)
+      printf 'iptables (>= 1.4.21)%skubernetes-cni (>= 1.2.0)%smount%sutil-linux%slibc6\n' \
+        "$separator" "$separator" "$separator" "$separator"
+      ;;
     kubeadm|kubectl|kubernetes-cni) printf 'NONE\n' ;;
     *) return 1 ;;
   esac
@@ -490,7 +499,7 @@ downloaded_debs_are_exact() {
 
 deb_dependency_contract_is_exact() {
   local deb=$1 package=$2 field value expected_depends
-  expected_depends=$(package_depends "$package") || return 1
+  expected_depends=$(package_depends "$package" dpkg-deb) || return 1
   for field in Depends Pre-Depends Recommends Suggests Conflicts Breaks Replaces Provides; do
     value=$(dpkg-deb -f "$deb" "$field" 2>/dev/null) || return 1
     if [[ "$field" == Depends ]]; then
@@ -908,7 +917,7 @@ for package in "${PACKAGES[@]}"; do
   expected_filename=$(package_filename "$package")
   expected_size=$(package_size "$package")
   expected_digest=$(package_sha256 "$package")
-  expected_depends=$(package_depends "$package")
+  expected_depends=$(package_depends "$package" packages-index)
   index_record=$(signed_index_record "$package" "$packages_index") || {
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "signed-index-metadata-invalid-${package}" "$EXIT_SUPPLY_CHAIN" NONE
@@ -933,6 +942,14 @@ for package in "${PACKAGES[@]}"; do
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "deb-size-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
   }
+  actual_digest=$(sha256_file "$deb") || {
+    rm -r -- "$download_dir"
+    complete STOP_SUPPLY_CHAIN_MISMATCH "deb-digest-unreadable-${package}" "$EXIT_SUPPLY_CHAIN" NONE
+  }
+  [[ "$actual_digest" == "$expected_digest" && "$actual_digest" == "$index_digest" ]] || {
+    rm -r -- "$download_dir"
+    complete STOP_SUPPLY_CHAIN_MISMATCH "deb-digest-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
+  }
   deb_package=$(dpkg-deb -f "$deb" Package 2>/dev/null) || {
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "deb-metadata-unreadable-${package}" "$EXIT_SUPPLY_CHAIN" NONE
@@ -952,14 +969,6 @@ for package in "${PACKAGES[@]}"; do
   deb_dependency_contract_is_exact "$deb" "$package" || {
     rm -r -- "$download_dir"
     complete STOP_SUPPLY_CHAIN_MISMATCH "deb-dependency-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
-  }
-  actual_digest=$(sha256_file "$deb") || {
-    rm -r -- "$download_dir"
-    complete STOP_SUPPLY_CHAIN_MISMATCH "deb-digest-unreadable-${package}" "$EXIT_SUPPLY_CHAIN" NONE
-  }
-  [[ "$actual_digest" == "$expected_digest" && "$actual_digest" == "$index_digest" ]] || {
-    rm -r -- "$download_dir"
-    complete STOP_SUPPLY_CHAIN_MISMATCH "deb-digest-drift-${package}" "$EXIT_SUPPLY_CHAIN" NONE
   }
   debs+=("$deb")
 done
