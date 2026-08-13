@@ -1419,6 +1419,54 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.assertIn('NEXT_STAGE=10', result.stdout)
         self.assertEqual(list(self.state_dir.iterdir()), [])
 
+    def test_check_resumes_from_every_legal_checkpoint(self) -> None:
+        cases = (
+            ((), 'PASS_BOOTSTRAP_CHECK', '10'),
+            (('10',), 'PASS_BOOTSTRAP_CHECK', '20'),
+            (('10', '20'), 'PASS_BOOTSTRAP_CHECK', '30'),
+            (('10', '20', '30'), 'PASS_BOOTSTRAP_CHECK', '40'),
+            (('10', '20', '30', '40'), 'PASS_BOOTSTRAP_CHECK', '50'),
+            (('10', '20', '30', '40', '50'), 'PASS_BOOTSTRAP_CHECK', '60'),
+            (
+                ('10', '20', '30', '40', '50', '60'),
+                'PASS_BOOTSTRAP_ALL_CHECK',
+                'NONE',
+            ),
+        )
+        for completed, expected_result, expected_next in cases:
+            with self.subTest(completed=completed):
+                self.reset_fixture()
+                for stage in completed:
+                    (self.state_dir / stage).touch()
+
+                result = self.run_orchestrator('--check')
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'RESULT={expected_result}', result.stdout)
+                self.assertIn(f'NEXT_STAGE={expected_next}', result.stdout)
+                expected_checks = ['00', *completed]
+                expected_checks.append('90' if expected_next == 'NONE' else expected_next)
+                self.assertEqual(
+                    self.command_log.read_text(encoding='utf-8').splitlines(),
+                    [f'{stage} --check' for stage in expected_checks],
+                )
+
+    def test_apply_on_fully_complete_state_performs_no_stage_apply(self) -> None:
+        for stage in ('10', '20', '30', '40', '50', '60'):
+            (self.state_dir / stage).touch()
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_ALL', result.stdout)
+        self.assertIn('NEXT_STAGE=NONE', result.stdout)
+        lines = self.command_log.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(
+            lines,
+            [f'{stage} --check' for stage in ('00', '10', '20', '30', '40', '50', '60', '90')],
+        )
+        self.assertTrue(all('--apply' not in line for line in lines))
+
     def test_apply_resumes_at_40_and_reaches_final_verify(self) -> None:
         for stage in ('10', '20', '30'):
             (self.state_dir / stage).touch()
