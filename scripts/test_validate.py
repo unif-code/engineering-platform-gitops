@@ -713,6 +713,28 @@ class ValidationCatalogTest(unittest.TestCase):
         self.assertTrue(selectors)
         self.assertTrue(selectors.isdisjoint(heavy))
 
+    def test_fast_profile_uses_focused_contract_smoke_selectors(self) -> None:
+        import validation_catalog
+
+        selectors = set(validation_catalog.selectors_for_profile('fast'))
+        self.assertNotIn('test_bootstrap.PreflightTest', selectors)
+        self.assertNotIn('test_bootstrap.BootstrapOrchestratorTest', selectors)
+        self.assertIn(
+            'test_bootstrap.PreflightTest.'
+            'test_stage30_owned_runtime_footprint_does_not_fail_preflight',
+            selectors,
+        )
+        self.assertIn(
+            'test_bootstrap.BootstrapOrchestratorTest.'
+            'test_check_resumes_from_every_legal_checkpoint',
+            selectors,
+        )
+        contract_classes = set(validation_catalog.SHARDS['contracts'])
+        self.assertTrue(
+            all('.'.join(selector.split('.')[:2]) in contract_classes
+                for selector in selectors)
+        )
+
     def test_catalog_rejects_missing_and_duplicate_selectors(self) -> None:
         import validation_catalog
         from unittest import mock
@@ -730,6 +752,33 @@ class ValidationCatalogTest(unittest.TestCase):
         with mock.patch.object(validation_catalog, 'SHARDS', duplicate):
             with self.assertRaisesRegex(ValueError, 'duplicate'):
                 validation_catalog.validate_catalog()
+
+    def test_catalog_rejects_invalid_fast_selectors(self) -> None:
+        import validation_catalog
+        from unittest import mock
+
+        original = validation_catalog.FAST_SELECTORS
+        cases = (
+            ('duplicate', (*original, original[0]), 'fast_duplicate'),
+            (
+                'unknown-method',
+                (*original, 'test_bootstrap.PreflightTest.test_missing'),
+                'fast_unknown',
+            ),
+            (
+                'outside-contracts',
+                (*original, 'test_bootstrap.ArtifactStageTest'),
+                'fast_outside_contracts',
+            ),
+            ('malformed', (*original, 'malformed'), 'fast_unknown'),
+        )
+        for name, selectors, expected in cases:
+            with self.subTest(name=name):
+                with mock.patch.object(
+                    validation_catalog, 'FAST_SELECTORS', selectors
+                ):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        validation_catalog.validate_catalog()
 
 
 if __name__ == '__main__':
