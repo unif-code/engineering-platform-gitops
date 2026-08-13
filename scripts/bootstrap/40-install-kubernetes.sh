@@ -154,8 +154,32 @@ kubernetes_shadow_paths_absent() {
   done
 }
 
+dpkg_package_verification_is_exact() {
+  local package=$1 verification excludes exclude_count
+  verification=$(dpkg --verify "$package" 2>/dev/null) || return 1
+  [[ -n "$verification" ]] || return 0
+  excludes=$(host_path /etc/dpkg/dpkg.cfg.d/excludes)
+  [[ -f "$excludes" && ! -L "$excludes" && "$(path_mode "$excludes")" == 644 ]] || return 1
+  owned_by_expected "$excludes" || return 1
+  exclude_count=$(grep -Fxc 'path-exclude=/usr/share/doc/*' "$excludes") || true
+  [[ "$exclude_count" == 1 ]] || return 1
+  awk -v package="$package" '
+    BEGIN {
+      license="/usr/share/doc/" package "/LICENSE"
+      readme="/usr/share/doc/" package "/README.md"
+    }
+    NF != 2 || $1 != "missing" {exit 1}
+    $2 == license {if (seen_license++) exit 1; lines++; next}
+    $2 == readme {if (seen_readme++) exit 1; lines++; next}
+    {exit 1}
+    END {
+      if (lines != 2 || seen_license != 1 || seen_readme != 1) exit 1
+    }
+  ' <<<"$verification"
+}
+
 managed_kubernetes_binaries_are_exact() {
-  local package logical target ownership verification
+  local package logical target ownership
   for package in kubeadm kubectl kubelet; do
     logical="/usr/bin/${package}"
     target=$(host_path "$logical")
@@ -165,9 +189,34 @@ managed_kubernetes_binaries_are_exact() {
     [[ "$ownership" == "${package}: ${logical}" ]] || return 1
   done
   for package in "${PACKAGES[@]}"; do
-    verification=$(dpkg --verify "$package" 2>/dev/null) || return 1
-    [[ -z "$verification" ]] || return 1
+    dpkg_package_verification_is_exact "$package" || return 1
   done
+}
+
+unit_package_ownership_is_exact() {
+  local logical=$1 package=$2 ownership alias
+  local lib_root canonical_file alias_file canonical_real alias_real
+  if ownership=$(dpkg-query -S "$logical" 2>/dev/null); then
+    [[ "$ownership" == "${package}: ${logical}" ]]
+    return
+  fi
+  case "$logical" in
+    /usr/lib/systemd/system/kubelet.service|/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf)
+      alias=${logical#/usr}
+      ;;
+    *) return 1 ;;
+  esac
+  lib_root=$(host_path /lib)
+  [[ -L "$lib_root" && "$(readlink "$lib_root")" == usr/lib ]] || return 1
+  owned_by_expected "$lib_root" || return 1
+  canonical_file=$(host_path "$logical")
+  alias_file=$(host_path "$alias")
+  [[ -f "$canonical_file" && ! -L "$canonical_file" && -f "$alias_file" && ! -L "$alias_file" ]] || return 1
+  canonical_real=$(readlink -f "$canonical_file") || return 1
+  alias_real=$(readlink -f "$alias_file") || return 1
+  [[ -n "$canonical_real" && "$canonical_real" == "$alias_real" ]] || return 1
+  ownership=$(dpkg-query -S "$alias" 2>/dev/null) || return 1
+  [[ "$ownership" == "${package}: ${alias}" ]]
 }
 
 download_parent_safe() {
@@ -616,13 +665,17 @@ all_holds_from_loaded_state() {
   ' <<<"$HOLDS_RAW" | sort
 }
 
-verify_installed_package_state() {
+verify_installed_package_payload_state() {
   verify_package_selection_and_holds || return "$?"
   kubernetes_shadow_paths_absent || return 1
   managed_kubernetes_binaries_are_exact || return 1
   [[ "$(cni_directory_state "$(host_path /opt/cni/bin)")" == COMPLIANT ]] || return 1
-  kubelet_pre_init_state_is_expected || return 1
   kubelet_operator_override_is_pristine
+}
+
+verify_installed_package_state() {
+  verify_installed_package_payload_state || return "$?"
+  [[ "$(kubelet_unit_state)" == READY ]]
 }
 
 verify_package_selection_and_holds() {
@@ -637,46 +690,102 @@ verify_package_selection_and_holds() {
   [[ "$holds" == $'kubeadm\nkubectl\nkubelet\nkubernetes-cni' ]] || return 1
 }
 
-kubelet_pre_init_state_is_expected() {
-  local output fragment dropin fragment_file dropin_file unit_file ownership
+kubelet_unit_state() {
+  local output state fragment dropin fragment_file dropin_file unit_file
   output=$(systemctl show kubelet.service \
     --property=LoadState \
     --property=UnitFileState \
     --property=ActiveState \
     --property=SubState \
     --property=FragmentPath \
-    --property=DropInPaths 2>/dev/null) || return 1
-  awk -F= '
+    --property=DropInPaths \
+    --property=Result 2>/dev/null) || {
+      printf 'UNKNOWN\n'
+      return
+    }
+  state=$(awk -F= '
     NF != 2 {exit 1}
     $1 != "LoadState" && $1 != "UnitFileState" && $1 != "ActiveState" &&
-      $1 != "SubState" && $1 != "FragmentPath" && $1 != "DropInPaths" {exit 1}
+      $1 != "SubState" && $1 != "FragmentPath" && $1 != "DropInPaths" &&
+      $1 != "Result" {exit 1}
     {if (seen[$1]++) exit 1; value[$1]=$2; field_count++}
     END {
       fragment_ok=(value["FragmentPath"] == "/usr/lib/systemd/system/kubelet.service" ||
                    value["FragmentPath"] == "/lib/systemd/system/kubelet.service")
       dropin_ok=(value["DropInPaths"] == "/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf" ||
                  value["DropInPaths"] == "/lib/systemd/system/kubelet.service.d/10-kubeadm.conf")
-      state_ok=((value["ActiveState"] == "activating" &&
-                 value["SubState"] == "auto-restart") ||
-                (value["ActiveState"] == "active" &&
-                 value["SubState"] == "running"))
-      if (field_count != 6 || value["LoadState"] != "loaded" ||
-          value["UnitFileState"] != "enabled" || !fragment_ok || !dropin_ok ||
-          !state_ok) exit 1
+      if (field_count != 7 || value["LoadState"] != "loaded" ||
+          value["UnitFileState"] != "enabled" || !fragment_ok || !dropin_ok) exit 1
+      if ((value["ActiveState"] == "activating" && value["SubState"] == "auto-restart") ||
+          (value["ActiveState"] == "active" && value["SubState"] == "running")) {
+        print "READY"
+      } else if (value["Result"] == "success" &&
+                 value["ActiveState"] == "inactive" && value["SubState"] == "dead") {
+        print "START_REQUIRED"
+      } else {
+        print "UNKNOWN"
+      }
     }
-  ' <<<"$output" || return 1
-  fragment=$(awk -F= '$1 == "FragmentPath" {print $2}' <<<"$output") || return 1
-  dropin=$(awk -F= '$1 == "DropInPaths" {print $2}' <<<"$output") || return 1
+  ' <<<"$output") || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  fragment=$(awk -F= '$1 == "FragmentPath" {print $2}' <<<"$output") || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  dropin=$(awk -F= '$1 == "DropInPaths" {print $2}' <<<"$output") || {
+    printf 'UNKNOWN\n'
+    return
+  }
   fragment_file=$(host_path "$fragment")
   dropin_file=$(host_path "$dropin")
   for unit_file in "$fragment_file" "$dropin_file"; do
-    [[ -f "$unit_file" && ! -L "$unit_file" && "$(path_mode "$unit_file")" == 644 ]] || return 1
-    owned_by_expected "$unit_file" || return 1
+    [[ -f "$unit_file" && ! -L "$unit_file" && "$(path_mode "$unit_file")" == 644 ]] || {
+      printf 'UNKNOWN\n'
+      return
+    }
+    owned_by_expected "$unit_file" || {
+      printf 'UNKNOWN\n'
+      return
+    }
   done
-  ownership=$(dpkg-query -S "$fragment" 2>/dev/null) || return 1
-  [[ "$ownership" == "kubelet: ${fragment}" ]] || return 1
-  ownership=$(dpkg-query -S "$dropin" 2>/dev/null) || return 1
-  [[ "$ownership" == "kubeadm: ${dropin}" ]] || return 1
+  unit_package_ownership_is_exact "$fragment" kubelet || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  unit_package_ownership_is_exact "$dropin" kubeadm || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  printf '%s\n' "$state"
+}
+
+restart_kubelet_and_verify() {
+  local verification_result=0
+  systemctl restart kubelet.service >/dev/null 2>&1 || return 1
+  verify_installed_package_state || verification_result=$?
+  (( verification_result != 2 )) || return 3
+  (( verification_result == 0 )) || return 2
+}
+
+complete_successful_kubernetes_install() {
+  local evidence_dir package package_upper
+  evidence_dir=$(host_path /root/dev-infra-evidence)
+  open_evidence 11-kubernetes "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
+
+  log_evidence REPOSITORY_MINOR=v1.36
+  log_evidence RELEASE_KEY_SHA256="$RELEASE_KEY_SHA256"
+  log_evidence RELEASE_KEY_FINGERPRINT="$RELEASE_KEY_FINGERPRINT"
+  for package in "${PACKAGES[@]}"; do
+    package_upper=$(printf '%s' "$package" | tr '[:lower:]-' '[:upper:]_')
+    log_evidence "PACKAGE_${package_upper}_VERSION=$(package_version "$package")"
+    log_evidence "PACKAGE_${package_upper}_SHA256=$(package_sha256 "$package")"
+  done
+  log_evidence PACKAGE_HOLD=kubeadm,kubectl,kubelet,kubernetes-cni
+  log_evidence CNI_FILE_COUNT=20
+  log_evidence CNI_OWNERSHIP=kubernetes-cni
+  complete PASS_KUBERNETES_INSTALLED kubernetes-packages-ready 0 '50-kubeadm-init.sh --check'
 }
 
 apt_workspace=
@@ -797,7 +906,7 @@ download_directory_exact() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln mkdir mktemp rm sed sort stat sync systemctl tr wc; do
+for required_command in apt-config apt-get apt-mark awk cat chmod curl date dpkg dpkg-deb dpkg-query find gpg grep id install ln mkdir mktemp readlink rm sed sort stat sync systemctl tr wc; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -869,10 +978,35 @@ if (( installed_count == 0 )); then
 else
   [[ "$source_contract" == COMPLIANT && "$hold_count" == "${#PACKAGES[@]}" && "$cni_state" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE partial-kubernetes-contract "$EXIT_UNKNOWN_STATE" NONE
   verification_result=0
-  verify_installed_package_state || verification_result=$?
+  verify_installed_package_payload_state || verification_result=$?
   (( verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
   (( verification_result == 0 )) || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
-  complete ALREADY_COMPLIANT kubernetes-packages-ready 0 '50-kubeadm-init.sh --check'
+  kubelet_state=$(kubelet_unit_state)
+  case "$kubelet_state" in
+    READY)
+      complete ALREADY_COMPLIANT kubernetes-packages-ready 0 '50-kubeadm-init.sh --check'
+      ;;
+    START_REQUIRED)
+      # MODE 由公共 parse_mode helper 赋值。
+      # shellcheck disable=SC2153
+      if [[ "$MODE" == CHECK ]]; then
+        complete PASS_KUBERNETES_CHECK apply-required 0 '40-install-kubernetes.sh --apply'
+      fi
+      restart_result=0
+      restart_kubelet_and_verify || restart_result=$?
+      case "$restart_result" in
+        0) ;;
+        1) complete STOP_APPLY_FAILED kubelet-start-failed "$EXIT_APPLY_FAILED" NONE ;;
+        2) complete STOP_VERIFY_FAILED kubelet-start-verification-failed "$EXIT_VERIFY_FAILED" NONE ;;
+        3) complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE ;;
+        *) complete STOP_UNKNOWN_STATE kubelet-start-result-invalid "$EXIT_UNKNOWN_STATE" NONE ;;
+      esac
+      complete_successful_kubernetes_install
+      ;;
+    *)
+      complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
+      ;;
+  esac
 fi
 
 # MODE 由公共 parse_mode helper 赋值。
@@ -1085,25 +1219,21 @@ cni_path_chain_safe || {
 }
 rm -r -- "$download_dir"
 verification_result=0
-verify_installed_package_state || verification_result=$?
+verify_installed_package_payload_state || verification_result=$?
 (( verification_result != 2 )) || complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE
 (( verification_result == 0 )) || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
+kubelet_state=$(kubelet_unit_state)
+[[ "$kubelet_state" == READY || "$kubelet_state" == START_REQUIRED ]] || complete STOP_VERIFY_FAILED kubernetes-package-verification-failed "$EXIT_VERIFY_FAILED" NONE
+restart_result=0
+restart_kubelet_and_verify || restart_result=$?
+case "$restart_result" in
+  0) ;;
+  1) complete STOP_APPLY_FAILED kubelet-start-failed "$EXIT_APPLY_FAILED" NONE ;;
+  2) complete STOP_VERIFY_FAILED kubelet-start-verification-failed "$EXIT_VERIFY_FAILED" NONE ;;
+  3) complete STOP_UNKNOWN_STATE package-hold-state-unreadable "$EXIT_UNKNOWN_STATE" NONE ;;
+  *) complete STOP_UNKNOWN_STATE kubelet-start-result-invalid "$EXIT_UNKNOWN_STATE" NONE ;;
+esac
 if dpkg-query -W -f='${Status}\n' cri-tools >/dev/null 2>&1; then
   complete STOP_VERIFY_FAILED cri-tools-package-installed "$EXIT_VERIFY_FAILED" NONE
 fi
-
-evidence_dir=$(host_path /root/dev-infra-evidence)
-open_evidence 11-kubernetes "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
-
-log_evidence REPOSITORY_MINOR=v1.36
-log_evidence RELEASE_KEY_SHA256="$RELEASE_KEY_SHA256"
-log_evidence RELEASE_KEY_FINGERPRINT="$RELEASE_KEY_FINGERPRINT"
-for package in "${PACKAGES[@]}"; do
-  package_upper=$(printf '%s' "$package" | tr '[:lower:]-' '[:upper:]_')
-  log_evidence "PACKAGE_${package_upper}_VERSION=$(package_version "$package")"
-  log_evidence "PACKAGE_${package_upper}_SHA256=$(package_sha256 "$package")"
-done
-log_evidence PACKAGE_HOLD=kubeadm,kubectl,kubelet,kubernetes-cni
-log_evidence CNI_FILE_COUNT=20
-log_evidence CNI_OWNERSHIP=kubernetes-cni
-complete PASS_KUBERNETES_INSTALLED kubernetes-packages-ready 0 '50-kubeadm-init.sh --check'
+complete_successful_kubernetes_install

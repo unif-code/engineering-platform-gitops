@@ -3858,6 +3858,21 @@ class KubernetesInstallTest(BootstrapTestCase):
             ''',
         )
         self.write_executable(
+            fake_bin / 'readlink',
+            '''
+            #!/bin/sh
+            last=
+            for last do :; done
+            if [ "${FAKE_READLINK_DIFFERENT_ALIAS:-0}" = 1 ] && \
+               [ "$1" = -f ] && \
+               [ "$last" = "$FAKE_HOST_ROOT/lib/systemd/system/kubelet.service" ]; then
+              printf '%s\n' "$FAKE_HOST_ROOT/unapproved-kubelet.service"
+              exit 0
+            fi
+            exec /usr/bin/readlink "$@"
+            ''',
+        )
+        self.write_executable(
             fake_bin / 'curl',
             '''
             #!/bin/sh
@@ -4319,10 +4334,18 @@ kubernetes-cni'
                 logical=${2#"$FAKE_HOST_ROOT"}
                 case "$logical" in
                   /usr/lib/systemd/system/kubelet.service|/lib/systemd/system/kubelet.service)
+                    if [ "${FAKE_DPKG_UNIT_PATH_STYLE:-both}" = lib-only ] && \
+                       [ "$logical" = /usr/lib/systemd/system/kubelet.service ]; then
+                      exit 1
+                    fi
                     owner=kubelet
                     [ "${FAKE_KUBELET_OWNER_DRIFT:-}" != fragment ] || owner=unapproved
                     ;;
                   /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf|/lib/systemd/system/kubelet.service.d/10-kubeadm.conf)
+                    if [ "${FAKE_DPKG_UNIT_PATH_STYLE:-both}" = lib-only ] && \
+                       [ "$logical" = /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf ]; then
+                      exit 1
+                    fi
                     owner=kubeadm
                     [ "${FAKE_KUBELET_OWNER_DRIFT:-}" != dropin ] || owner=unapproved
                     ;;
@@ -4332,6 +4355,10 @@ kubernetes-cni'
                   /opt/cni/bin/*) owner=kubernetes-cni ;;
                   *) exit 1 ;;
                 esac
+                if [ "${FAKE_DPKG_CANONICAL_OWNER_DRIFT:-0}" = 1 ] && \
+                   [ "$logical" = /usr/lib/systemd/system/kubelet.service ]; then
+                  owner=unapproved
+                fi
                 [ "${FAKE_PACKAGE_BINARY_OWNER_DRIFT:-}" != "$logical" ] || owner=unapproved
                 printf '%s: %s\n' "$owner" "$logical"
                 exit 0
@@ -4379,6 +4406,41 @@ kubernetes-cni'
             if [ "$1" = --verify ]; then
               printf 'dpkg %s\n' "$*" >>"$FAKE_COMMAND_LOG"
               case "$2" in kubelet|kubeadm|kubectl|kubernetes-cni) ;; *) exit 64 ;; esac
+              if [ "${FAKE_PACKAGE_VERIFY_DOC_EXCLUDES:-0}" = 1 ]; then
+                case "${FAKE_PACKAGE_VERIFY_DOC_SHAPE:-exact}" in
+                  exact)
+                    printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                    printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                    ;;
+                  single)
+                    printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                    ;;
+                  duplicate)
+                    printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                    printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                    printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                    ;;
+                  other-package)
+                    printf 'missing     /usr/share/doc/unapproved/LICENSE\n'
+                    printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                    ;;
+                  extra-missing)
+                    printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                    printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                    printf 'missing     /usr/bin/%s\n' "$2"
+                    ;;
+                  checksum)
+                    printf '??5??????   /usr/bin/%s\n' "$2"
+                    ;;
+                  nonzero)
+                    printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                    printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                    exit 1
+                    ;;
+                  *) exit 64 ;;
+                esac
+                exit 0
+              fi
               drift=0
               [ "$2" != kubelet ] || drift=${FAKE_KUBELET_VERIFY_DRIFT:-0}
               [ "$2" != kubeadm ] || drift=${FAKE_KUBEADM_VERIFY_DRIFT:-0}
@@ -4483,13 +4545,38 @@ kubernetes-cni'
             '''
             #!/bin/sh
             printf 'systemctl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
-            [ "$*" = 'show kubelet.service --property=LoadState --property=UnitFileState --property=ActiveState --property=SubState --property=FragmentPath --property=DropInPaths' ] || exit 64
+            if [ "$*" = 'restart kubelet.service' ]; then
+              [ "${FAKE_KUBELET_RESTART_FAIL:-0}" != 1 ] || exit 1
+              [ "${FAKE_KUBELET_RESTART_STAYS_INACTIVE:-0}" = 1 ] || : >"$FAKE_KUBELET_RESTARTED"
+              exit 0
+            fi
+            [ "$*" = 'show kubelet.service --property=LoadState --property=UnitFileState --property=ActiveState --property=SubState --property=FragmentPath --property=DropInPaths --property=Result' ] || exit 64
+            if [ -f "$FAKE_KUBELET_RESTARTED" ]; then
+              case "${FAKE_KUBELET_RESTART_STATE:-auto-restart}" in
+                auto-restart)
+                  active_state=activating
+                  sub_state=auto-restart
+                  result=exit-code
+                  ;;
+                failed)
+                  active_state=failed
+                  sub_state=failed
+                  result=exit-code
+                  ;;
+                *) exit 64 ;;
+              esac
+            else
+              active_state=${FAKE_KUBELET_ACTIVE_STATE:-activating}
+              sub_state=${FAKE_KUBELET_SUB_STATE:-auto-restart}
+              result=${FAKE_KUBELET_RESULT:-success}
+            fi
             printf 'LoadState=%s\n' "${FAKE_KUBELET_LOAD_STATE:-loaded}"
             printf 'UnitFileState=%s\n' "${FAKE_KUBELET_UNIT_FILE_STATE:-enabled}"
-            printf 'ActiveState=%s\n' "${FAKE_KUBELET_ACTIVE_STATE:-activating}"
-            printf 'SubState=%s\n' "${FAKE_KUBELET_SUB_STATE:-auto-restart}"
+            printf 'ActiveState=%s\n' "$active_state"
+            printf 'SubState=%s\n' "$sub_state"
             printf 'FragmentPath=%s\n' "${FAKE_KUBELET_FRAGMENT_PATH:-/usr/lib/systemd/system/kubelet.service}"
             printf 'DropInPaths=%s\n' "${FAKE_KUBELET_DROPIN_PATHS-/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf}"
+            case " $* " in *' --property=Result '*) printf 'Result=%s\n' "$result" ;; esac
             ''',
         )
 
@@ -4507,6 +4594,7 @@ kubernetes-cni'
                 'FAKE_PACKAGES_HELD': str(directory / 'packages-held'),
                 'FAKE_HOLD_ENUM_COUNT': str(directory / 'hold-enumeration-count'),
                 'FAKE_CNI_INSTALL_HELPER': str(fake_bin / 'install-cni-fixture'),
+                'FAKE_KUBELET_RESTARTED': str(directory / 'kubelet-restarted'),
                 'FAKE_CNI_MANIFEST': str(cni_manifest),
                 'FAKE_CNI_ROOT': str(host / 'opt/cni/bin'),
                 'FAKE_PACKAGES_INDEX': str(packages_index),
@@ -4698,6 +4786,292 @@ kubernetes-cni'
 
                 self.assertEqual(result.returncode, 30, result.stderr)
                 self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+
+    def test_usrmerge_unit_paths_preserve_package_ownership(self) -> None:
+        """捕获 systemd canonical /usr/lib 与 dpkg manifest /lib 的合法差异。"""
+        environment, host, _ = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        (host / 'lib').symlink_to('usr/lib', target_is_directory=True)
+        environment['FAKE_DPKG_UNIT_PATH_STYLE'] = 'lib-only'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+
+    def test_usrmerge_unit_paths_reject_unsafe_alias_root(self) -> None:
+        """usrmerge fallback 只接受 root-owned 的相对 /lib -> usr/lib。"""
+        for drift in (
+            'not-symlink',
+            'absolute-target',
+            'other-directory',
+            'owner',
+            'different-file',
+            'package-owner',
+            'canonical-owner',
+        ):
+            with self.subTest(drift=drift):
+                environment, host, _ = self.make_environment()
+                self.install_repository_contract(host)
+                environment['FAKE_INSTALLED_STATE'] = 'exact'
+                Path(environment['FAKE_PACKAGES_HELD']).touch()
+                self.install_cni_contract(host)
+                if drift == 'not-symlink':
+                    (host / 'lib').mkdir()
+                    (host / 'lib').chmod(0o755)
+                else:
+                    link_target = {
+                        'absolute-target': '/usr/lib',
+                        'other-directory': 'opt',
+                    }.get(drift, 'usr/lib')
+                    (host / 'lib').symlink_to(
+                        link_target, target_is_directory=True
+                    )
+                if drift != 'canonical-owner':
+                    environment['FAKE_DPKG_UNIT_PATH_STYLE'] = 'lib-only'
+                if drift == 'owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(host / 'lib')
+                elif drift == 'different-file':
+                    environment['FAKE_READLINK_DIFFERENT_ALIAS'] = '1'
+                elif drift == 'package-owner':
+                    environment['FAKE_KUBELET_OWNER_DRIFT'] = 'fragment'
+                elif drift == 'canonical-owner':
+                    environment['FAKE_DPKG_CANONICAL_OWNER_DRIFT'] = '1'
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 50, result.stderr)
+                self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+
+    def test_dpkg_verify_accepts_only_declared_doc_exclusions(self) -> None:
+        """捕获 Ubuntu dpkg path-exclude 令批准文档缺失的合法 verify shape。"""
+        environment, host, _ = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+        excludes.parent.mkdir(parents=True)
+        excludes.write_text(
+            'path-exclude=/usr/share/man/*\n'
+            'path-exclude=/usr/share/doc/*\n'
+            'path-include=/usr/share/doc/*/copyright\n',
+            encoding='utf-8',
+        )
+        excludes.chmod(0o644)
+        environment['FAKE_PACKAGE_VERIFY_DOC_EXCLUDES'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+
+    def test_dpkg_verify_rejects_unsafe_doc_exclusion_shapes(self) -> None:
+        """缺失/不安全 exclude 合同或额外 payload 缺失都必须拒绝。"""
+        for drift in (
+            'missing-config',
+            'symlink-config',
+            'unsafe-mode',
+            'owner',
+            'single',
+            'duplicate',
+            'other-package',
+            'extra-missing',
+            'checksum',
+            'nonzero',
+        ):
+            with self.subTest(drift=drift):
+                environment, host, _ = self.make_environment()
+                self.install_repository_contract(host)
+                environment['FAKE_INSTALLED_STATE'] = 'exact'
+                Path(environment['FAKE_PACKAGES_HELD']).touch()
+                self.install_cni_contract(host)
+                environment['FAKE_PACKAGE_VERIFY_DOC_EXCLUDES'] = '1'
+                excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+                if drift != 'missing-config':
+                    excludes.parent.mkdir(parents=True)
+                    if drift == 'symlink-config':
+                        outside = host.parent / 'unapproved-dpkg-excludes'
+                        outside.write_text(
+                            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+                        )
+                        outside.chmod(0o644)
+                        excludes.symlink_to(outside)
+                    else:
+                        excludes.write_text(
+                            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+                        )
+                        excludes.chmod(
+                            0o666 if drift == 'unsafe-mode' else 0o644
+                        )
+                if drift == 'owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(excludes)
+                if drift in {
+                    'single',
+                    'duplicate',
+                    'other-package',
+                    'extra-missing',
+                    'checksum',
+                    'nonzero',
+                }:
+                    environment['FAKE_PACKAGE_VERIFY_DOC_SHAPE'] = drift
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 50, result.stderr)
+                self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+
+    def test_resumes_exact_installed_inactive_kubelet_without_reinstall(
+        self,
+    ) -> None:
+        """捕获官方 postinst 仅 preset 后的 installed START_REQUIRED 状态。"""
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        environment['FAKE_KUBELET_ACTIVE_STATE'] = 'inactive'
+        environment['FAKE_KUBELET_SUB_STATE'] = 'dead'
+        environment['FAKE_KUBELET_RESULT'] = 'success'
+
+        check = self.run_stage(environment)
+
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_CHECK', check.stdout)
+        self.assertIn('REASON=apply-required', check.stdout)
+        self.assertNotIn('systemctl restart', command_log.read_text(encoding='utf-8'))
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('11-kubernetes-*.txt')),
+            [],
+        )
+
+        apply = self.run_stage(environment, '--apply')
+
+        self.assertEqual(apply.returncode, 0, apply.stderr)
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', apply.stdout)
+        commands_after_apply = command_log.read_text(encoding='utf-8')
+        self.assertEqual(commands_after_apply.count('systemctl restart kubelet.service'), 1)
+        self.assertNotIn('apt-get ', commands_after_apply)
+
+        repeated = self.run_stage(environment, '--apply')
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', repeated.stdout)
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8').count(
+                'systemctl restart kubelet.service'
+            ),
+            1,
+        )
+
+    def test_fresh_install_explicitly_starts_kubelet(self) -> None:
+        """捕获 Stage 40 误依赖官方 postinst 自动启动 kubelet 的缺陷。"""
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_KUBELET_ACTIVE_STATE'] = 'inactive'
+        environment['FAKE_KUBELET_SUB_STATE'] = 'dead'
+        environment['FAKE_KUBELET_RESULT'] = 'success'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_KUBERNETES_INSTALLED', result.stdout)
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8').count(
+                'systemctl restart kubelet.service'
+            ),
+            1,
+        )
+
+    def test_accepts_preinit_kubelet_restart_loop_result(self) -> None:
+        """kubeadm 前 auto-restart 可保留上一轮 exit-code Result。"""
+        environment, host, command_log = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        environment['FAKE_KUBELET_ACTIVE_STATE'] = 'activating'
+        environment['FAKE_KUBELET_SUB_STATE'] = 'auto-restart'
+        environment['FAKE_KUBELET_RESULT'] = 'exit-code'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertNotIn(
+            'systemctl restart', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_kubelet_start_failures_are_fail_closed(self) -> None:
+        """重启失败或重启后仍 inactive 都不得写成功 evidence。"""
+        cases = (
+            (
+                'restart-failed',
+                {'FAKE_KUBELET_RESTART_FAIL': '1'},
+                40,
+                'kubelet-start-failed',
+            ),
+            (
+                'still-inactive',
+                {'FAKE_KUBELET_RESTART_STAYS_INACTIVE': '1'},
+                50,
+                'kubelet-start-verification-failed',
+            ),
+            (
+                'failed-after-restart',
+                {'FAKE_KUBELET_RESTART_STATE': 'failed'},
+                50,
+                'kubelet-start-verification-failed',
+            ),
+        )
+        for name, overrides, expected_exit, expected_reason in cases:
+            with self.subTest(name=name):
+                environment, host, command_log = self.make_environment()
+                self.install_repository_contract(host)
+                environment['FAKE_INSTALLED_STATE'] = 'exact'
+                Path(environment['FAKE_PACKAGES_HELD']).touch()
+                self.install_cni_contract(host)
+                environment.update(
+                    {
+                        'FAKE_KUBELET_ACTIVE_STATE': 'inactive',
+                        'FAKE_KUBELET_SUB_STATE': 'dead',
+                        'FAKE_KUBELET_RESULT': 'success',
+                        **overrides,
+                    }
+                )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, expected_exit, result.stderr)
+                self.assertIn(f'REASON={expected_reason}', result.stdout)
+                self.assertEqual(
+                    command_log.read_text(encoding='utf-8').count(
+                        'systemctl restart kubelet.service'
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    list(
+                        (host / 'root/dev-infra-evidence').glob(
+                            '11-kubernetes-*.txt'
+                        )
+                    ),
+                    [],
+                )
 
     def test_rejects_base_dependency_version_or_architecture_drift(self) -> None:
         for override in (
@@ -4922,11 +5296,12 @@ kubernetes-cni'
             {
                 'FAKE_KUBELET_ACTIVE_STATE': 'failed',
                 'FAKE_KUBELET_SUB_STATE': 'failed',
+                'FAKE_KUBELET_RESULT': 'exit-code',
             },
         )
         for override in cases:
             with self.subTest(override=override):
-                environment, host, _ = self.make_environment()
+                environment, host, command_log = self.make_environment()
                 self.install_repository_contract(host)
                 environment['FAKE_INSTALLED_STATE'] = 'exact'
                 Path(environment['FAKE_PACKAGES_HELD']).touch()
@@ -4937,6 +5312,17 @@ kubernetes-cni'
 
                 self.assertEqual(result.returncode, 50, result.stderr)
                 self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+                self.assertNotIn(
+                    'systemctl restart', command_log.read_text(encoding='utf-8')
+                )
+                self.assertEqual(
+                    list(
+                        (host / 'root/dev-infra-evidence').glob(
+                            '11-kubernetes-*.txt'
+                        )
+                    ),
+                    [],
+                )
 
     def test_rejects_kubelet_dropin_or_package_payload_provenance_drift(
         self,

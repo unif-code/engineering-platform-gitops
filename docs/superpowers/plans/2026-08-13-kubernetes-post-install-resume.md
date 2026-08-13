@@ -126,7 +126,7 @@ Expected: `Ran 2 tests` / `OK`。
 
 **Interfaces:**
 - Consumes: exact unit static provenance、systemd 7-field show output。
-- Produces: `kubelet_unit_state()` 输出 `READY`、`START_REQUIRED` 或 `UNKNOWN`；`restart_kubelet_and_verify()` 返回 0/1/2（ready/apply failure/verify failure）。
+- Produces: `kubelet_unit_state()` 输出 `READY`、`START_REQUIRED` 或 `UNKNOWN`；`restart_kubelet_and_verify()` 返回 0/1/2/3（ready/apply failure/verify failure/hold state unreadable）。
 
 - [ ] **Step 1: 写 installed resume RED**
 
