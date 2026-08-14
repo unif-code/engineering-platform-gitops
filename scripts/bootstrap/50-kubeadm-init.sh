@@ -32,6 +32,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/kubelet-default.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
@@ -68,6 +70,12 @@ path_mode() {
 
 path_owner() {
   stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
+}
+
+# 由 source 的 kubelet-default validator 间接调用。
+# shellcheck disable=SC2329
+path_size() {
+  stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null
 }
 
 owned_by_expected() {
@@ -205,9 +213,8 @@ initialization_state() {
 }
 
 kubelet_pre_init_inputs_gate() {
-  local kubelet_root default_file root_mode first_entry sensitive_path
+  local kubelet_root root_mode first_entry sensitive_path
   kubelet_root=$(host_path /var/lib/kubelet)
-  default_file=$(host_path /etc/default/kubelet)
   if [[ -e "$kubelet_root" || -L "$kubelet_root" ]]; then
     if ! kubelet_state_package_footprint_is_pristine "$kubelet_root"; then
       if [[ ! -d "$kubelet_root" || -L "$kubelet_root" ]] || ! owned_by_expected "$kubelet_root"; then
@@ -231,10 +238,7 @@ kubelet_pre_init_inputs_gate() {
       complete STOP_ALREADY_INITIALIZED kubelet-generated-or-identity-state-present "$EXIT_UNKNOWN_STATE" NONE
     fi
   done
-  if [[ ! -e "$default_file" && ! -L "$default_file" ]]; then
-    return
-  fi
-  if [[ ! -f "$default_file" || -L "$default_file" || "$(path_mode "$default_file")" != 644 ]] || ! owned_by_expected "$default_file" || [[ -s "$default_file" ]]; then
+  if ! kubelet_default_conffile_is_pristine "$(host_path /etc/default/kubelet)"; then
     complete STOP_ALREADY_INITIALIZED kubelet-operator-override-present "$EXIT_UNKNOWN_STATE" NONE
   fi
 }
@@ -523,7 +527,7 @@ initialized_control_plane_gate() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk date dpkg dpkg-query find grep hostname id install ip mktemp openssl python3 rm sed sha256sum sort ss stat swapon sync systemctl tr uname; do
+for required_command in awk cat date dpkg dpkg-query find grep hostname id install ip md5sum mktemp openssl python3 rm sed sha256sum sort ss stat swapon sync systemctl tr uname; do
   if [[ "$required_command" == sha256sum ]] && command -v shasum >/dev/null 2>&1; then
     continue
   fi
@@ -592,6 +596,9 @@ if ! "$kubeadm_binary" init phase preflight --config "$config_snapshot" >/dev/nu
 fi
 fresh_pre_init_gates
 config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
+kubelet_default_conffile_is_pristine "$(host_path /etc/default/kubelet)" ||
+  complete STOP_ALREADY_INITIALIZED kubelet-operator-override-present \
+    "$EXIT_UNKNOWN_STATE" NONE
 if ! "$kubeadm_binary" init --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-init-failed "$EXIT_APPLY_FAILED" NONE
 fi

@@ -179,6 +179,43 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 30)
         self.assertEqual(evidence.read_text(encoding='utf-8'), 'preserve\n')
 
+    def test_kubernetes_stages_share_kubelet_default_validator(self) -> None:
+        shared = ROOT / 'scripts/bootstrap/lib/kubelet-default.sh'
+        self.assertTrue(shared.is_file(), 'shared kubelet validator is missing')
+
+        shared_source = shared.read_text(encoding='utf-8')
+        stage40 = INSTALL_KUBERNETES.read_text(encoding='utf-8')
+        stage50 = KUBEADM_INIT.read_text(encoding='utf-8')
+        static = (ROOT / 'scripts/validate-static.sh').read_text(
+            encoding='utf-8'
+        )
+        source_line = 'source "${script_dir}/lib/kubelet-default.sh"'
+        call = (
+            'kubelet_default_conffile_is_pristine '
+            '"$(host_path /etc/default/kubelet)"'
+        )
+
+        self.assertIn(source_line, stage40)
+        self.assertIn(source_line, stage50)
+        self.assertIn(call, stage40)
+        self.assertIn(call, stage50)
+        combined = shared_source + stage40 + stage50
+        for declaration in (
+            'readonly KUBELET_DEFAULT_CONTENT=',
+            'readonly KUBELET_DEFAULT_SIZE=',
+            'readonly KUBELET_DEFAULT_SHA256=',
+            'readonly KUBELET_DEFAULT_MD5=',
+            'kubelet_registered_default_md5()',
+            'kubelet_default_conffile_is_pristine()',
+        ):
+            self.assertEqual(combined.count(declaration), 1, declaration)
+            self.assertIn(declaration, shared_source)
+        self.assertNotIn('kubelet_operator_override_is_pristine()', stage40)
+        self.assertNotIn('[[ -s "$default_file" ]]', stage50)
+        self.assertIn(
+            '"$repo_root"/scripts/bootstrap/lib/*.sh', static
+        )
+
 
 class CidrCheckTest(BootstrapTestCase):
     def run_cidr(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -6298,6 +6335,13 @@ class KubeadmInitTest(BootstrapTestCase):
         keep.write_bytes(b'')
         keep.chmod(0o644)
 
+    def seed_official_kubelet_default_conffile(self, host: Path) -> Path:
+        target = host / 'etc/default/kubelet'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'KUBELET_EXTRA_ARGS=\n')
+        target.chmod(0o644)
+        return target
+
     def make_environment(self) -> tuple[dict[str, str], Path, Path]:
         directory = self.temporary_directory()
         host = directory / 'host'
@@ -6373,6 +6417,34 @@ class KubeadmInitTest(BootstrapTestCase):
             '''#!/bin/sh
             last=
             for last do :; done
+            if [ "$last" = "$FAKE_HOST_ROOT/etc/default/kubelet" ]; then
+              value=
+              case "$1:$2" in
+                '-c:%a') value=$(/usr/bin/stat -c '%a' "$last" 2>/dev/null) || value= ;;
+                '-f:%Lp') value=$(/usr/bin/stat -f '%Lp' "$last" 2>/dev/null) || value= ;;
+              esac
+              if [ -n "$value" ] && \
+                 [ "${FAKE_KUBELET_DEFAULT_MODE_OUTPUT_FAIL:-0}" = 1 ]; then
+                printf '%s\n' "$value"
+                exit 1
+              fi
+              value=
+              case "$1:$2" in
+                '-c:%s') value=$(/usr/bin/stat -c '%s' "$last" 2>/dev/null) || value= ;;
+                '-f:%z') value=$(/usr/bin/stat -f '%z' "$last" 2>/dev/null) || value= ;;
+              esac
+              if [ -n "$value" ] && \
+                 [ -n "${FAKE_KUBELET_DEFAULT_SIZE_OUTPUT_FAIL_ON_CALL:-}" ]; then
+                calls_file="$FAKE_DRIFT_DIR/kubelet-default-size-calls"
+                calls=0
+                [ ! -f "$calls_file" ] || IFS= read -r calls <"$calls_file"
+                calls=$((calls + 1))
+                printf '%s\n' "$calls" >"$calls_file"
+                printf '%s\n' "$value"
+                [ "$calls" != "$FAKE_KUBELET_DEFAULT_SIZE_OUTPUT_FAIL_ON_CALL" ] || exit 1
+                exit 0
+              fi
+            fi
             if [ "$last" = "${FAKE_STAT_OWNER_DRIFT:-}" ]; then
               case "$*" in *'%u:%g'*) printf '999:999\n'; exit 0 ;; esac
             fi
@@ -6389,6 +6461,24 @@ class KubeadmInitTest(BootstrapTestCase):
             #!/bin/sh
             last=
             for last do :; done
+            if [ "$last" = "$FAKE_HOST_ROOT/etc/default/kubelet" ]; then
+              [ "${FAKE_KUBELET_DEFAULT_SHA256_FAIL:-0}" != 1 ] || exit 1
+              if [ "${FAKE_KUBELET_DEFAULT_SHA256_DRIFT:-0}" = 1 ]; then
+                printf '%064d  %s\n' 0 "$last"
+                exit 0
+              fi
+              if [ -n "${FAKE_KUBELET_DEFAULT_SHA256_OUTPUT_FAIL_ON_CALL:-}" ]; then
+                calls_file="$FAKE_DRIFT_DIR/kubelet-default-sha256-calls"
+                calls=0
+                [ ! -f "$calls_file" ] || IFS= read -r calls <"$calls_file"
+                calls=$((calls + 1))
+                printf '%s\n' "$calls" >"$calls_file"
+                if [ "$calls" = "$FAKE_KUBELET_DEFAULT_SHA256_OUTPUT_FAIL_ON_CALL" ]; then
+                  printf '2737f011e1fc6995aeeb6a2071e268e37b1437481bbdb205f5075939f40d7ae7  %s\n' "$last"
+                  exit 1
+                fi
+              fi
+            fi
             if [ "${last##*/}" = .kubelet-keep ] &&
                { [ -z "${FAKE_KUBELET_KEEP_SHA256_TARGET:-}" ] ||
                  [ "$FAKE_KUBELET_KEEP_SHA256_TARGET" = "$last" ]; }; then
@@ -6402,6 +6492,18 @@ class KubeadmInitTest(BootstrapTestCase):
               exec /usr/bin/sha256sum "$@"
             fi
             exec /usr/bin/shasum -a 256 "$@"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'cat',
+            '''#!/bin/sh
+            if [ "$#" = 1 ] && \
+               [ "$1" = "$FAKE_HOST_ROOT/etc/default/kubelet" ] && \
+               [ "${FAKE_KUBELET_DEFAULT_CONTENT_OUTPUT_FAIL:-0}" = 1 ]; then
+              /bin/cat "$1"
+              exit 1
+            fi
+            exec /bin/cat "$@"
             ''',
         )
         self.write_executable(
@@ -6437,6 +6539,10 @@ class KubeadmInitTest(BootstrapTestCase):
                 config) printf '\n# drift\n' >>"$FAKE_CONFIG_SOURCE" ;;
                 kubelet-package-footprint)
                   printf 'raced\n' >"$FAKE_HOST_ROOT/var/lib/kubelet/unknown-state"
+                  ;;
+                kubelet-default-conffile)
+                  printf 'KUBELET_EXTRA_ARGS=--config=/tmp/evil\n' \
+                    >"$FAKE_HOST_ROOT/etc/default/kubelet"
                   ;;
                 snapshot-content|snapshot-mode|snapshot-symlink)
                   case "$config" in
@@ -6509,6 +6615,28 @@ class KubeadmInitTest(BootstrapTestCase):
             fake_bin / 'dpkg-query',
             '''
             #!/bin/sh
+            if [ "$#" = 3 ] && [ "$1" = -W ] && \
+               [ "$2" = '-f=${Conffiles}' ] && [ "$3" = kubelet ]; then
+              [ "${FAKE_KUBELET_CONFFILES_QUERY_FAIL:-0}" != 1 ] || exit 1
+              case "${FAKE_KUBELET_CONFFILES_SHAPE:-exact}" in
+                exact)
+                  printf ' /etc/default/kubelet 9ba5cd2e9a1e368fa51e13f1dd6a5ec1\n'
+                  ;;
+                missing) printf '' ;;
+                duplicate)
+                  printf ' /etc/default/kubelet 9ba5cd2e9a1e368fa51e13f1dd6a5ec1\n'
+                  printf ' /etc/default/kubelet 9ba5cd2e9a1e368fa51e13f1dd6a5ec1\n'
+                  ;;
+                malformed)
+                  printf ' /etc/default/kubelet not-a-digest extra\n'
+                  ;;
+                digest-drift)
+                  printf ' /etc/default/kubelet 00000000000000000000000000000000\n'
+                  ;;
+                *) exit 64 ;;
+              esac
+              exit 0
+            fi
             [ "$1" = -S ] || exit 64
             case "$2" in
               /usr/bin/kubeadm) package=kubeadm ;;
@@ -6518,6 +6646,27 @@ class KubeadmInitTest(BootstrapTestCase):
                 ;;
               /var/lib/kubelet|/var/lib/kubelet/.kubelet-keep)
                 package=kubelet
+                ;;
+              /etc/default/kubelet)
+                case "${FAKE_KUBELET_DEFAULT_OWNER_SHAPE:-exact}" in
+                  exact) package=kubelet ;;
+                  fail) exit 1 ;;
+                  other) package=unapproved ;;
+                  duplicate)
+                    printf 'kubelet: /etc/default/kubelet\n'
+                    printf 'kubelet: /etc/default/kubelet\n'
+                    exit 0
+                    ;;
+                  no-final-newline)
+                    printf 'kubelet: /etc/default/kubelet'
+                    exit 0
+                    ;;
+                  trailing-blank)
+                    printf 'kubelet: /etc/default/kubelet\n\n'
+                    exit 0
+                    ;;
+                  *) exit 64 ;;
+                esac
                 ;;
               *) exit 1 ;;
             esac
@@ -6547,6 +6696,19 @@ class KubeadmInitTest(BootstrapTestCase):
               esac
             fi
             printf '%s: %s\n' "$package" "$2"
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'md5sum',
+            '''
+            #!/bin/sh
+            [ "$#" = 1 ] && \
+              [ "$1" = "$FAKE_HOST_ROOT/etc/default/kubelet" ] || exit 64
+            [ "${FAKE_KUBELET_DEFAULT_MD5_FAIL:-0}" != 1 ] || exit 1
+            digest=9ba5cd2e9a1e368fa51e13f1dd6a5ec1
+            [ "${FAKE_KUBELET_DEFAULT_MD5_DRIFT:-0}" != 1 ] || \
+              digest=00000000000000000000000000000000
+            printf '%s  %s\n' "$digest" "$1"
             ''',
         )
         self.write_executable(
@@ -6616,6 +6778,17 @@ class KubeadmInitTest(BootstrapTestCase):
             [ "${FAKE_CIDR_GATE_FAIL:-0}" != 1 ] || exit 1
             [ ! -f "$FAKE_DRIFT_DIR/cidr" ] || exit 1
             [ ! -f "$FAKE_DRIFT_DIR/route" ] || exit 1
+            if [ -n "${FAKE_KUBELET_DEFAULT_DRIFT_AFTER_CIDR_CALL:-}" ]; then
+              calls_file="$FAKE_DRIFT_DIR/cidr-calls"
+              calls=0
+              [ ! -f "$calls_file" ] || IFS= read -r calls <"$calls_file"
+              calls=$((calls + 1))
+              printf '%s\n' "$calls" >"$calls_file"
+              if [ "$calls" = "$FAKE_KUBELET_DEFAULT_DRIFT_AFTER_CIDR_CALL" ]; then
+                printf 'KUBELET_EXTRA_ARGS=--config=/tmp/evil\n' \
+                  >"$FAKE_HOST_ROOT/etc/default/kubelet"
+              fi
+            fi
             printf 'RESULT=PASS_CIDRS\nREASON=no-server-local-overlap\nSCOPE=SERVER_LOCAL_SCOPE_ONLY\n'
             ''',
         )
@@ -6768,6 +6941,241 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertIn(
             'kubeadm init --config ', command_log.read_text(encoding='utf-8')
         )
+
+    def test_accepts_exact_official_kubelet_default_conffile(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.seed_official_kubelet_package_footprint(host)
+        self.seed_official_kubelet_state_footprint(host)
+        default_file = self.seed_official_kubelet_default_conffile(host)
+        before = self.tree_snapshot(host)
+
+        checked = self.run_stage(environment, '--check')
+
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', checked.stdout)
+        self.assertEqual(self.tree_snapshot(host), before)
+        commands_after_check = command_log.read_text(encoding='utf-8')
+        self.assertNotIn('kubeadm ', commands_after_check)
+
+        environment['FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES'] = '1'
+        applied = self.run_stage(environment, '--apply')
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_INITIALIZED', applied.stdout)
+        commands_after_apply = command_log.read_text(encoding='utf-8')
+        kubeadm_commands = [
+            line for line in commands_after_apply.splitlines()
+            if line.startswith('kubeadm ')
+        ]
+        self.assertEqual(len(kubeadm_commands), 3)
+        snapshots = [line.rsplit(' ', 1)[1] for line in kubeadm_commands]
+        self.assertEqual(len(set(snapshots)), 1)
+        config = snapshots[0]
+        self.assertEqual(
+            kubeadm_commands,
+            [
+                f'kubeadm config validate --config {config}',
+                f'kubeadm init phase preflight --config {config}',
+                f'kubeadm init --config {config}',
+            ],
+        )
+        self.assertEqual(
+            self.tree_snapshot(host)['etc/default/kubelet'],
+            before['etc/default/kubelet'],
+        )
+
+    def test_rejects_official_kubelet_default_conffile_drift(self) -> None:
+        cases = (
+            ('directory', {}),
+            ('symlink', {}),
+            ('mode', {}),
+            ('owner', {'FAKE_STAT_OWNER_DRIFT': 'TARGET'}),
+            ('size', {}),
+            ('bytes', {}),
+            ('no-final-newline', {}),
+            ('trailing-blank', {}),
+            (
+                'ownership-query-fail',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'fail'},
+            ),
+            (
+                'ownership-other',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'other'},
+            ),
+            (
+                'ownership-duplicate',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'duplicate'},
+            ),
+            (
+                'ownership-no-final-newline',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'no-final-newline'},
+            ),
+            (
+                'ownership-trailing-blank',
+                {'FAKE_KUBELET_DEFAULT_OWNER_SHAPE': 'trailing-blank'},
+            ),
+            (
+                'conffile-query-fail',
+                {'FAKE_KUBELET_CONFFILES_QUERY_FAIL': '1'},
+            ),
+            (
+                'conffile-missing',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'missing'},
+            ),
+            (
+                'conffile-duplicate',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'duplicate'},
+            ),
+            (
+                'conffile-malformed',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'malformed'},
+            ),
+            (
+                'conffile-digest',
+                {'FAKE_KUBELET_CONFFILES_SHAPE': 'digest-drift'},
+            ),
+            ('md5-command-fail', {'FAKE_KUBELET_DEFAULT_MD5_FAIL': '1'}),
+            ('md5-drift', {'FAKE_KUBELET_DEFAULT_MD5_DRIFT': '1'}),
+            (
+                'mode-command-output-then-fail',
+                {'FAKE_KUBELET_DEFAULT_MODE_OUTPUT_FAIL': '1'},
+            ),
+            (
+                'content-command-output-then-fail',
+                {'FAKE_KUBELET_DEFAULT_CONTENT_OUTPUT_FAIL': '1'},
+            ),
+            (
+                'size-command-output-then-fail',
+                {'FAKE_KUBELET_DEFAULT_SIZE_OUTPUT_FAIL_ON_CALL': '2'},
+            ),
+            (
+                'sha256-command-fail',
+                {'FAKE_KUBELET_DEFAULT_SHA256_FAIL': '1'},
+            ),
+            (
+                'sha256-drift',
+                {'FAKE_KUBELET_DEFAULT_SHA256_DRIFT': '1'},
+            ),
+            (
+                'sha256-command-output-then-fail',
+                {'FAKE_KUBELET_DEFAULT_SHA256_OUTPUT_FAIL_ON_CALL': '2'},
+            ),
+        )
+        content_mutations = {
+            'size': b'x',
+            'bytes': b'XUBELET_EXTRA_ARGS=\n',
+            'no-final-newline': b'KUBELET_EXTRA_ARGS=',
+            'trailing-blank': b'KUBELET_EXTRA_ARGS=\n\n',
+        }
+
+        for drift, overrides in cases:
+            with self.subTest(drift=drift):
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                self.seed_official_kubelet_state_footprint(host)
+                default_file = self.seed_official_kubelet_default_conffile(host)
+
+                baseline = self.run_stage(environment, '--check')
+                self.assertEqual(baseline.returncode, 0, baseline.stderr)
+                command_log.write_text('', encoding='utf-8')
+
+                environment.update(
+                    {
+                        key: str(default_file) if value == 'TARGET' else value
+                        for key, value in overrides.items()
+                    }
+                )
+                if drift == 'directory':
+                    default_file.unlink()
+                    default_file.mkdir()
+                elif drift == 'symlink':
+                    outside = host.parent / 'outside-default-kubelet'
+                    outside.write_bytes(b'KUBELET_EXTRA_ARGS=\n')
+                    outside.chmod(0o644)
+                    default_file.unlink()
+                    default_file.symlink_to(outside)
+                elif drift == 'mode':
+                    default_file.chmod(0o666)
+                elif drift in content_mutations:
+                    default_file.write_bytes(content_mutations[drift])
+                before = self.tree_snapshot(default_file.parent)
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                self.assertIn(
+                    'REASON=kubelet-operator-override-present', result.stdout
+                )
+                commands = (
+                    command_log.read_text(encoding='utf-8')
+                    if command_log.exists()
+                    else ''
+                )
+                self.assertNotIn('kubeadm init --config ', commands)
+                self.assertEqual(self.tree_snapshot(default_file.parent), before)
+                self.assertFalse(
+                    list(
+                        (host / 'root/dev-infra-evidence').glob(
+                            '12-kubeadm-*.txt'
+                        )
+                    )
+                )
+
+    def test_regates_official_kubelet_default_conffile_before_init(
+        self,
+    ) -> None:
+        baseline_environment, baseline_host, _ = self.make_environment()
+        self.seed_official_kubelet_package_footprint(baseline_host)
+        self.seed_official_kubelet_state_footprint(baseline_host)
+        self.seed_official_kubelet_default_conffile(baseline_host)
+        baseline = self.run_stage(baseline_environment, '--check')
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+        for seam in ('validate', 'preflight', 'cidr'):
+            with self.subTest(seam=seam):
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                self.seed_official_kubelet_state_footprint(host)
+                self.seed_official_kubelet_default_conffile(host)
+                if seam == 'cidr':
+                    environment[
+                        'FAKE_KUBELET_DEFAULT_DRIFT_AFTER_CIDR_CALL'
+                    ] = '3'
+                else:
+                    environment[f'FAKE_DRIFT_AFTER_{seam.upper()}'] = (
+                        'kubelet-default-conffile'
+                    )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                self.assertIn(
+                    'REASON=kubelet-operator-override-present', result.stdout
+                )
+                commands = command_log.read_text(encoding='utf-8')
+                self.assertIn('kubeadm config validate --config ', commands)
+                if seam == 'validate':
+                    self.assertNotIn(
+                        'kubeadm init phase preflight --config ', commands
+                    )
+                else:
+                    self.assertIn(
+                        'kubeadm init phase preflight --config ', commands
+                    )
+                self.assertNotIn('kubeadm init --config ', commands)
+                self.assertEqual(
+                    (host / 'etc/default/kubelet').read_bytes(),
+                    b'KUBELET_EXTRA_ARGS=--config=/tmp/evil\n',
+                )
+                self.assertFalse(
+                    list(
+                        (host / 'root/dev-infra-evidence').glob(
+                            '12-kubeadm-*.txt'
+                        )
+                    )
+                )
 
     def test_rejects_official_kubelet_state_footprint_drift(self) -> None:
         baseline_environment, baseline_host, _ = self.make_environment()

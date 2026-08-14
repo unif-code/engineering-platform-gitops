@@ -21,5 +21,5 @@ command -v shellcheck >/dev/null 2>&1 || {
 PYTHONDONTWRITEBYTECODE=1 python3 -c 'import yaml'
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/validate.py"
 shellcheck \
-  "$repo_root/scripts/bootstrap/lib/common.sh" \
+  "$repo_root"/scripts/bootstrap/lib/*.sh \
   "$repo_root"/scripts/bootstrap/*.sh

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 让 Stage 40 严格识别 kubelet `1.36.3-1.1` 未修改的官方 `/etc/default/kubelet` conffile，并从服务器当前已安装、hold、kubelet inactive 的状态安全恢复。
+**Goal:** 让 Stage 40 与 Stage 50 通过同一个严格 validator 识别 kubelet `1.36.3-1.1` 未修改的官方 `/etc/default/kubelet` conffile，并从服务器当前已安装、hold、kubelet inactive 的状态安全恢复到 kubeadm init。
 
-**Architecture:** 保留 `kubelet_operator_override_is_pristine()` 作为唯一入口，把 nonempty 分支收紧为“固定 bytes + 固定 SHA-256 + kubelet 唯一 ownership + 固定 conffile MD5 + 当前文件 MD5”五重绑定。missing 与安全空文件沿用现有快速路径；官方文件只读验真后继续现有 `START_REQUIRED` 状态机，CHECK 零写，APPLY 只 restart/复验，不触发 APT。
+**Architecture:** 已完成的 Stage 40 五重绑定迁入 `scripts/bootstrap/lib/kubelet-default.sh`，Stage 40 与 Stage 50 都只调用 `kubelet_default_conffile_is_pristine()`。missing、安全空文件与精确官方 conffile 使用同一事实源；共享 library 不决定业务 RESULT/退出码。Stage 40 保持 installed-state 50 分类，Stage 50 保持 pre-init 30 分类，并在 validate、preflight 与真正 init 前重复验真。
 
 **Tech Stack:** Bash 3.2、GNU `md5sum`、`sha256sum`、dpkg-query、Python `unittest` fixture、ShellCheck。
 
@@ -19,6 +19,12 @@
 - 不执行 shell 语义解析，不接受空格、注释、额外换行、额外行或其他等价写法。
 - CHECK 不 restart、不写 evidence；installed resume 不执行任何 APT、download、install 或 hold mutation。
 - 本地只运行受影响 focused tests、`validate-fast.sh` 与 static checks；完整动态 shard 由普通 push 后 GitHub `validation-gate` 执行。
+
+## 执行状态（2026-08-14）
+
+- Task 1 的 Stage 40 官方 conffile 兼容已在 main 完成，并在真实 Ubuntu 24.04 主机通过；以下 Task 1 步骤保留为历史设计与证据，不重复执行。
+- Task 2 已推进到服务器 Stage 50；真实 Stop Gate 为 `kubelet-operator-override-present`，由 Stage 50 未复用 Stage 40 合同导致。
+- 本轮只执行新增 Task 3/4；不重装 Stage 40 package，不修改服务器 `/etc/default/kubelet`。
 
 ---
 
@@ -384,3 +390,417 @@ echo "COMMAND_EXIT_CODE=$rc"
 ```
 
 Expected: Stage 40 不再重新下载/安装四包；只 restart kubelet、完整复验并继续 Stage 50，或在下一个真实 Stop Gate 精确停止。
+
+---
+
+### Task 3: 抽取共享 validator 并修复 Stage 50 重复误判
+
+**Files:**
+- Create: `scripts/bootstrap/lib/kubelet-default.sh`
+- Modify: `scripts/bootstrap/40-install-kubernetes.sh`
+- Modify: `scripts/bootstrap/50-kubeadm-init.sh`
+- Modify: `scripts/test_bootstrap.py`
+- Modify: `scripts/validate-static.sh`
+
+**Interfaces:**
+- Produces: `kubelet_default_conffile_is_pristine <mapped-path>` 与内部 `${Conffiles}` parser。
+- Consumes: 调用 Stage 提供的 `path_mode`、`path_size`、`owned_by_expected`，以及 common 的 `sha256_file`。
+- Invariant: shared library 不调用 `complete`、不输出 RESULT、不缓存文件状态，也不修改目标文件。
+
+- [ ] **Step 1: 给 Stage 50 fixture 增加真实官方 conffile 边界**
+
+在 `KubeadmInitTest` 中新增 `seed_official_kubelet_default_conffile(host)`，只创建：
+
+```python
+target = host / 'etc/default/kubelet'
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_bytes(b'KUBELET_EXTRA_ARGS=\n')
+target.chmod(0o644)
+```
+
+扩展 fake tools，但不改变既有 `/etc/kubernetes` 与 `/var/lib/kubelet` package-footprint fixture：
+
+- `dpkg-query -S /etc/default/kubelet` 默认只输出
+  `kubelet: /etc/default/kubelet`；支持 fail、other、duplicate、无终止换行和尾随空行。
+- `dpkg-query -W -f='${Conffiles}' kubelet` 默认只输出唯一批准记录；支持 command fail、missing、duplicate、malformed 与 digest drift。
+- fake `md5sum` 默认返回批准 MD5；支持 command fail 与 digest drift。
+- fake `sha256sum` 对 default conffile 支持 command fail 与 digest drift，同时保持 `.kubelet-keep` 既有行为。
+- fake kubeadm 的 validate/preflight seam 支持
+  `FAKE_DRIFT_AFTER_VALIDATE=kubelet-default-conffile` 与
+  `FAKE_DRIFT_AFTER_PREFLIGHT=kubelet-default-conffile`。
+
+- [ ] **Step 2: 写 Stage 50 official conffile 正向 RED**
+
+新增：
+
+```text
+KubeadmInitTest.test_accepts_exact_official_kubelet_default_conffile
+```
+
+每次 setup 同时 seed 已批准的 `/etc/kubernetes` package footprint、`/var/lib/kubelet`
+package footprint 与官方 `/etc/default/kubelet`。断言：
+
+- `--check` exit 0、`RESULT=PASS_KUBEADM_CHECK`、tree byte/metadata snapshot 完全不变；
+- `--apply` exit 0、`RESULT=PASS_KUBEADM_INITIALIZED`，且只调用批准的 kubeadm sequence；
+- init 前没有删除、清空、chmod 或重写 `/etc/default/kubelet`。
+
+运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" \
+  python3 -m unittest -v \
+  test_bootstrap.KubeadmInitTest.test_accepts_exact_official_kubelet_default_conffile
+```
+
+Expected RED: `Ran 1 test`、FAIL、exit 1；旧 Stage 50 对 nonempty 文件返回 30。不得出现 loader、fixture 或 syntax error。
+
+- [ ] **Step 3: 写 Stage 50 provenance 与 race RED**
+
+新增：
+
+```text
+KubeadmInitTest.test_rejects_official_kubelet_default_conffile_drift
+KubeadmInitTest.test_regates_official_kubelet_default_conffile_before_init
+```
+
+第一个 method 的每个 subtest 必须先证明 exact baseline 能通过，再分别破坏：
+
+- type/symlink、mode、owner、size；
+- bytes、无终止换行、尾随空行；
+- package ownership query fail/other/duplicate/no-final-newline/trailing-blank；
+- `${Conffiles}` query fail/missing/duplicate/malformed/digest drift；
+- MD5 command fail/digest drift；
+- mode/content command 输出批准值后非零退出；
+- final size/SHA-256 command 输出批准值后非零退出；
+- SHA-256 command fail/digest drift。
+
+全部必须 exit 30、`REASON=kubelet-operator-override-present`，并证明没有执行
+`kubeadm init`、没有 success evidence、目标文件未被生产代码修复。
+
+第二个 method 分别在 config validate 后、preflight 后，以及最后一轮 CIDR Gate
+返回 PASS 后把 exact conffile 改成非批准 bytes。除 exit 30、reason 和 no-init 外，
+还必须断言：
+
+- after-validate case 的 command log 已出现 `kubeadm config validate`，但没有 preflight/init；
+- after-preflight case 已出现 validate 与 `kubeadm init phase preflight`，但没有真正 init。
+- after-CIDR case 只在第三次 CIDR 调用漂移，已完成 validate/preflight，但仍没有真正 init。
+
+这样旧 Stage 50 在初始 nonempty Gate 提前返回同样的 rc/reason 时，测试仍会 RED，不能假绿。
+
+先在旧 production 上运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" \
+  python3 -m unittest -v \
+  test_bootstrap.KubeadmInitTest.test_rejects_official_kubelet_default_conffile_drift \
+  test_bootstrap.KubeadmInitTest.test_regates_official_kubelet_default_conffile_before_init
+```
+
+Expected RED: exact baseline 或 race 分类产生 load-bearing assertion failures、exit 1；不得以 fixture error 充当 RED。
+
+- [ ] **Step 4: 写单一事实源静态 RED**
+
+新增：
+
+```text
+CommonLibraryTest.test_kubernetes_stages_share_kubelet_default_validator
+```
+
+断言必须同时成立：
+
+- Stage 40 与 Stage 50 都精确 source `lib/kubelet-default.sh`；
+- 两个 Stage 都调用 `kubelet_default_conffile_is_pristine`；
+- approved content/SHA/MD5 常量与 `${Conffiles}` parser 只存在于 shared library；
+- Stage 40 不再定义 `kubelet_operator_override_is_pristine`；
+- Stage 50 不再以 `-s /etc/default/kubelet` 作为 nonempty 拒绝规则；
+- `validate-static.sh` 的 ShellCheck scope 覆盖 `scripts/bootstrap/lib/*.sh`。
+
+运行该 method，Expected RED 为 missing shared library/source，exit 1。
+
+- [ ] **Step 5: 创建 shared library**
+
+`scripts/bootstrap/lib/kubelet-default.sh` 必须逐行迁移当前 Stage 40 已验证的实现，并只把
+target 改为显式参数：
+
+```bash
+#!/usr/bin/env bash
+
+readonly KUBELET_DEFAULT_CONTENT='KUBELET_EXTRA_ARGS='
+readonly KUBELET_DEFAULT_SIZE=20
+readonly KUBELET_DEFAULT_SHA256=2737f011e1fc6995aeeb6a2071e268e37b1437481bbdb205f5075939f40d7ae7
+readonly KUBELET_DEFAULT_MD5=9ba5cd2e9a1e368fa51e13f1dd6a5ec1
+
+kubelet_registered_default_md5() {
+  local conffiles
+  conffiles=$(dpkg-query -W -f='${Conffiles}' kubelet 2>/dev/null) || return 1
+  awk '
+    NF == 0 {next}
+    $1 != "/etc/default/kubelet" {next}
+    NF != 2 || $2 !~ /^[0-9a-f]{32}$/ || seen++ {exit 1}
+    {digest=$2}
+    END {
+      if (seen != 1) exit 1
+      print digest
+    }
+  ' <<<"$conffiles"
+}
+
+kubelet_default_conffile_is_pristine() {
+  local default_file=$1 mode size content actual_sha256 ownership
+  local registered_md5 actual_md5
+  local ownership_sentinel=__KUBELET_DEFAULT_OWNERSHIP_END__
+  if [[ ! -e "$default_file" && ! -L "$default_file" ]]; then
+    return 0
+  fi
+  [[ -f "$default_file" && ! -L "$default_file" ]] || return 1
+  mode=$(path_mode "$default_file") || return 1
+  [[ "$mode" == 644 ]] || return 1
+  owned_by_expected "$default_file" || return 1
+  size=$(path_size "$default_file") || return 1
+  [[ "$size" == 0 ]] && return 0
+  [[ "$size" == "$KUBELET_DEFAULT_SIZE" ]] || return 1
+  content=$(cat "$default_file") || return 1
+  [[ "$content" == "$KUBELET_DEFAULT_CONTENT" ]] || return 1
+  actual_sha256=$(sha256_file "$default_file") || return 1
+  [[ "$actual_sha256" == "$KUBELET_DEFAULT_SHA256" ]] || return 1
+  ownership=$(
+    dpkg-query -S /etc/default/kubelet 2>/dev/null &&
+      printf '%s' "$ownership_sentinel"
+  ) || return 1
+  [[ "$ownership" == $'kubelet: /etc/default/kubelet\n'"$ownership_sentinel" ]] || return 1
+  registered_md5=$(kubelet_registered_default_md5) || return 1
+  [[ "$registered_md5" == "$KUBELET_DEFAULT_MD5" ]] || return 1
+  actual_md5=$(md5sum "$default_file" 2>/dev/null) || return 1
+  [[ "$actual_md5" == "${registered_md5}  ${default_file}" ]] || return 1
+  [[ -f "$default_file" && ! -L "$default_file" ]] || return 1
+  mode=$(path_mode "$default_file") || return 1
+  [[ "$mode" == 644 ]] || return 1
+  owned_by_expected "$default_file" || return 1
+  size=$(path_size "$default_file") || return 1
+  [[ "$size" == "$KUBELET_DEFAULT_SIZE" ]] || return 1
+  actual_sha256=$(sha256_file "$default_file") || return 1
+  [[ "$actual_sha256" == "$KUBELET_DEFAULT_SHA256" ]]
+}
+```
+
+实现必须保留 Stage 40 现有 load-bearing 边界：
+
+- metadata、size、bytes、SHA、唯一 package owner、唯一 conffile record、registered MD5、current MD5；
+- command substitution 的 sentinel 逻辑，严格区分终止换行、无终止换行和额外空行；
+- mode、content、size、SHA 等 helper 的 stdout 与退出码必须分别验证，禁止把
+  command substitution 直接嵌入 `[[ ... ]]` 而吞掉非零退出；
+- 完成验证后再次检查 metadata、size 与 SHA，捕获验证期间 drift。
+
+library 不自行寻找 host path；调用者传入 mapped target。不要复制或缓存 target。
+
+- [ ] **Step 6: Stage 40 改为只调用 shared validator**
+
+在 `common.sh` 后 source 新 library，并：
+
+- 删除 Stage 40 内重复的 content/SHA/MD5 常量；
+- 删除 Stage 40 内 `${Conffiles}` parser 与
+  `kubelet_operator_override_is_pristine()` 实现；
+- installed-state 与 post-install Gate 改为调用：
+
+```bash
+kubelet_default_conffile_is_pristine "$(host_path /etc/default/kubelet)"
+```
+
+失败仍按 Stage 40 原逻辑返回 `STOP_VERIFY_FAILED` / 50，不改变状态机与 restart 行为。
+
+- [ ] **Step 7: Stage 50 改为只调用 shared validator**
+
+在 `common.sh` 后 source 新 library；补齐 `path_size()`，并把 `cat`、`md5sum` 加入
+Stage 50 required commands。将 `kubelet_pre_init_inputs_gate()` 中 default-file 分支替换为：
+
+```bash
+kubelet_default_conffile_is_pristine "$(host_path /etc/default/kubelet)" ||
+  complete STOP_ALREADY_INITIALIZED kubelet-operator-override-present "$EXIT_UNKNOWN_STATE" NONE
+```
+
+必须复用 `fresh_pre_init_gates` 的三个现有执行点（初始、validate 后、preflight 后），
+并在最后一次 config snapshot 复验之后、真正 `kubeadm init` 之前直接再执行一次
+shared conffile validator，闭合最后一轮 host/CIDR Gate 内的漂移窗口；不新增缓存变量。
+失败继续返回 30，不改变其他 package footprint、listener、manifest、etcd 或 kubeadm
+state Gate。
+
+- [ ] **Step 8: 扩展 static scope 并运行完整 focused GREEN**
+
+把 `validate-static.sh` 的 ShellCheck 输入从单个 `lib/common.sh` 扩展为
+`scripts/bootstrap/lib/*.sh`，然后运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" \
+  python3 -m unittest -v \
+  test_bootstrap.CommonLibraryTest.test_kubernetes_stages_share_kubelet_default_validator \
+  test_bootstrap.KubeadmInitTest.test_accepts_exact_official_kubelet_default_conffile \
+  test_bootstrap.KubeadmInitTest.test_rejects_official_kubelet_default_conffile_drift \
+  test_bootstrap.KubeadmInitTest.test_regates_official_kubelet_default_conffile_before_init
+```
+
+Expected GREEN: `Ran 4 tests`、`OK`、exit 0。
+
+- [ ] **Step 9: 运行 Stage 40/50 受影响回归集**
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" \
+  python3 -m unittest -v \
+  test_bootstrap.KubernetesInstallTest.test_accepts_unmodified_official_kubelet_default_conffile \
+  test_bootstrap.KubernetesInstallTest.test_rejects_kubelet_default_conffile_provenance_drift \
+  test_bootstrap.KubernetesInstallTest.test_exact_packages_still_reject_kubelet_operator_override \
+  test_bootstrap.KubernetesInstallTest.test_allows_secure_kubelet_root_and_empty_operator_override \
+  test_bootstrap.KubernetesInstallTest.test_rejects_kubelet_default_conffile_drift_during_validation \
+  test_bootstrap.KubernetesInstallTest.test_rechecks_installed_payload_before_kubelet_restart \
+  test_bootstrap.KubeadmInitTest.test_check_allows_secure_kubelet_root_and_empty_operator_file \
+  test_bootstrap.KubeadmInitTest.test_rejects_official_kubelet_state_footprint_drift \
+  test_bootstrap.KubeadmInitTest.test_apply_reruns_complete_gate_set_after_validate_and_preflight
+```
+
+Expected: `Ran 9 tests`、`OK`、exit 0。若实际 method 名因当前 main 有精确重命名，只允许映射到语义相同的现有 method，并在报告记录映射；不得删减覆盖。
+
+- [ ] **Step 10: 运行提交前 fast/static 门禁**
+
+```bash
+./scripts/validate-fast.sh
+./scripts/validate-static.sh
+bash -n \
+  scripts/bootstrap/lib/kubelet-default.sh \
+  scripts/bootstrap/40-install-kubernetes.sh \
+  scripts/bootstrap/50-kubeadm-init.sh
+shellcheck \
+  scripts/bootstrap/lib/*.sh \
+  scripts/bootstrap/40-install-kubernetes.sh \
+  scripts/bootstrap/50-kubeadm-init.sh
+git diff --check
+```
+
+所有命令必须 exit 0。按治理约定不在本机重跑完整 Kubernetes/Kubeadm shard 或
+`validate.sh`。
+
+- [ ] **Step 11: 独立 review、单一实现提交**
+
+独立 review 必须确认 Critical=0、Important=0，并核对：
+
+- shared validator 没有丢失 Stage 40 的 sentinel/TOCTOU Gate；
+- Stage 50 三个 fresh Gate 执行点都真实复验，且最后一次紧邻真正 init；
+- missing/empty 合同未变；
+- error code 50/30 未串线；
+- fixture 负向 mutation 不能绕过 shared function。
+
+若 review 有 finding，逐项 RED→GREEN 后重跑受影响 focused/static。全部 clean 后一次提交所有实现：
+
+```bash
+git add \
+  scripts/bootstrap/lib/kubelet-default.sh \
+  scripts/bootstrap/40-install-kubernetes.sh \
+  scripts/bootstrap/50-kubeadm-init.sh \
+  scripts/test_bootstrap.py \
+  scripts/validate-static.sh
+git commit -m 'fix(bootstrap): share kubelet default conffile gate'
+git show --check --stat HEAD
+```
+
+### Task 4: GitHub 门禁与服务器继续部署
+
+**Files:**
+- Verify only: Task 3 commit and GitHub workflow output
+- Server state: `/opt/uni-code/engineering-platform-gitops`
+
+- [ ] **Step 1: 普通 push 并等待该 SHA 的 GitHub validation-gate**
+
+```bash
+git push origin main
+head_sha=$(git rev-parse HEAD)
+run_id=
+for _ in {1..30}; do
+  run_id=$(gh run list --workflow validate.yml --branch main --commit "$head_sha" \
+    --limit 1 --json databaseId --jq '.[0].databaseId')
+  [[ -z "$run_id" ]] || break
+  sleep 10
+done
+[[ -n "$run_id" ]]
+gh run watch "$run_id" --exit-status
+printf 'CI_VERIFIED_HEAD_SHA=%s\n' "$head_sha"
+printf '%s\n' 'MATERIALIZED_SERVER_PREFIX_BEGIN'
+printf "APPROVED_SHA=%s bash <<'EOF'\n" "$head_sha"
+printf '%s\n' 'MATERIALIZED_SERVER_PREFIX_END'
+```
+
+只有该 SHA 的 gate 全绿后才给服务器同步命令。若 CI 失败，只做 fix-forward，不重写 main 历史。
+
+- [ ] **Step 2: 服务器安全 fast-forward 并先 CHECK**
+
+服务器命令必须把 Step 1 打印的 `CI_VERIFIED_HEAD_SHA` 物化为首行
+`APPROVED_SHA=<实际40字符SHA>`（不得保留 `$head_sha`、shell substitution 或从服务器
+`origin/main` 动态推导）。Step 1 已打印包含实际 literal 的
+`MATERIALIZED_SERVER_PREFIX`；下面 code fence 展示跟在该 prefix 后的 script body。执行
+agent 必须把两部分拼成一个完整命令再交付，且检查最终文本不含 `$head_sha`。完整脚本检查
+root、repo、origin、main、clean worktree、remote SHA 与 merge 后 local SHA：
+
+```bash
+set -Eeuo pipefail
+export LC_ALL=C
+
+repo=/opt/uni-code/engineering-platform-gitops
+expected=${APPROVED_SHA:?}
+expected_origin=git@github-unif-code:unif-code/engineering-platform-gitops.git
+
+[[ "$expected" =~ ^[0-9a-f]{40}$ ]] || { echo 'STOP: invalid approved SHA'; exit 90; }
+[[ "$(id -u)" == 0 ]] || { echo 'STOP: must run as root'; exit 91; }
+[[ -d "$repo/.git" && ! -L "$repo" ]] || { echo 'STOP: repository is missing or unsafe'; exit 92; }
+[[ "$(/usr/bin/git -C "$repo" remote get-url origin)" == "$expected_origin" ]] || { echo 'STOP: unexpected origin'; exit 93; }
+[[ "$(/usr/bin/git -C "$repo" branch --show-current)" == main ]] || { echo 'STOP: current branch is not main'; exit 94; }
+worktree=$(/usr/bin/git -C "$repo" status --porcelain=v1 --untracked-files=all)
+[[ -z "$worktree" ]] || { echo 'STOP: worktree is not clean'; printf '%s\n' "$worktree"; exit 95; }
+
+/usr/bin/git -C "$repo" fetch --prune origin main
+[[ "$(/usr/bin/git -C "$repo" rev-parse origin/main)" == "$expected" ]] || { echo 'STOP: origin/main SHA mismatch'; exit 96; }
+/usr/bin/git -C "$repo" merge --ff-only origin/main
+[[ "$(/usr/bin/git -C "$repo" rev-parse HEAD)" == "$expected" ]] || { echo 'STOP: local HEAD SHA mismatch'; exit 97; }
+
+set +e
+"$repo/scripts/bootstrap/bootstrap-all.sh" --check
+rc=$?
+set -e
+echo "COMMAND_EXIT_CODE=$rc"
+exit "$rc"
+EOF
+```
+
+Expected: Stage 50 不再以 `kubelet-operator-override-present` 停止；CHECK 到下一真实状态或返回 apply-required。
+
+- [ ] **Step 3: 用户确认后继续 APPLY**
+
+即使用户已重连，也必须再次把同一个 CI-verified SHA 物化为
+`APPROVED_SHA=<实际40字符SHA>`；不得依赖 Step 2 的 shell 变量。APPLY 前重新验证
+root、repo、origin、main、clean 与 local HEAD，且不再 fetch 或 merge。与 Step 2 相同，
+下面是 script body；交付时必须把首行渲染为包含实际 literal 的
+`APPROVED_SHA=<实际40字符SHA> bash <<'EOF'`：
+
+```bash
+set -Eeuo pipefail
+export LC_ALL=C
+
+repo=/opt/uni-code/engineering-platform-gitops
+expected=${APPROVED_SHA:?}
+expected_origin=git@github-unif-code:unif-code/engineering-platform-gitops.git
+
+[[ "$expected" =~ ^[0-9a-f]{40}$ ]] || { echo 'STOP: invalid approved SHA'; exit 90; }
+[[ "$(id -u)" == 0 ]] || { echo 'STOP: must run as root'; exit 91; }
+[[ -d "$repo/.git" && ! -L "$repo" ]] || { echo 'STOP: repository is missing or unsafe'; exit 92; }
+[[ "$(/usr/bin/git -C "$repo" remote get-url origin)" == "$expected_origin" ]] || { echo 'STOP: unexpected origin'; exit 93; }
+[[ "$(/usr/bin/git -C "$repo" branch --show-current)" == main ]] || { echo 'STOP: current branch is not main'; exit 94; }
+worktree=$(/usr/bin/git -C "$repo" status --porcelain=v1 --untracked-files=all)
+[[ -z "$worktree" ]] || { echo 'STOP: worktree is not clean'; printf '%s\n' "$worktree"; exit 95; }
+[[ "$(/usr/bin/git -C "$repo" rev-parse HEAD)" == "$expected" ]] || { echo 'STOP: local HEAD SHA mismatch'; exit 96; }
+
+set +e
+"$repo/scripts/bootstrap/bootstrap-all.sh" --apply
+rc=$?
+set -e
+echo "COMMAND_EXIT_CODE=$rc"
+exit "$rc"
+EOF
+```
+
+Expected: Stage 40 保持 already compliant；Stage 50 在 exact official conffile 下执行批准的 kubeadm sequence，或在下一个独立真实 Stop Gate 精确停止。记录完整 terminal block、exit code 与 evidence SHA，作为下一轮服务器验收输入。
