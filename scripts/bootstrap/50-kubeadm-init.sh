@@ -133,8 +133,8 @@ package_directory_is_safe() {
   package_owner_is_exact "$logical" kubelet
 }
 
-kubelet_keep_is_exact() {
-  local logical=/etc/kubernetes/manifests/.kubelet-keep target digest
+kubelet_package_placeholder_is_exact() {
+  local logical=$1 target digest
   target=$(host_path "$logical")
   [[ -f "$target" && ! -L "$target" && ! -s "$target" &&
      "$(path_mode "$target")" == 644 ]] || return 1
@@ -142,6 +142,22 @@ kubelet_keep_is_exact() {
   package_owner_is_exact "$logical" kubelet || return 1
   digest=$(sha256_file "$target") || return 1
   [[ "$digest" == "$KUBELET_KEEP_SHA256" ]]
+}
+
+kubelet_keep_is_exact() {
+  kubelet_package_placeholder_is_exact /etc/kubernetes/manifests/.kubelet-keep
+}
+
+kubelet_state_package_footprint_is_pristine() {
+  local kubelet_root=$1 root_entries
+  [[ -d "$kubelet_root" && ! -L "$kubelet_root" ]] || return 1
+  owned_by_expected "$kubelet_root" || return 1
+  [[ "$(path_mode "$kubelet_root")" == 775 ]] || return 1
+  package_owner_is_exact /var/lib/kubelet kubelet || return 1
+  root_entries=$(find "$kubelet_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null |
+    sed 's#.*/##' | sort) || return 1
+  [[ "$root_entries" == .kubelet-keep ]] || return 1
+  kubelet_package_placeholder_is_exact /var/lib/kubelet/.kubelet-keep
 }
 
 kubelet_package_footprint_is_fresh() {
@@ -193,16 +209,18 @@ kubelet_pre_init_inputs_gate() {
   kubelet_root=$(host_path /var/lib/kubelet)
   default_file=$(host_path /etc/default/kubelet)
   if [[ -e "$kubelet_root" || -L "$kubelet_root" ]]; then
-    if [[ ! -d "$kubelet_root" || -L "$kubelet_root" ]] || ! owned_by_expected "$kubelet_root"; then
-      complete STOP_ALREADY_INITIALIZED kubelet-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
+    if ! kubelet_state_package_footprint_is_pristine "$kubelet_root"; then
+      if [[ ! -d "$kubelet_root" || -L "$kubelet_root" ]] || ! owned_by_expected "$kubelet_root"; then
+        complete STOP_ALREADY_INITIALIZED kubelet-root-unsafe "$EXIT_UNKNOWN_STATE" NONE
+      fi
+      root_mode=$(path_mode "$kubelet_root") || complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable "$EXIT_UNKNOWN_STATE" NONE
+      [[ "$root_mode" == 700 || "$root_mode" == 750 || "$root_mode" == 755 ]] ||
+        complete STOP_ALREADY_INITIALIZED kubelet-root-mode-unsafe "$EXIT_UNKNOWN_STATE" NONE
+      first_entry=$(find "$kubelet_root" -mindepth 1 -print -quit 2>/dev/null) ||
+        complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable "$EXIT_UNKNOWN_STATE" NONE
+      [[ -z "$first_entry" ]] ||
+        complete STOP_ALREADY_INITIALIZED kubelet-generated-state-present "$EXIT_UNKNOWN_STATE" NONE
     fi
-    root_mode=$(path_mode "$kubelet_root") || complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable "$EXIT_UNKNOWN_STATE" NONE
-    [[ "$root_mode" == 700 || "$root_mode" == 750 || "$root_mode" == 755 ]] ||
-      complete STOP_ALREADY_INITIALIZED kubelet-root-mode-unsafe "$EXIT_UNKNOWN_STATE" NONE
-    first_entry=$(find "$kubelet_root" -mindepth 1 -print -quit 2>/dev/null) ||
-      complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable "$EXIT_UNKNOWN_STATE" NONE
-    [[ -z "$first_entry" ]] ||
-      complete STOP_ALREADY_INITIALIZED kubelet-generated-state-present "$EXIT_UNKNOWN_STATE" NONE
   fi
   for sensitive_path in \
     "${kubelet_root}/kubeadm-flags.env" \

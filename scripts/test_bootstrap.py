@@ -6290,6 +6290,14 @@ class KubeadmInitTest(BootstrapTestCase):
         keep.write_bytes(b'')
         keep.chmod(0o644)
 
+    def seed_official_kubelet_state_footprint(self, host: Path) -> None:
+        kubelet_root = host / 'var/lib/kubelet'
+        kubelet_root.mkdir(parents=True)
+        kubelet_root.chmod(0o775)
+        keep = kubelet_root / '.kubelet-keep'
+        keep.write_bytes(b'')
+        keep.chmod(0o644)
+
     def make_environment(self) -> tuple[dict[str, str], Path, Path]:
         directory = self.temporary_directory()
         host = directory / 'host'
@@ -6381,7 +6389,9 @@ class KubeadmInitTest(BootstrapTestCase):
             #!/bin/sh
             last=
             for last do :; done
-            if [ "${last##*/}" = .kubelet-keep ]; then
+            if [ "${last##*/}" = .kubelet-keep ] &&
+               { [ -z "${FAKE_KUBELET_KEEP_SHA256_TARGET:-}" ] ||
+                 [ "$FAKE_KUBELET_KEEP_SHA256_TARGET" = "$last" ]; }; then
               [ "${FAKE_KUBELET_KEEP_SHA256_FAIL:-0}" != 1 ] || exit 1
               if [ "${FAKE_KUBELET_KEEP_SHA256_DRIFT:-0}" = 1 ]; then
                 printf '%064d  %s\n' 0 "$last"
@@ -6425,6 +6435,9 @@ class KubeadmInitTest(BootstrapTestCase):
               [ -n "$drift" ] || return 0
               case "$drift" in
                 config) printf '\n# drift\n' >>"$FAKE_CONFIG_SOURCE" ;;
+                kubelet-package-footprint)
+                  printf 'raced\n' >"$FAKE_HOST_ROOT/var/lib/kubelet/unknown-state"
+                  ;;
                 snapshot-content|snapshot-mode|snapshot-symlink)
                   case "$config" in
                     "$FAKE_HOST_ROOT"/var/tmp/.kubeadm-config.*/*) ;;
@@ -6501,6 +6514,9 @@ class KubeadmInitTest(BootstrapTestCase):
               /usr/bin/kubeadm) package=kubeadm ;;
               /usr/bin/kubectl) package=kubectl ;;
               /etc/kubernetes|/etc/kubernetes/manifests|/etc/kubernetes/manifests/.kubelet-keep)
+                package=kubelet
+                ;;
+              /var/lib/kubelet|/var/lib/kubelet/.kubelet-keep)
                 package=kubelet
                 ;;
               *) exit 1 ;;
@@ -6730,6 +6746,156 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertIn(
             'kubeadm init --config ', command_log.read_text(encoding='utf-8')
         )
+
+    def test_accepts_exact_official_kubelet_state_footprint(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.seed_official_kubelet_package_footprint(host)
+        self.seed_official_kubelet_state_footprint(host)
+        before = self.tree_snapshot(host)
+
+        checked = self.run_stage(environment, '--check')
+
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', checked.stdout)
+        self.assertEqual(self.tree_snapshot(host), before)
+
+        environment['FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES'] = '1'
+        applied = self.run_stage(environment, '--apply')
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_INITIALIZED', applied.stdout)
+        self.assertTrue((host / 'var/lib/kubelet/.kubelet-keep').is_file())
+        self.assertIn(
+            'kubeadm init --config ', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_rejects_official_kubelet_state_footprint_drift(self) -> None:
+        baseline_environment, baseline_host, _ = self.make_environment()
+        self.seed_official_kubelet_package_footprint(baseline_host)
+        self.seed_official_kubelet_state_footprint(baseline_host)
+        baseline = self.run_stage(baseline_environment, '--check')
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+        cases = (
+            'extra-entry',
+            'root-mode',
+            'root-filesystem-owner',
+            'root-package-owner',
+            'root-package-query',
+            'root-symlink',
+            'keep-mode',
+            'keep-bytes',
+            'keep-filesystem-owner',
+            'keep-package-owner',
+            'keep-package-query',
+            'keep-sha256-drift',
+            'keep-sha256-fail',
+            'keep-symlink',
+        )
+        shaped_cases = (
+            ('root-owner-shape', '/var/lib/kubelet'),
+            ('keep-owner-shape', '/var/lib/kubelet/.kubelet-keep'),
+        )
+
+        scenarios = [(case, None, None) for case in cases]
+        for case, logical in shaped_cases:
+            for shape in ('duplicate', 'trailing-blank', 'extra', 'nonzero-output'):
+                scenarios.append((case, logical, shape))
+
+        for case, logical, shape in scenarios:
+            with self.subTest(case=case, shape=shape):
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                self.seed_official_kubelet_state_footprint(host)
+                kubelet_root = host / 'var/lib/kubelet'
+                keep = kubelet_root / '.kubelet-keep'
+
+                if case == 'extra-entry':
+                    (kubelet_root / 'unknown-state').write_text(
+                        'unknown\n', encoding='utf-8'
+                    )
+                elif case == 'root-mode':
+                    kubelet_root.chmod(0o755)
+                elif case == 'root-filesystem-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(kubelet_root)
+                elif case == 'root-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/var/lib/kubelet'
+                    )
+                elif case == 'root-package-query':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_FAIL'] = (
+                        '/var/lib/kubelet'
+                    )
+                elif case == 'root-symlink':
+                    target = host / 'outside-kubelet-state'
+                    kubelet_root.rename(target)
+                    kubelet_root.symlink_to(target, target_is_directory=True)
+                elif case == 'keep-mode':
+                    keep.chmod(0o600)
+                elif case == 'keep-bytes':
+                    keep.write_bytes(b'drift\n')
+                elif case == 'keep-filesystem-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(keep)
+                elif case == 'keep-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/var/lib/kubelet/.kubelet-keep'
+                    )
+                elif case == 'keep-package-query':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_FAIL'] = (
+                        '/var/lib/kubelet/.kubelet-keep'
+                    )
+                elif case == 'keep-sha256-drift':
+                    environment['FAKE_KUBELET_KEEP_SHA256_TARGET'] = str(keep)
+                    environment['FAKE_KUBELET_KEEP_SHA256_DRIFT'] = '1'
+                elif case == 'keep-sha256-fail':
+                    environment['FAKE_KUBELET_KEEP_SHA256_TARGET'] = str(keep)
+                    environment['FAKE_KUBELET_KEEP_SHA256_FAIL'] = '1'
+                elif case == 'keep-symlink':
+                    target = host / 'outside-kubelet-state-keep'
+                    target.write_bytes(b'')
+                    keep.unlink()
+                    keep.symlink_to(target)
+                else:
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_SHAPE_TARGET'] = (
+                        logical
+                    )
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_SHAPE'] = shape
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                commands = (
+                    command_log.read_text(encoding='utf-8')
+                    if command_log.exists()
+                    else ''
+                )
+                self.assertNotIn('kubeadm init --config ', commands)
+
+    def test_regates_official_kubelet_state_footprint_before_init(self) -> None:
+        baseline_environment, baseline_host, _ = self.make_environment()
+        self.seed_official_kubelet_package_footprint(baseline_host)
+        self.seed_official_kubelet_state_footprint(baseline_host)
+        baseline = self.run_stage(baseline_environment, '--check')
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+        for seam in ('validate', 'preflight'):
+            with self.subTest(seam=seam):
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                self.seed_official_kubelet_state_footprint(host)
+                environment[f'FAKE_DRIFT_AFTER_{seam.upper()}'] = (
+                    'kubelet-package-footprint'
+                )
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                self.assertNotIn(
+                    'kubeadm init --config ',
+                    command_log.read_text(encoding='utf-8'),
+                )
 
     def test_rejects_official_kubelet_package_footprint_drift(self) -> None:
         cases = (
