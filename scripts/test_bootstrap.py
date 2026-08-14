@@ -213,6 +213,9 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertNotIn('kubelet_operator_override_is_pristine()', stage40)
         self.assertNotIn('[[ -s "$default_file" ]]', stage50)
         self.assertIn(
+            '# shellcheck disable=SC2317,SC2329\npath_size()', stage50
+        )
+        self.assertIn(
             '"$repo_root"/scripts/bootstrap/lib/*.sh', static
         )
 

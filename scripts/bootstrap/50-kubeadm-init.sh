@@ -73,7 +73,7 @@ path_owner() {
 }
 
 # 由 source 的 kubelet-default validator 间接调用。
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 path_size() {
   stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null
 }
