@@ -113,8 +113,12 @@ root_is_missing_or_safe_empty() {
 
 package_owner_is_exact() {
   local logical=$1 package=$2 ownership
-  ownership=$(dpkg-query -S "$logical" 2>/dev/null) || return 1
-  [[ "$ownership" == "${package}: ${logical}" ]]
+  local ownership_sentinel=__KUBELET_FOOTPRINT_OWNERSHIP_END__
+  ownership=$(
+    dpkg-query -S "$logical" 2>/dev/null &&
+      printf '%s' "$ownership_sentinel"
+  ) || return 1
+  [[ "$ownership" == "${package}: ${logical}"$'\n'"$ownership_sentinel" ]]
 }
 
 package_directory_is_safe() {

@@ -6376,6 +6376,25 @@ class KubeadmInitTest(BootstrapTestCase):
             ''',
         )
         self.write_executable(
+            fake_bin / 'sha256sum',
+            '''
+            #!/bin/sh
+            last=
+            for last do :; done
+            if [ "${last##*/}" = .kubelet-keep ]; then
+              [ "${FAKE_KUBELET_KEEP_SHA256_FAIL:-0}" != 1 ] || exit 1
+              if [ "${FAKE_KUBELET_KEEP_SHA256_DRIFT:-0}" = 1 ]; then
+                printf '%064d  %s\n' 0 "$last"
+                exit 0
+              fi
+            fi
+            if [ -x /usr/bin/sha256sum ]; then
+              exec /usr/bin/sha256sum "$@"
+            fi
+            exec /usr/bin/shasum -a 256 "$@"
+            ''',
+        )
+        self.write_executable(
             fake_bin / 'ss',
             '#!/bin/sh\n[ "${FAKE_SS_FAIL:-0}" != 1 ] || exit 1\n[ "${FAKE_6443_LISTENER:-0}" != 1 ] && [ ! -f "$FAKE_LISTENER_MARKER" ] || printf "LISTEN 0 4096 [::]:6443 [::]:*\\n"\n',
         )
@@ -6489,6 +6508,28 @@ class KubeadmInitTest(BootstrapTestCase):
             [ "${FAKE_KUBELET_FOOTPRINT_OWNER_FAIL:-}" != "$2" ] || exit 1
             [ "${FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT:-}" != "$2" ] || package=unapproved
             [ "${FAKE_CLIENT_PACKAGE_OWNER_DRIFT:-}" != "$2" ] || package=unapproved
+            if [ "${FAKE_KUBELET_FOOTPRINT_OWNER_SHAPE_TARGET:-}" = "$2" ]; then
+              case "${FAKE_KUBELET_FOOTPRINT_OWNER_SHAPE:-exact}" in
+                exact) ;;
+                duplicate)
+                  printf '%s: %s\n%s: %s\n' "$package" "$2" "$package" "$2"
+                  exit 0
+                  ;;
+                trailing-blank)
+                  printf '%s: %s\n\n' "$package" "$2"
+                  exit 0
+                  ;;
+                extra)
+                  printf '%s: %s\nunapproved: %s\n' "$package" "$2" "$2"
+                  exit 0
+                  ;;
+                nonzero-output)
+                  printf '%s: %s\n' "$package" "$2"
+                  exit 1
+                  ;;
+                *) exit 64 ;;
+              esac
+            fi
             printf '%s: %s\n' "$package" "$2"
             ''',
         )
@@ -6700,6 +6741,8 @@ class KubeadmInitTest(BootstrapTestCase):
             'keep-bytes',
             'root-filesystem-owner',
             'root-package-owner',
+            'manifest-package-owner',
+            'keep-filesystem-owner',
             'keep-package-owner-query',
             'root-symlink',
             'manifest-symlink',
@@ -6738,6 +6781,12 @@ class KubeadmInitTest(BootstrapTestCase):
                     environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
                         '/etc/kubernetes'
                     )
+                elif case == 'manifest-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/etc/kubernetes/manifests'
+                    )
+                elif case == 'keep-filesystem-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(keep)
                 elif case == 'keep-package-owner-query':
                     environment['FAKE_KUBELET_FOOTPRINT_OWNER_FAIL'] = (
                         '/etc/kubernetes/manifests/.kubelet-keep'
@@ -6772,6 +6821,60 @@ class KubeadmInitTest(BootstrapTestCase):
                     commands,
                 )
 
+    def test_rejects_malformed_kubelet_package_ownership_output(self) -> None:
+        for shape in ('duplicate', 'trailing-blank', 'extra', 'nonzero-output'):
+            with self.subTest(shape=shape):
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                environment['FAKE_KUBELET_FOOTPRINT_OWNER_SHAPE_TARGET'] = (
+                    '/etc/kubernetes/manifests'
+                )
+                environment['FAKE_KUBELET_FOOTPRINT_OWNER_SHAPE'] = shape
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                commands = (
+                    command_log.read_text(encoding='utf-8')
+                    if command_log.exists()
+                    else ''
+                )
+                self.assertNotIn('kubeadm init --config ', commands)
+
+    def test_rejects_kubelet_package_placeholder_digest_drift(self) -> None:
+        for state in ('fresh', 'initialized'):
+            for behavior in ('drift', 'fail'):
+                with self.subTest(state=state, behavior=behavior):
+                    environment, host, command_log = self.make_environment()
+                    self.seed_official_kubelet_package_footprint(host)
+                    if state == 'initialized':
+                        environment['FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES'] = (
+                            '1'
+                        )
+                        applied = self.run_stage(environment, '--apply')
+                        self.assertEqual(applied.returncode, 0, applied.stderr)
+                        command_log.write_text('', encoding='utf-8')
+                    environment[f'FAKE_KUBELET_KEEP_SHA256_{behavior.upper()}'] = (
+                        '1'
+                    )
+
+                    checked = self.run_stage(environment, '--check')
+
+                    self.assertEqual(checked.returncode, 30, checked.stderr)
+                    expected_result = (
+                        'STOP_ALREADY_INITIALIZED'
+                        if state == 'fresh'
+                        else 'STOP_UNKNOWN_STATE'
+                    )
+                    self.assertIn(f'RESULT={expected_result}', checked.stdout)
+                    commands = (
+                        command_log.read_text(encoding='utf-8')
+                        if command_log.exists()
+                        else ''
+                    )
+                    self.assertNotIn('kubeadm init --config ', commands)
+
     def test_regates_official_kubelet_package_footprint_before_init(self) -> None:
         baseline_environment, baseline_host, _ = self.make_environment()
         self.seed_official_kubelet_package_footprint(baseline_host)
@@ -6796,10 +6899,13 @@ class KubeadmInitTest(BootstrapTestCase):
             'exact',
             'absent',
             'unknown-fifth-entry',
+            'unknown-sixth-entry',
             'keep-bytes',
             'keep-mode',
             'keep-symlink',
             'keep-package-owner',
+            'root-package-owner',
+            'manifest-package-owner',
         )
         for case in cases:
             with self.subTest(case=case):
@@ -6815,6 +6921,11 @@ class KubeadmInitTest(BootstrapTestCase):
                 if case == 'absent':
                     keep.unlink()
                 elif case == 'unknown-fifth-entry':
+                    keep.unlink()
+                    (manifests / 'unknown.yaml').write_text(
+                        'unknown\n', encoding='utf-8'
+                    )
+                elif case == 'unknown-sixth-entry':
                     (manifests / 'unknown.yaml').write_text(
                         'unknown\n', encoding='utf-8'
                     )
@@ -6831,12 +6942,25 @@ class KubeadmInitTest(BootstrapTestCase):
                     environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
                         '/etc/kubernetes/manifests/.kubelet-keep'
                     )
+                elif case == 'root-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/etc/kubernetes'
+                    )
+                elif case == 'manifest-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/etc/kubernetes/manifests'
+                    )
 
                 checked = self.run_stage(environment, '--check')
 
                 if case in ('exact', 'absent'):
                     self.assertEqual(checked.returncode, 0, checked.stderr)
                     self.assertIn('RESULT=ALREADY_COMPLIANT', checked.stdout)
+                elif case == 'root-package-owner':
+                    self.assertEqual(checked.returncode, 30, checked.stderr)
+                    self.assertIn(
+                        'RESULT=STOP_ALREADY_INITIALIZED', checked.stdout
+                    )
                 else:
                     self.assertEqual(checked.returncode, 30, checked.stderr)
                     self.assertIn('RESULT=STOP_UNKNOWN_STATE', checked.stdout)
