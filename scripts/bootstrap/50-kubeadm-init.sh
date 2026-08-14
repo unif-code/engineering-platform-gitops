@@ -41,6 +41,7 @@ readonly EXPECTED_NODE_IP=10.93.1.27
 readonly SERVICE_CIDR=172.20.0.0/16
 readonly POD_CIDR=172.21.0.0/16
 readonly CONFIG_SHA256=e37b38f198bd7279ae3d203a990a4c2d40e1b2a8b59796475b814f09445103c6
+readonly KUBELET_KEEP_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 readonly CONFIG_FILE="${repo_root}/bootstrap/kubeadm/init.yaml"
 readonly KERNEL_TRANSCRIPT=$'PHASE=prepare-kernel\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kernel-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=30-install-containerd\nSHA256=NONE'
 readonly CONTAINERD_TRANSCRIPT=$'PHASE=containerd\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=containerd-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=40-install-kubernetes\nSHA256=NONE'
@@ -110,12 +111,57 @@ root_is_missing_or_safe_empty() {
   [[ -z "$first_entry" ]]
 }
 
+package_owner_is_exact() {
+  local logical=$1 package=$2 ownership
+  ownership=$(dpkg-query -S "$logical" 2>/dev/null) || return 1
+  [[ "$ownership" == "${package}: ${logical}" ]]
+}
+
+package_directory_is_safe() {
+  local logical=$1 target=$2 normal_mode=$3 mode
+  [[ -d "$target" && ! -L "$target" ]] || return 1
+  owned_by_expected "$target" || return 1
+  mode=$(path_mode "$target") || return 1
+  if [[ "$mode" == "$normal_mode" ]]; then
+    return 0
+  fi
+  [[ "$mode" == 775 ]] || return 1
+  package_owner_is_exact "$logical" kubelet
+}
+
+kubelet_keep_is_exact() {
+  local logical=/etc/kubernetes/manifests/.kubelet-keep target digest
+  target=$(host_path "$logical")
+  [[ -f "$target" && ! -L "$target" && ! -s "$target" &&
+     "$(path_mode "$target")" == 644 ]] || return 1
+  owned_by_expected "$target" || return 1
+  package_owner_is_exact "$logical" kubelet || return 1
+  digest=$(sha256_file "$target") || return 1
+  [[ "$digest" == "$KUBELET_KEEP_SHA256" ]]
+}
+
+kubelet_package_footprint_is_fresh() {
+  local kubernetes_root=$1 manifests root_entries manifest_entries
+  manifests="${kubernetes_root}/manifests"
+  package_directory_is_safe /etc/kubernetes "$kubernetes_root" 775 || return 1
+  package_owner_is_exact /etc/kubernetes kubelet || return 1
+  root_entries=$(find "$kubernetes_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null |
+    sed 's#.*/##' | sort) || return 1
+  [[ "$root_entries" == manifests ]] || return 1
+  package_directory_is_safe /etc/kubernetes/manifests "$manifests" 775 || return 1
+  package_owner_is_exact /etc/kubernetes/manifests kubelet || return 1
+  manifest_entries=$(find "$manifests" -mindepth 1 -maxdepth 1 -print 2>/dev/null |
+    sed 's#.*/##' | sort) || return 1
+  [[ "$manifest_entries" == .kubelet-keep ]] || return 1
+  kubelet_keep_is_exact
+}
+
 initialization_state() {
   local kubernetes_root etcd_root listener
   kubernetes_root=$(host_path /etc/kubernetes)
   etcd_root=$(host_path /var/lib/etcd)
 
-  if root_is_safe_directory "$kubernetes_root" 755 &&
+  if package_directory_is_safe /etc/kubernetes "$kubernetes_root" 755 &&
      root_is_safe_directory "$etcd_root" 700 &&
      [[ -f "${kubernetes_root}/admin.conf" &&
         ! -L "${kubernetes_root}/admin.conf" &&
@@ -126,7 +172,8 @@ initialization_state() {
     printf 'CANDIDATE\n'
     return 0
   fi
-  if root_is_missing_or_safe_empty "$kubernetes_root" &&
+  if { root_is_missing_or_safe_empty "$kubernetes_root" ||
+       kubelet_package_footprint_is_fresh "$kubernetes_root"; } &&
      root_is_missing_or_safe_empty "$etcd_root"; then
     listener=$(ss -H -ltn 'sport = :6443' 2>/dev/null) || return "$EXIT_PRECONDITION"
     if [[ -z "$listener" ]]; then
@@ -355,7 +402,8 @@ kubectl_query_is_empty() {
 }
 
 initialized_control_plane_gate() {
-  local failure_result=$1 failure_code=$2 listener
+  local failure_result=$1 failure_code=$2 listener kubernetes_root
+  local expected_manifests_with_keep
 
   managed_kubernetes_clients_gate
   host_and_dependency_gates
@@ -370,6 +418,10 @@ initialized_control_plane_gate() {
     complete "$failure_result" apiserver-listener-missing \
       "$failure_code" NONE
 
+  kubernetes_root=$(host_path /etc/kubernetes)
+  package_directory_is_safe /etc/kubernetes "$kubernetes_root" 755 ||
+    complete "$failure_result" kubernetes-root-metadata-drift \
+      "$failure_code" NONE
   admin_conf=$(host_path /etc/kubernetes/admin.conf)
   etcd_member=$(host_path /var/lib/etcd/member)
 
@@ -377,14 +429,20 @@ initialized_control_plane_gate() {
     complete "$failure_result" admin-conf-metadata-drift "$failure_code" NONE
   fi
   manifest_dir=$(host_path /etc/kubernetes/manifests)
-  root_is_safe_directory "$manifest_dir" 700 ||
+  package_directory_is_safe /etc/kubernetes/manifests "$manifest_dir" 700 ||
     complete "$failure_result" static-manifest-directory-metadata-drift \
       "$failure_code" NONE
   actual_manifests=$(find "$manifest_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's#.*/##' | sort) ||
     complete "$failure_result" static-manifest-state-unreadable "$failure_code" NONE
   expected_manifests=$'etcd.yaml\nkube-apiserver.yaml\nkube-controller-manager.yaml\nkube-scheduler.yaml'
-  [[ "$actual_manifests" == "$expected_manifests" ]] ||
+  expected_manifests_with_keep=$'.kubelet-keep\netcd.yaml\nkube-apiserver.yaml\nkube-controller-manager.yaml\nkube-scheduler.yaml'
+  if [[ "$actual_manifests" == "$expected_manifests_with_keep" ]]; then
+    kubelet_keep_is_exact ||
+      complete "$failure_result" static-manifest-package-placeholder-drift \
+        "$failure_code" NONE
+  elif [[ "$actual_manifests" != "$expected_manifests" ]]; then
     complete "$failure_result" static-manifest-set-drift "$failure_code" NONE
+  fi
   for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
     manifest="${manifest_dir}/${component}.yaml"
     if [[ ! -f "$manifest" || -L "$manifest" || "$(path_mode "$manifest")" != 600 ]] || ! owned_by_expected "$manifest"; then

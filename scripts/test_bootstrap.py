@@ -6280,6 +6280,16 @@ class KubeadmInitTest(BootstrapTestCase):
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
         path.chmod(0o755)
 
+    def seed_official_kubelet_package_footprint(self, host: Path) -> None:
+        kubernetes_root = host / 'etc/kubernetes'
+        manifests = kubernetes_root / 'manifests'
+        manifests.mkdir(parents=True)
+        kubernetes_root.chmod(0o775)
+        manifests.chmod(0o775)
+        keep = manifests / '.kubelet-keep'
+        keep.write_bytes(b'')
+        keep.chmod(0o644)
+
     def make_environment(self) -> tuple[dict[str, str], Path, Path]:
         directory = self.temporary_directory()
         host = directory / 'host'
@@ -6439,7 +6449,6 @@ class KubeadmInitTest(BootstrapTestCase):
                 fi
                 printf '%s\n' "$FAKE_CANARY token certificate-key kubeconfig"
                 mkdir -p "$FAKE_HOST_ROOT/etc/kubernetes/manifests" "$FAKE_HOST_ROOT/etc/kubernetes/pki"
-                chmod 0700 "$FAKE_HOST_ROOT/etc/kubernetes/manifests"
                 printf 'kubeconfig\n' >"$FAKE_HOST_ROOT/etc/kubernetes/admin.conf"
                 chmod 0600 "$FAKE_HOST_ROOT/etc/kubernetes/admin.conf"
                 for component in kube-apiserver kube-controller-manager kube-scheduler etcd; do
@@ -6447,7 +6456,10 @@ class KubeadmInitTest(BootstrapTestCase):
                   chmod 0600 "$FAKE_HOST_ROOT/etc/kubernetes/manifests/${component}.yaml"
                 done
                 [ "${FAKE_CREATE_KUBE_PROXY:-0}" != 1 ] || printf 'forbidden\n' >"$FAKE_HOST_ROOT/etc/kubernetes/manifests/kube-proxy.yaml"
-                chmod 0755 "$FAKE_HOST_ROOT/etc/kubernetes"
+                if [ "${FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES:-0}" != 1 ]; then
+                  chmod 0700 "$FAKE_HOST_ROOT/etc/kubernetes/manifests"
+                  chmod 0755 "$FAKE_HOST_ROOT/etc/kubernetes"
+                fi
                 mkdir -p "$FAKE_HOST_ROOT/var/lib/etcd/member"
                 chmod 0700 "$FAKE_HOST_ROOT/var/lib/etcd"
                 printf 'certificate\n' >"$FAKE_HOST_ROOT/etc/kubernetes/pki/apiserver.crt"
@@ -6469,8 +6481,13 @@ class KubeadmInitTest(BootstrapTestCase):
             case "$2" in
               /usr/bin/kubeadm) package=kubeadm ;;
               /usr/bin/kubectl) package=kubectl ;;
+              /etc/kubernetes|/etc/kubernetes/manifests|/etc/kubernetes/manifests/.kubelet-keep)
+                package=kubelet
+                ;;
               *) exit 1 ;;
             esac
+            [ "${FAKE_KUBELET_FOOTPRINT_OWNER_FAIL:-}" != "$2" ] || exit 1
+            [ "${FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT:-}" != "$2" ] || package=unapproved
             [ "${FAKE_CLIENT_PACKAGE_OWNER_DRIFT:-}" != "$2" ] || package=unapproved
             printf '%s: %s\n' "$package" "$2"
             ''',
@@ -6649,6 +6666,183 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertIn('RESULT=ALREADY_COMPLIANT', repeated.stdout)
         self.assertNotIn('kubeadm init', command_log.read_text(encoding='utf-8'))
+
+    def test_accepts_exact_official_kubelet_package_footprint(self) -> None:
+        environment, host, command_log = self.make_environment()
+        self.seed_official_kubelet_package_footprint(host)
+        before = self.tree_snapshot(host)
+
+        checked = self.run_stage(environment, '--check')
+
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', checked.stdout)
+        self.assertEqual(self.tree_snapshot(host), before)
+
+        environment['FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES'] = '1'
+        applied = self.run_stage(environment, '--apply')
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_INITIALIZED', applied.stdout)
+        self.assertTrue(
+            (host / 'etc/kubernetes/manifests/.kubelet-keep').is_file()
+        )
+        self.assertIn(
+            'kubeadm init --config ', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_rejects_official_kubelet_package_footprint_drift(self) -> None:
+        cases = (
+            'extra-root-entry',
+            'extra-manifest-entry',
+            'root-mode',
+            'manifest-mode',
+            'keep-mode',
+            'keep-bytes',
+            'root-filesystem-owner',
+            'root-package-owner',
+            'keep-package-owner-query',
+            'root-symlink',
+            'manifest-symlink',
+            'keep-symlink',
+            'listener',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                baseline_environment, baseline_host, _ = self.make_environment()
+                self.seed_official_kubelet_package_footprint(baseline_host)
+                baseline = self.run_stage(baseline_environment, '--check')
+                self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                kubernetes_root = host / 'etc/kubernetes'
+                manifests = kubernetes_root / 'manifests'
+                keep = manifests / '.kubelet-keep'
+                if case == 'extra-root-entry':
+                    (kubernetes_root / 'pki').mkdir()
+                elif case == 'extra-manifest-entry':
+                    (manifests / 'unknown.yaml').write_text(
+                        'unknown\n', encoding='utf-8'
+                    )
+                elif case == 'root-mode':
+                    kubernetes_root.chmod(0o755)
+                elif case == 'manifest-mode':
+                    manifests.chmod(0o755)
+                elif case == 'keep-mode':
+                    keep.chmod(0o600)
+                elif case == 'keep-bytes':
+                    keep.write_bytes(b'drift\n')
+                elif case == 'root-filesystem-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(kubernetes_root)
+                elif case == 'root-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/etc/kubernetes'
+                    )
+                elif case == 'keep-package-owner-query':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_FAIL'] = (
+                        '/etc/kubernetes/manifests/.kubelet-keep'
+                    )
+                elif case == 'root-symlink':
+                    target = host / 'outside-kubernetes'
+                    kubernetes_root.rename(target)
+                    kubernetes_root.symlink_to(target, target_is_directory=True)
+                elif case == 'manifest-symlink':
+                    target = host / 'outside-manifests'
+                    manifests.rename(target)
+                    manifests.symlink_to(target, target_is_directory=True)
+                elif case == 'keep-symlink':
+                    target = host / 'outside-keep'
+                    target.write_bytes(b'')
+                    keep.unlink()
+                    keep.symlink_to(target)
+                else:
+                    environment['FAKE_6443_LISTENER'] = '1'
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_ALREADY_INITIALIZED', result.stdout)
+                commands = (
+                    command_log.read_text(encoding='utf-8')
+                    if command_log.exists()
+                    else ''
+                )
+                self.assertNotIn(
+                    'kubeadm init --config ',
+                    commands,
+                )
+
+    def test_regates_official_kubelet_package_footprint_before_init(self) -> None:
+        baseline_environment, baseline_host, _ = self.make_environment()
+        self.seed_official_kubelet_package_footprint(baseline_host)
+        baseline = self.run_stage(baseline_environment, '--check')
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+        environment, host, command_log = self.make_environment()
+        self.seed_official_kubelet_package_footprint(host)
+        environment['FAKE_PREINIT_RACE'] = 'manifest'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertNotIn(
+            'kubeadm init --config ', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_initialized_state_accepts_only_exact_package_placeholder(
+        self,
+    ) -> None:
+        cases = (
+            'exact',
+            'absent',
+            'unknown-fifth-entry',
+            'keep-bytes',
+            'keep-mode',
+            'keep-symlink',
+            'keep-package-owner',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host, command_log = self.make_environment()
+                self.seed_official_kubelet_package_footprint(host)
+                environment['FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES'] = '1'
+                applied = self.run_stage(environment, '--apply')
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                command_log.write_text('', encoding='utf-8')
+
+                manifests = host / 'etc/kubernetes/manifests'
+                keep = manifests / '.kubelet-keep'
+                if case == 'absent':
+                    keep.unlink()
+                elif case == 'unknown-fifth-entry':
+                    (manifests / 'unknown.yaml').write_text(
+                        'unknown\n', encoding='utf-8'
+                    )
+                elif case == 'keep-bytes':
+                    keep.write_bytes(b'drift\n')
+                elif case == 'keep-mode':
+                    keep.chmod(0o600)
+                elif case == 'keep-symlink':
+                    target = host / 'outside-initialized-keep'
+                    target.write_bytes(b'')
+                    keep.unlink()
+                    keep.symlink_to(target)
+                elif case == 'keep-package-owner':
+                    environment['FAKE_KUBELET_FOOTPRINT_OWNER_DRIFT'] = (
+                        '/etc/kubernetes/manifests/.kubelet-keep'
+                    )
+
+                checked = self.run_stage(environment, '--check')
+
+                if case in ('exact', 'absent'):
+                    self.assertEqual(checked.returncode, 0, checked.stderr)
+                    self.assertIn('RESULT=ALREADY_COMPLIANT', checked.stdout)
+                else:
+                    self.assertEqual(checked.returncode, 30, checked.stderr)
+                    self.assertIn('RESULT=STOP_UNKNOWN_STATE', checked.stdout)
+                self.assertNotIn(
+                    'kubeadm init', command_log.read_text(encoding='utf-8')
+                )
 
     def test_initialized_marker_live_symlinks_are_untrusted_footprint(self) -> None:
         for case in ('admin-conf', 'manifests', 'etcd-member'):
