@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make Stage 50 recognize the exact Ubuntu 24.04 `kubelet` package footprint as a fresh, fail-closed kubeadm state without deleting or weakening package-owned files.
+**Goal:** Make Stage 50 recognize the exact Ubuntu 24.04 `kubelet` package footprints under both `/etc/kubernetes` and `/var/lib/kubelet` as pristine, fail-closed kubeadm state without deleting or weakening package-owned files.
 
-**Architecture:** Add small Stage 50 helpers that bind directory/file metadata and exact `dpkg-query -S` ownership to logical Kubernetes paths. Reuse those helpers in fresh-state classification and initialized-state verification, while keeping the existing missing/empty contract and repeated pre-init gates intact.
+**Architecture:** Add small Stage 50 helpers that bind directory/file metadata and exact `dpkg-query -S` ownership to logical Kubernetes paths. Reuse those helpers in fresh-state classification, kubelet pre-init validation, and initialized-state verification, while keeping the existing missing/empty contracts and repeated pre-init gates intact.
 
 **Tech Stack:** Bash 3.2-compatible shell, Python `unittest`, fake host/tool fixtures in `scripts/test_bootstrap.py`, ShellCheck, repository validation wrappers.
 
@@ -12,6 +12,7 @@
 
 - Work directly on the current `main` branch, as explicitly requested by the user.
 - Preserve `/etc/kubernetes/manifests/.kubelet-keep`; do not delete or rewrite package-owned state.
+- Preserve `/var/lib/kubelet/.kubelet-keep`; do not chmod, delete, or rewrite the package-owned root or placeholder.
 - Accept mode `0775` only for exact root-owned paths with the exact `kubelet` package ownership record.
 - The placeholder must be regular, non-symlink, `0644`, root-owned, zero bytes, and SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 - `--check` remains zero-write; every mutation, extra entry, unreadable query, or provenance drift remains fail-closed.
@@ -214,12 +215,16 @@ readonly KUBELET_KEEP_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca49
 
 package_owner_is_exact() {
   local logical=$1 package=$2 ownership
-  ownership=$(dpkg-query -S "$logical" 2>/dev/null) || return 1
-  [[ "$ownership" == "${package}: ${logical}" ]]
+  local ownership_sentinel=__KUBELET_FOOTPRINT_OWNERSHIP_END__
+  ownership=$(
+    dpkg-query -S "$logical" 2>/dev/null &&
+      printf '%s' "$ownership_sentinel"
+  ) || return 1
+  [[ "$ownership" == "${package}: ${logical}"$'\n'"$ownership_sentinel" ]]
 }
 ```
 
-Do not use substring matching and do not discard duplicate lines.
+Do not use substring matching. The sentinel must remain in the same successful command substitution so duplicate lines, trailing blank lines, extra records, and non-zero commands with output are all rejected.
 
 - [ ] **Step 2: Add package-bound directory and placeholder predicates**
 
@@ -393,3 +398,243 @@ On `retail-test-workflow`, verify a clean `main`, fetch the exact commit, fast-f
 ```
 
 Capture the complete terminal result and `COMMAND_EXIT_CODE`. Do not manually delete `.kubelet-keep` or any Kubernetes state.
+
+---
+
+### Task 5: Accept the exact `/var/lib/kubelet` package footprint
+
+**Files:**
+- Modify: `scripts/test_bootstrap.py:6270-7200`
+- Modify: `scripts/bootstrap/50-kubeadm-init.sh:110-230`
+- Test: `scripts/test_bootstrap.py`
+
+**Interfaces:**
+- Consumes: `package_owner_is_exact(logical, package)`, `owned_by_expected(target)`, `path_mode(target)`, `sha256_file(target)`, and the repeated `fresh_pre_init_gates` calls.
+- Produces: `package_placeholder_is_exact(logical)`, `kubelet_state_package_footprint_is_pristine(kubelet_root)`, and three load-bearing `KubeadmInitTest` methods.
+
+- [ ] **Step 1: Extend the fixture with the exact server-observed package payload**
+
+Add beside `seed_official_kubelet_package_footprint`:
+
+```python
+def seed_official_kubelet_state_footprint(self, host: Path) -> None:
+    kubelet_root = host / 'var/lib/kubelet'
+    kubelet_root.mkdir(parents=True)
+    kubelet_root.chmod(0o775)
+    keep = kubelet_root / '.kubelet-keep'
+    keep.write_bytes(b'')
+    keep.chmod(0o644)
+```
+
+Extend only the fake `dpkg-query -S` path case:
+
+```sh
+/var/lib/kubelet|/var/lib/kubelet/.kubelet-keep)
+  package=kubelet
+  ;;
+```
+
+Reuse the existing target-specific query failure, package drift, and malformed-output controls. Add this exact fake kubeadm mutation case inside `apply_drift`:
+
+```sh
+kubelet-package-footprint)
+  printf 'raced\n' >"$FAKE_HOST_ROOT/var/lib/kubelet/unknown-state"
+  ;;
+```
+
+Make the existing fake SHA mutation targetable without weakening its prior default behavior:
+
+```sh
+if [ "${last##*/}" = .kubelet-keep ] &&
+   { [ -z "${FAKE_KUBELET_KEEP_SHA256_TARGET:-}" ] ||
+     [ "$FAKE_KUBELET_KEEP_SHA256_TARGET" = "$last" ]; }; then
+  [ "${FAKE_KUBELET_KEEP_SHA256_FAIL:-0}" != 1 ] || exit 1
+  if [ "${FAKE_KUBELET_KEEP_SHA256_DRIFT:-0}" = 1 ]; then
+    printf '%064d  %s\n' 0 "$last"
+    exit 0
+  fi
+fi
+```
+
+The new `/var/lib/kubelet` digest subtests must set `FAKE_KUBELET_KEEP_SHA256_TARGET` to the mapped `/var/lib/kubelet/.kubelet-keep` path so they cannot pass by corrupting the `/etc/kubernetes` placeholder instead.
+
+- [ ] **Step 2: Write the three behavior regressions before changing production**
+
+Add `test_accepts_exact_official_kubelet_state_footprint`. Seed both official package footprints, snapshot the host tree, and assert `--check` returns `PASS_KUBEADM_CHECK` without tree changes. Then set `FAKE_PRESERVE_PACKAGE_DIRECTORY_MODES=1`, run `--apply`, and assert `PASS_KUBEADM_INITIALIZED` plus a logged approved `kubeadm init --config` command.
+
+Add `test_rejects_official_kubelet_state_footprint_drift` with independent environments for these exact cases:
+
+```python
+cases = (
+    'extra-entry', 'root-mode', 'root-filesystem-owner',
+    'root-package-owner', 'root-package-query', 'root-owner-shape',
+    'root-symlink', 'keep-mode', 'keep-bytes',
+    'keep-filesystem-owner', 'keep-package-owner', 'keep-package-query',
+    'keep-owner-shape', 'keep-sha256-drift', 'keep-sha256-fail',
+    'keep-symlink',
+)
+```
+
+For `root-owner-shape` and `keep-owner-shape`, iterate the existing `duplicate`, `trailing-blank`, `extra`, and `nonzero-output` fake shapes. Every drift must return 30, include `RESULT=STOP_ALREADY_INITIALIZED`, and never log `kubeadm init --config`.
+
+Add `test_regates_official_kubelet_state_footprint_before_init`. For `FAKE_DRIFT_AFTER_VALIDATE=kubelet-package-footprint` and `FAKE_DRIFT_AFTER_PREFLIGHT=kubelet-package-footprint`, start from both exact package footprints, run `--apply`, and assert return 30 with no `kubeadm init --config` consumption.
+
+- [ ] **Step 3: Run the three new methods and verify a valid RED**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" python3 -m unittest -v \
+  test_bootstrap.KubeadmInitTest.test_accepts_exact_official_kubelet_state_footprint \
+  test_bootstrap.KubeadmInitTest.test_rejects_official_kubelet_state_footprint_drift \
+  test_bootstrap.KubeadmInitTest.test_regates_official_kubelet_state_footprint_before_init
+```
+
+Expected: test failures because the current Stage 50 rejects the exact baseline with `kubelet-root-mode-unsafe`. There must be no loader, fixture, syntax, or setup error.
+
+- [ ] **Step 4: Generalize exact placeholder validation and add the package-root predicate**
+
+Replace the hardcoded placeholder body with:
+
+```bash
+package_placeholder_is_exact() {
+  local logical=$1 target digest
+  target=$(host_path "$logical")
+  [[ -f "$target" && ! -L "$target" && ! -s "$target" &&
+     "$(path_mode "$target")" == 644 ]] || return 1
+  owned_by_expected "$target" || return 1
+  package_owner_is_exact "$logical" kubelet || return 1
+  digest=$(sha256_file "$target") || return 1
+  [[ "$digest" == "$KUBELET_KEEP_SHA256" ]]
+}
+
+kubelet_keep_is_exact() {
+  package_placeholder_is_exact \
+    /etc/kubernetes/manifests/.kubelet-keep
+}
+
+kubelet_state_package_footprint_is_pristine() {
+  local kubelet_root=$1 entries
+  [[ -d "$kubelet_root" && ! -L "$kubelet_root" &&
+     "$(path_mode "$kubelet_root")" == 775 ]] || return 1
+  owned_by_expected "$kubelet_root" || return 1
+  package_owner_is_exact /var/lib/kubelet kubelet || return 1
+  entries=$(find "$kubelet_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null |
+    sed 's#.*/##' | sort) || return 1
+  [[ "$entries" == .kubelet-keep ]] || return 1
+  package_placeholder_is_exact /var/lib/kubelet/.kubelet-keep
+}
+```
+
+The predicate must not accept mode `0775` when the directory is empty, contains any additional entry, or has an inexact package owner record.
+
+- [ ] **Step 5: Wire the predicate without weakening existing safe-empty states**
+
+In `kubelet_pre_init_inputs_gate`, retain the existing missing-root behavior. For an existing root, first accept `kubelet_state_package_footprint_is_pristine "$kubelet_root"`; otherwise execute the existing real-directory, root-owner, mode `0700/0750/0755`, and completely-empty checks unchanged:
+
+```bash
+if [[ -e "$kubelet_root" || -L "$kubelet_root" ]]; then
+  if kubelet_state_package_footprint_is_pristine "$kubelet_root"; then
+    :
+  else
+    if [[ ! -d "$kubelet_root" || -L "$kubelet_root" ]] ||
+       ! owned_by_expected "$kubelet_root"; then
+      complete STOP_ALREADY_INITIALIZED kubelet-root-unsafe \
+        "$EXIT_UNKNOWN_STATE" NONE
+    fi
+    root_mode=$(path_mode "$kubelet_root") ||
+      complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable \
+        "$EXIT_UNKNOWN_STATE" NONE
+    [[ "$root_mode" == 700 || "$root_mode" == 750 ||
+       "$root_mode" == 755 ]] ||
+      complete STOP_ALREADY_INITIALIZED kubelet-root-mode-unsafe \
+        "$EXIT_UNKNOWN_STATE" NONE
+    first_entry=$(find "$kubelet_root" -mindepth 1 -print -quit 2>/dev/null) ||
+      complete STOP_ALREADY_INITIALIZED kubelet-root-unreadable \
+        "$EXIT_UNKNOWN_STATE" NONE
+    [[ -z "$first_entry" ]] ||
+      complete STOP_ALREADY_INITIALIZED kubelet-generated-state-present \
+        "$EXIT_UNKNOWN_STATE" NONE
+  fi
+fi
+```
+
+Keep the subsequent explicit sensitive-path loop and `/etc/default/kubelet` contract unchanged. Because `fresh_pre_init_gates` already runs before validate, after validate, after preflight, and immediately before init, do not add a new execution path.
+
+- [ ] **Step 6: Run the RED command and verify GREEN**
+
+Run the exact command from Step 3.
+
+Expected: `Ran 3 tests`, `OK`, exit 0.
+
+- [ ] **Step 7: Run the affected pre-init regression set**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/scripts" python3 -m unittest -v \
+  test_bootstrap.KubeadmInitTest.test_accepts_exact_official_kubelet_state_footprint \
+  test_bootstrap.KubeadmInitTest.test_rejects_official_kubelet_state_footprint_drift \
+  test_bootstrap.KubeadmInitTest.test_regates_official_kubelet_state_footprint_before_init \
+  test_bootstrap.KubeadmInitTest.test_check_rejects_non_pristine_kubelet_pre_init_inputs \
+  test_bootstrap.KubeadmInitTest.test_check_allows_secure_kubelet_root_and_empty_operator_file \
+  test_bootstrap.KubeadmInitTest.test_apply_reruns_complete_gate_set_after_validate_and_preflight
+```
+
+Expected: `Ran 6 tests`, `OK`, exit 0.
+
+---
+
+### Task 6: Review, validate, deliver, and resume the server
+
+**Files:**
+- Verify: `scripts/bootstrap/50-kubeadm-init.sh`
+- Verify: `scripts/test_bootstrap.py`
+- Verify: `docs/superpowers/specs/2026-08-14-kubelet-package-footprint-design.md`
+
+**Interfaces:**
+- Consumes: Task 5 GREEN tree and the repository validation catalog.
+- Produces: reviewed commits, green latest-main GitHub `validation-gate`, and a server deployment receipt beyond Stage 50.
+
+- [ ] **Step 1: Run local delivery gates**
+
+```bash
+./scripts/validate-fast.sh
+./scripts/validate-static.sh
+bash -n scripts/bootstrap/50-kubeadm-init.sh
+shellcheck scripts/bootstrap/lib/common.sh scripts/bootstrap/50-kubeadm-init.sh
+git diff --check
+```
+
+Expected: every command exits 0; fast/static report successful manifest validation.
+
+- [ ] **Step 2: Review the exact fail-closed boundary**
+
+Review the final diff against the approved design. Block delivery if mode `0775` is accepted without exact filesystem owner, exact single-entry set, exact placeholder metadata/digest, and exact sentinel-bound package ownership. Require zero Critical and zero Important findings.
+
+- [ ] **Step 3: Commit and push normally**
+
+```bash
+git add scripts/bootstrap/50-kubeadm-init.sh scripts/test_bootstrap.py
+git diff --cached --check
+git commit -m "fix(bootstrap): accept kubelet state package footprint"
+git push origin main
+```
+
+Do not force push. Record the exact 40-character commit SHA and verify the worktree is clean.
+
+- [ ] **Step 4: Wait for the latest-main GitHub gate**
+
+Bind the GitHub run to the pushed SHA. Do not resume the server until static, every dynamic test shard, final-verify, and `validation-gate` all report `success`.
+
+- [ ] **Step 5: Resume only from the verified SHA**
+
+On `retail-test-workflow`, verify a clean `main`, fetch and fast-forward to the exact green SHA, then run:
+
+```bash
+./scripts/bootstrap/bootstrap-all.sh --apply
+rc=$?
+echo "COMMAND_EXIT_CODE=$rc"
+```
+
+Capture the complete output. Do not delete or chmod `/var/lib/kubelet` or either package placeholder.
