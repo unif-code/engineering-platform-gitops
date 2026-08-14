@@ -1,8 +1,8 @@
 # 当前开发进度
 
 - Repository: engineering-platform-gitops
-- Updated At: 2026-08-14T07:12:19Z
-- Based On Commit: cc8356e831cf1f6795a65ec3694a0ed292db8247
+- Updated At: 2026-08-14T07:36:38Z
+- Based On Commit: ba634b8e0bd0e7a718420d5d0d5b1e2e7d8115eb
 - Branch: main
 - State: active
 - Active Plan: docs/superpowers/plans/2026-08-14-kubelet-package-footprint-compatibility.md
@@ -12,17 +12,16 @@
 
 - Stage 50 已通过 `c1bc47c`、`e593271` 收口 `/etc/kubernetes` 官方 kubelet package footprint 的识别与 provenance fail-closed 边界。
 - `a527aac` 将设计扩展到 `/var/lib/kubelet/.kubelet-keep`，`cc8356e` 将对应实现与交付步骤写入 active plan。
-- 当前工作树 clean；设计与计划均已提交，将与本次 progress 初始化一起推送。
+- `ba634b8` 已实现 `/var/lib/kubelet` package root/placeholder 的精确类型、mode、owner、digest、entry set 与 package provenance 校验，并保留既有 safe-empty contract。
 
 ## 进行中
 
-- active plan 的 Task 5–6 尚待执行：先用测试锁定 `/var/lib/kubelet` 官方 package footprint，再最小扩展 Stage 50 的 pre-init gate，完成 review、验证、push、CI 与服务器恢复。
+- active plan Task 5 的实现与聚焦 GREEN 已完成；Task 6 的完整 repository gates、review、push 后 CI 与服务器恢复尚待继续。
 
 ## 剩余工作
 
-- 按计划先扩展 fake host fixture，取得精确 RED；不得先改生产脚本。
-- 实现 package root/placeholder 的类型、mode、owner、digest、entry set 与 `dpkg-query -S` 精确校验，并保持 `--check` 零写入。
-- 运行 affected unittest、`validate-fast.sh`、ShellCheck 和计划列出的 delivery gates；完成只读 review 后按主题提交。
+- 运行 active plan Task 6 的 `validate-fast.sh`、ShellCheck、完整 affected regressions 与其余 delivery gates。
+- 对 exact fail-closed boundary 做只读 review；如发现 Critical/Important，先补回归再修复。
 - 普通 push 后等待 exact SHA 的 GitHub `validation-gate` 全绿，再继续服务器部署或验收。
 
 ## 阻塞项
@@ -31,10 +30,10 @@
 
 ## 最近验证
 
-- 本次同步只核对 Git、设计与计划，没有重新运行 active plan 的 fixture、ShellCheck 或 repository gates。
-- 既有 `/etc/kubernetes` footprint 修复已提交；新增 `/var/lib/kubelet` scope 目前只有设计和计划，不能宣称实现或测试通过。
+- 新增三个 focused regression 全绿：exact official footprint、完整 drift 矩阵、validate/preflight 重复门竞态；`Ran 3 tests in 369.300s`，exit 0。
+- `git diff --check` PASS。尚未运行 Task 6 的完整 `validate-fast.sh`、ShellCheck 或 GitHub validation-gate，不能宣称交付完成。
 
 ## 工作树
 
 - clean。
-- 同步前 `main` 比 `origin/main` 领先 2 个文档提交；本次 progress commit 推送后，继续开发所需的设计、计划和状态均可从远端恢复，因此 `Remote Recoverable: yes`。
+- 业务代码基线 `ba634b8` 将与本次 progress commit 一起推送；代码、设计、计划和测试证据均可从远端恢复，因此 `Remote Recoverable: yes`。
