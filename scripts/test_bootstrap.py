@@ -6622,6 +6622,9 @@ class KubeadmInitTest(BootstrapTestCase):
         (host / 'swap.img').write_bytes(b'preserve swap\n')
         config_source.write_bytes((ROOT / 'bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml').read_bytes())
         config_source.chmod(0o644)
+        hosts_root = directory / 'hosts'
+        hosts_root.mkdir()
+        self.write_fixture_host(hosts_root)
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
         self.write_executable(
@@ -7137,6 +7140,7 @@ class KubeadmInitTest(BootstrapTestCase):
                 'BOOTSTRAP_TEST_KUBERNETES_SCRIPT': str(gates / 'kubernetes'),
                 'BOOTSTRAP_TEST_CIDR_SCRIPT': str(gates / 'cidr'),
                 'BOOTSTRAP_TEST_CONFIG_FILE': str(config_source),
+                'BOOTSTRAP_TEST_HOSTS_DIR': str(hosts_root),
                 'FAKE_COMMAND_LOG': str(command_log),
                 'FAKE_HOST_ROOT': str(host),
                 'FAKE_CONFIG_SOURCE': str(config_source),
@@ -7158,6 +7162,38 @@ class KubeadmInitTest(BootstrapTestCase):
         return self.run_command(
             ['/bin/bash', str(KUBEADM_INIT), mode], env=environment
         )
+
+    def test_config_pin_and_host_values_come_from_host_directory(self) -> None:
+        """CONFIG digest 与主机值必须来自 host 目录，而不是脚本字面量。"""
+        environment, _, _ = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        pins = hosts_root / 'retail-test-workflow' / 'pins.sha256'
+        pins.write_text(
+            pins.read_text(encoding='utf-8').replace('e37b38f1', '00000000', 1),
+            encoding='utf-8',
+        )
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 10, result.stdout)
+        self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
+        self.assertIn('REASON=kubeadm-config-contract-drift', result.stdout)
+
+    def test_pins_shape_drift_is_fail_closed(self) -> None:
+        for name, mutate in (
+            ('reversed', lambda t: ''.join(reversed(t.splitlines(keepends=True)))),
+            ('third-line', lambda t: t + 'x\n'),
+            ('no-newline', lambda t: t.rstrip('\n')),
+        ):
+            with self.subTest(case=name):
+                environment, _, _ = self.make_environment()
+                pins = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR']) / 'retail-test-workflow/pins.sha256'
+                pins.write_text(mutate(pins.read_text(encoding='utf-8')), encoding='utf-8')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 20, result.stdout)
+                self.assertIn('REASON=host-pins-invalid', result.stdout)
 
     def test_exact_initialized_state_is_already_compliant_and_zero_write(self) -> None:
         environment, host, command_log = self.make_environment()

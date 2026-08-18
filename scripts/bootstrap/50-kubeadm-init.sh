@@ -29,9 +29,10 @@ else
 fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/host-config.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
 # shellcheck disable=SC1091
@@ -42,13 +43,7 @@ source "${script_dir}/lib/os-release.sh"
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
 readonly PHASE=kubeadm-init
-readonly EXPECTED_HOSTNAME=retail-test-workflow
-readonly EXPECTED_NODE_IP=10.93.1.27
-readonly SERVICE_CIDR=172.20.0.0/16
-readonly POD_CIDR=172.21.0.0/16
-readonly CONFIG_SHA256=e37b38f198bd7279ae3d203a990a4c2d40e1b2a8b59796475b814f09445103c6
 readonly KUBELET_KEEP_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-readonly CONFIG_FILE="${repo_root}/bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml"
 readonly KERNEL_TRANSCRIPT=$'PHASE=prepare-kernel\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kernel-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=30-install-containerd\nSHA256=NONE'
 readonly CONTAINERD_TRANSCRIPT=$'PHASE=containerd\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=containerd-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=40-install-kubernetes\nSHA256=NONE'
 readonly KUBERNETES_TRANSCRIPT=$'PHASE=install-kubernetes\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kubernetes-packages-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=50-kubeadm-init.sh --check\nSHA256=NONE'
@@ -277,13 +272,11 @@ config_file_is_safe() {
 }
 
 host_and_dependency_gates() {
-  local actual_hostname os_release os_id os_version cgroup_path cgroup_fs
+  local os_release os_id os_version cgroup_path cgroup_fs
   local address_output swap_file swap_output swap_lines swap_name swap_bytes
   local route_output cidr_output
   local -a cidr_arguments
 
-  actual_hostname=$(hostname 2>/dev/null) || complete STOP_PRECONDITION hostname-unreadable "$EXIT_PRECONDITION" NONE
-  [[ "$actual_hostname" == "$EXPECTED_HOSTNAME" ]] || complete STOP_PRECONDITION hostname-mismatch "$EXIT_PRECONDITION" NONE
   os_release=$(ubuntu_os_release_path) ||
     complete STOP_PRECONDITION os-release-unsafe "$EXIT_PRECONDITION" NONE
   os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
@@ -297,18 +290,18 @@ host_and_dependency_gates() {
   [[ "$cgroup_fs" == cgroup2fs ]] || complete STOP_PRECONDITION cgroup-v2-required "$EXIT_PRECONDITION" NONE
 
   address_output=$(ip -o -4 address show up 2>/dev/null) || complete STOP_PRECONDITION address-unreadable "$EXIT_PRECONDITION" NONE
-  printf '%s\n' "$address_output" | awk -v ip="$EXPECTED_NODE_IP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}' ||
+  printf '%s\n' "$address_output" | awk -v ip="$HOST_NODE_IP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}' ||
     complete STOP_PRECONDITION node-ip-not-bound-up "$EXIT_PRECONDITION" NONE
 
-  swap_file=$(host_path /swap.img)
+  swap_file=$(host_path "$HOST_SWAP_FILE")
   [[ -f "$swap_file" && ! -L "$swap_file" ]] || complete STOP_PRECONDITION swap-file-missing "$EXIT_PRECONDITION" NONE
   swap_output=$(swapon --show=NAME,SIZE --noheadings --raw --bytes 2>/dev/null) || complete STOP_PRECONDITION swap-unreadable "$EXIT_PRECONDITION" NONE
   swap_lines=$(printf '%s\n' "$swap_output" | awk 'NF {count++} END {print count+0}')
   swap_name=$(printf '%s\n' "$swap_output" | awk 'NF {print $1}')
   swap_bytes=$(printf '%s\n' "$swap_output" | awk 'NF {print $2}')
-  [[ "$swap_lines" == 1 && "$swap_name" == /swap.img && "$swap_bytes" =~ ^[0-9]+$ ]] ||
+  [[ "$swap_lines" == 1 && "$swap_name" == "$HOST_SWAP_FILE" && "$swap_bytes" =~ ^[0-9]+$ ]] ||
     complete STOP_PRECONDITION swap-layout-mismatch "$EXIT_PRECONDITION" NONE
-  (( swap_bytes >= 4000000000 && swap_bytes <= 4400000000 )) ||
+  (( swap_bytes >= HOST_SWAP_MIN_BYTES && swap_bytes <= HOST_SWAP_MAX_BYTES )) ||
     complete STOP_PRECONDITION swap-size-mismatch "$EXIT_PRECONDITION" NONE
 
   run_stage_gate "$kernel_script" "$KERNEL_TRANSCRIPT" || complete STOP_PRECONDITION kernel-gate-failed "$EXIT_PRECONDITION" NONE
@@ -316,7 +309,7 @@ host_and_dependency_gates() {
   run_stage_gate "$kubernetes_script" "$KUBERNETES_TRANSCRIPT" || complete STOP_PRECONDITION kubernetes-gate-failed "$EXIT_PRECONDITION" NONE
 
   route_output=$(ip -o -4 route show table all 2>/dev/null) || complete STOP_PRECONDITION route-unreadable "$EXIT_PRECONDITION" NONE
-  cidr_arguments=(--service-cidr "$SERVICE_CIDR" --pod-cidr "$POD_CIDR")
+  cidr_arguments=(--service-cidr "$HOST_SERVICE_CIDR" --pod-cidr "$HOST_POD_CIDR")
   while IFS= read -r address; do
     [[ -n "$address" ]] && cidr_arguments+=(--address "$address")
   done < <(printf '%s\n' "$address_output" | awk '{print $4}')
@@ -523,7 +516,7 @@ initialized_control_plane_gate() {
     complete "$failure_result" certificate-subject-invalid "$failure_code" NONE
   [[ -n "$certificate_expiry" && "$certificate_expiry" != *$'\n'* ]] ||
     complete "$failure_result" certificate-expiry-invalid "$failure_code" NONE
-  grep -Fq 'IP Address:10.93.1.27' <<<"$certificate_output" ||
+  grep -Fq "IP Address:${HOST_NODE_IP}" <<<"$certificate_output" ||
     complete "$failure_result" certificate-san-missing "$failure_code" NONE
 }
 
@@ -535,6 +528,14 @@ for required_command in awk cat date dpkg dpkg-query find grep hostname id insta
   fi
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
+
+# 主机身份与 config digest 唯一来源：bootstrap/hosts/<hostname>/。
+# 顺序固定：parse_mode → require_root → required_command（含 hostname）→ load_host_config → host_pin。
+load_host_config || complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
+CONFIG_SHA256=$(host_pin kubeadm-init.yaml) ||
+  complete STOP_SUPPLY_CHAIN_MISMATCH host-pins-invalid "$EXIT_SUPPLY_CHAIN" NONE
+readonly CONFIG_SHA256
+readonly CONFIG_FILE="${HOST_CONFIG_DIR}/kubeadm-init.yaml"
 
 kernel_script="${script_dir}/20-prepare-kernel.sh"
 containerd_script="${script_dir}/30-install-containerd.sh"
@@ -610,9 +611,11 @@ initialized_control_plane_gate STOP_VERIFY_FAILED "$EXIT_VERIFY_FAILED"
 evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 12-kubeadm "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
 
+log_evidence "HOST_NAME=${HOST_NAME}"
+log_evidence "HOST_NODE_IP=${HOST_NODE_IP}"
 log_evidence CONFIG_SHA256="$CONFIG_SHA256"
-log_evidence NODE="$EXPECTED_HOSTNAME"
-log_evidence CONTROL_PLANE_ENDPOINT=10.93.1.27:6443
+log_evidence NODE="$HOST_NAME"
+log_evidence CONTROL_PLANE_ENDPOINT="${HOST_NODE_IP}:6443"
 log_evidence ADMIN_CONF_PRESENT=true
 log_evidence ADMIN_CONF_MODE=600
 log_evidence STATIC_COMPONENTS=kube-apiserver,kube-controller-manager,kube-scheduler,etcd
@@ -620,6 +623,6 @@ log_evidence RUNTIME_COMPONENTS=kube-apiserver,kube-controller-manager,kube-sche
 log_evidence KUBE_PROXY_OBJECTS=absent
 log_evidence KUBELET_ACTIVE=active
 log_evidence "CERTIFICATE_SUBJECT=${certificate_subject}"
-log_evidence CERTIFICATE_SAN_IP=10.93.1.27
+log_evidence CERTIFICATE_SAN_IP="$HOST_NODE_IP"
 log_evidence "CERTIFICATE_EXPIRY=${certificate_expiry}"
 complete PASS_KUBEADM_INITIALIZED control-plane-initialized 0 '60-install-cilium.sh --check'
