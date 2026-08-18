@@ -33,6 +33,8 @@ repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/dpkg-package-verification.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/kubelet-default.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
@@ -244,7 +246,7 @@ kubelet_pre_init_inputs_gate() {
 }
 
 managed_kubernetes_clients_gate() {
-  local package logical target shadow ownership verification
+  local package logical target shadow ownership
   for package in kubeadm kubectl; do
     shadow=$(host_path "/usr/sbin/${package}")
     if [[ -e "$shadow" || -L "$shadow" ]]; then
@@ -259,9 +261,7 @@ managed_kubernetes_clients_gate() {
       complete STOP_UNKNOWN_STATE kubernetes-client-owner-unreadable "$EXIT_UNKNOWN_STATE" NONE
     [[ "$ownership" == "${package}: ${logical}" ]] ||
       complete STOP_UNKNOWN_STATE kubernetes-client-package-owner-drift "$EXIT_UNKNOWN_STATE" NONE
-    verification=$(dpkg --verify "$package" 2>/dev/null) ||
-      complete STOP_UNKNOWN_STATE kubernetes-client-package-verification-failed "$EXIT_UNKNOWN_STATE" NONE
-    [[ -z "$verification" ]] ||
+    dpkg_package_verification_is_exact "$package" ||
       complete STOP_UNKNOWN_STATE kubernetes-client-package-content-drift "$EXIT_UNKNOWN_STATE" NONE
   done
 }

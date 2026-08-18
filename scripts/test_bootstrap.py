@@ -6724,6 +6724,23 @@ class KubeadmInitTest(BootstrapTestCase):
               printf '??5??????   /usr/bin/%s\n' "$2"
               exit 1
             }
+            if [ "${FAKE_CLIENT_PACKAGE_VERIFY_DOC_EXCLUDES:-0}" = 1 ]; then
+              printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+              printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+            fi
+            ''',
+        )
+        self.write_executable(
+            fake_bin / 'grep',
+            '''
+            #!/bin/sh
+            if [ "${FAKE_DPKG_EXCLUDES_GREP_ERROR:-0}" = 1 ] &&
+               [ "$1" = -Fxc ] &&
+               [ "$2" = 'path-exclude=/usr/share/doc/*' ]; then
+              printf '1\n'
+              exit 2
+            fi
+            exec /usr/bin/grep "$@"
             ''',
         )
         self.write_executable(
@@ -7729,6 +7746,53 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertIn('RESULT=PASS_KUBEADM_CHECK', result.stdout)
         self.assertNotIn(
             'kubeadm ', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_check_accepts_declared_client_doc_exclusions(self) -> None:
+        """捕获 Stage 50 把官方 dpkg 文档排除输出误判为 payload 漂移。"""
+        environment, host, command_log = self.make_environment()
+        excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+        excludes.parent.mkdir(parents=True)
+        excludes.write_text(
+            'path-exclude=/usr/share/man/*\n'
+            'path-exclude=/usr/share/doc/*\n'
+            'path-include=/usr/share/doc/*/copyright\n'
+            'path-include=/usr/share/doc/*/changelog.*\n',
+            encoding='utf-8',
+        )
+        excludes.chmod(0o644)
+        environment['FAKE_CLIENT_PACKAGE_VERIFY_DOC_EXCLUDES'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', result.stdout)
+        self.assertNotIn(
+            'kubeadm ', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_check_rejects_dpkg_excludes_grep_error(self) -> None:
+        """grep 输出合法计数但读取失败时仍必须 fail closed。"""
+        environment, host, _ = self.make_environment()
+        excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+        excludes.parent.mkdir(parents=True)
+        excludes.write_text(
+            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+        )
+        excludes.chmod(0o644)
+        environment['FAKE_CLIENT_PACKAGE_VERIFY_DOC_EXCLUDES'] = '1'
+        environment['FAKE_DPKG_EXCLUDES_GREP_ERROR'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertIn(
+            'REASON=kubernetes-client-package-content-drift', result.stdout
         )
 
     def test_check_rejects_client_provenance_or_usr_sbin_shadow(self) -> None:
