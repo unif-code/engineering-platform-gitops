@@ -28,11 +28,14 @@ digest_of() {
   fi | awk '{print $1}'
 }
 
+# 先落到局部变量：digest_of 失败时由 set -e 中止，避免写入空 digest。
+kubeadm_digest=$(digest_of "${host_dir}/kubeadm-init.yaml")
+cilium_digest=$(digest_of "${host_dir}/cilium-values.yaml")
 temporary=$(mktemp "${host_dir}/.pins.XXXXXX")
 trap 'rm -f -- "$temporary"' EXIT
 {
-  printf '%s  kubeadm-init.yaml\n' "$(digest_of "${host_dir}/kubeadm-init.yaml")"
-  printf '%s  cilium-values.yaml\n' "$(digest_of "${host_dir}/cilium-values.yaml")"
+  printf '%s  kubeadm-init.yaml\n' "$kubeadm_digest"
+  printf '%s  cilium-values.yaml\n' "$cilium_digest"
 } >"$temporary"
 chmod 0644 "$temporary"
 mv -f -- "$temporary" "${host_dir}/pins.sha256"

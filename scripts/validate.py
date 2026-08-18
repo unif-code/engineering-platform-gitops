@@ -294,6 +294,38 @@ HOST_ENV_LINE_RE = re.compile(r'^(HOST_[A-Z_]+)=([A-Za-z0-9./_-]+)$')
 SWAP_FILE_RE = re.compile(r'^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
 PIN_LINE_RE = re.compile(r'^([0-9a-f]{64})  (kubeadm-init\.yaml|cilium-values\.yaml)$')
 
+# cilium-values.yaml 的锁死骨架：唯一可变的是 {node_ip}（取 host.env 的 HOST_NODE_IP）。
+# 运行期孪生在 scripts/bootstrap/60-install-cilium.sh 的 values_semantics_are_exact，
+# 改这里必须同步改那里。
+CILIUM_VALUES_SKELETON = '''kubeProxyReplacement: true
+k8sServiceHost: {node_ip}
+k8sServicePort: 6443
+
+cgroup:
+  autoMount:
+    enabled: false
+  hostRoot: /sys/fs/cgroup
+
+gatewayAPI:
+  enabled: true
+
+hubble:
+  enabled: false
+
+image:
+  digest: sha256:383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93
+  useDigest: true
+
+ipam:
+  mode: kubernetes
+
+operator:
+  image:
+    genericDigest: sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3
+    useDigest: true
+  replicas: 1
+'''
+
 
 def parse_host_env(path: Path) -> dict[str, str]:
     label = path.as_posix()
@@ -425,12 +457,19 @@ def validate_host_cilium(path: Path, host: dict[str, str]) -> None:
     )
     for path_tokens, expected, name in contracts:
         expect_contract(name, value_at(cilium, path_tokens), expected)
+    # 结构化断言给出可读的失败原因；最后再按字节锁死排版、注释与键序。
+    expected_text = CILIUM_VALUES_SKELETON.replace('{node_ip}', host['HOST_NODE_IP'])
+    if path.read_text(encoding='utf-8') != expected_text:
+        fail(f'{label} 内容必须与锁死骨架逐字一致（仅 k8sServiceHost 取 host.env）')
 
 
 def validate_host_pins(host_dir: Path) -> None:
     pins = host_dir / 'pins.sha256'
     label = pins.as_posix()
-    text = pins.read_text(encoding='utf-8')
+    try:
+        text = pins.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as error:
+        fail(f'{label} 必须是可读的 UTF-8 文件：{error}')
     if not text.endswith('\n'):
         fail(f'{label} 末行必须以换行结束')
     lines = text.split('\n')[:-1]

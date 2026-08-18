@@ -576,6 +576,51 @@ class BootstrapContractTest(unittest.TestCase):
 
                 self.assert_contract_fails(root)
 
+    def repin_host(self, root: Path) -> None:
+        subprocess.run(
+            ['/bin/bash', str(validator.ROOT / 'scripts/bootstrap/pin-host.sh'),
+             str(root / self.HOST_DIR)],
+            check=True, capture_output=True,
+        )
+
+    def test_host_cilium_values_must_match_locked_skeleton(self) -> None:
+        """结构化断言之外，cilium-values.yaml 必须与锁死骨架逐字一致。"""
+        original = (validator.ROOT / self.HOST_DIR / 'cilium-values.yaml').read_text(
+            encoding='utf-8'
+        )
+        node_ip = validator.parse_host_env(
+            validator.ROOT / self.HOST_DIR / 'host.env'
+        )['HOST_NODE_IP']
+        validator.validate_bootstrap_contracts(self.copy_bootstrap_root())
+        cases = (
+            (
+                'extra-blank-line',
+                original.replace(
+                    'k8sServicePort: 6443\n', 'k8sServicePort: 6443\n\n', 1
+                ),
+            ),
+            ('comment', '# 说明：这行不该被接受\n' + original),
+            (
+                'reordered-keys',
+                original.replace(
+                    f'k8sServiceHost: {node_ip}\nk8sServicePort: 6443\n',
+                    f'k8sServicePort: 6443\nk8sServiceHost: {node_ip}\n',
+                    1,
+                ),
+            ),
+        )
+        for name, content in cases:
+            with self.subTest(case=name):
+                self.assertNotEqual(content, original)
+                root = self.copy_bootstrap_root()
+                (root / self.HOST_DIR / 'cilium-values.yaml').write_text(
+                    content, encoding='utf-8'
+                )
+                # 同步 pins，确保失败来自骨架比对而非 digest 校验。
+                self.repin_host(root)
+
+                self.assert_contract_fails(root)
+
     def test_pins_must_match_files(self) -> None:
         root = self.copy_bootstrap_root()
         pins = root / self.HOST_DIR / 'pins.sha256'
@@ -583,6 +628,13 @@ class BootstrapContractTest(unittest.TestCase):
             pins.read_text(encoding='utf-8').replace('e37b38f1', '00000000', 1),
             encoding='utf-8',
         )
+
+        self.assert_contract_fails(root)
+
+    def test_pins_must_be_readable_utf8(self) -> None:
+        """非 UTF-8 的 pins 必须走 fail()，而不是抛未捕获的解码异常。"""
+        root = self.copy_bootstrap_root()
+        (root / self.HOST_DIR / 'pins.sha256').write_bytes(b'\xff\xfe pins\n')
 
         self.assert_contract_fails(root)
 
@@ -636,6 +688,33 @@ class BootstrapContractTest(unittest.TestCase):
         self.assertEqual({p.name: p.read_bytes() for p in host_dir.iterdir() if p.name != 'pins.sha256'}, before)
         self.assertEqual(oct((host_dir / 'pins.sha256').stat().st_mode & 0o777), '0o644')
         validator.validate_bootstrap_contracts(root)
+
+    def test_pin_host_tool_aborts_when_digest_fails(self) -> None:
+        """digest 计算失败必须中止，而不是写入空 digest 的 pins。"""
+        root = self.copy_bootstrap_root()
+        host_dir = root / self.HOST_DIR
+        before = (host_dir / 'pins.sha256').read_bytes()
+        fake_bin = root / 'bin'
+        fake_bin.mkdir()
+        for name in ('sha256sum', 'shasum'):
+            tool = fake_bin / name
+            tool.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+            tool.chmod(0o755)
+        environment = dict(os.environ)
+        environment['PATH'] = f'{fake_bin}:{environment["PATH"]}'
+
+        result = subprocess.run(
+            ['/bin/bash', str(validator.ROOT / 'scripts/bootstrap/pin-host.sh'),
+             str(host_dir)],
+            capture_output=True, text=True, check=False, env=environment,
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((host_dir / 'pins.sha256').read_bytes(), before)
+        self.assertEqual(
+            sorted(entry.name for entry in host_dir.iterdir()),
+            sorted(validator.HOST_FILES),
+        )
 
 
 class ValidateEntrypointTest(unittest.TestCase):
