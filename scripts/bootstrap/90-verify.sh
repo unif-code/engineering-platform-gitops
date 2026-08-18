@@ -61,6 +61,8 @@ fi
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/dpkg-package-verification.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
@@ -205,7 +207,7 @@ package_state_is_exact() {
 }
 
 managed_clients_are_exact() {
-  local package logical target shadow ownership verification
+  local package logical target shadow ownership
   for package in kubeadm kubectl kubelet; do
     for shadow in "/usr/sbin/${package}" "/usr/local/bin/${package}" "/usr/local/sbin/${package}"; do
       shadow=$(host_path "$shadow")
@@ -218,8 +220,7 @@ managed_clients_are_exact() {
     [[ "$ownership" == "${package}: ${logical}" ]] || return 1
   done
   for package in kubeadm kubectl kubelet kubernetes-cni; do
-    verification=$(dpkg --verify "$package" 2>/dev/null) || return 1
-    [[ -z "$verification" ]] || return 1
+    dpkg_package_verification_is_exact "$package" || return 1
   done
   safe_directory "$(host_path /usr)" 755 || return 1
   safe_directory "$(host_path /usr/local)" 755 || return 1
@@ -1106,7 +1107,7 @@ if [[ "$MODE" != CHECK ]]; then
   complete STOP_PRECONDITION read-only-stage-does-not-accept-apply "$EXIT_PRECONDITION" NONE
 fi
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk cmp date dpkg dpkg-query find id sed sort stat swapon; do
+for required_command in awk cmp date dpkg dpkg-query find grep id sed sort stat swapon; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE

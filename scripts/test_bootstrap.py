@@ -8940,6 +8940,41 @@ operator:
             '''
             #!/bin/sh
             [ "$1" = --verify ] && [ "$2" = kubectl ] || exit 64
+            if [ "${FAKE_KUBECTL_VERIFY_DOC_EXCLUDES:-0}" = 1 ]; then
+              case "${FAKE_KUBECTL_VERIFY_DOC_SHAPE:-exact}" in
+                exact)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                  ;;
+                single)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                  ;;
+                duplicate)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                  ;;
+                other-package)
+                  printf 'missing     /usr/share/doc/unapproved/LICENSE\n'
+                  printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                  ;;
+                extra-missing)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                  printf 'missing     /usr/bin/%s\n' "$2"
+                  ;;
+                checksum)
+                  printf '??5??????   /usr/bin/%s\n' "$2"
+                  ;;
+                nonzero)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\n' "$2"
+                  exit 1
+                  ;;
+                *) exit 64 ;;
+              esac
+              exit 0
+            fi
             [ "${FAKE_KUBECTL_VERIFY_DRIFT:-0}" != 1 ] || printf '??5?????? /usr/bin/kubectl\n'
             ''',
         )
@@ -9382,6 +9417,85 @@ operator:
             commands = command_log.read_text(encoding='utf-8')
             self.assertNotIn(' apply ', commands)
             self.assertNotIn('helm --kubeconfig', commands)
+
+    def test_check_accepts_declared_kubectl_doc_exclusions(self) -> None:
+        """捕获 Stage 60 把官方 dpkg 文档排除输出误判为 kubectl provenance 漂移。"""
+        environment, host, _, _ = self.make_environment()
+        excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+        excludes.parent.mkdir(parents=True)
+        excludes.write_text(
+            'path-exclude=/usr/share/man/*\n'
+            'path-exclude=/usr/share/doc/*\n'
+            'path-include=/usr/share/doc/*/copyright\n'
+            'path-include=/usr/share/doc/*/changelog.*\n',
+            encoding='utf-8',
+        )
+        excludes.chmod(0o644)
+        environment['FAKE_KUBECTL_VERIFY_DOC_EXCLUDES'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+
+    def test_check_rejects_unsafe_kubectl_doc_exclusion_shapes(self) -> None:
+        """缺失或不安全的 exclude 合同与任何额外 payload 缺失都必须 fail closed。"""
+        for drift in (
+            'missing-config',
+            'symlink-config',
+            'unsafe-mode',
+            'single',
+            'duplicate',
+            'other-package',
+            'extra-missing',
+            'checksum',
+            'nonzero',
+        ):
+            with self.subTest(drift=drift):
+                environment, host, _, _ = self.make_environment()
+                environment['FAKE_KUBECTL_VERIFY_DOC_EXCLUDES'] = '1'
+                excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+                if drift != 'missing-config':
+                    excludes.parent.mkdir(parents=True)
+                    if drift == 'symlink-config':
+                        outside = host.parent / 'unapproved-dpkg-excludes'
+                        outside.write_text(
+                            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+                        )
+                        outside.chmod(0o644)
+                        excludes.symlink_to(outside)
+                    else:
+                        excludes.write_text(
+                            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+                        )
+                        excludes.chmod(
+                            0o666 if drift == 'unsafe-mode' else 0o644
+                        )
+                if drift not in {
+                    'missing-config', 'symlink-config', 'unsafe-mode'
+                }:
+                    environment['FAKE_KUBECTL_VERIFY_DOC_SHAPE'] = drift
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertIn('REASON=kubectl-provenance-drift', result.stdout)
+
+    def test_check_declares_dpkg_verification_dependencies(self) -> None:
+        """共享 dpkg 校验预期的 awk/grep 必须在 Stage 60 前置声明。"""
+        required_commands = next(
+            line
+            for line in INSTALL_CILIUM.read_text(encoding='utf-8').splitlines()
+            if line.startswith('for required_command in ')
+        )
+
+        self.assertIn('awk', required_commands.split())
+        self.assertIn('grep', required_commands.split())
 
     def test_rejects_staged_digest_or_values_contract_drift(self) -> None:
         for drift in ('helm', 'gateway', 'chart', 'values'):
@@ -10766,6 +10880,41 @@ class FinalVerifyTest(BootstrapTestCase):
             #!/bin/sh
             [ "$1" = --verify ] || exit 64
             case "$2" in kubeadm|kubectl|kubelet|kubernetes-cni) ;; *) exit 64 ;; esac
+            if [ "${FAKE_VERIFY_DOC_EXCLUDES:-0}" = 1 ]; then
+              case "${FAKE_VERIFY_DOC_SHAPE:-exact}" in
+                exact)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\\n' "$2"
+                  ;;
+                single)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\\n' "$2"
+                  ;;
+                duplicate)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/LICENSE\\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\\n' "$2"
+                  ;;
+                other-package)
+                  printf 'missing     /usr/share/doc/unapproved/LICENSE\\n'
+                  printf 'missing     /usr/share/doc/%s/README.md\\n' "$2"
+                  ;;
+                extra-missing)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\\n' "$2"
+                  printf 'missing     /usr/bin/%s\\n' "$2"
+                  ;;
+                checksum)
+                  printf '??5??????   /usr/bin/%s\\n' "$2"
+                  ;;
+                nonzero)
+                  printf 'missing     /usr/share/doc/%s/LICENSE\\n' "$2"
+                  printf 'missing     /usr/share/doc/%s/README.md\\n' "$2"
+                  exit 1
+                  ;;
+                *) exit 64 ;;
+              esac
+              exit 0
+            fi
             [ "${FAKE_VERIFY_DRIFT:-}" != "$2" ] || printf '??5?????? /unapproved\\n'
             ''',
         )
@@ -11665,6 +11814,83 @@ class FinalVerifyTest(BootstrapTestCase):
                     environment['FAKE_CNI_DIGEST_DRIFT'] = 'bridge'
                 result = self.run_stage(environment)
                 self.assert_stops_without_evidence(result, host)
+
+    def test_verify_accepts_declared_client_doc_exclusions(self) -> None:
+        """捕获 Stage 90 把官方 dpkg 文档排除输出误判为 package payload 漂移。"""
+        environment, host, _ = self.make_environment()
+        excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+        excludes.parent.mkdir(parents=True, exist_ok=True)
+        excludes.write_text(
+            'path-exclude=/usr/share/man/*\n'
+            'path-exclude=/usr/share/doc/*\n'
+            'path-include=/usr/share/doc/*/copyright\n'
+            'path-include=/usr/share/doc/*/changelog.*\n',
+            encoding='utf-8',
+        )
+        excludes.chmod(0o644)
+        environment['FAKE_VERIFY_DOC_EXCLUDES'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
+
+    def test_verify_rejects_unsafe_client_doc_exclusion_shapes(self) -> None:
+        """缺失或不安全的 exclude 合同与任何额外 payload 缺失都必须 fail closed。"""
+        for drift in (
+            'missing-config',
+            'symlink-config',
+            'unsafe-mode',
+            'single',
+            'duplicate',
+            'other-package',
+            'extra-missing',
+            'checksum',
+            'nonzero',
+        ):
+            with self.subTest(drift=drift):
+                environment, host, _ = self.make_environment()
+                environment['FAKE_VERIFY_DOC_EXCLUDES'] = '1'
+                excludes = host / 'etc/dpkg/dpkg.cfg.d/excludes'
+                if drift != 'missing-config':
+                    excludes.parent.mkdir(parents=True, exist_ok=True)
+                    if drift == 'symlink-config':
+                        outside = host.parent / 'unapproved-dpkg-excludes'
+                        outside.write_text(
+                            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+                        )
+                        outside.chmod(0o644)
+                        excludes.symlink_to(outside)
+                    else:
+                        excludes.write_text(
+                            'path-exclude=/usr/share/doc/*\n', encoding='utf-8'
+                        )
+                        excludes.chmod(
+                            0o666 if drift == 'unsafe-mode' else 0o644
+                        )
+                if drift not in {
+                    'missing-config', 'symlink-config', 'unsafe-mode'
+                }:
+                    environment['FAKE_VERIFY_DOC_SHAPE'] = drift
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+
+    def test_verify_declares_dpkg_verification_dependencies(self) -> None:
+        """共享 dpkg 校验预期的 grep 必须在 Stage 90 前置声明。"""
+        required_commands = next(
+            line
+            for line in FINAL_VERIFY.read_text(encoding='utf-8').splitlines()
+            if line.startswith('for required_command in ')
+        )
+
+        self.assertIn('awk', required_commands.split())
+        self.assertIn('grep', required_commands.split())
 
     def test_rejects_cri_version_or_api_endpoint_health_drift(self) -> None:
         cases = (

@@ -60,6 +60,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/dpkg-package-verification.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
@@ -200,7 +202,7 @@ staged_inputs_gate() {
 }
 
 managed_kubectl_gate() {
-  local shadow ownership verification
+  local shadow ownership
   for shadow in /usr/sbin/kubectl /usr/local/bin/kubectl /usr/local/sbin/kubectl; do
     shadow=$(host_path "$shadow")
     [[ ! -e "$shadow" && ! -L "$shadow" ]] || return 1
@@ -210,8 +212,7 @@ managed_kubectl_gate() {
   owned_by_expected "$kubectl_binary" || return 1
   ownership=$(dpkg-query -S /usr/bin/kubectl 2>/dev/null) || return 1
   [[ "$ownership" == 'kubectl: /usr/bin/kubectl' ]] || return 1
-  verification=$(dpkg --verify kubectl 2>/dev/null) || return 1
-  [[ -z "$verification" ]]
+  dpkg_package_verification_is_exact kubectl
 }
 
 admin_conf_metadata_gate() {
@@ -1166,7 +1167,7 @@ load_cluster_state() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in chmod cmp date dirname dpkg dpkg-query id install ln mktemp rm rmdir stat sync; do
+for required_command in awk chmod cmp date dirname dpkg dpkg-query grep id install ln mktemp rm rmdir stat sync; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE
