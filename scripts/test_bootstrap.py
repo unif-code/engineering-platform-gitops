@@ -6408,6 +6408,25 @@ class KubeadmInitTest(BootstrapTestCase):
         self.write_executable(
             fake_bin / 'swapon',
             '''#!/bin/sh
+            if [ "$#" = 4 ] &&
+               [ "$1" = '--show=NAME,SIZE' ] &&
+               [ "$2" = --noheadings ] &&
+               [ "$3" = --raw ] &&
+               [ "$4" = --bytes ]; then
+              :
+            elif [ "$#" = 5 ] &&
+                 [ "$1" = --show ] &&
+                 [ "$2" = --noheadings ] &&
+                 [ "$3" = --bytes ] &&
+                 [ "$4" = --output ] &&
+                 [ "$5" = NAME,SIZE ]; then
+              if [ "${FAKE_SWAPON_UTIL_LINUX_239:-0}" = 1 ]; then
+                printf '/swap.img file 4106219520    0   -2 fixture-uuid \n'
+                exit 0
+              fi
+            else
+              exit 64
+            fi
             if [ -f "$FAKE_DRIFT_DIR/swap" ]; then
               printf '/swap.img invalid\n'
             else
@@ -7932,6 +7951,23 @@ class KubeadmInitTest(BootstrapTestCase):
                 self.assertEqual(result.returncode, 10, result.stderr)
                 self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
                 self.assertFalse(command_log.exists())
+
+    def test_check_uses_raw_swap_columns_on_util_linux_239(self) -> None:
+        """捕获 util-linux 2.39.3 忽略旧 --output 组合并回退六列。"""
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_SWAPON_UTIL_LINUX_239'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', result.stdout)
+        self.assertNotIn(
+            'kubeadm ', command_log.read_text(encoding='utf-8')
+        )
 
     def test_check_rejects_any_existing_kubernetes_or_etcd_state(self) -> None:
         cases = (
@@ -10771,8 +10807,26 @@ class FinalVerifyTest(BootstrapTestCase):
             fake_bin / 'swapon',
             '''
             #!/bin/sh
-            [ "$*" = "--show --noheadings --bytes --output NAME,SIZE" ] || exit 64
             [ "${FAKE_SWAP_FAIL:-0}" != 1 ] || exit 1
+            if [ "$#" = 4 ] &&
+               [ "$1" = '--show=NAME,SIZE' ] &&
+               [ "$2" = --noheadings ] &&
+               [ "$3" = --raw ] &&
+               [ "$4" = --bytes ]; then
+              :
+            elif [ "$#" = 5 ] &&
+                 [ "$1" = --show ] &&
+                 [ "$2" = --noheadings ] &&
+                 [ "$3" = --bytes ] &&
+                 [ "$4" = --output ] &&
+                 [ "$5" = NAME,SIZE ]; then
+              if [ "${FAKE_SWAPON_UTIL_LINUX_239:-0}" = 1 ]; then
+                printf '/swap.img file 4106219520    0   -2 fixture-uuid \n'
+                exit 0
+              fi
+            else
+              exit 64
+            fi
             if [ "${FAKE_SWAP_OUTPUT+x}" = x ]; then
               printf '%s\\n' "$FAKE_SWAP_OUTPUT"
             else
@@ -11877,6 +11931,20 @@ class FinalVerifyTest(BootstrapTestCase):
                     )
                 result = self.run_stage(environment)
                 self.assert_stops_without_evidence(result, host)
+
+    def test_check_uses_raw_swap_columns_on_util_linux_239(self) -> None:
+        """捕获最终验证在 util-linux 2.39.3 上把 TYPE 当成 SIZE。"""
+        environment, _, _ = self.make_environment()
+        environment['FAKE_SWAPON_UTIL_LINUX_239'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
 
     def test_csr_summary_is_strict_and_never_leaks_request_or_certificate(self) -> None:
         for case in ('requester', 'usages', 'san', 'malformed'):

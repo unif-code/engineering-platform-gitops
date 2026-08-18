@@ -302,7 +302,7 @@ host_and_dependency_gates() {
 
   swap_file=$(host_path /swap.img)
   [[ -f "$swap_file" && ! -L "$swap_file" ]] || complete STOP_PRECONDITION swap-file-missing "$EXIT_PRECONDITION" NONE
-  swap_output=$(swapon --show --noheadings --bytes --output NAME,SIZE 2>/dev/null) || complete STOP_PRECONDITION swap-unreadable "$EXIT_PRECONDITION" NONE
+  swap_output=$(swapon --show=NAME,SIZE --noheadings --raw --bytes 2>/dev/null) || complete STOP_PRECONDITION swap-unreadable "$EXIT_PRECONDITION" NONE
   swap_lines=$(printf '%s\n' "$swap_output" | awk 'NF {count++} END {print count+0}')
   swap_name=$(printf '%s\n' "$swap_output" | awk 'NF {print $1}')
   swap_bytes=$(printf '%s\n' "$swap_output" | awk 'NF {print $2}')

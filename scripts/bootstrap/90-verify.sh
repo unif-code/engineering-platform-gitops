@@ -993,7 +993,7 @@ raise SystemExit(0 if valid else 1)
 swap_is_exact() {
   local output lines name bytes
   safe_file "$(host_path /swap.img)" 600 || return 1
-  output=$(swapon --show --noheadings --bytes --output NAME,SIZE 2>/dev/null) || return 1
+  output=$(swapon --show=NAME,SIZE --noheadings --raw --bytes 2>/dev/null) || return 1
   lines=$(printf '%s\n' "$output" | awk 'NF {count++} END {print count+0}')
   name=$(printf '%s\n' "$output" | awk 'NF {print $1}')
   bytes=$(printf '%s\n' "$output" | awk 'NF {print $2}')
