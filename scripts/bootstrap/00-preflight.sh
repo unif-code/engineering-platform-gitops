@@ -8,13 +8,13 @@ repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck source=scripts/bootstrap/lib/common.sh
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/host-config.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/os-release.sh"
 
+# PHASE 由公共 evidence helper 间接读取。
+# shellcheck disable=SC2034
 readonly PHASE=preflight
-readonly EXPECTED_HOSTNAME=retail-test-workflow
-readonly EXPECTED_NODE_IP=10.93.1.27
-readonly SERVICE_CIDR=172.20.0.0/16
-readonly POD_CIDR=172.21.0.0/16
 readonly CLEANUP_EVIDENCE_SHA256=a68a3d2ff340bcdcb4265853107a3a2c22a9f7328728473d81d9be2d1486e635
 
 host_path() {
@@ -62,11 +62,8 @@ if ! require_root; then
   complete STOP_HOST_IDENTITY not-root "$EXIT_PRECONDITION" NONE
 fi
 
-actual_hostname=$(hostname 2>/dev/null) || complete STOP_HOST_IDENTITY hostname-unreadable "$EXIT_PRECONDITION" NONE
-if [[ "$actual_hostname" != "$EXPECTED_HOSTNAME" ]]; then
-  complete STOP_HOST_IDENTITY hostname-mismatch "$EXIT_PRECONDITION" NONE
-fi
-log_evidence "HOSTNAME=${actual_hostname}"
+load_host_config || complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
+log_evidence "HOSTNAME=${HOST_NAME}"
 
 os_release=$(ubuntu_os_release_path) ||
   complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
@@ -91,12 +88,12 @@ fi
 log_evidence "CGROUP_FS=${cgroup_fs}"
 
 address_output=$(ip -o -4 address show up 2>/dev/null) || complete STOP_NETWORK ip-address-unreadable "$EXIT_PRECONDITION" NONE
-if ! printf '%s\n' "$address_output" | awk -v ip="$EXPECTED_NODE_IP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
+if ! printf '%s\n' "$address_output" | awk -v ip="$HOST_NODE_IP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
   complete STOP_NETWORK node-ip-not-bound-up "$EXIT_PRECONDITION" NONE
 fi
-log_evidence "NODE_IP=${EXPECTED_NODE_IP}"
+log_evidence "NODE_IP=${HOST_NODE_IP}"
 
-swap_file=$(host_path /swap.img)
+swap_file=$(host_path "$HOST_SWAP_FILE")
 if [[ ! -f "$swap_file" || -L "$swap_file" ]]; then
   complete STOP_SWAP swap-file-missing "$EXIT_PRECONDITION" NONE
 fi
@@ -104,13 +101,13 @@ swap_output=$(swapon --show=NAME,SIZE --noheadings --raw --bytes 2>/dev/null) ||
 swap_lines=$(printf '%s\n' "$swap_output" | awk 'NF {count++} END {print count+0}')
 swap_name=$(printf '%s\n' "$swap_output" | awk 'NF {print $1}')
 swap_bytes=$(printf '%s\n' "$swap_output" | awk 'NF {print $2}')
-if [[ "$swap_lines" != 1 || "$swap_name" != /swap.img || ! "$swap_bytes" =~ ^[0-9]+$ ]]; then
+if [[ "$swap_lines" != 1 || "$swap_name" != "$HOST_SWAP_FILE" || ! "$swap_bytes" =~ ^[0-9]+$ ]]; then
   complete STOP_SWAP swap-layout-mismatch "$EXIT_PRECONDITION" NONE
 fi
-if (( swap_bytes < 4000000000 || swap_bytes > 4400000000 )); then
+if (( swap_bytes < HOST_SWAP_MIN_BYTES || swap_bytes > HOST_SWAP_MAX_BYTES )); then
   complete STOP_SWAP swap-size-mismatch "$EXIT_PRECONDITION" NONE
 fi
-log_evidence "SWAP=/swap.img"
+log_evidence "SWAP=${HOST_SWAP_FILE}"
 log_evidence "SWAP_BYTES=${swap_bytes}"
 
 for service in chrony systemd-networkd systemd-resolved ssh; do
@@ -163,8 +160,8 @@ log_evidence "OLD_RUNTIME=absent"
 log_evidence "PORT_3001=closed"
 
 cidr_arguments=(
-  --service-cidr "$SERVICE_CIDR"
-  --pod-cidr "$POD_CIDR"
+  --service-cidr "$HOST_SERVICE_CIDR"
+  --pod-cidr "$HOST_POD_CIDR"
 )
 while IFS= read -r address; do
   [[ -n "$address" ]] && cidr_arguments+=(--address "$address")
@@ -183,8 +180,8 @@ if [[ "$cidr_exit" -ne 0 ]]; then
   cidr_result=$(printf '%s\n' "$cidr_output" | awk -F= '$1 == "RESULT" {print $2}')
   complete "${cidr_result:-STOP_CIDR_INVALID}" cidr-overlap-or-invalid "$EXIT_PRECONDITION" NONE
 fi
-log_evidence "SERVICE_CIDR=${SERVICE_CIDR}"
-log_evidence "POD_CIDR=${POD_CIDR}"
+log_evidence "SERVICE_CIDR=${HOST_SERVICE_CIDR}"
+log_evidence "POD_CIDR=${HOST_POD_CIDR}"
 log_evidence "CIDR_SCOPE=SERVER_LOCAL_SCOPE_ONLY"
 log_evidence "REPO_ROOT=${repo_root}"
 

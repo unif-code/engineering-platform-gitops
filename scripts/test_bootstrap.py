@@ -50,6 +50,63 @@ class BootstrapTestCase(unittest.TestCase):
             text=True,
         )
 
+    HOST_TEMPLATE_DIR = ROOT / 'bootstrap/hosts/retail-test-workflow'
+
+    def write_fixture_host(
+        self,
+        hosts_root: Path,
+        *,
+        name: str = 'retail-test-workflow',
+        node_ip: str = '10.93.1.27',
+        cluster_name: str = 'engineering-platform-dev',
+        pod_cidr: str = '172.21.0.0/16',
+        service_cidr: str = '172.20.0.0/16',
+        swap_file: str = '/swap.img',
+        swap_min: int = 4000000000,
+        swap_max: int = 4400000000,
+    ) -> Path:
+        """按 retail-test-workflow 的真实文件生成一台 fixture 主机目录。
+
+        默认参数生成的文件与仓库文件逐字节相同，pins 因而也相同。"""
+        host_dir = hosts_root / name
+        host_dir.mkdir(parents=True)
+        substitutions = (
+            ('10.93.1.27', node_ip),
+            ('retail-test-workflow', name),
+            ('engineering-platform-dev', cluster_name),
+            ('172.21.0.0/16', pod_cidr),
+            ('172.20.0.0/16', service_cidr),
+        )
+        for filename in ('kubeadm-init.yaml', 'cilium-values.yaml'):
+            text = (self.HOST_TEMPLATE_DIR / filename).read_text(encoding='utf-8')
+            for old, new in substitutions:
+                text = text.replace(old, new)
+            (host_dir / filename).write_text(text, encoding='utf-8')
+        (host_dir / 'host.env').write_text(
+            f'HOST_NAME={name}\n'
+            f'HOST_NODE_IP={node_ip}\n'
+            f'HOST_CLUSTER_NAME={cluster_name}\n'
+            f'HOST_POD_CIDR={pod_cidr}\n'
+            f'HOST_SERVICE_CIDR={service_cidr}\n'
+            f'HOST_SWAP_FILE={swap_file}\n'
+            f'HOST_SWAP_MIN_BYTES={swap_min}\n'
+            f'HOST_SWAP_MAX_BYTES={swap_max}\n',
+            encoding='utf-8',
+        )
+        (host_dir / 'pins.sha256').write_text(
+            ''.join(
+                hashlib.sha256((host_dir / filename).read_bytes()).hexdigest()
+                + f'  {filename}\n'
+                for filename in ('kubeadm-init.yaml', 'cilium-values.yaml')
+            ),
+            encoding='utf-8',
+        )
+        for entry in host_dir.iterdir():
+            entry.chmod(0o644)
+        host_dir.chmod(0o755)
+        hosts_root.chmod(0o755)
+        return host_dir
+
     def tree_snapshot(self, root: Path) -> dict[str, tuple[object, ...]]:
         snapshot: dict[str, tuple[object, ...]] = {}
         paths = [root]
@@ -402,6 +459,9 @@ class PreflightTest(BootstrapTestCase):
         (host / 'etc').mkdir(parents=True)
         (host / 'root/dev-infra-evidence').mkdir(parents=True)
         fake_bin.mkdir()
+        hosts_root = directory / 'hosts'
+        hosts_root.mkdir()
+        self.write_fixture_host(hosts_root)
         support_bin.mkdir()
         support_path = ambient_support_path or os.environ.get('PATH', os.defpath)
         for command in (
@@ -470,9 +530,16 @@ class PreflightTest(BootstrapTestCase):
             #!/bin/sh
             if [ "$1" = "-fc" ]; then
               printf '%s\n' "${FAKE_CGROUP_FS:-cgroup2fs}"
-            else
-              exec /usr/bin/stat "$@"
+              exit 0
             fi
+            last=
+            for last do :; done
+            if [ -n "${FAKE_STAT_OWNER_DRIFT:-}" ] && [ "$last" = "$FAKE_STAT_OWNER_DRIFT" ] &&
+               { [ "$2" = '%u:%g' ] || [ "$2" = '%u' ]; }; then
+              printf '65534:65534\n'
+              exit 0
+            fi
+            exec /usr/bin/stat "$@"
             ''',
         )
         self.write_executable(
@@ -535,6 +602,7 @@ class PreflightTest(BootstrapTestCase):
                 'PATH': os.pathsep.join((str(fake_bin), str(support_bin))),
                 'BOOTSTRAP_TEST_MODE': '1',
                 'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_HOSTS_DIR': str(hosts_root),
             }
         )
         return environment, host
@@ -564,7 +632,80 @@ class PreflightTest(BootstrapTestCase):
         result, _ = self.run_preflight(FAKE_HOSTNAME='wrong-host')
 
         self.assertEqual(result.returncode, 10)
-        self.assertIn('RESULT=STOP_HOST_IDENTITY', result.stdout)
+        self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
+        self.assertIn('REASON=host-not-registered', result.stdout)
+
+    def test_host_directory_contract_is_fail_closed(self) -> None:
+        cases = (
+            'directory-symlink', 'directory-mode', 'directory-owner',
+            'env-symlink', 'env-mode', 'env-owner', 'extra-file',
+            'missing-file', 'pins-mode', 'name-mismatch', 'invalid-env',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                environment, host = self.make_environment()
+                hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+                host_dir = hosts_root / 'retail-test-workflow'
+                expected = 'host-config-unsafe'
+                if case == 'directory-symlink':
+                    real = hosts_root / 'real'
+                    host_dir.rename(real)
+                    host_dir.symlink_to(real)
+                elif case == 'directory-mode':
+                    host_dir.chmod(0o777)
+                elif case == 'directory-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(host_dir)
+                elif case == 'env-symlink':
+                    (host_dir / 'host.env').rename(hosts_root / 'outside.env')
+                    (host_dir / 'host.env').symlink_to(hosts_root / 'outside.env')
+                elif case == 'env-mode':
+                    (host_dir / 'host.env').chmod(0o666)
+                elif case == 'env-owner':
+                    environment['FAKE_STAT_OWNER_DRIFT'] = str(host_dir / 'host.env')
+                elif case == 'extra-file':
+                    (host_dir / 'README.md').write_text('x\n', encoding='utf-8')
+                elif case == 'missing-file':
+                    (host_dir / 'pins.sha256').unlink()
+                elif case == 'pins-mode':
+                    (host_dir / 'pins.sha256').chmod(0o600)
+                elif case == 'name-mismatch':
+                    expected = 'host-config-name-mismatch'
+                    env = host_dir / 'host.env'
+                    env.write_text(
+                        env.read_text(encoding='utf-8').replace(
+                            'HOST_NAME=retail-test-workflow', 'HOST_NAME=other-host'
+                        ),
+                        encoding='utf-8',
+                    )
+                else:
+                    expected = 'host-config-invalid'
+                    env = host_dir / 'host.env'
+                    env.write_text(
+                        env.read_text(encoding='utf-8').replace(
+                            'HOST_NODE_IP=10.93.1.27', 'HOST_NODE_IP=10.93.1.256'
+                        ),
+                        encoding='utf-8',
+                    )
+
+                result = self.run_command(
+                    ['/bin/bash', str(PREFLIGHT), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+                self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
+                self.assertIn(f'REASON={expected}', result.stdout)
+
+    def test_swap_contract_comes_from_host_env(self) -> None:
+        """swap 文件名与区间必须来自 host.env，而不是脚本字面量。"""
+        environment, _ = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        shutil.rmtree(hosts_root / 'retail-test-workflow')
+        self.write_fixture_host(hosts_root, swap_min=1000, swap_max=2000)
+
+        result = self.run_command(['/bin/bash', str(PREFLIGHT), '--check'], env=environment)
+
+        self.assertEqual(result.returncode, 10, result.stdout)
+        self.assertIn('REASON=swap-size-mismatch', result.stdout)
 
     def test_accepts_canonical_ubuntu_os_release_symlink(self) -> None:
         environment, host = self.make_environment()
