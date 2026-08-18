@@ -74,13 +74,14 @@ class BootstrapTestCase(unittest.TestCase):
         return snapshot
 
     def admin_config_object(self) -> dict[str, object]:
+        # 服务器实测形态：kubectl v1.36 省略空 preferences，cluster 与 context
+        # 名称由 bootstrap/kubeadm/init.yaml 的 clusterName 决定。
         return {
             'apiVersion': 'v1',
             'kind': 'Config',
-            'preferences': {},
             'clusters': [
                 {
-                    'name': 'kubernetes',
+                    'name': 'engineering-platform-dev',
                     'cluster': {
                         'server': 'https://10.93.1.27:6443',
                         'certificate-authority-data': 'Y2EtZml4dHVyZQ==',
@@ -89,14 +90,14 @@ class BootstrapTestCase(unittest.TestCase):
             ],
             'contexts': [
                 {
-                    'name': 'kubernetes-admin@kubernetes',
+                    'name': 'kubernetes-admin@engineering-platform-dev',
                     'context': {
-                        'cluster': 'kubernetes',
+                        'cluster': 'engineering-platform-dev',
                         'user': 'kubernetes-admin',
                     },
                 }
             ],
-            'current-context': 'kubernetes-admin@kubernetes',
+            'current-context': 'kubernetes-admin@engineering-platform-dev',
             'users': [
                 {
                     'name': 'kubernetes-admin',
@@ -9954,6 +9955,77 @@ operator:
                     commands = command_log.read_text(encoding='utf-8')
                     self.assertNotIn(' apply ', commands)
                     self.assertNotIn(' install ', commands)
+
+    def test_check_accepts_optional_empty_preferences(self) -> None:
+        """kubectl 若序列化空 preferences，也必须被接受。"""
+        environment, _, _, _ = self.make_environment()
+        payload = self.admin_config_object()
+        payload['preferences'] = {}
+        environment['FAKE_ADMIN_VIEW_JSON'] = json.dumps(payload)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+
+    def test_check_rejects_cluster_or_context_naming_drift(self) -> None:
+        """cluster/context 命名或非空 preferences 偏离固定合同必须 fail closed。"""
+        for case in (
+            'nonempty-preferences',
+            'cluster-name',
+            'context-name',
+            'context-cluster',
+        ):
+            with self.subTest(case=case):
+                environment, _, _, _ = self.make_environment()
+                payload = self.admin_config_object()
+                if case == 'nonempty-preferences':
+                    payload['preferences'] = {'colors': True}
+                elif case == 'cluster-name':
+                    payload['clusters'][0]['name'] = 'kubernetes'
+                elif case == 'context-name':
+                    payload['contexts'][0]['name'] = 'kubernetes-admin@kubernetes'
+                else:
+                    payload['contexts'][0]['context']['cluster'] = 'kubernetes'
+                environment['FAKE_ADMIN_VIEW_JSON'] = json.dumps(payload)
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertIn(
+                    'REASON=admin-conf-content-or-structure-drift',
+                    result.stdout,
+                )
+
+    def test_admin_conf_contract_tracks_pinned_cluster_name(self) -> None:
+        """admin.conf 合同必须跟随 init.yaml 的 clusterName，不得各写各的。"""
+        pinned = next(
+            line.split(':', 1)[1].strip()
+            for line in (ROOT / 'bootstrap/kubeadm/init.yaml')
+            .read_text(encoding='utf-8').splitlines()
+            if line.startswith('clusterName:')
+        )
+        library = (
+            ROOT / 'scripts/bootstrap/lib/admin-conf.sh'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn(f'ADMIN_CONF_CLUSTER_NAME={pinned}\n', library)
+        self.assertIn(
+            f'ADMIN_CONF_CONTEXT_NAME=kubernetes-admin@{pinned}\n', library
+        )
+
+    def test_admin_conf_predicate_is_not_duplicated(self) -> None:
+        """Stage 60/90 必须共用同一份 admin.conf 谓词，避免再次漂移。"""
+        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding='utf-8')
+                self.assertIn('lib/admin-conf.sh', text)
+                self.assertNotIn('admin_conf_json_is_exact() {', text)
 
     def test_all_cluster_clients_use_validated_in_memory_admin_config(self) -> None:
         environment, host, command_log, _ = self.make_environment()

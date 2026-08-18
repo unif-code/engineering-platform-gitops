@@ -60,6 +60,8 @@ fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
+source "${script_dir}/lib/admin-conf.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
@@ -282,93 +284,6 @@ admin_conf_metadata_is_safe() {
 
 ADMIN_CONF_CAPTURED=0
 ADMIN_CONF_CONTENT=
-
-admin_conf_json_is_exact() {
-  python_isolated -c '
-import base64
-import json
-import sys
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key")
-        result[key] = value
-    return result
-
-def reject_constant(_value):
-    raise ValueError("non-finite number")
-
-def valid_base64(value):
-    if not isinstance(value, str) or not value:
-        return False
-    try:
-        return bool(base64.b64decode(value, validate=True))
-    except (ValueError, TypeError):
-        return False
-
-try:
-    document = json.load(
-        sys.stdin,
-        object_pairs_hook=unique_object,
-        parse_constant=reject_constant,
-    )
-    if not isinstance(document, dict) or set(document) != {
-        "apiVersion", "kind", "preferences", "clusters", "contexts",
-        "current-context", "users",
-    }:
-        raise ValueError
-    clusters = document["clusters"]
-    contexts = document["contexts"]
-    users = document["users"]
-    if (
-        document["apiVersion"] != "v1" or document["kind"] != "Config" or
-        document["preferences"] != {} or
-        document["current-context"] != "kubernetes-admin@kubernetes" or
-        not isinstance(clusters, list) or len(clusters) != 1 or
-        not isinstance(contexts, list) or len(contexts) != 1 or
-        not isinstance(users, list) or len(users) != 1
-    ):
-        raise ValueError
-    cluster_record = clusters[0]
-    context_record = contexts[0]
-    user_record = users[0]
-    if (
-        not isinstance(cluster_record, dict) or
-        set(cluster_record) != {"name", "cluster"} or
-        cluster_record.get("name") != "kubernetes" or
-        not isinstance(cluster_record.get("cluster"), dict) or
-        set(cluster_record["cluster"]) != {"server", "certificate-authority-data"} or
-        cluster_record["cluster"].get("server") != "https://10.93.1.27:6443" or
-        not valid_base64(cluster_record["cluster"].get("certificate-authority-data"))
-    ):
-        raise ValueError
-    if (
-        not isinstance(context_record, dict) or
-        set(context_record) != {"name", "context"} or
-        context_record.get("name") != "kubernetes-admin@kubernetes" or
-        context_record.get("context") != {
-            "cluster": "kubernetes", "user": "kubernetes-admin"
-        }
-    ):
-        raise ValueError
-    if (
-        not isinstance(user_record, dict) or
-        set(user_record) != {"name", "user"} or
-        user_record.get("name") != "kubernetes-admin" or
-        not isinstance(user_record.get("user"), dict) or
-        set(user_record["user"]) != {
-            "client-certificate-data", "client-key-data"
-        } or
-        not valid_base64(user_record["user"].get("client-certificate-data")) or
-        not valid_base64(user_record["user"].get("client-key-data"))
-    ):
-        raise ValueError
-except (KeyError, TypeError, ValueError):
-    raise SystemExit(1)
-' >/dev/null 2>&1
-}
 
 capture_admin_conf() {
   local captured output with_sentinel
