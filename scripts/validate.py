@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import re
 import subprocess
 import sys
@@ -280,20 +282,198 @@ def expect_contract(label: str, actual: Any, expected: Any) -> None:
         fail(f'{label} 期望 {expected!r}，实测 {actual!r}')
 
 
+HOST_ENV_KEYS = (
+    'HOST_NAME', 'HOST_NODE_IP', 'HOST_CLUSTER_NAME', 'HOST_POD_CIDR',
+    'HOST_SERVICE_CIDR', 'HOST_SWAP_FILE', 'HOST_SWAP_MIN_BYTES',
+    'HOST_SWAP_MAX_BYTES',
+)
+HOST_FILES = ('host.env', 'kubeadm-init.yaml', 'cilium-values.yaml', 'pins.sha256')
+PIN_FILES = ('kubeadm-init.yaml', 'cilium-values.yaml')
+LABEL_RE = re.compile(r'^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')
+HOST_ENV_LINE_RE = re.compile(r'^(HOST_[A-Z_]+)=([A-Za-z0-9./_-]+)$')
+SWAP_FILE_RE = re.compile(r'^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
+PIN_LINE_RE = re.compile(r'^([0-9a-f]{64})  (kubeadm-init\.yaml|cilium-values\.yaml)$')
+
+
+def parse_host_env(path: Path) -> dict[str, str]:
+    label = path.as_posix()
+    try:
+        text = path.read_bytes().decode('utf-8')
+    except (OSError, UnicodeDecodeError) as error:
+        # 仅注释行可含非 ASCII；键与值的 ASCII 约束由 HOST_ENV_LINE_RE 保证。
+        fail(f'{label} 必须是可读的 UTF-8 文件：{error}')
+    if not text.endswith('\n'):
+        fail(f'{label} 末行必须以换行结束')
+    values: dict[str, str] = {}
+    for number, line in enumerate(text.split('\n')[:-1], 1):
+        if not line or line.startswith('#'):
+            continue
+        match = HOST_ENV_LINE_RE.match(line)
+        if match is None:
+            fail(f'{label}:{number} 不符合 KEY=VALUE 语法（无引号、无空格、值仅含 [A-Za-z0-9./_-]）')
+        key, value = match.groups()
+        if key not in HOST_ENV_KEYS:
+            fail(f'{label}:{number} 未知键 {key}')
+        if key in values:
+            fail(f'{label}:{number} 重复键 {key}')
+        values[key] = value
+    missing = [key for key in HOST_ENV_KEYS if key not in values]
+    if missing:
+        fail(f'{label} 缺少键：{", ".join(missing)}')
+    for key in ('HOST_NAME', 'HOST_CLUSTER_NAME'):
+        if LABEL_RE.match(values[key]) is None:
+            fail(f'{label} {key} 必须是 RFC 1123 label：{values[key]}')
+    octet = r'(0|[1-9][0-9]{0,2})'
+    if re.fullmatch(rf'{octet}(\.{octet}){{3}}', values['HOST_NODE_IP']) is None:
+        fail(f'{label} HOST_NODE_IP 不是点分四段且无前导零：{values["HOST_NODE_IP"]}')
+    try:
+        ipaddress.IPv4Address(values['HOST_NODE_IP'])
+    except ValueError:
+        fail(f'{label} HOST_NODE_IP 不是合法 IPv4：{values["HOST_NODE_IP"]}')
+    for key in ('HOST_POD_CIDR', 'HOST_SERVICE_CIDR'):
+        try:
+            ipaddress.IPv4Network(values[key], strict=True)
+        except ValueError:
+            fail(f'{label} {key} 不是合法 IPv4 网络：{values[key]}')
+        if '/' not in values[key]:
+            fail(f'{label} {key} 必须带前缀长度：{values[key]}')
+    if SWAP_FILE_RE.match(values['HOST_SWAP_FILE']) is None or '..' in values['HOST_SWAP_FILE']:
+        fail(f'{label} HOST_SWAP_FILE 必须是绝对路径：{values["HOST_SWAP_FILE"]}')
+    for key in ('HOST_SWAP_MIN_BYTES', 'HOST_SWAP_MAX_BYTES'):
+        if not re.fullmatch(r'[1-9][0-9]{0,17}', values[key]):
+            fail(f'{label} {key} 必须是正整数：{values[key]}')
+    if int(values['HOST_SWAP_MIN_BYTES']) >= int(values['HOST_SWAP_MAX_BYTES']):
+        fail(f'{label} HOST_SWAP_MIN_BYTES 必须小于 HOST_SWAP_MAX_BYTES')
+    return values
+
+
+def validate_host_kubeadm(path: Path, host: dict[str, str]) -> None:
+    label = path.as_posix()
+    try:
+        documents = {
+            document.get('kind'): document
+            for document in yaml.safe_load_all(path.read_text(encoding='utf-8'))
+            if isinstance(document, dict)
+        }
+    except yaml.YAMLError as error:
+        fail(f'{label} YAML 解析失败：{error}')
+    expect_contract(
+        f'{label} kinds', set(documents),
+        {'InitConfiguration', 'ClusterConfiguration', 'KubeletConfiguration'},
+    )
+    node_ip = host['HOST_NODE_IP']
+    init = documents['InitConfiguration']
+    expect_contract('InitConfiguration apiVersion', init.get('apiVersion'), 'kubeadm.k8s.io/v1beta4')
+    expect_contract('API advertiseAddress', value_at(init, ('localAPIEndpoint', 'advertiseAddress')), node_ip)
+    expect_contract('API bindPort', value_at(init, ('localAPIEndpoint', 'bindPort')), 6443)
+    expect_contract('Node name', value_at(init, ('nodeRegistration', 'name')), host['HOST_NAME'])
+    expect_contract('CRI socket', value_at(init, ('nodeRegistration', 'criSocket')), 'unix:///run/containerd/containerd.sock')
+    expect_contract('single-node taints', value_at(init, ('nodeRegistration', 'taints')), [])
+    expect_contract(
+        'kubelet node-ip',
+        value_at(init, ('nodeRegistration', 'kubeletExtraArgs')),
+        [{'name': 'node-ip', 'value': node_ip}],
+    )
+    expect_contract('kube-proxy skip phase', init.get('skipPhases'), ['addon/kube-proxy'])
+
+    cluster = documents['ClusterConfiguration']
+    expect_contract('ClusterConfiguration apiVersion', cluster.get('apiVersion'), 'kubeadm.k8s.io/v1beta4')
+    expect_contract('Kubernetes version', cluster.get('kubernetesVersion'), 'v1.36.3')
+    expect_contract('clusterName', cluster.get('clusterName'), host['HOST_CLUSTER_NAME'])
+    expect_contract('controlPlaneEndpoint', cluster.get('controlPlaneEndpoint'), f'{node_ip}:6443')
+    expect_contract('API certificate SANs', value_at(cluster, ('apiServer', 'certSANs')), [node_ip])
+    expect_contract('Service CIDR', value_at(cluster, ('networking', 'serviceSubnet')), host['HOST_SERVICE_CIDR'])
+    expect_contract('Pod CIDR', value_at(cluster, ('networking', 'podSubnet')), host['HOST_POD_CIDR'])
+    expect_contract('DNS domain', value_at(cluster, ('networking', 'dnsDomain')), 'cluster.local')
+    expect_contract('kube-proxy disabled', value_at(cluster, ('proxy', 'disabled')), True)
+
+    kubelet = documents['KubeletConfiguration']
+    expect_contract('KubeletConfiguration apiVersion', kubelet.get('apiVersion'), 'kubelet.config.k8s.io/v1beta1')
+    expect_contract('kubelet cgroup driver', kubelet.get('cgroupDriver'), 'systemd')
+    expect_contract('kubelet failSwapOn', kubelet.get('failSwapOn'), False)
+    expect_contract('kubelet swap behavior', value_at(kubelet, ('memorySwap', 'swapBehavior')), 'NoSwap')
+    expect_contract('kubelet serverTLSBootstrap', kubelet.get('serverTLSBootstrap'), True)
+
+
+def validate_host_cilium(path: Path, host: dict[str, str]) -> None:
+    label = path.as_posix()
+    try:
+        cilium = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except yaml.YAMLError as error:
+        fail(f'{label} YAML 解析失败：{error}')
+    if not isinstance(cilium, dict):
+        fail(f'{label} 顶层必须是 YAML mapping')
+    expect_contract(
+        f'{label} 顶层键集', set(cilium),
+        {'kubeProxyReplacement', 'k8sServiceHost', 'k8sServicePort', 'cgroup',
+         'gatewayAPI', 'hubble', 'image', 'ipam', 'operator'},
+    )
+    contracts = (
+        (('kubeProxyReplacement',), True, 'kube-proxy replacement'),
+        (('k8sServiceHost',), host['HOST_NODE_IP'], 'Cilium API host'),
+        (('k8sServicePort',), 6443, 'Cilium API port'),
+        (('ipam', 'mode'), 'kubernetes', 'Cilium IPAM'),
+        (('gatewayAPI', 'enabled'), True, 'Cilium Gateway API'),
+        (('cgroup', 'autoMount', 'enabled'), False, 'Cilium cgroup automount'),
+        (('cgroup', 'hostRoot'), '/sys/fs/cgroup', 'Cilium cgroup root'),
+        (('operator', 'replicas'), 1, 'Cilium operator replicas'),
+        (('hubble', 'enabled'), False, 'Hubble staged state'),
+        (('image', 'useDigest'), True, 'Cilium image useDigest'),
+        (('image', 'digest'), 'sha256:383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93', 'Cilium image digest'),
+        (('operator', 'image', 'useDigest'), True, 'Cilium operator useDigest'),
+        (('operator', 'image', 'genericDigest'), 'sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3', 'Cilium operator digest'),
+    )
+    for path_tokens, expected, name in contracts:
+        expect_contract(name, value_at(cilium, path_tokens), expected)
+
+
+def validate_host_pins(host_dir: Path) -> None:
+    pins = host_dir / 'pins.sha256'
+    label = pins.as_posix()
+    text = pins.read_text(encoding='utf-8')
+    if not text.endswith('\n'):
+        fail(f'{label} 末行必须以换行结束')
+    lines = text.split('\n')[:-1]
+    if len(lines) != len(PIN_FILES):
+        fail(f'{label} 必须恰好 {len(PIN_FILES)} 行')
+    hint = f'运行 scripts/bootstrap/pin-host.sh {host_dir.as_posix()}'
+    for line, expected_name in zip(lines, PIN_FILES):
+        match = PIN_LINE_RE.match(line)
+        if match is None or match.group(2) != expected_name:
+            fail(f'{label} 第 {PIN_FILES.index(expected_name) + 1} 行必须是 "<sha256>  {expected_name}"；{hint}')
+        actual = hashlib.sha256((host_dir / expected_name).read_bytes()).hexdigest()
+        if match.group(1) != actual:
+            fail(f'{label} 中 {expected_name} 的 digest 与文件不一致；{hint}')
+
+
+def validate_host_directory(host_dir: Path) -> None:
+    label = host_dir.as_posix()
+    if host_dir.is_symlink() or not host_dir.is_dir():
+        fail(f'{label} 必须是真实目录')
+    if LABEL_RE.match(host_dir.name) is None:
+        fail(f'{label} 目录名必须是 RFC 1123 label')
+    entries = sorted(entry.name for entry in host_dir.iterdir())
+    if entries != sorted(HOST_FILES):
+        fail(f'{label} 文件集必须精确为 {", ".join(HOST_FILES)}，实际：{", ".join(entries)}')
+    for name in HOST_FILES:
+        entry = host_dir / name
+        if entry.is_symlink() or not entry.is_file():
+            fail(f'{entry.as_posix()} 必须是常规文件（非软链）')
+    host = parse_host_env(host_dir / 'host.env')
+    if host['HOST_NAME'] != host_dir.name:
+        fail(f'{label} 目录名必须等于 HOST_NAME={host["HOST_NAME"]}')
+    validate_host_kubeadm(host_dir / 'kubeadm-init.yaml', host)
+    validate_host_cilium(host_dir / 'cilium-values.yaml', host)
+    validate_host_pins(host_dir)
+
+
 def validate_bootstrap_contracts(root: Path = ROOT) -> None:
     bootstrap = root / 'bootstrap'
     validate_artifact_lock(bootstrap / 'artifacts.lock.tsv')
 
     containerd_config = bootstrap / 'containerd/config.toml'
     containerd_unit = bootstrap / 'containerd/containerd.service'
-    kubeadm_config = bootstrap / 'kubeadm/init.yaml'
-    cilium_values = bootstrap / 'cilium/values.yaml'
-    for path in (
-        containerd_config,
-        containerd_unit,
-        kubeadm_config,
-        cilium_values,
-    ):
+    for path in (containerd_config, containerd_unit):
         if not path.is_file():
             fail(f'{path.relative_to(root)} 不存在')
 
@@ -338,66 +518,17 @@ def validate_bootstrap_contracts(root: Path = ROOT) -> None:
         if unit_source.count(fragment) != 1:
             fail(f'bootstrap/containerd/containerd.service 合同漂移：{fragment}')
 
-    try:
-        kubeadm_documents = {
-            document.get('kind'): document
-            for document in yaml.safe_load_all(
-                kubeadm_config.read_text(encoding='utf-8')
-            )
-            if isinstance(document, dict)
-        }
-    except yaml.YAMLError as error:
-        fail(f'bootstrap/kubeadm/init.yaml YAML 解析失败：{error}')
-    expect_contract(
-        'kubeadm kinds',
-        set(kubeadm_documents),
-        {'InitConfiguration', 'ClusterConfiguration', 'KubeletConfiguration'},
-    )
-
-    init = kubeadm_documents['InitConfiguration']
-    expect_contract('InitConfiguration apiVersion', init.get('apiVersion'), 'kubeadm.k8s.io/v1beta4')
-    expect_contract('API advertiseAddress', value_at(init, ('localAPIEndpoint', 'advertiseAddress')), '10.93.1.27')
-    expect_contract('API bindPort', value_at(init, ('localAPIEndpoint', 'bindPort')), 6443)
-    expect_contract('Node name', value_at(init, ('nodeRegistration', 'name')), 'retail-test-workflow')
-    expect_contract('CRI socket', value_at(init, ('nodeRegistration', 'criSocket')), 'unix:///run/containerd/containerd.sock')
-    expect_contract('single-node taints', value_at(init, ('nodeRegistration', 'taints')), [])
-    expect_contract('kube-proxy skip phase', init.get('skipPhases'), ['addon/kube-proxy'])
-
-    cluster = kubeadm_documents['ClusterConfiguration']
-    expect_contract('ClusterConfiguration apiVersion', cluster.get('apiVersion'), 'kubeadm.k8s.io/v1beta4')
-    expect_contract('Kubernetes version', cluster.get('kubernetesVersion'), 'v1.36.3')
-    expect_contract('controlPlaneEndpoint', cluster.get('controlPlaneEndpoint'), '10.93.1.27:6443')
-    expect_contract('API certificate SANs', value_at(cluster, ('apiServer', 'certSANs')), ['10.93.1.27'])
-    expect_contract('Service CIDR', value_at(cluster, ('networking', 'serviceSubnet')), '172.20.0.0/16')
-    expect_contract('Pod CIDR', value_at(cluster, ('networking', 'podSubnet')), '172.21.0.0/16')
-    expect_contract('kube-proxy disabled', value_at(cluster, ('proxy', 'disabled')), True)
-
-    kubelet = kubeadm_documents['KubeletConfiguration']
-    expect_contract('KubeletConfiguration apiVersion', kubelet.get('apiVersion'), 'kubelet.config.k8s.io/v1beta1')
-    expect_contract('kubelet cgroup driver', kubelet.get('cgroupDriver'), 'systemd')
-    expect_contract('kubelet failSwapOn', kubelet.get('failSwapOn'), False)
-    expect_contract('kubelet swap behavior', value_at(kubelet, ('memorySwap', 'swapBehavior')), 'NoSwap')
-    expect_contract('kubelet serverTLSBootstrap', kubelet.get('serverTLSBootstrap'), True)
-
-    try:
-        cilium = yaml.safe_load(cilium_values.read_text(encoding='utf-8'))
-    except yaml.YAMLError as error:
-        fail(f'bootstrap/cilium/values.yaml YAML 解析失败：{error}')
-    if not isinstance(cilium, dict):
-        fail('bootstrap/cilium/values.yaml 顶层必须是 YAML mapping')
-    cilium_contracts = (
-        (('kubeProxyReplacement',), True, 'kube-proxy replacement'),
-        (('k8sServiceHost',), '10.93.1.27', 'Cilium API host'),
-        (('k8sServicePort',), 6443, 'Cilium API port'),
-        (('ipam', 'mode'), 'kubernetes', 'Cilium IPAM'),
-        (('gatewayAPI', 'enabled'), True, 'Cilium Gateway API'),
-        (('cgroup', 'autoMount', 'enabled'), False, 'Cilium cgroup automount'),
-        (('cgroup', 'hostRoot'), '/sys/fs/cgroup', 'Cilium cgroup root'),
-        (('operator', 'replicas'), 1, 'Cilium operator replicas'),
-        (('hubble', 'enabled'), False, 'Hubble staged state'),
-    )
-    for path, expected, label in cilium_contracts:
-        expect_contract(label, value_at(cilium, path), expected)
+    for legacy in ('kubeadm', 'cilium'):
+        if (bootstrap / legacy).exists():
+            fail(f'bootstrap/{legacy}/ 已迁入 bootstrap/hosts/<hostname>/，禁止保留旧目录')
+    hosts_root = bootstrap / 'hosts'
+    if hosts_root.is_symlink() or not hosts_root.is_dir():
+        fail('bootstrap/hosts/ 必须是真实目录')
+    host_dirs = sorted(entry for entry in hosts_root.iterdir())
+    if not host_dirs:
+        fail('bootstrap/hosts/ 至少需要一个主机目录')
+    for host_dir in host_dirs:
+        validate_host_directory(host_dir)
 
 
 def expect_value(

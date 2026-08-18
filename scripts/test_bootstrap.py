@@ -76,7 +76,7 @@ class BootstrapTestCase(unittest.TestCase):
 
     def admin_config_object(self) -> dict[str, object]:
         # 服务器实测形态：kubectl v1.36 省略空 preferences，cluster 与 context
-        # 名称由 bootstrap/kubeadm/init.yaml 的 clusterName 决定。
+        # 名称由 bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml 的 clusterName 决定。
         return {
             'apiVersion': 'v1',
             'kind': 'Config',
@@ -6479,7 +6479,7 @@ class KubeadmInitTest(BootstrapTestCase):
             'ID=ubuntu\nVERSION_ID="24.04"\n', encoding='utf-8'
         )
         (host / 'swap.img').write_bytes(b'preserve swap\n')
-        config_source.write_bytes((ROOT / 'bootstrap/kubeadm/init.yaml').read_bytes())
+        config_source.write_bytes((ROOT / 'bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml').read_bytes())
         config_source.chmod(0o644)
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
@@ -8977,7 +8977,7 @@ operator:
             artifact.chmod(0o600)
 
         values = directory / 'values.yaml'
-        values.write_bytes((ROOT / 'bootstrap/cilium/values.yaml').read_bytes())
+        values.write_bytes((ROOT / 'bootstrap/hosts/retail-test-workflow/cilium-values.yaml').read_bytes())
         values.chmod(0o644)
         admin_conf = host / 'etc/kubernetes/admin.conf'
         admin_conf.write_text(self.canary + '\n', encoding='utf-8')
@@ -10120,7 +10120,7 @@ operator:
         """admin.conf 合同必须跟随 init.yaml 的 clusterName，不得各写各的。"""
         pinned = next(
             line.split(':', 1)[1].strip()
-            for line in (ROOT / 'bootstrap/kubeadm/init.yaml')
+            for line in (ROOT / 'bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml')
             .read_text(encoding='utf-8').splitlines()
             if line.startswith('clusterName:')
         )

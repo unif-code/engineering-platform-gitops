@@ -48,7 +48,7 @@ readonly SERVICE_CIDR=172.20.0.0/16
 readonly POD_CIDR=172.21.0.0/16
 readonly CONFIG_SHA256=e37b38f198bd7279ae3d203a990a4c2d40e1b2a8b59796475b814f09445103c6
 readonly KUBELET_KEEP_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-readonly CONFIG_FILE="${repo_root}/bootstrap/kubeadm/init.yaml"
+readonly CONFIG_FILE="${repo_root}/bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml"
 readonly KERNEL_TRANSCRIPT=$'PHASE=prepare-kernel\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kernel-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=30-install-containerd\nSHA256=NONE'
 readonly CONTAINERD_TRANSCRIPT=$'PHASE=containerd\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=containerd-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=40-install-kubernetes\nSHA256=NONE'
 readonly KUBERNETES_TRANSCRIPT=$'PHASE=install-kubernetes\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nREASON=kubernetes-packages-ready\nEVIDENCE=NONE\nEXIT_CODE=0\nNEXT=50-kubeadm-init.sh --check\nSHA256=NONE'

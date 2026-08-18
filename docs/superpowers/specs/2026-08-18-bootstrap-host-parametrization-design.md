@@ -116,11 +116,11 @@ Stage 50 读第一行代替 `CONFIG_SHA256`；Stage 60 读第二行代替 `VALUE
 2. `host.env` 按上表语法完整校验（含 CIDR 为合法 IPv4 网络、`MIN < MAX`）。
 3. `kubeadm-init.yaml`：`localAPIEndpoint.advertiseAddress` = `HOST_NODE_IP`；`nodeRegistration.name` = `HOST_NAME`；`nodeRegistration.kubeletExtraArgs` 含 `node-ip=HOST_NODE_IP`；`apiServer.certSANs` = `[HOST_NODE_IP]`；`clusterName` = `HOST_CLUSTER_NAME`；`controlPlaneEndpoint` = `HOST_NODE_IP:6443`；`networking.podSubnet`/`serviceSubnet` = 对应 CIDR；锁死字段 `kubernetesVersion`、`cgroupDriver`、`skipPhases`、`proxy.disabled`、`failSwapOn`、`memorySwap`、`serverTLSBootstrap` 等于预期值。
 4. `cilium-values.yaml`：`k8sServiceHost` = `HOST_NODE_IP`；其余内容与锁死骨架逐字一致。
-5. `pins.sha256` 两行格式正确且与两个文件实际 digest 一致；不一致时错误信息提示运行 `scripts/bootstrap/pin-host.sh <hostname>`。
+5. `pins.sha256` 两行格式正确且与两个文件实际 digest 一致；不一致时错误信息提示运行 `scripts/bootstrap/pin-host.sh <host-dir>`。
 
 ## 工具
 
-`scripts/bootstrap/pin-host.sh <hostname>`：重算并原子写入 `bootstrap/hosts/<hostname>/pins.sha256`。只写这一个文件，不修改 yaml。
+`scripts/bootstrap/pin-host.sh <host-dir>`：重算并原子写入 `<host-dir>/pins.sha256`。只写这一个文件，不修改 yaml。例：`scripts/bootstrap/pin-host.sh bootstrap/hosts/retail-test-workflow`。
 
 ## 执行与错误行为
 

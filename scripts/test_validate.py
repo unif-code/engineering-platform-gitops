@@ -489,7 +489,7 @@ class BootstrapContractTest(unittest.TestCase):
 
     def test_kubeadm_contract_rejects_pod_cidr_drift(self) -> None:
         root = self.copy_bootstrap_root()
-        path = root / 'bootstrap' / 'kubeadm' / 'init.yaml'
+        path = root / 'bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml'
         path.write_text(
             path.read_text(encoding='utf-8').replace(
                 '172.21.0.0/16', '10.244.0.0/16', 1
@@ -501,7 +501,7 @@ class BootstrapContractTest(unittest.TestCase):
 
     def test_cilium_contract_rejects_disabled_kube_proxy_replacement(self) -> None:
         root = self.copy_bootstrap_root()
-        path = root / 'bootstrap' / 'cilium' / 'values.yaml'
+        path = root / 'bootstrap/hosts/retail-test-workflow/cilium-values.yaml'
         path.write_text(
             path.read_text(encoding='utf-8').replace(
                 'kubeProxyReplacement: true', 'kubeProxyReplacement: false', 1
@@ -510,6 +510,132 @@ class BootstrapContractTest(unittest.TestCase):
         )
 
         self.assert_contract_fails(root)
+
+    HOST_DIR = Path('bootstrap/hosts/retail-test-workflow')
+
+    def rewrite_host_env(self, root: Path, old: str, new: str) -> None:
+        path = root / self.HOST_DIR / 'host.env'
+        text = path.read_text(encoding='utf-8')
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+    def test_host_env_is_parsed_strictly(self) -> None:
+        root = self.copy_bootstrap_root()
+        parsed = validator.parse_host_env(root / self.HOST_DIR / 'host.env')
+
+        self.assertEqual(parsed['HOST_NAME'], 'retail-test-workflow')
+        self.assertEqual(parsed['HOST_NODE_IP'], '10.93.1.27')
+        self.assertEqual(sorted(parsed), sorted(validator.HOST_ENV_KEYS))
+
+    def test_host_env_drift_is_rejected(self) -> None:
+        cases = (
+            ('missing-key', 'HOST_SWAP_FILE=/swap.img\n', ''),
+            ('extra-key', 'HOST_SWAP_MAX_BYTES=4400000000\n',
+             'HOST_SWAP_MAX_BYTES=4400000000\nHOST_EXTRA=1\n'),
+            ('duplicate-key', 'HOST_NODE_IP=10.93.1.27\n',
+             'HOST_NODE_IP=10.93.1.27\nHOST_NODE_IP=10.93.1.27\n'),
+            ('bad-ip', 'HOST_NODE_IP=10.93.1.27', 'HOST_NODE_IP=10.93.1.256'),
+            ('bad-cidr', 'HOST_POD_CIDR=172.21.0.0/16', 'HOST_POD_CIDR=172.21.0.1/16'),
+            ('quoted', 'HOST_SWAP_FILE=/swap.img', 'HOST_SWAP_FILE="/swap.img"'),
+            ('swap-range', 'HOST_SWAP_MAX_BYTES=4400000000', 'HOST_SWAP_MAX_BYTES=1'),
+            ('name-mismatch', 'HOST_NAME=retail-test-workflow', 'HOST_NAME=other-host'),
+        )
+        for name, old, new in cases:
+            with self.subTest(case=name):
+                root = self.copy_bootstrap_root()
+                self.rewrite_host_env(root, old, new)
+                self.assert_contract_fails(root)
+
+    def test_host_env_without_trailing_newline_is_rejected(self) -> None:
+        root = self.copy_bootstrap_root()
+        path = root / self.HOST_DIR / 'host.env'
+        path.write_text(path.read_text(encoding='utf-8').rstrip('\n'), encoding='utf-8')
+
+        self.assert_contract_fails(root)
+
+    def test_host_yaml_must_match_host_env(self) -> None:
+        cases = (
+            ('kubeadm-init.yaml', '10.93.1.27', '10.93.1.28'),
+            ('kubeadm-init.yaml', 'clusterName: engineering-platform-dev', 'clusterName: other'),
+            ('kubeadm-init.yaml', 'name: retail-test-workflow', 'name: other-host'),
+            ('cilium-values.yaml', 'k8sServiceHost: 10.93.1.27', 'k8sServiceHost: 10.93.1.28'),
+        )
+        for filename, old, new in cases:
+            with self.subTest(file=filename, old=old):
+                root = self.copy_bootstrap_root()
+                path = root / self.HOST_DIR / filename
+                text = path.read_text(encoding='utf-8')
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new), encoding='utf-8')
+                # 同步 pins，确保失败来自一致性校验而非 digest 校验。
+                subprocess.run(
+                    ['/bin/bash', str(validator.ROOT / 'scripts/bootstrap/pin-host.sh'),
+                     str(root / self.HOST_DIR)],
+                    check=True, capture_output=True,
+                )
+
+                self.assert_contract_fails(root)
+
+    def test_pins_must_match_files(self) -> None:
+        root = self.copy_bootstrap_root()
+        pins = root / self.HOST_DIR / 'pins.sha256'
+        pins.write_text(
+            pins.read_text(encoding='utf-8').replace('e37b38f1', '00000000', 1),
+            encoding='utf-8',
+        )
+
+        self.assert_contract_fails(root)
+
+    def test_pins_shape_is_exact(self) -> None:
+        good = (validator.ROOT / self.HOST_DIR / 'pins.sha256').read_text(encoding='utf-8')
+        for name, content in (
+            ('reversed', ''.join(reversed(good.splitlines(keepends=True)))),
+            ('third-line', good + 'x\n'),
+            ('single-space', good.replace('  kubeadm', ' kubeadm', 1)),
+            ('no-newline', good.rstrip('\n')),
+        ):
+            with self.subTest(case=name):
+                root = self.copy_bootstrap_root()
+                (root / self.HOST_DIR / 'pins.sha256').write_text(content, encoding='utf-8')
+                self.assert_contract_fails(root)
+
+    def test_host_directory_file_set_is_exact(self) -> None:
+        for name in ('extra-file', 'missing-file', 'symlinked-file', 'legacy-directory'):
+            with self.subTest(case=name):
+                root = self.copy_bootstrap_root()
+                host_dir = root / self.HOST_DIR
+                if name == 'extra-file':
+                    (host_dir / 'notes.txt').write_text('x\n', encoding='utf-8')
+                elif name == 'missing-file':
+                    (host_dir / 'pins.sha256').unlink()
+                elif name == 'symlinked-file':
+                    (host_dir / 'host.env').unlink()
+                    (host_dir / 'host.env').symlink_to(root / 'outside.env')
+                    (root / 'outside.env').write_text('HOST_NAME=x\n', encoding='utf-8')
+                else:
+                    (root / 'bootstrap/kubeadm').mkdir()
+                    (root / 'bootstrap/kubeadm/init.yaml').write_text('x\n', encoding='utf-8')
+                self.assert_contract_fails(root)
+
+    def test_pin_host_tool_rewrites_only_pins(self) -> None:
+        root = self.copy_bootstrap_root()
+        host_dir = root / self.HOST_DIR
+        (host_dir / 'pins.sha256').write_text('broken\n', encoding='utf-8')
+        before = {p.name: p.read_bytes() for p in host_dir.iterdir() if p.name != 'pins.sha256'}
+
+        result = subprocess.run(
+            ['/bin/bash', str(validator.ROOT / 'scripts/bootstrap/pin-host.sh'), str(host_dir)],
+            capture_output=True, text=True, check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (host_dir / 'pins.sha256').read_text(encoding='utf-8'),
+            (validator.ROOT / self.HOST_DIR / 'pins.sha256').read_text(encoding='utf-8'),
+        )
+        self.assertEqual({p.name: p.read_bytes() for p in host_dir.iterdir() if p.name != 'pins.sha256'}, before)
+        self.assertEqual(oct((host_dir / 'pins.sha256').stat().st_mode & 0o777), '0o644')
+        validator.validate_bootstrap_contracts(root)
 
 
 class ValidateEntrypointTest(unittest.TestCase):
