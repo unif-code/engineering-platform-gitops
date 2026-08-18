@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMON = ROOT / 'scripts/bootstrap/lib/common.sh'
+HOST_CONFIG = ROOT / 'scripts/bootstrap/lib/host-config.sh'
 CIDR_CHECK = ROOT / 'scripts/bootstrap/check_cidrs.py'
 PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
 STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
@@ -108,6 +109,112 @@ class BootstrapTestCase(unittest.TestCase):
                 }
             ],
         }
+
+
+class HostConfigTest(BootstrapTestCase):
+    """lib/host-config.sh 的纯解析与目录合同边界。"""
+
+    VALID_HOST_ENV = (
+        '# fixture\n'
+        'HOST_NAME=retail-test-workflow\n'
+        'HOST_NODE_IP=10.93.1.27\n'
+        '\n'
+        'HOST_CLUSTER_NAME=engineering-platform-dev\n'
+        'HOST_POD_CIDR=172.21.0.0/16\n'
+        'HOST_SERVICE_CIDR=172.20.0.0/16\n'
+        'HOST_SWAP_FILE=/swap.img\n'
+        'HOST_SWAP_MIN_BYTES=4000000000\n'
+        'HOST_SWAP_MAX_BYTES=4400000000\n'
+    )
+
+    def run_parse(self, content: str) -> subprocess.CompletedProcess[str]:
+        directory = self.temporary_directory()
+        target = directory / 'host.env'
+        target.write_bytes(content.encode('utf-8'))
+        body = (
+            'set -u\n'
+            'if host_env_parse "$2"; then\n'
+            '  printf "%s|%s|%s|%s|%s|%s|%s|%s\\n" '
+            '"$HOST_NAME" "$HOST_NODE_IP" "$HOST_CLUSTER_NAME" '
+            '"$HOST_POD_CIDR" "$HOST_SERVICE_CIDR" "$HOST_SWAP_FILE" '
+            '"$HOST_SWAP_MIN_BYTES" "$HOST_SWAP_MAX_BYTES"\n'
+            'else\n'
+            '  printf "ERROR=%s\\n" "$HOST_CONFIG_ERROR"\n'
+            '  exit 1\n'
+            'fi\n'
+        )
+        return self.run_command(
+            ['/bin/bash', '-c', f'source "$1"\n{body}', 'test-host-config',
+             str(HOST_CONFIG), str(target)],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def test_parse_accepts_comments_blank_lines_and_exact_key_set(self) -> None:
+        result = self.run_parse(self.VALID_HOST_ENV)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'retail-test-workflow|10.93.1.27|engineering-platform-dev|'
+            '172.21.0.0/16|172.20.0.0/16|/swap.img|4000000000|4400000000\n',
+        )
+
+    def test_parse_rejects_every_invalid_shape(self) -> None:
+        valid = self.VALID_HOST_ENV
+        cases = {
+            'missing-key': valid.replace('HOST_SWAP_FILE=/swap.img\n', ''),
+            'extra-key': valid + 'HOST_EXTRA=1\n',
+            'unknown-key': valid.replace('HOST_NAME=', 'HOSTNAME='),
+            'duplicate-key': valid + 'HOST_NODE_IP=10.93.1.27\n',
+            'quoted-value': valid.replace(
+                'HOST_SWAP_FILE=/swap.img', 'HOST_SWAP_FILE="/swap.img"'
+            ),
+            'space-in-value': valid.replace(
+                'HOST_SWAP_FILE=/swap.img', 'HOST_SWAP_FILE=/swap img'
+            ),
+            'dollar-in-value': valid.replace(
+                'HOST_SWAP_FILE=/swap.img', 'HOST_SWAP_FILE=/$HOME/swap.img'
+            ),
+            'backtick-in-value': valid.replace(
+                'HOST_CLUSTER_NAME=engineering-platform-dev',
+                'HOST_CLUSTER_NAME=`id`',
+            ),
+            'crlf': valid.replace('\n', '\r\n'),
+            'no-trailing-newline': valid.rstrip('\n'),
+            'empty-file': '',
+            'bad-ip-octet': valid.replace('10.93.1.27', '10.93.1.256'),
+            'bad-ip-leading-zero': valid.replace('10.93.1.27', '010.93.1.27'),
+            'bad-ip-shape': valid.replace('10.93.1.27', '10.93.1'),
+            'bad-cidr-prefix': valid.replace('172.21.0.0/16', '172.21.0.0/33'),
+            'bad-cidr-no-prefix': valid.replace('172.21.0.0/16', '172.21.0.0'),
+            'uppercase-hostname': valid.replace(
+                'HOST_NAME=retail-test-workflow', 'HOST_NAME=Retail'
+            ),
+            'hostname-trailing-dash': valid.replace(
+                'HOST_NAME=retail-test-workflow', 'HOST_NAME=retail-'
+            ),
+            'relative-swap-path': valid.replace(
+                'HOST_SWAP_FILE=/swap.img', 'HOST_SWAP_FILE=swap.img'
+            ),
+            'dotdot-swap-path': valid.replace(
+                'HOST_SWAP_FILE=/swap.img', 'HOST_SWAP_FILE=/../swap.img'
+            ),
+            'swap-min-not-numeric': valid.replace(
+                'HOST_SWAP_MIN_BYTES=4000000000', 'HOST_SWAP_MIN_BYTES=4G'
+            ),
+            'swap-min-zero': valid.replace(
+                'HOST_SWAP_MIN_BYTES=4000000000', 'HOST_SWAP_MIN_BYTES=0'
+            ),
+            'swap-min-not-below-max': valid.replace(
+                'HOST_SWAP_MAX_BYTES=4400000000', 'HOST_SWAP_MAX_BYTES=4000000000'
+            ),
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                result = self.run_parse(content)
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, 'ERROR=host-config-invalid\n')
 
 
 class CommonLibraryTest(BootstrapTestCase):
