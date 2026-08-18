@@ -273,6 +273,35 @@ class HostConfigTest(BootstrapTestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, 'ERROR=host-config-invalid\n')
 
+    def test_stage_scripts_contain_no_host_literals(self) -> None:
+        """主机身份只能出现在 bootstrap/hosts/ 与测试文件里。"""
+        forbidden = (
+            '10.93.1.27', 'retail-test-workflow', 'engineering-platform-dev',
+            'CONFIG_SHA256=e', 'VALUES_SHA256=1', 'EXPECTED_HOSTNAME=',
+            'EXPECTED_NODE_IP=', 'EXPECTED_NODE=', '/swap.img',
+            '4000000000', '4400000000', '172.20.0.0/16', '172.21.0.0/16',
+        )
+        scripts = sorted(
+            list((ROOT / 'scripts/bootstrap').glob('*.sh'))
+            + list((ROOT / 'scripts/bootstrap/lib').glob('*.sh'))
+            + [ROOT / 'scripts/bootstrap/check_cidrs.py']
+        )
+        for script in scripts:
+            text = script.read_text(encoding='utf-8')
+            for literal in forbidden:
+                with self.subTest(script=script.name, literal=literal):
+                    self.assertNotIn(literal, text)
+
+    def test_only_host_directories_carry_host_identity(self) -> None:
+        for path in sorted((ROOT / 'bootstrap').rglob('*')):
+            relative = path.relative_to(ROOT / 'bootstrap')
+            if not path.is_file() or relative.parts[0] == 'hosts':
+                continue
+            with self.subTest(path=str(relative)):
+                self.assertNotIn(
+                    '10.93.1.27', path.read_text(encoding='utf-8', errors='ignore')
+                )
+
 
 class CommonLibraryTest(BootstrapTestCase):
     def run_common(self, body: str) -> subprocess.CompletedProcess[str]:
@@ -517,9 +546,11 @@ class PreflightTest(BootstrapTestCase):
             fake_bin / 'ip',
             '''
             #!/bin/sh
+            node_ip="${FAKE_NODE_IP:-10.93.1.27}"
+            node_subnet="${node_ip%.*}.0/24"
             case "$*" in
-              *address*) printf '%s\n' "${FAKE_IP_ADDRESS:-2: ens160    inet 10.93.1.27/24 scope global ens160}" ;;
-              *route*) printf '%s\n' "${FAKE_IP_ROUTES:-10.93.1.0/24 dev ens160 proto kernel scope link src 10.93.1.27}" ;;
+              *address*) printf '%s\n' "${FAKE_IP_ADDRESS:-2: ens160    inet ${node_ip}/24 scope global ens160}" ;;
+              *route*) printf '%s\n' "${FAKE_IP_ROUTES:-${node_subnet} dev ens160 proto kernel scope link src ${node_ip}}" ;;
               *) exit 2 ;;
             esac
             ''',
@@ -706,6 +737,27 @@ class PreflightTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 10, result.stdout)
         self.assertIn('REASON=swap-size-mismatch', result.stdout)
+
+    def test_registered_second_host_flows_through_preflight(self) -> None:
+        environment, host = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        self.write_fixture_host(
+            hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
+            cluster_name='fixture-b', pod_cidr='10.244.0.0/16',
+            service_cidr='10.96.0.0/12', swap_file='/swap.img',
+            swap_min=4000000000, swap_max=4400000000,
+        )
+        environment['FAKE_HOSTNAME'] = 'fixture-host-b'
+        environment['FAKE_NODE_IP'] = '10.200.0.2'
+
+        result = self.run_command(['/bin/bash', str(PREFLIGHT), '--check'], env=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+        evidence = self.evidence_text(host)
+        self.assertIn('HOSTNAME=fixture-host-b', evidence)
+        self.assertIn('NODE_IP=10.200.0.2', evidence)
+        self.assertIn('POD_CIDR=10.244.0.0/16', evidence)
 
     def test_accepts_canonical_ubuntu_os_release_symlink(self) -> None:
         environment, host = self.make_environment()
@@ -6638,19 +6690,21 @@ class KubeadmInitTest(BootstrapTestCase):
             fake_bin / 'ip',
             '''
             #!/bin/sh
+            node_ip="${FAKE_NODE_IP:-10.93.1.27}"
+            node_subnet="${node_ip%.*}.0/24"
             case "$*" in
               *address*)
                 if [ -f "$FAKE_DRIFT_DIR/ip" ]; then
                   printf '2: ens160 inet 10.93.1.99/24 scope global ens160\n'
                 else
-                  printf '%s\n' "${FAKE_IP_ADDRESS:-2: ens160 inet 10.93.1.27/24 scope global ens160}"
+                  printf '%s\n' "${FAKE_IP_ADDRESS:-2: ens160 inet ${node_ip}/24 scope global ens160}"
                 fi
                 ;;
               *route*)
                 if [ -f "$FAKE_DRIFT_DIR/route" ]; then
                   printf '172.21.0.0/24 dev ens160\n'
                 else
-                  printf '%s\n' "${FAKE_IP_ROUTES:-10.93.1.0/24 dev ens160 src 10.93.1.27}"
+                  printf '%s\n' "${FAKE_IP_ROUTES:-${node_subnet} dev ens160 src ${node_ip}}"
                 fi
                 ;;
               *) exit 64 ;;
@@ -7194,6 +7248,23 @@ class KubeadmInitTest(BootstrapTestCase):
 
                 self.assertEqual(result.returncode, 20, result.stdout)
                 self.assertIn('REASON=host-pins-invalid', result.stdout)
+
+    def test_registered_second_host_flows_through_kubeadm_check(self) -> None:
+        environment, _, _ = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        host_dir = self.write_fixture_host(
+            hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
+            cluster_name='fixture-b', pod_cidr='10.244.0.0/16',
+            service_cidr='10.96.0.0/12',
+        )
+        environment['FAKE_HOSTNAME'] = 'fixture-host-b'
+        environment['FAKE_NODE_IP'] = '10.200.0.2'
+        environment['BOOTSTRAP_TEST_CONFIG_FILE'] = str(host_dir / 'kubeadm-init.yaml')
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', result.stdout)
 
     def test_exact_initialized_state_is_already_compliant_and_zero_write(self) -> None:
         environment, host, command_log = self.make_environment()
@@ -10348,6 +10419,29 @@ operator:
                 self.assertEqual(result.returncode, expected_code, result.stdout)
                 self.assertIn(f'REASON={expected_reason}', result.stdout)
 
+    def test_registered_second_host_flows_through_cilium_check(self) -> None:
+        environment, _, _, _ = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        host_dir = self.write_fixture_host(
+            hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
+            cluster_name='fixture-b',
+        )
+        environment['FAKE_HOSTNAME'] = 'fixture-host-b'
+        environment['BOOTSTRAP_TEST_VALUES_FILE'] = str(host_dir / 'cilium-values.yaml')
+        environment['FAKE_API_ENDPOINT'] = 'https://10.200.0.2:6443'
+        payload = self.admin_config_object()
+        payload['clusters'][0]['name'] = 'fixture-b'
+        payload['clusters'][0]['cluster']['server'] = 'https://10.200.0.2:6443'
+        payload['contexts'][0]['name'] = 'kubernetes-admin@fixture-b'
+        payload['contexts'][0]['context']['cluster'] = 'fixture-b'
+        payload['current-context'] = 'kubernetes-admin@fixture-b'
+        environment['FAKE_ADMIN_VIEW_JSON'] = json.dumps(payload)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+
     def test_admin_conf_predicate_is_not_duplicated(self) -> None:
         """Stage 60/90 必须共用同一份 admin.conf 谓词，避免再次漂移。"""
         for script in (INSTALL_CILIUM, FINAL_VERIFY):
@@ -11054,7 +11148,13 @@ class FinalVerifyTest(BootstrapTestCase):
     def cilium_config_json() -> str:
         return CiliumInstallTest.cilium_config_json()
 
-    def node_json(self, *, ready: bool = True, ip: str = '10.93.1.27') -> str:
+    def node_json(
+        self,
+        *,
+        ready: bool = True,
+        name: str = 'retail-test-workflow',
+        ip: str = '10.93.1.27',
+    ) -> str:
         return json.dumps(
             {
                 'apiVersion': 'v1',
@@ -11063,7 +11163,7 @@ class FinalVerifyTest(BootstrapTestCase):
                     {
                         'apiVersion': 'v1',
                         'kind': 'Node',
-                        'metadata': {'name': 'retail-test-workflow'},
+                        'metadata': {'name': name},
                         'status': {
                             'conditions': [
                                 {
@@ -11073,7 +11173,7 @@ class FinalVerifyTest(BootstrapTestCase):
                             ],
                             'addresses': [
                                 {'type': 'InternalIP', 'address': ip},
-                                {'type': 'Hostname', 'address': 'retail-test-workflow'},
+                                {'type': 'Hostname', 'address': name},
                             ],
                         },
                     }
@@ -11561,7 +11661,7 @@ class FinalVerifyTest(BootstrapTestCase):
                 ('--namespace', 'kube-system', 'get', 'pods', '--selector', 'k8s-app=cilium-envoy', '--output=json'): ('envoy-pods', 'FAKE_ENVOY_PODS_JSON'),
                 ('--namespace', 'kube-system', 'get', 'configmap/cilium-config', '--output=json'): ('cilium-config', 'FAKE_CILIUM_CONFIG_JSON'),
                 ('get', 'nodes', '--output=json'): ('nodes', 'FAKE_NODE_JSON'),
-                ('get', '--raw=/api/v1/nodes/retail-test-workflow/proxy/configz'): ('configz', 'FAKE_CONFIGZ_JSON'),
+                ('get', '--raw=/api/v1/nodes/' + os.environ.get('FAKE_NODE_NAME', 'retail-test-workflow') + '/proxy/configz'): ('configz', 'FAKE_CONFIGZ_JSON'),
                 ('get', 'certificatesigningrequests.certificates.k8s.io', '--output=json'): ('csr', 'FAKE_CSR_JSON'),
             }
             kube_proxy = {
@@ -12257,6 +12357,40 @@ class FinalVerifyTest(BootstrapTestCase):
 
                 self.assert_stops_without_evidence(result, host)
                 self.assertIn(f'REASON={expected}', result.stdout)
+
+    def test_registered_second_host_flows_through_verify(self) -> None:
+        environment, _, _ = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        self.write_fixture_host(
+            hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
+            cluster_name='fixture-b',
+        )
+        environment['FAKE_HOSTNAME'] = 'fixture-host-b'
+        environment['FAKE_API_ENDPOINT'] = 'https://10.200.0.2:6443'
+        environment['FAKE_NODE_NAME'] = 'fixture-host-b'
+        environment['FAKE_NODE_IP'] = '10.200.0.2'
+        environment['FAKE_NODE_JSON'] = self.node_json(
+            name=environment['FAKE_NODE_NAME'], ip=environment['FAKE_NODE_IP']
+        )
+        values = json.loads(json.dumps(self.desired_values_object))
+        values['k8sServiceHost'] = environment['FAKE_NODE_IP']
+        environment['FAKE_HELM_VALUES_JSON'] = json.dumps(values)
+        environment['FAKE_CSR_SAN'] = 'DNS:fixture-host-b, IP Address:10.200.0.2'
+        environment['FAKE_CSR_JSON'] = self.csr_json(username='system:node:fixture-host-b')
+        payload = self.admin_config_object()
+        payload['clusters'][0]['name'] = 'fixture-b'
+        payload['clusters'][0]['cluster']['server'] = 'https://10.200.0.2:6443'
+        payload['contexts'][0]['name'] = 'kubernetes-admin@fixture-b'
+        payload['contexts'][0]['context']['cluster'] = 'fixture-b'
+        payload['current-context'] = 'kubernetes-admin@fixture-b'
+        environment['FAKE_ADMIN_VIEW_JSON'] = json.dumps(payload)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
+        self.assertIn('NODE_NAME=fixture-host-b', result.stdout)
+        self.assertIn('CSR_SAN=DNS:fixture-host-b,IP:10.200.0.2', result.stdout)
 
     def test_rejects_package_hold_binary_or_cni_drift(self) -> None:
         for package in ('kubeadm', 'kubectl', 'kubelet', 'kubernetes-cni'):
