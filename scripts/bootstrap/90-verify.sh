@@ -67,6 +67,8 @@ source "${script_dir}/lib/common.sh"
 source "${script_dir}/lib/cni-manifest.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/host-config.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
@@ -1015,9 +1017,10 @@ if [[ "$MODE" != CHECK ]]; then
   complete STOP_PRECONDITION read-only-stage-does-not-accept-apply "$EXIT_PRECONDITION" NONE
 fi
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk cmp date dpkg dpkg-query find grep id mktemp rm rmdir sed sort stat swapon; do
+for required_command in awk cmp date dpkg dpkg-query find grep hostname id mktemp rm rmdir sed sort stat swapon; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
+load_host_config || complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE
 [[ -x "$TAR_BINARY" ]] || complete STOP_PRECONDITION missing-command-tar "$EXIT_PRECONDITION" NONE
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then

@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 
-# kubeadm 依据 bootstrap/kubeadm/init.yaml 的 clusterName 生成 admin.conf 的
-# cluster 与 context 名称，因此这里的固定值必须跟随该 Desired State。
-ADMIN_CONF_CLUSTER_NAME=engineering-platform-dev
-ADMIN_CONF_CONTEXT_NAME=kubernetes-admin@engineering-platform-dev
-ADMIN_CONF_USER_NAME=kubernetes-admin
-ADMIN_CONF_SERVER=https://10.93.1.27:6443
-readonly ADMIN_CONF_CLUSTER_NAME ADMIN_CONF_CONTEXT_NAME
-readonly ADMIN_CONF_USER_NAME ADMIN_CONF_SERVER
+# admin.conf 的 cluster/context 名由 kubeadm 依据 host.env 的 HOST_CLUSTER_NAME 生成，
+# server 由 HOST_NODE_IP 派生；调用方须先完成 load_host_config。
 
 admin_conf_json_is_exact() {
   python_isolated -c '
@@ -102,6 +96,6 @@ try:
         raise ValueError
 except (KeyError, TypeError, ValueError):
     raise SystemExit(1)
-' "$ADMIN_CONF_CLUSTER_NAME" "$ADMIN_CONF_CONTEXT_NAME" \
-    "$ADMIN_CONF_USER_NAME" "$ADMIN_CONF_SERVER" >/dev/null 2>&1
+' "$HOST_CLUSTER_NAME" "kubernetes-admin@${HOST_CLUSTER_NAME}" \
+    kubernetes-admin "https://${HOST_NODE_IP}:6443" >/dev/null 2>&1
 }

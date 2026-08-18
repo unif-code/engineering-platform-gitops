@@ -9182,6 +9182,13 @@ operator:
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
         self.write_executable(
+            fake_bin / 'hostname',
+            '#!/bin/sh\nprintf "%s\\n" "${FAKE_HOSTNAME:-retail-test-workflow}"\n',
+        )
+        hosts_root = directory / 'hosts'
+        hosts_root.mkdir()
+        self.write_fixture_host(hosts_root)
+        self.write_executable(
             fake_bin / 'sha256sum',
             '''
             #!/bin/sh
@@ -9593,6 +9600,7 @@ operator:
                 'HOME': str(home),
                 'BOOTSTRAP_TEST_MODE': '1',
                 'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_HOSTS_DIR': str(hosts_root),
                 'BOOTSTRAP_TEST_VALUES_FILE': str(values),
                 'FAKE_COMMAND_LOG': str(command_log),
                 'FAKE_CANARY': self.canary,
@@ -10293,22 +10301,52 @@ operator:
                     result.stdout,
                 )
 
-    def test_admin_conf_contract_tracks_pinned_cluster_name(self) -> None:
-        """admin.conf 合同必须跟随 init.yaml 的 clusterName，不得各写各的。"""
-        pinned = next(
-            line.split(':', 1)[1].strip()
-            for line in (ROOT / 'bootstrap/hosts/retail-test-workflow/kubeadm-init.yaml')
-            .read_text(encoding='utf-8').splitlines()
-            if line.startswith('clusterName:')
-        )
-        library = (
-            ROOT / 'scripts/bootstrap/lib/admin-conf.sh'
-        ).read_text(encoding='utf-8')
+    def test_admin_conf_contract_is_derived_from_host_config(self) -> None:
+        """admin.conf 合同来自 host.env，lib 与 stage 内不得再写死名字。"""
+        library = (ROOT / 'scripts/bootstrap/lib/admin-conf.sh').read_text(encoding='utf-8')
+        for literal in ('engineering-platform-dev', '10.93.1.27', 'ADMIN_CONF_CLUSTER_NAME='):
+            self.assertNotIn(literal, library)
 
-        self.assertIn(f'ADMIN_CONF_CLUSTER_NAME={pinned}\n', library)
-        self.assertIn(
-            f'ADMIN_CONF_CONTEXT_NAME=kubernetes-admin@{pinned}\n', library
-        )
+        environment, _, _, _ = self.make_environment()
+        hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+        shutil.rmtree(hosts_root / 'retail-test-workflow')
+        self.write_fixture_host(hosts_root, cluster_name='fixture-cluster')
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 30, result.stdout)
+        self.assertIn('REASON=admin-conf-content-or-structure-drift', result.stdout)
+
+    def test_values_semantics_and_endpoint_come_from_host_env(self) -> None:
+        cases = ('pin', 'semantics', 'endpoint')
+        for case in cases:
+            with self.subTest(case=case):
+                environment, _, _, _ = self.make_environment()
+                hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+                retail_pins = (hosts_root / 'retail-test-workflow/pins.sha256').read_text(encoding='utf-8')
+                if case == 'pin':
+                    pins = hosts_root / 'retail-test-workflow/pins.sha256'
+                    pins.write_text(retail_pins.replace('105ca75f', '00000000', 1), encoding='utf-8')
+                    expected_code, expected_reason = 20, 'staged-input-contract-drift'
+                elif case == 'semantics':
+                    # host.env 说 IP 是 .99，但 values 文件与 pins 仍是 retail 的：
+                    # digest 通过，形状比对必须按 .99 拒绝。
+                    shutil.rmtree(hosts_root / 'retail-test-workflow')
+                    host_dir = self.write_fixture_host(hosts_root, node_ip='10.93.1.99')
+                    (host_dir / 'pins.sha256').write_text(retail_pins, encoding='utf-8')
+                    expected_code, expected_reason = 20, 'staged-input-contract-drift'
+                else:
+                    # values 与 pins 一致地换成 .99，staged inputs 通过；
+                    # admin.conf fixture 仍是 .27 → 谓词按 .99 拒绝。
+                    shutil.rmtree(hosts_root / 'retail-test-workflow')
+                    host_dir = self.write_fixture_host(hosts_root, node_ip='10.93.1.99')
+                    environment['BOOTSTRAP_TEST_VALUES_FILE'] = str(host_dir / 'cilium-values.yaml')
+                    expected_code, expected_reason = 30, 'admin-conf-content-or-structure-drift'
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, expected_code, result.stdout)
+                self.assertIn(f'REASON={expected_reason}', result.stdout)
 
     def test_admin_conf_predicate_is_not_duplicated(self) -> None:
         """Stage 60/90 必须共用同一份 admin.conf 谓词，避免再次漂移。"""
@@ -11200,6 +11238,13 @@ class FinalVerifyTest(BootstrapTestCase):
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
         self.write_executable(
+            fake_bin / 'hostname',
+            '#!/bin/sh\nprintf "%s\\n" "${FAKE_HOSTNAME:-retail-test-workflow}"\n',
+        )
+        hosts_root = directory / 'hosts'
+        hosts_root.mkdir()
+        self.write_fixture_host(hosts_root)
+        self.write_executable(
             fake_bin / 'systemctl',
             '''
             #!/bin/sh
@@ -11636,6 +11681,7 @@ class FinalVerifyTest(BootstrapTestCase):
                 'HOME': str(home),
                 'BOOTSTRAP_TEST_MODE': '1',
                 'BOOTSTRAP_TEST_ROOT': str(host),
+                'BOOTSTRAP_TEST_HOSTS_DIR': str(hosts_root),
                 'BOOTSTRAP_TEST_LOCK_FILE': str(lock),
                 'BOOTSTRAP_TEST_APPROVED_LOCK_FILE': str(approved_lock),
                 'FAKE_COMMAND_LOG': str(command_log),

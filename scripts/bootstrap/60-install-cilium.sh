@@ -57,11 +57,12 @@ else
 fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-repo_root=$(cd "${script_dir}/../.." && pwd -P)
-# shellcheck disable=SC1091
-source "${script_dir}/lib/admin-conf.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/host-config.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/admin-conf.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
 
@@ -75,8 +76,6 @@ readonly GATEWAY_MANIFEST_NAME=standard-install.yaml
 readonly GATEWAY_MANIFEST_SHA256=24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73
 readonly CILIUM_CHART_NAME=cilium-1.20.0.tgz
 readonly CILIUM_CHART_SHA256=c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883
-readonly VALUES_SHA256=105ca75fdefc07a32a1b944ad749baf0e66b2b2437dbe0ab995c323f71cdd887
-readonly VALUES_FILE="${repo_root}/bootstrap/hosts/retail-test-workflow/cilium-values.yaml"
 readonly PYTHON_BINARY=/usr/bin/python3
 readonly TAR_BINARY=/usr/bin/tar
 readonly FIELD_MANAGER=engineering-platform-bootstrap
@@ -151,12 +150,13 @@ safe_file_with_digest() {
 }
 
 values_semantics_are_exact() {
-  python_isolated - "$1" <<'PY' >/dev/null 2>&1
+  python_isolated - "$1" "$HOST_NODE_IP" <<'PY' >/dev/null 2>&1
 import pathlib
 import sys
 
-expected = """kubeProxyReplacement: true
-k8sServiceHost: 10.93.1.27
+node_ip = sys.argv[2]
+expected = f"""kubeProxyReplacement: true
+k8sServiceHost: {node_ip}
 k8sServicePort: 6443
 
 cgroup:
@@ -296,7 +296,7 @@ api_endpoint_is_exact() {
   local output
   output=$(kubectl_run config view --minify \
     '--output=jsonpath={.clusters[0].cluster.server}' 2>/dev/null) || return 1
-  [[ "$output" == 'https://10.93.1.27:6443' ]]
+  [[ "$output" == "https://${HOST_NODE_IP}:6443" ]]
 }
 
 helm_parent_and_shadows_gate() {
@@ -968,7 +968,7 @@ import sys
 
 expected = {
     "kubeProxyReplacement": True,
-    "k8sServiceHost": "10.93.1.27",
+    "k8sServiceHost": sys.argv[1],
     "k8sServicePort": 6443,
     "cgroup": {
         "autoMount": {"enabled": False},
@@ -1023,7 +1023,7 @@ try:
 except (TypeError, ValueError):
     raise SystemExit(1)
 raise SystemExit(0 if exactly_equal(actual, expected) else 1)
-' >/dev/null 2>&1
+' "$HOST_NODE_IP" >/dev/null 2>&1
 }
 
 helm_release_state() {
@@ -1111,7 +1111,7 @@ load_cluster_state() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk chmod cmp date dirname dpkg dpkg-query grep id install ln mktemp rm rmdir stat sync; do
+for required_command in awk chmod cmp date dirname dpkg dpkg-query grep hostname id install ln mktemp rm rmdir stat sync; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE
@@ -1119,6 +1119,14 @@ done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   complete STOP_PRECONDITION missing-command-sha256 "$EXIT_PRECONDITION" NONE
 fi
+
+# 主机身份与 values digest 唯一来源：bootstrap/hosts/<hostname>/。
+# 必须排在 required_command（含 hostname）之后、任何读取 HOST_* 的谓词之前。
+load_host_config || complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
+VALUES_SHA256=$(host_pin cilium-values.yaml) ||
+  complete STOP_SUPPLY_CHAIN_MISMATCH host-pins-invalid "$EXIT_SUPPLY_CHAIN" NONE
+readonly VALUES_SHA256
+readonly VALUES_FILE="${HOST_CONFIG_DIR}/cilium-values.yaml"
 
 staged_root=$(host_path "$STAGED_ROOT")
 helm_archive="${staged_root}/${HELM_ARCHIVE_NAME}"
@@ -1246,6 +1254,8 @@ cleanup_apply_state || complete STOP_UNKNOWN_STATE apply-temporary-cleanup-unsaf
 trap - EXIT
 evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 13-cilium "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
+log_evidence "HOST_NAME=${HOST_NAME}"
+log_evidence "HOST_NODE_IP=${HOST_NODE_IP}"
 log_evidence HELM_VERSION=v3.21.0
 log_evidence GATEWAY_API_BUNDLE=v1.6.1-standard
 log_evidence GATEWAY_FIELD_MANAGER="$FIELD_MANAGER"
