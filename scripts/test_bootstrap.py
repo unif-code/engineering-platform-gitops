@@ -10027,6 +10027,14 @@ operator:
                 self.assertIn('lib/admin-conf.sh', text)
                 self.assertNotIn('admin_conf_json_is_exact() {', text)
 
+    def test_cni_manifest_is_not_duplicated(self) -> None:
+        """Stage 40/90 必须共用同一份 CNI payload 锁定清单，避免再次漂移。"""
+        for script in (INSTALL_KUBERNETES, FINAL_VERIFY):
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding='utf-8')
+                self.assertIn('lib/cni-manifest.sh', text)
+                self.assertNotIn('cni_manifest() {', text)
+
     def test_all_cluster_clients_use_validated_in_memory_admin_config(self) -> None:
         environment, host, command_log, _ = self.make_environment()
 
@@ -10764,7 +10772,8 @@ class FinalVerifyTest(BootstrapTestCase):
         spec: dict[str, object] = {
             'signerName': 'kubernetes.io/kubelet-serving',
             'username': 'system:node:retail-test-workflow',
-            'usages': ['server auth', 'digital signature', 'key encipherment'],
+            # 服务器实测：ECDSA serving 证书不请求 key encipherment。
+            'usages': ['server auth', 'digital signature'],
             'request': 'ZmFrZS1jc3ItcmVxdWVzdA==',
         }
         spec.update(overrides)
@@ -11467,6 +11476,9 @@ class FinalVerifyTest(BootstrapTestCase):
         self.assertIn('NEXT=NONE', result.stdout)
         self.assertIn('CSR_COUNT=1', result.stdout)
         self.assertIn('CSR_NAME=csr-serving-fixture', result.stdout)
+        self.assertIn(
+            'CSR_USAGES=digital signature,server auth', result.stdout
+        )
         self.assertIn(
             'CSR_SAN=DNS:retail-test-workflow,IP:10.93.1.27', result.stdout
         )
@@ -12245,7 +12257,10 @@ class FinalVerifyTest(BootstrapTestCase):
         self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
 
     def test_csr_summary_is_strict_and_never_leaks_request_or_certificate(self) -> None:
-        for case in ('requester', 'usages', 'san', 'malformed'):
+        for case in (
+            'requester', 'usages', 'stale-usages', 'extra-usage',
+            'san', 'malformed',
+        ):
             with self.subTest(case=case):
                 environment, host, _ = self.make_environment()
                 if case == 'requester':
@@ -12255,6 +12270,19 @@ class FinalVerifyTest(BootstrapTestCase):
                 elif case == 'usages':
                     environment['FAKE_CSR_JSON'] = self.csr_json(
                         usages=['server auth']
+                    )
+                elif case == 'stale-usages':
+                    environment['FAKE_CSR_JSON'] = self.csr_json(
+                        usages=[
+                            'server auth', 'digital signature',
+                            'key encipherment',
+                        ]
+                    )
+                elif case == 'extra-usage':
+                    environment['FAKE_CSR_JSON'] = self.csr_json(
+                        usages=[
+                            'server auth', 'digital signature', 'client auth',
+                        ]
                     )
                 elif case == 'san':
                     environment['FAKE_CSR_SAN'] = (

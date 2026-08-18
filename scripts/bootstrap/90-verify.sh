@@ -64,6 +64,8 @@ source "${script_dir}/lib/admin-conf.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/cni-manifest.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
@@ -232,31 +234,6 @@ managed_clients_are_exact() {
     [[ ! -e "$shadow" && ! -L "$shadow" ]] || return 1
   done
   [[ -x "$crictl_binary" ]] && safe_file "$crictl_binary" 755
-}
-
-cni_manifest() {
-  cat <<'EOF'
-LICENSE	644	11357	b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1
-README.md	644	2343	43c32d29316a4a9fe23af500917bd89e51d6a84fa0dcbfcc75b5fbd834c3145a
-bandwidth	755	5042926	01c59cee777ade0608361d94bf3bfe01bda82bc8da276d8be917e225aa660639
-bridge	755	5698763	3553f5e8f47ed62aec728ab6f7444f6bf1624f916769852c6deb52cd216e22ba
-dhcp	755	13725422	bf0552ff2ef54fbd8846b21ffe149f4de63dcd98d86d6b91de5e0bd94473870d
-dummy	755	5251069	88f9c9d018681a2b806db2c33184a0a4a532773cb71a60e975a9bf2f017199f6
-firewall	755	5702145	ecbd112d77192a125e85ab1fa4ded6cfaf4e9732172e072ee248caa81eba7aed
-host-device	755	5159967	a891bd77c5e25b6c4dfa65c8b78cf7f0a00be5ba5d5bbeccd902c08d7f0ea7f3
-host-local	755	4350778	ac5ff19b1120bd1d58203b20d45165f244691fcf9776ba55d6dd1747f043c90f
-ipvlan	755	5274322	40ceded59770a0f28e7a45a0ed5f8c49044e786bc728f34d6c9de7bc5d3fb660
-loopback	755	4302030	02956bdd03b9b71693b3efd72afce88384e4472b644a1c6410fe817f618c1a83
-macvlan	755	5307111	33d2730d229dea786c56465a1a96db84ca27b3d5ac552bbc9aa5cdc942622814
-portmap	755	5108385	10cc11a28d9c16465889eb59968be76cf04fa884939edf70c27b722cec2c0156
-ptp	755	5475470	1cbbce28e96accfef5fe6021762a55ad2b114705f410b8837361a201df6c0b03
-sbr	755	4525826	bb886c24182afbad535f158b585524b08a9f1cf0618679987d6b0e11ebf50bb5
-static	755	3776708	7bf980bedb303f6d314239413fd4aca5479a9affcd38509057ae203b0da67058
-tap	755	5453308	ebff11573fa4ed5793cc08776b8811a3c0f44705b2b530fd5014e6bf69275c1a
-tuning	755	4389084	4659e9129d8c669c21c932cd778dc1ac17a717d100768ea23242883401cbb536
-vlan	755	5267679	5f6973d15ad2b0d44d1dc0e59982ed05e34e4709630ecd367f766202f9034ac8
-vrf	755	4685012	3f3363182c4777bd0d3ead028147f9ecebd60bb32f2d47b7c181877a00ae049b
-EOF
 }
 
 cni_payload_is_exact() {
@@ -973,8 +950,9 @@ try:
             raise ValueError
         if not isinstance(created, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", created):
             raise ValueError
-        expected = {"digital signature", "key encipherment", "server auth"}
-        if requester != "system:node:retail-test-workflow" or not isinstance(usages, list) or len(usages) != 3 or set(usages) != expected:
+        # kubelet 的 ECDSA serving 证书不请求 key encipherment（仅 RSA 密钥传输需要）。
+        expected = {"digital signature", "server auth"}
+        if requester != "system:node:retail-test-workflow" or not isinstance(usages, list) or len(usages) != 2 or set(usages) != expected:
             raise ValueError
         if not isinstance(request, str) or not request or "\t" in request or "\n" in request:
             raise ValueError
