@@ -336,7 +336,8 @@ helm_cluster_run() {
 }
 
 # trap 间接调用；只删除 /root 下本进程建立的 .helm-kubeconfig.* 目录。
-# shellcheck disable=SC2329
+# 静态检查 0.9 报 SC2317（不可达）、0.11 报 SC2329（未调用），均为 trap 间接调用的误报。
+# shellcheck disable=SC2317,SC2329
 cleanup_helm_kubeconfig() {
   local parent
   [[ -n "$helm_kubeconfig_dir" ]] || return 0
