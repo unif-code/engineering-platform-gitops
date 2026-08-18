@@ -12224,6 +12224,40 @@ class FinalVerifyTest(BootstrapTestCase):
             script,
         )
 
+    def test_verify_stops_on_unregistered_host(self) -> None:
+        environment, host, _ = self.make_environment()
+        environment['FAKE_HOSTNAME'] = 'wrong-host'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 10, result.stdout)
+        self.assertIn('RESULT=STOP_PRECONDITION', result.stdout)
+        self.assertIn('REASON=host-not-registered', result.stdout)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('14-verify-*.txt')), []
+        )
+
+    def test_node_csr_and_swap_contracts_come_from_host_env(self) -> None:
+        """把 host.env 的值改掉后，对应 gate 必须按新值拒绝原 fixture。"""
+        cases = (
+            ('node-name', {'name': 'fixture-host-b'}, 'node-readiness-or-address-drift'),
+            ('node-ip', {'node_ip': '10.93.1.99'}, 'admin-conf-content-or-structure-drift'),
+            ('swap-range', {'swap_min': 1000, 'swap_max': 2000}, 'swap-contract-drift'),
+        )
+        for case, overrides, expected in cases:
+            with self.subTest(case=case):
+                environment, host, _ = self.make_environment()
+                hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
+                shutil.rmtree(hosts_root / 'retail-test-workflow')
+                name = overrides.get('name', 'retail-test-workflow')
+                self.write_fixture_host(hosts_root, **overrides)
+                environment['FAKE_HOSTNAME'] = name
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+                self.assertIn(f'REASON={expected}', result.stdout)
+
     def test_rejects_package_hold_binary_or_cni_drift(self) -> None:
         for package in ('kubeadm', 'kubectl', 'kubelet', 'kubernetes-cni'):
             with self.subTest(package=package):

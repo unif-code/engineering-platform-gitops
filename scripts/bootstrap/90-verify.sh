@@ -73,8 +73,6 @@ source "${script_dir}/lib/host-config.sh"
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
 readonly PHASE=verify
-readonly EXPECTED_NODE=retail-test-workflow
-readonly EXPECTED_NODE_IP=10.93.1.27
 readonly CRI_ENDPOINT=unix:///run/containerd/containerd.sock
 readonly STAGED_ROOT=/root/dev-infra-artifacts/pcs-2026-08-10.1
 readonly HELM_ARCHIVE_NAME=helm-v3.21.0-linux-amd64.tar.gz
@@ -441,7 +439,7 @@ api_is_exact_and_ready() {
   local output
   output=$(kubectl_run config view --minify \
     '--output=jsonpath={.clusters[0].cluster.server}' 2>/dev/null) || return 1
-  [[ "$output" == 'https://10.93.1.27:6443' ]] || return 1
+  [[ "$output" == "https://${HOST_NODE_IP}:6443" ]] || return 1
   output=$(kubectl_run get --raw=/readyz 2>/dev/null) || return 1
   [[ "$output" == ok ]]
 }
@@ -469,7 +467,7 @@ import sys
 
 expected = {
     "kubeProxyReplacement": True,
-    "k8sServiceHost": "10.93.1.27",
+    "k8sServiceHost": sys.argv[1],
     "k8sServicePort": 6443,
     "cgroup": {
         "autoMount": {"enabled": False},
@@ -524,7 +522,7 @@ try:
 except (TypeError, ValueError):
     raise SystemExit(1)
 raise SystemExit(0 if exactly_equal(actual, expected) else 1)
-' >/dev/null 2>&1
+' "$HOST_NODE_IP" >/dev/null 2>&1
 }
 
 helm_release_is_exact() {
@@ -890,30 +888,30 @@ try:
     ready = [entry for entry in conditions if isinstance(entry, dict) and entry.get("type") == "Ready"] if isinstance(conditions, list) else []
     internal = [entry.get("address") for entry in addresses if isinstance(entry, dict) and entry.get("type") == "InternalIP"] if isinstance(addresses, list) else []
     valid = (
-        isinstance(metadata, dict) and metadata.get("name") == "retail-test-workflow" and
+        isinstance(metadata, dict) and metadata.get("name") == sys.argv[1] and
         len(ready) == 1 and ready[0].get("status") == "True" and
-        internal == ["10.93.1.27"]
+        internal == [sys.argv[2]]
     )
 except (TypeError, ValueError):
     valid = False
 raise SystemExit(0 if valid else 1)
-' >/dev/null 2>&1
+' "$HOST_NAME" "$HOST_NODE_IP" >/dev/null 2>&1
 }
 
 swap_is_exact() {
   local output lines name bytes
-  safe_file "$(host_path /swap.img)" 600 || return 1
+  safe_file "$(host_path "$HOST_SWAP_FILE")" 600 || return 1
   output=$(swapon --show=NAME,SIZE --noheadings --raw --bytes 2>/dev/null) || return 1
   lines=$(printf '%s\n' "$output" | awk 'NF {count++} END {print count+0}')
   name=$(printf '%s\n' "$output" | awk 'NF {print $1}')
   bytes=$(printf '%s\n' "$output" | awk 'NF {print $2}')
-  [[ "$lines" == 1 && "$name" == /swap.img && "$bytes" =~ ^[0-9]+$ ]] || return 1
-  (( bytes >= 4000000000 && bytes <= 4400000000 ))
+  [[ "$lines" == 1 && "$name" == "$HOST_SWAP_FILE" && "$bytes" =~ ^[0-9]+$ ]] || return 1
+  (( bytes >= HOST_SWAP_MIN_BYTES && bytes <= HOST_SWAP_MAX_BYTES ))
 }
 
 kubelet_swap_config_is_exact() {
   kubectl_run get \
-    --raw="/api/v1/nodes/${EXPECTED_NODE}/proxy/configz" 2>/dev/null |
+    --raw="/api/v1/nodes/${HOST_NAME}/proxy/configz" 2>/dev/null |
     python_isolated -c '
 import json
 import sys
@@ -969,7 +967,7 @@ try:
             raise ValueError
         # kubelet 的 ECDSA serving 证书不请求 key encipherment（仅 RSA 密钥传输需要）。
         expected = {"digital signature", "server auth"}
-        if requester != "system:node:retail-test-workflow" or not isinstance(usages, list) or len(usages) != 2 or set(usages) != expected:
+        if requester != "system:node:" + sys.argv[1] or not isinstance(usages, list) or len(usages) != 2 or set(usages) != expected:
             raise ValueError
         if not isinstance(request, str) or not request or "\t" in request or "\n" in request:
             raise ValueError
@@ -977,7 +975,7 @@ try:
         print("\t".join((name, created, requester, ",".join(sorted(expected)), request)))
 except (TypeError, ValueError):
     raise SystemExit(1)
-') || return 1
+' "$HOST_NAME") || return 1
   while IFS=$'\t' read -r name created requester usages request; do
     [[ -n "$name" ]] || continue
     san_text=$(
@@ -994,11 +992,11 @@ for index, line in enumerate(lines):
         if index + 1 >= len(lines):
             raise SystemExit(1)
         values.extend(part.strip() for part in lines[index + 1].strip().split(","))
-if sorted(values) != ["DNS:retail-test-workflow", "IP Address:10.93.1.27"]:
+if sorted(values) != ["DNS:" + sys.argv[1], "IP Address:" + sys.argv[2]]:
     raise SystemExit(1)
-print("DNS:retail-test-workflow,IP:10.93.1.27")
-' 2>/dev/null) || return 1
-    [[ "$san_marker" == 'DNS:retail-test-workflow,IP:10.93.1.27' ]] || return 1
+print("DNS:" + sys.argv[1] + ",IP:" + sys.argv[2])
+' "$HOST_NAME" "$HOST_NODE_IP" 2>/dev/null) || return 1
+    [[ "$san_marker" == "DNS:${HOST_NAME},IP:${HOST_NODE_IP}" ]] || return 1
     CSR_SUMMARIES+=(
       "CSR_NAME=${name}"
       "CSR_CREATION_TIMESTAMP=${created}"
@@ -1063,10 +1061,12 @@ csr_summaries_are_safe || complete STOP_VERIFY_FAILED kubelet-serving-csr-drift 
 
 evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 14-verify "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
+log_evidence HOST_NAME="$HOST_NAME"
+log_evidence HOST_NODE_IP="$HOST_NODE_IP"
 log_evidence KUBERNETES_VERSION=1.36.3
 log_evidence KUBERNETES_PACKAGES=kubeadm,kubectl,kubelet,kubernetes-cni
 log_evidence CRI_RUNTIME_READY=true
-log_evidence API_ENDPOINT=10.93.1.27:6443
+log_evidence API_ENDPOINT="${HOST_NODE_IP}:6443"
 log_evidence KUBE_PROXY_OBJECTS=absent
 log_evidence HELM_RELEASE=kube-system/cilium
 log_evidence HELM_CHART=cilium-1.20.0
@@ -1074,11 +1074,11 @@ log_evidence CILIUM_VERSION=1.20.0
 log_evidence CILIUM_DAEMONSET_READY=true
 log_evidence CILIUM_OPERATOR_READY=true
 log_evidence GATEWAY_API_BUNDLE=v1.6.1-standard
-log_evidence NODE_NAME="$EXPECTED_NODE"
+log_evidence NODE_NAME="$HOST_NAME"
 log_evidence NODE_READY=true
-log_evidence NODE_INTERNAL_IP="$EXPECTED_NODE_IP"
-log_evidence SWAP_DEVICE=/swap.img
-log_evidence SWAP_BYTES=4000000000-4400000000
+log_evidence NODE_INTERNAL_IP="$HOST_NODE_IP"
+log_evidence SWAP_DEVICE="$HOST_SWAP_FILE"
+log_evidence SWAP_BYTES="${HOST_SWAP_MIN_BYTES}-${HOST_SWAP_MAX_BYTES}"
 log_evidence KUBELET_FAIL_SWAP_ON=false
 log_evidence KUBELET_SWAP_BEHAVIOR=NoSwap
 if (( CSR_COUNT > 0 )); then
