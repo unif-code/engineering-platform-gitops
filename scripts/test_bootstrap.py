@@ -577,7 +577,7 @@ class PreflightTest(BootstrapTestCase):
             fake_bin / 'swapon',
             '''
             #!/bin/sh
-            printf '/swap.img 4294963200\n'
+            printf '%s\n' "${FAKE_SWAP_OUTPUT:-/swap.img 4294963200}"
             ''',
         )
         self.write_executable(
@@ -744,11 +744,13 @@ class PreflightTest(BootstrapTestCase):
         self.write_fixture_host(
             hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
             cluster_name='fixture-b', pod_cidr='10.244.0.0/16',
-            service_cidr='10.96.0.0/12', swap_file='/swap.img',
-            swap_min=4000000000, swap_max=4400000000,
+            service_cidr='10.96.0.0/12', swap_file='/swap-b.img',
+            swap_min=3000000000, swap_max=3400000000,
         )
+        (host / 'swap-b.img').write_bytes(b'')
         environment['FAKE_HOSTNAME'] = 'fixture-host-b'
         environment['FAKE_NODE_IP'] = '10.200.0.2'
+        environment['FAKE_SWAP_OUTPUT'] = '/swap-b.img 3221225472'
 
         result = self.run_command(['/bin/bash', str(PREFLIGHT), '--check'], env=environment)
 
@@ -758,6 +760,7 @@ class PreflightTest(BootstrapTestCase):
         self.assertIn('HOSTNAME=fixture-host-b', evidence)
         self.assertIn('NODE_IP=10.200.0.2', evidence)
         self.assertIn('POD_CIDR=10.244.0.0/16', evidence)
+        self.assertIn('SWAP=/swap-b.img', evidence)
 
     def test_accepts_canonical_ubuntu_os_release_symlink(self) -> None:
         environment, host = self.make_environment()
@@ -7250,15 +7253,18 @@ class KubeadmInitTest(BootstrapTestCase):
                 self.assertIn('REASON=host-pins-invalid', result.stdout)
 
     def test_registered_second_host_flows_through_kubeadm_check(self) -> None:
-        environment, _, _ = self.make_environment()
+        environment, host, _ = self.make_environment()
         hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
         host_dir = self.write_fixture_host(
             hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
             cluster_name='fixture-b', pod_cidr='10.244.0.0/16',
-            service_cidr='10.96.0.0/12',
+            service_cidr='10.96.0.0/12', swap_file='/swap-b.img',
+            swap_min=3000000000, swap_max=3400000000,
         )
+        (host / 'swap-b.img').write_bytes(b'preserve swap\n')
         environment['FAKE_HOSTNAME'] = 'fixture-host-b'
         environment['FAKE_NODE_IP'] = '10.200.0.2'
+        environment['FAKE_SWAP_OUTPUT'] = '/swap-b.img 3221225472'
         environment['BOOTSTRAP_TEST_CONFIG_FILE'] = str(host_dir / 'kubeadm-init.yaml')
 
         result = self.run_stage(environment)
@@ -12359,12 +12365,17 @@ class FinalVerifyTest(BootstrapTestCase):
                 self.assertIn(f'REASON={expected}', result.stdout)
 
     def test_registered_second_host_flows_through_verify(self) -> None:
-        environment, _, _ = self.make_environment()
+        environment, host, _ = self.make_environment()
         hosts_root = Path(environment['BOOTSTRAP_TEST_HOSTS_DIR'])
         self.write_fixture_host(
             hosts_root, name='fixture-host-b', node_ip='10.200.0.2',
-            cluster_name='fixture-b',
+            cluster_name='fixture-b', swap_file='/swap-b.img',
+            swap_min=3000000000, swap_max=3400000000,
         )
+        swap_file = host / 'swap-b.img'
+        swap_file.write_text('swap fixture\n', encoding='utf-8')
+        swap_file.chmod(0o600)
+        environment['FAKE_SWAP_OUTPUT'] = '/swap-b.img 3221225472'
         environment['FAKE_HOSTNAME'] = 'fixture-host-b'
         environment['FAKE_API_ENDPOINT'] = 'https://10.200.0.2:6443'
         environment['FAKE_NODE_NAME'] = 'fixture-host-b'
@@ -12391,6 +12402,7 @@ class FinalVerifyTest(BootstrapTestCase):
         self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
         self.assertIn('NODE_NAME=fixture-host-b', result.stdout)
         self.assertIn('CSR_SAN=DNS:fixture-host-b,IP:10.200.0.2', result.stdout)
+        self.assertIn('SWAP_DEVICE=/swap-b.img', result.stdout)
 
     def test_rejects_package_hold_binary_or_cni_drift(self) -> None:
         for package in ('kubeadm', 'kubectl', 'kubelet', 'kubernetes-cni'):
