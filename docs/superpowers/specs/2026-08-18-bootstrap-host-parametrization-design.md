@@ -135,9 +135,9 @@ Stage 50 读第一行代替 `CONFIG_SHA256`；Stage 60 读第二行代替 `VALUE
 
 pins.sha256 **缺失**不会走到 `host-pins-invalid`：目录合同要求文件集精确为 4 个，缺文件在 `load_host_config` 阶段即以 `STOP_PRECONDITION host-config-unsafe` / 10 失败。
 
-`--check` 保持零写入，唯一的文档化例外是 Stage 60/90 的 helm kubeconfig：helm 3.21 无法从管道读取 kubeconfig，CHECK 期间会在 `/root/.helm-kubeconfig.XXXXXX/config`（0700 目录、0600 文件，内容仅为已校验的 admin.conf 字节）建立私有临时文件，helm 返回后立即删除，并由 EXIT trap 保证被信号中断时同样删除。上次运行被中断留下的残留 fail-closed：Stage 60 报 `STOP_UNKNOWN_STATE helm-kubeconfig-residue` / 30，Stage 90 报 `STOP_VERIFY_FAILED helm-kubeconfig-residue` / 50；只检测不自动删除，由运维检查后手工清理。
+`--check` 保持零写入，唯一的文档化例外是 Stage 60/90 的 helm kubeconfig：helm 3.21 无法从管道读取 kubeconfig，CHECK 期间会在 `/root/.helm-kubeconfig.XXXXXX/config`（0700 目录、0600 文件，内容仅为已校验的 admin.conf 字节）建立私有临时文件，helm 返回后立即删除；被信号中断时由 EXIT trap 尽力删除（`mktemp` 与 trap 安装之间的极短窗口无法覆盖），因此启动时的残留检测是最终兜底。上次运行被中断留下的残留 fail-closed：Stage 60 报 `STOP_UNKNOWN_STATE helm-kubeconfig-residue` / 30，Stage 90 报 `STOP_VERIFY_FAILED helm-kubeconfig-residue` / 50；只检测不自动删除，由运维检查后手工清理。
 
-加载了 host config 的 stage 在 evidence 中记录 `HOST_NAME=`、`HOST_NODE_IP=`；Stage 00 另行保留其既有的 `HOSTNAME=`、`NODE_IP=` evidence 键（Stage 50/60/90 新增 `HOST_NAME=`、`HOST_NODE_IP=`）。evidence 保持纯 ASCII。
+Stage 50/60/90 在 evidence 中记录 `HOST_NAME=`、`HOST_NODE_IP=`；Stage 00 沿用其既有的 `HOSTNAME=`、`NODE_IP=` evidence 键，不另加新键。evidence 保持纯 ASCII。
 
 ## Test strategy
 
