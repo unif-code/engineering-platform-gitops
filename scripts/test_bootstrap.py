@@ -9203,7 +9203,7 @@ operator:
                 elif Path(os.environ['FAKE_GATEWAY_MARKER']).exists():
                     path = os.environ['FAKE_GATEWAY_EXACT_JSON']
                 else:
-                    print('{"apiVersion":"v1","kind":"List","items":[]}')
+                    # 真实 kubectl：按名字 get 且全部不存在时，--ignore-not-found 不打印任何字节。
                     raise SystemExit(0)
                 sys.stdout.write(Path(path).read_text(encoding='utf-8'))
                 raise SystemExit(0)
@@ -9266,7 +9266,7 @@ operator:
                 elif Path(os.environ['FAKE_CILIUM_MARKER']).exists():
                     path = os.environ['FAKE_CILIUM_EXACT_JSON']
                 else:
-                    print('{"apiVersion":"v1","kind":"List","items":[]}')
+                    # 真实 kubectl：按名字 get 且全部不存在时，--ignore-not-found 不打印任何字节。
                     raise SystemExit(0)
                 sys.stdout.write(Path(path).read_text(encoding='utf-8'))
                 raise SystemExit(0)

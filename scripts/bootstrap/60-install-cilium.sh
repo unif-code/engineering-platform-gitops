@@ -579,7 +579,13 @@ gateway_bundle_state() {
     printf 'UNKNOWN\n'
     return
   }
-  parsed=$(printf '%s' "$output" | gateway_json_state) || parsed=UNKNOWN
+  # 按名字 get 且全部不存在时 kubectl 不输出任何字节；空输出即 MISSING，
+  # 再由 server-side diff 交叉确认。
+  if [[ -z "$output" ]]; then
+    parsed=MISSING
+  else
+    parsed=$(printf '%s' "$output" | gateway_json_state) || parsed=UNKNOWN
+  fi
   [[ "$parsed" == MISSING || "$parsed" == COMPLIANT ]] || {
     printf 'UNKNOWN\n'
     return
@@ -742,6 +748,10 @@ cilium_workload_state() {
   output=$(kubectl_run --namespace kube-system get \
     daemonset/cilium deployment/cilium-operator --ignore-not-found --output=json 2>/dev/null) || {
     printf 'UNKNOWN\n'
+    return
+  }
+  [[ -n "$output" ]] || {
+    printf 'MISSING\n'
     return
   }
   parsed=$(printf '%s' "$output" | cilium_workload_json_state) || parsed=UNKNOWN
