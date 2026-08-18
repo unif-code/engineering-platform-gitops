@@ -184,10 +184,16 @@ class HostConfigTest(BootstrapTestCase):
         'HOST_SWAP_MAX_BYTES=4400000000\n'
     )
 
-    def run_parse(self, content: str) -> subprocess.CompletedProcess[str]:
-        directory = self.temporary_directory()
-        target = directory / 'host.env'
-        target.write_bytes(content.encode('utf-8'))
+    def run_parse(
+        self, content: str = '', *, path: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """path 为空时把 content 写进临时 host.env；否则直接解析给定文件。"""
+        if path is None:
+            directory = self.temporary_directory()
+            target = directory / 'host.env'
+            target.write_bytes(content.encode('utf-8'))
+        else:
+            target = path
         body = (
             'set -u\n'
             'if host_env_parse "$2"; then\n'
@@ -273,6 +279,52 @@ class HostConfigTest(BootstrapTestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, 'ERROR=host-config-invalid\n')
 
+    def test_shipped_host_env_parses_with_bash_loader(self) -> None:
+        """仓库里发货的 host.env 必须被 bash 解析器逐值接受。"""
+        result = self.run_parse(path=self.HOST_TEMPLATE_DIR / 'host.env')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'retail-test-workflow|10.93.1.27|engineering-platform-dev|'
+            '172.21.0.0/16|172.20.0.0/16|/swap.img|4000000000|4400000000\n',
+        )
+
+    def test_load_reports_unreadable_hostname(self) -> None:
+        """hostname 读不出来时必须是 hostname-unreadable，不得降级成其他 reason。"""
+        directory = self.temporary_directory()
+        hosts_root = directory / 'hosts'
+        hosts_root.mkdir()
+        self.write_fixture_host(hosts_root)
+        fake_bin = directory / 'bin'
+        fake_bin.mkdir()
+        fake_hostname = fake_bin / 'hostname'
+        fake_hostname.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+        fake_hostname.chmod(0o755)
+        body = (
+            'set -u\n'
+            'if load_host_config; then\n'
+            '  printf "LOADED=%s\\n" "$HOST_NAME"\n'
+            'else\n'
+            '  printf "ERROR=%s\\n" "$HOST_CONFIG_ERROR"\n'
+            '  exit 1\n'
+            'fi\n'
+        )
+
+        result = self.run_command(
+            ['/bin/bash', '-c', f'source "$1"\n{body}', 'test-host-config',
+             str(HOST_CONFIG)],
+            env={
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'LC_ALL': 'C',
+                'BOOTSTRAP_TEST_MODE': '1',
+                'BOOTSTRAP_TEST_HOSTS_DIR': str(hosts_root),
+            },
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, 'ERROR=hostname-unreadable\n')
+
     def test_stage_scripts_contain_no_host_literals(self) -> None:
         """主机身份只能出现在 bootstrap/hosts/ 与测试文件里。"""
         forbidden = (
@@ -281,11 +333,12 @@ class HostConfigTest(BootstrapTestCase):
             'EXPECTED_NODE_IP=', 'EXPECTED_NODE=', '/swap.img',
             '4000000000', '4400000000', '172.20.0.0/16', '172.21.0.0/16',
         )
-        scripts = sorted(
-            list((ROOT / 'scripts/bootstrap').glob('*.sh'))
-            + list((ROOT / 'scripts/bootstrap/lib').glob('*.sh'))
-            + [ROOT / 'scripts/bootstrap/check_cidrs.py']
+        # 递归收集：新增子目录或新脚本自动纳入，不依赖手写清单。
+        scripts = (
+            sorted((ROOT / 'scripts/bootstrap').rglob('*.sh'))
+            + sorted((ROOT / 'scripts/bootstrap').rglob('*.py'))
         )
+        self.assertGreaterEqual(len(scripts), 18, scripts)
         for script in scripts:
             text = script.read_text(encoding='utf-8')
             for literal in forbidden:
@@ -8789,7 +8842,9 @@ operator:
                 import json
                 import os
                 from pathlib import Path
+                import signal
                 import sys
+                import time
 
                 args = sys.argv[1:]
                 with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
@@ -8817,6 +8872,11 @@ operator:
                     raise SystemExit(64)
                 if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT'] or supplied_again != supplied:
                     raise SystemExit(64)
+                if os.environ.get('FAKE_HELM_KILL_PARENT', '0') == '1':
+                    # 模拟运维中断：kubeconfig 临时目录还在时杀掉调用 stage 的 shell。
+                    os.kill(os.getppid(), signal.SIGTERM)
+                    time.sleep(0.5)
+                    raise SystemExit(0)
                 prefix = ['--kubeconfig', args[1]]
                 if args == prefix + ['list', '--all-namespaces', '--all', '--output', 'json']:
                     override = os.environ.get('FAKE_HELM_LIST_JSON')
@@ -9772,6 +9832,7 @@ operator:
         Path(environment['FAKE_RELEASE_MARKER']).touch()
         Path(environment['FAKE_CILIUM_MARKER']).touch()
 
+    # "零写入" = 运行结束后无残留；CHECK 期间允许 helm 的私有 kubeconfig 临时目录短暂存在。
     def test_check_is_zero_write_for_clean_apply_required_state(self) -> None:
         environment, host, command_log, _ = self.make_environment()
 
@@ -10493,6 +10554,47 @@ operator:
             self.assertNotIn(str(host / 'etc/kubernetes/admin.conf'), line)
         self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
 
+    def write_helm_kubeconfig_residue(self, host: Path) -> Path:
+        residue = host / 'root/.helm-kubeconfig.stale'
+        residue.mkdir()
+        config = residue / 'config'
+        config.write_text('leftover kubeconfig\n', encoding='utf-8')
+        config.chmod(0o600)
+        residue.chmod(0o700)
+        return residue
+
+    def test_check_stops_on_helm_kubeconfig_residue(self) -> None:
+        """上次运行被中断留下的 kubeconfig 残留必须 fail-closed，且不被自动删除。"""
+        environment, host, command_log, _ = self.make_environment()
+        residue = self.write_helm_kubeconfig_residue(host)
+        before_host = self.tree_snapshot(host)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertIn('REASON=helm-kubeconfig-residue', result.stdout)
+        self.assertTrue((residue / 'config').is_file())
+        self.assertEqual(self.tree_snapshot(host), before_host)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')), []
+        )
+        self.assertFalse(command_log.exists())
+
+    def test_helm_kubeconfig_is_removed_when_stage_is_signalled(self) -> None:
+        """helm 运行期间被 SIGTERM 杀死时，EXIT trap 必须清掉 kubeconfig 临时目录。"""
+        environment, host, command_log, _ = self.make_environment()
+        self.install_helm_contract(host)
+        environment['FAKE_HELM_KILL_PARENT'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            ' --kubeconfig ', command_log.read_text(encoding='utf-8')
+        )
+        self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
+
     def test_fresh_workload_query_uses_ignore_not_found(self) -> None:
         environment, _, command_log, _ = self.make_environment()
         environment['FAKE_REQUIRE_IGNORE_NOT_FOUND'] = '1'
@@ -10531,6 +10633,8 @@ operator:
             commands,
         )
 
+    # 断言的是"无残留"（tree snapshot 前后相同），不是字面意义的"没有写过"：
+    # helm 的私有 kubeconfig 临时目录会在 CHECK 期间建立并在返回前删除。
     def test_check_has_no_host_or_client_cache_writes(self) -> None:
         environment, host, _, _ = self.make_environment()
         self.install_full_cluster_contract(environment, host)
@@ -10860,7 +10964,9 @@ class FinalVerifyTest(BootstrapTestCase):
             #!/usr/bin/python3 -B
             import os
             from pathlib import Path
+            import signal
             import sys
+            import time
 
             args = sys.argv[1:]
             with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
@@ -10886,6 +10992,11 @@ class FinalVerifyTest(BootstrapTestCase):
                 raise SystemExit(64)
             if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT'] or supplied_again != supplied:
                 raise SystemExit(64)
+            if os.environ.get('FAKE_HELM_KILL_PARENT', '0') == '1':
+                # 模拟运维中断：kubeconfig 临时目录还在时杀掉调用 stage 的 shell。
+                os.kill(os.getppid(), signal.SIGTERM)
+                time.sleep(0.5)
+                raise SystemExit(0)
             expected = [
                 '--kubeconfig', args[1],
                 'list', '--all-namespaces', '--all', '--output', 'json',
@@ -11905,6 +12016,8 @@ class FinalVerifyTest(BootstrapTestCase):
         )
         self.assertNotIn(self.canary, result.stdout + result.stderr)
 
+    # 断言的是"无残留"（tree snapshot 前后仅多出 evidence 文件），不是字面意义的
+    # "没有写过"：helm 的私有 kubeconfig 临时目录会在 CHECK 期间建立并在返回前删除。
     def test_check_succeeds_read_only_with_allowlisted_evidence(self) -> None:
         environment, host, command_log = self.make_environment()
         environment['FAKE_SIMULATE_CLIENT_CACHE'] = '1'
@@ -12318,6 +12431,35 @@ class FinalVerifyTest(BootstrapTestCase):
                 self.assertIn(f' --kubeconfig {temporary_root}', line)
                 self.assertIn('/config ', line)
             self.assertNotIn(str(host / 'etc/kubernetes/admin.conf'), line)
+        self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
+
+    def test_check_stops_on_helm_kubeconfig_residue(self) -> None:
+        """上次运行被中断留下的 kubeconfig 残留必须 fail-closed，且不被自动删除。"""
+        environment, host, _ = self.make_environment()
+        residue = host / 'root/.helm-kubeconfig.stale'
+        residue.mkdir()
+        config = residue / 'config'
+        config.write_text('leftover kubeconfig\n', encoding='utf-8')
+        config.chmod(0o600)
+        residue.chmod(0o700)
+        before_host = self.tree_snapshot(host)
+
+        result = self.run_stage(environment)
+
+        self.assert_stops_without_evidence(result, host)
+        self.assertIn('REASON=helm-kubeconfig-residue', result.stdout)
+        self.assertTrue((residue / 'config').is_file())
+        self.assertEqual(self.tree_snapshot(host), before_host)
+
+    def test_helm_kubeconfig_is_removed_when_stage_is_signalled(self) -> None:
+        """helm 运行期间被 SIGTERM 杀死时，EXIT trap 必须清掉 kubeconfig 临时目录。"""
+        environment, host, command_log = self.make_environment()
+        environment['FAKE_HELM_KILL_PARENT'] = '1'
+
+        result = self.run_stage(environment)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(' --kubeconfig ', command_log.read_text(encoding='utf-8'))
         self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
 
     def test_containerd_gate_uses_privileged_child_bash(self) -> None:

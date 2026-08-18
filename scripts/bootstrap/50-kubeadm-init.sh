@@ -301,6 +301,7 @@ host_and_dependency_gates() {
   swap_bytes=$(printf '%s\n' "$swap_output" | awk 'NF {print $2}')
   [[ "$swap_lines" == 1 && "$swap_name" == "$HOST_SWAP_FILE" && "$swap_bytes" =~ ^[0-9]+$ ]] ||
     complete STOP_PRECONDITION swap-layout-mismatch "$EXIT_PRECONDITION" NONE
+  # HOST_SWAP_*_BYTES 由 lib/host-config.sh 限定为 ^[1-9][0-9]{0,17}$，裸算术因此无注入与溢出风险。
   (( swap_bytes >= HOST_SWAP_MIN_BYTES && swap_bytes <= HOST_SWAP_MAX_BYTES )) ||
     complete STOP_PRECONDITION swap-size-mismatch "$EXIT_PRECONDITION" NONE
 

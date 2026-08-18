@@ -264,6 +264,9 @@ helm_run() {
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" "$@"
 }
 
+# 当前 helm kubeconfig 临时目录；EXIT trap 据此清理，成功 rmdir 后清空。
+helm_kubeconfig_dir=
+
 # helm 3.21 无法从进程替换的管道读取 kubeconfig（client-go 会多次加载，第二次
 # 读到空配置后回退到 localhost:8080）。因此把已校验的内存内容写入 /root 下的私有
 # 临时文件（0700 目录、0600 文件，umask 077 保证），按路径传给 helm，用完即删。
@@ -274,6 +277,10 @@ helm_cluster_run() {
   parent=$(host_path /root)
   safe_directory "$parent" 700 || return 1
   kubeconfig_dir=$(mktemp -d "${parent}/.helm-kubeconfig.XXXXXX") || return 1
+  helm_kubeconfig_dir=$kubeconfig_dir
+  # 命令替换子 shell 会把 EXIT trap 重置为继承值，主 shell 的 trap 看不到子 shell
+  # 里的目录名；只在子 shell 内补装，避免覆盖主 shell 的 APPLY trap。
+  (( BASH_SUBSHELL == 0 )) || trap 'cleanup_helm_kubeconfig || :' EXIT
   kubeconfig="${kubeconfig_dir}/config"
   if ! safe_directory "$kubeconfig_dir" 700 ||
      ! printf '%s' "$ADMIN_CONF_CONTENT" >"$kubeconfig" ||
@@ -281,16 +288,43 @@ helm_cluster_run() {
      ! owned_by_expected "$kubeconfig" ||
      ! cmp -s "$kubeconfig" <(printf '%s' "$ADMIN_CONF_CONTENT"); then
     rm -f -- "$kubeconfig"
-    rmdir -- "$kubeconfig_dir" 2>/dev/null
+    if rmdir -- "$kubeconfig_dir" 2>/dev/null; then
+      helm_kubeconfig_dir=
+    fi
     return 1
   fi
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" \
     --kubeconfig "$kubeconfig" "$@" || exit_code=$?
   rm -f -- "$kubeconfig" || return 1
   rmdir -- "$kubeconfig_dir" || return 1
+  helm_kubeconfig_dir=
   admin_conf_gate || return 1
   return "$exit_code"
 }
+
+# trap 间接调用；只删除 /root 下本进程建立的 .helm-kubeconfig.* 目录。
+cleanup_helm_kubeconfig() {
+  local parent
+  [[ -n "$helm_kubeconfig_dir" ]] || return 0
+  parent=$(host_path /root)
+  [[ "${helm_kubeconfig_dir%/*}" == "$parent" &&
+      "${helm_kubeconfig_dir##*/}" == .helm-kubeconfig.* ]] || return 1
+  [[ -d "$helm_kubeconfig_dir" && ! -L "$helm_kubeconfig_dir" ]] || return 1
+  rm -f -- "${helm_kubeconfig_dir}/config" || return 1
+  rmdir -- "$helm_kubeconfig_dir" || return 1
+  helm_kubeconfig_dir=
+}
+
+# 子 shell 隔离 shopt；只检测残留，绝不自动删除（留给运维检查后手工清理）。
+helm_kubeconfig_residue_exists() (
+  local entry
+  shopt -s nullglob dotglob
+  for entry in "$(host_path /root)"/.helm-kubeconfig.*; do
+    : "$entry"
+    exit 0
+  done
+  exit 1
+)
 
 api_endpoint_is_exact() {
   local output
@@ -414,6 +448,8 @@ cleanup_apply_snapshot() {
 
 cleanup_apply_state() {
   local result=0
+  # APPLY trap 覆盖早期 trap，因此这里必须接管 helm kubeconfig 的清理。
+  cleanup_helm_kubeconfig || result=1
   cleanup_helm_temporary || result=1
   cleanup_apply_snapshot || result=1
   return "$result"
@@ -1111,6 +1147,8 @@ load_cluster_state() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
+# helm kubeconfig 临时目录必须在任何退出路径（含被信号杀死）上被清掉。
+trap 'cleanup_helm_kubeconfig || :' EXIT
 for required_command in awk chmod cmp date dirname dpkg dpkg-query grep hostname id install ln mktemp rm rmdir stat sync; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
@@ -1123,6 +1161,11 @@ fi
 # 主机身份与 values digest 唯一来源：bootstrap/hosts/<hostname>/。
 # 必须排在 required_command（含 hostname）之后、任何读取 HOST_* 的谓词之前。
 load_host_config || complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
+# CHECK 的唯一写入是 helm kubeconfig 临时目录；上次运行被中断留下的残留说明
+# 状态未知，只报告不删除，由运维检查后手工清理。
+if helm_kubeconfig_residue_exists; then
+  complete STOP_UNKNOWN_STATE helm-kubeconfig-residue "$EXIT_UNKNOWN_STATE" NONE
+fi
 VALUES_SHA256=$(host_pin cilium-values.yaml) ||
   complete STOP_SUPPLY_CHAIN_MISMATCH host-pins-invalid "$EXIT_SUPPLY_CHAIN" NONE
 readonly VALUES_SHA256

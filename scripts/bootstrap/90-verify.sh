@@ -301,6 +301,9 @@ helm_run() {
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" "$@"
 }
 
+# 当前 helm kubeconfig 临时目录；EXIT trap 据此清理，成功 rmdir 后清空。
+helm_kubeconfig_dir=
+
 # 与 Stage 60 相同：helm 无法从管道读取 kubeconfig，改用 /root 下私有临时文件。
 helm_cluster_run() {
   local exit_code=0 parent kubeconfig_dir kubeconfig
@@ -308,22 +311,54 @@ helm_cluster_run() {
   parent=$(host_path /root)
   safe_directory "$parent" 700 || return 1
   kubeconfig_dir=$(mktemp -d "${parent}/.helm-kubeconfig.XXXXXX") || return 1
+  helm_kubeconfig_dir=$kubeconfig_dir
+  # 命令替换子 shell 会把 EXIT trap 重置为继承值，主 shell 的 trap 看不到子 shell
+  # 里的目录名；只在子 shell 内补装。
+  (( BASH_SUBSHELL == 0 )) || trap 'cleanup_helm_kubeconfig || :' EXIT
   kubeconfig="${kubeconfig_dir}/config"
   if ! safe_directory "$kubeconfig_dir" 700 ||
      ! printf '%s' "$ADMIN_CONF_CONTENT" >"$kubeconfig" ||
      ! safe_file "$kubeconfig" 600 ||
      ! cmp -s "$kubeconfig" <(printf '%s' "$ADMIN_CONF_CONTENT"); then
     rm -f -- "$kubeconfig"
-    rmdir -- "$kubeconfig_dir" 2>/dev/null
+    if rmdir -- "$kubeconfig_dir" 2>/dev/null; then
+      helm_kubeconfig_dir=
+    fi
     return 1
   fi
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" \
     --kubeconfig "$kubeconfig" "$@" || exit_code=$?
   rm -f -- "$kubeconfig" || return 1
   rmdir -- "$kubeconfig_dir" || return 1
+  helm_kubeconfig_dir=
   admin_conf_is_safe || return 1
   return "$exit_code"
 }
+
+# trap 间接调用；只删除 /root 下本进程建立的 .helm-kubeconfig.* 目录。
+# shellcheck disable=SC2329
+cleanup_helm_kubeconfig() {
+  local parent
+  [[ -n "$helm_kubeconfig_dir" ]] || return 0
+  parent=$(host_path /root)
+  [[ "${helm_kubeconfig_dir%/*}" == "$parent" &&
+      "${helm_kubeconfig_dir##*/}" == .helm-kubeconfig.* ]] || return 1
+  [[ -d "$helm_kubeconfig_dir" && ! -L "$helm_kubeconfig_dir" ]] || return 1
+  rm -f -- "${helm_kubeconfig_dir}/config" || return 1
+  rmdir -- "$helm_kubeconfig_dir" || return 1
+  helm_kubeconfig_dir=
+}
+
+# 子 shell 隔离 shopt；只检测残留，绝不自动删除（留给运维检查后手工清理）。
+helm_kubeconfig_residue_exists() (
+  local entry
+  shopt -s nullglob dotglob
+  for entry in "$(host_path /root)"/.helm-kubeconfig.*; do
+    : "$entry"
+    exit 0
+  done
+  exit 1
+)
 
 staged_inputs_are_exact() {
   local digest
@@ -906,6 +941,7 @@ swap_is_exact() {
   name=$(printf '%s\n' "$output" | awk 'NF {print $1}')
   bytes=$(printf '%s\n' "$output" | awk 'NF {print $2}')
   [[ "$lines" == 1 && "$name" == "$HOST_SWAP_FILE" && "$bytes" =~ ^[0-9]+$ ]] || return 1
+  # HOST_SWAP_*_BYTES 由 lib/host-config.sh 限定为 ^[1-9][0-9]{0,17}$，裸算术因此无注入与溢出风险。
   (( bytes >= HOST_SWAP_MIN_BYTES && bytes <= HOST_SWAP_MAX_BYTES ))
 }
 
@@ -1015,6 +1051,8 @@ if [[ "$MODE" != CHECK ]]; then
   complete STOP_PRECONDITION read-only-stage-does-not-accept-apply "$EXIT_PRECONDITION" NONE
 fi
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
+# helm kubeconfig 临时目录必须在任何退出路径（含被信号杀死）上被清掉。
+trap 'cleanup_helm_kubeconfig || :' EXIT
 for required_command in awk cmp date dpkg dpkg-query find grep hostname id mktemp rm rmdir sed sort stat swapon; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
@@ -1045,6 +1083,11 @@ package_state_is_exact || complete STOP_VERIFY_FAILED package-version-selection-
 managed_clients_are_exact || complete STOP_VERIFY_FAILED client-provenance-or-package-drift "$EXIT_VERIFY_FAILED" NONE
 cni_payload_is_exact || complete STOP_VERIFY_FAILED cni-payload-drift "$EXIT_VERIFY_FAILED" NONE
 capture_admin_conf || complete STOP_VERIFY_FAILED admin-conf-content-or-structure-drift "$EXIT_VERIFY_FAILED" NONE
+# CHECK 的唯一写入是 helm kubeconfig 临时目录；上次运行被中断留下的残留说明
+# 状态未知，只报告不删除，由运维检查后手工清理。
+if helm_kubeconfig_residue_exists; then
+  complete STOP_VERIFY_FAILED helm-kubeconfig-residue "$EXIT_VERIFY_FAILED" NONE
+fi
 staged_inputs_are_exact || complete STOP_VERIFY_FAILED staged-input-drift "$EXIT_VERIFY_FAILED" NONE
 helm_binary_is_exact || complete STOP_VERIFY_FAILED helm-binary-provenance-drift "$EXIT_VERIFY_FAILED" NONE
 version_contract_is_exact || complete STOP_VERIFY_FAILED executable-version-drift "$EXIT_VERIFY_FAILED" NONE

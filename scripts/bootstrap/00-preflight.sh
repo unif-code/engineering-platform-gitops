@@ -104,6 +104,7 @@ swap_bytes=$(printf '%s\n' "$swap_output" | awk 'NF {print $2}')
 if [[ "$swap_lines" != 1 || "$swap_name" != "$HOST_SWAP_FILE" || ! "$swap_bytes" =~ ^[0-9]+$ ]]; then
   complete STOP_SWAP swap-layout-mismatch "$EXIT_PRECONDITION" NONE
 fi
+# HOST_SWAP_*_BYTES 由 lib/host-config.sh 限定为 ^[1-9][0-9]{0,17}$，裸算术因此无注入与溢出风险。
 if (( swap_bytes < HOST_SWAP_MIN_BYTES || swap_bytes > HOST_SWAP_MAX_BYTES )); then
   complete STOP_SWAP swap-size-mismatch "$EXIT_PRECONDITION" NONE
 fi
