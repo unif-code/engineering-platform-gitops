@@ -264,11 +264,30 @@ helm_run() {
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" "$@"
 }
 
+# helm 3.21 无法从进程替换的管道读取 kubeconfig（client-go 会多次加载，第二次
+# 读到空配置后回退到 localhost:8080）。因此把已校验的内存内容写入 /root 下的私有
+# 临时文件（0700 目录、0600 文件，umask 077 保证），按路径传给 helm，用完即删。
+# helm 仍只消费校验过的字节；前后的 admin_conf_gate 照旧检测磁盘文件竞态。
 helm_cluster_run() {
-  local exit_code=0
+  local exit_code=0 parent kubeconfig_dir kubeconfig
   admin_conf_gate || return 1
+  parent=$(host_path /root)
+  safe_directory "$parent" 700 || return 1
+  kubeconfig_dir=$(mktemp -d "${parent}/.helm-kubeconfig.XXXXXX") || return 1
+  kubeconfig="${kubeconfig_dir}/config"
+  if ! safe_directory "$kubeconfig_dir" 700 ||
+     ! printf '%s' "$ADMIN_CONF_CONTENT" >"$kubeconfig" ||
+     [[ -L "$kubeconfig" || ! -f "$kubeconfig" || "$(path_mode "$kubeconfig")" != 600 ]] ||
+     ! owned_by_expected "$kubeconfig" ||
+     ! cmp -s "$kubeconfig" <(printf '%s' "$ADMIN_CONF_CONTENT"); then
+    rm -f -- "$kubeconfig"
+    rmdir -- "$kubeconfig_dir" 2>/dev/null
+    return 1
+  fi
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" \
-    --kubeconfig <(printf '%s' "$ADMIN_CONF_CONTENT") "$@" || exit_code=$?
+    --kubeconfig "$kubeconfig" "$@" || exit_code=$?
+  rm -f -- "$kubeconfig" || return 1
+  rmdir -- "$kubeconfig_dir" || return 1
   admin_conf_gate || return 1
   return "$exit_code"
 }

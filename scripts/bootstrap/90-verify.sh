@@ -301,11 +301,26 @@ helm_run() {
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" "$@"
 }
 
+# 与 Stage 60 相同：helm 无法从管道读取 kubeconfig，改用 /root 下私有临时文件。
 helm_cluster_run() {
-  local exit_code=0
+  local exit_code=0 parent kubeconfig_dir kubeconfig
   admin_conf_is_safe || return 1
+  parent=$(host_path /root)
+  safe_directory "$parent" 700 || return 1
+  kubeconfig_dir=$(mktemp -d "${parent}/.helm-kubeconfig.XXXXXX") || return 1
+  kubeconfig="${kubeconfig_dir}/config"
+  if ! safe_directory "$kubeconfig_dir" 700 ||
+     ! printf '%s' "$ADMIN_CONF_CONTENT" >"$kubeconfig" ||
+     ! safe_file "$kubeconfig" 600 ||
+     ! cmp -s "$kubeconfig" <(printf '%s' "$ADMIN_CONF_CONTENT"); then
+    rm -f -- "$kubeconfig"
+    rmdir -- "$kubeconfig_dir" 2>/dev/null
+    return 1
+  fi
   PYTHONDONTWRITEBYTECODE=1 KUBECACHEDIR=/dev/null "$helm_binary" \
-    --kubeconfig <(printf '%s' "$ADMIN_CONF_CONTENT") "$@" || exit_code=$?
+    --kubeconfig "$kubeconfig" "$@" || exit_code=$?
+  rm -f -- "$kubeconfig" || return 1
+  rmdir -- "$kubeconfig_dir" || return 1
   admin_conf_is_safe || return 1
   return "$exit_code"
 }
@@ -1000,7 +1015,7 @@ if [[ "$MODE" != CHECK ]]; then
   complete STOP_PRECONDITION read-only-stage-does-not-accept-apply "$EXIT_PRECONDITION" NONE
 fi
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk cmp date dpkg dpkg-query find grep id sed sort stat swapon; do
+for required_command in awk cmp date dpkg dpkg-query find grep id mktemp rm rmdir sed sort stat swapon; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE

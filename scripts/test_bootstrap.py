@@ -8557,9 +8557,11 @@ operator:
                     raise SystemExit(64)
                 try:
                     supplied = Path(args[1]).read_text(encoding='utf-8')
+                    # 真实 helm/client-go 会多次加载 kubeconfig；管道第二次读到空。
+                    supplied_again = Path(args[1]).read_text(encoding='utf-8')
                 except OSError:
                     raise SystemExit(64)
-                if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+                if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT'] or supplied_again != supplied:
                     raise SystemExit(64)
                 prefix = ['--kubeconfig', args[1]]
                 if args == prefix + ['list', '--all-namespaces', '--all', '--output', 'json']:
@@ -9764,7 +9766,12 @@ operator:
         self.assertEqual(snapshot_dir.parent, host / 'root')
         self.assertTrue(snapshot_dir.name.startswith('.cilium-inputs.'))
         self.assertEqual(helm_argv[:2], ['helm', '--kubeconfig'])
-        self.assertTrue(helm_argv[2].startswith('/dev/fd/'))
+        helm_kubeconfig = Path(helm_argv[2])
+        self.assertEqual(helm_kubeconfig.name, 'config')
+        self.assertEqual(helm_kubeconfig.parent.parent, host / 'root')
+        self.assertTrue(helm_kubeconfig.parent.name.startswith('.helm-kubeconfig.'))
+        self.assertFalse(helm_kubeconfig.exists(), 'helm 临时 kubeconfig 用完必须删除')
+        self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
         self.assertEqual(helm_argv[3:5], ['install', 'cilium'])
         self.assertEqual(Path(helm_argv[5]).parent, snapshot_dir)
         self.assertEqual(Path(helm_argv[5]).name, 'cilium-1.20.0.tgz')
@@ -10160,9 +10167,16 @@ operator:
             )
         ]
         self.assertTrue(cluster_clients)
+        temporary_root = str(host / 'root/.helm-kubeconfig.')
         for line in cluster_clients:
-            self.assertIn(' --kubeconfig /dev/fd/', line)
+            if line.startswith('kubectl '):
+                self.assertIn(' --kubeconfig /dev/fd/', line)
+            else:
+                # helm 不能读管道：只接受 /root 下私有临时文件里的已校验内容。
+                self.assertIn(f' --kubeconfig {temporary_root}', line)
+                self.assertIn('/config ', line)
             self.assertNotIn(str(host / 'etc/kubernetes/admin.conf'), line)
+        self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
 
     def test_fresh_workload_query_uses_ignore_not_found(self) -> None:
         environment, _, command_log, _ = self.make_environment()
@@ -10551,9 +10565,11 @@ class FinalVerifyTest(BootstrapTestCase):
                 raise SystemExit(64)
             try:
                 supplied = Path(args[1]).read_text(encoding='utf-8')
+                # 真实 helm/client-go 会多次加载 kubeconfig；管道第二次读到空。
+                supplied_again = Path(args[1]).read_text(encoding='utf-8')
             except OSError:
                 raise SystemExit(64)
-            if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+            if supplied != os.environ['FAKE_ADMIN_CONF_CONTENT'] or supplied_again != supplied:
                 raise SystemExit(64)
             expected = [
                 '--kubeconfig', args[1],
@@ -11626,7 +11642,7 @@ class FinalVerifyTest(BootstrapTestCase):
             for line in command_lines
         ))
         self.assertTrue(any(
-            line.startswith('helm --kubeconfig /dev/fd/') and
+            line.startswith(f"helm --kubeconfig {host / 'root/.helm-kubeconfig.'}") and
             line.endswith(' list --all-namespaces --all --output json')
             for line in command_lines
         ))
@@ -11964,9 +11980,16 @@ class FinalVerifyTest(BootstrapTestCase):
             )
         ]
         self.assertTrue(cluster_clients)
+        temporary_root = str(host / 'root/.helm-kubeconfig.')
         for line in cluster_clients:
-            self.assertIn(' --kubeconfig /dev/fd/', line)
+            if line.startswith('kubectl '):
+                self.assertIn(' --kubeconfig /dev/fd/', line)
+            else:
+                # helm 不能读管道：只接受 /root 下私有临时文件里的已校验内容。
+                self.assertIn(f' --kubeconfig {temporary_root}', line)
+                self.assertIn('/config ', line)
             self.assertNotIn(str(host / 'etc/kubernetes/admin.conf'), line)
+        self.assertEqual(list((host / 'root').glob('.helm-kubeconfig.*')), [])
 
     def test_containerd_gate_uses_privileged_child_bash(self) -> None:
         script = FINAL_VERIFY.read_text(encoding='utf-8')
