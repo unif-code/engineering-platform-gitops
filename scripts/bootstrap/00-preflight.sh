@@ -7,6 +7,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck source=scripts/bootstrap/lib/common.sh
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/os-release.sh"
 
 readonly PHASE=preflight
 readonly EXPECTED_HOSTNAME=retail-test-workflow
@@ -66,19 +68,8 @@ if [[ "$actual_hostname" != "$EXPECTED_HOSTNAME" ]]; then
 fi
 log_evidence "HOSTNAME=${actual_hostname}"
 
-os_release=$(host_path /etc/os-release)
-canonical_os_release=$(host_path /usr/lib/os-release)
-if [[ -L "$os_release" ]]; then
-  os_release_link=$(readlink -- "$os_release" 2>/dev/null) ||
-    complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
-  if [[ "$os_release_link" != ../usr/lib/os-release ||
-        ! -f "$canonical_os_release" || -L "$canonical_os_release" ]]; then
-    complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
-  fi
-  os_release=$canonical_os_release
-elif [[ ! -f "$os_release" ]]; then
+os_release=$(ubuntu_os_release_path) ||
   complete STOP_HOST_IDENTITY os-release-missing "$EXIT_PRECONDITION" NONE
-fi
 os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
 os_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' "$os_release")
 if [[ "$os_id" != ubuntu || "$os_version" != 24.04* ]]; then

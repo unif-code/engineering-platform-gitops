@@ -36,6 +36,8 @@ source "${script_dir}/lib/common.sh"
 source "${script_dir}/lib/dpkg-package-verification.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/kubelet-default.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/os-release.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
@@ -282,8 +284,8 @@ host_and_dependency_gates() {
 
   actual_hostname=$(hostname 2>/dev/null) || complete STOP_PRECONDITION hostname-unreadable "$EXIT_PRECONDITION" NONE
   [[ "$actual_hostname" == "$EXPECTED_HOSTNAME" ]] || complete STOP_PRECONDITION hostname-mismatch "$EXIT_PRECONDITION" NONE
-  os_release=$(host_path /etc/os-release)
-  [[ -f "$os_release" && ! -L "$os_release" ]] || complete STOP_PRECONDITION os-release-unsafe "$EXIT_PRECONDITION" NONE
+  os_release=$(ubuntu_os_release_path) ||
+    complete STOP_PRECONDITION os-release-unsafe "$EXIT_PRECONDITION" NONE
   os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
   os_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' "$os_release")
   [[ "$os_id" == ubuntu && "$os_version" == 24.04* ]] || complete STOP_PRECONDITION os-mismatch "$EXIT_PRECONDITION" NONE
@@ -527,7 +529,7 @@ initialized_control_plane_gate() {
 
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
-for required_command in awk cat date dpkg dpkg-query find grep hostname id install ip md5sum mktemp openssl python3 rm sed sha256sum sort ss stat swapon sync systemctl tr uname; do
+for required_command in awk cat date dpkg dpkg-query find grep hostname id install ip md5sum mktemp openssl python3 readlink rm sed sha256sum sort ss stat swapon sync systemctl tr uname; do
   if [[ "$required_command" == sha256sum ]] && command -v shasum >/dev/null 2>&1; then
     continue
   fi

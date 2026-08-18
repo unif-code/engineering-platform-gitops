@@ -7748,6 +7748,35 @@ class KubeadmInitTest(BootstrapTestCase):
             'kubeadm ', command_log.read_text(encoding='utf-8')
         )
 
+    def test_check_accepts_canonical_ubuntu_os_release_symlink(self) -> None:
+        """捕获 Stage 50 误拒绝 Ubuntu 标准 os-release 符号链接。"""
+        environment, host, command_log = self.make_environment()
+        canonical = host / 'usr/lib/os-release'
+        canonical.parent.mkdir(parents=True)
+        (host / 'etc/os-release').replace(canonical)
+        (host / 'etc/os-release').symlink_to('../usr/lib/os-release')
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_KUBEADM_CHECK', result.stdout)
+        self.assertNotIn(
+            'kubeadm ', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_check_declares_readlink_dependency(self) -> None:
+        """共享 os-release resolver 的命令依赖必须在 Stage 50 前置声明。"""
+        required_commands = next(
+            line for line in KUBEADM_INIT.read_text(encoding='utf-8').splitlines()
+            if line.startswith('for required_command in ')
+        )
+
+        self.assertIn('readlink', required_commands.split())
+
     def test_check_accepts_declared_client_doc_exclusions(self) -> None:
         """捕获 Stage 50 把官方 dpkg 文档排除输出误判为 payload 漂移。"""
         environment, host, command_log = self.make_environment()
