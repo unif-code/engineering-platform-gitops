@@ -384,15 +384,20 @@ fi
 readonly expected_stage_uid
 
 # 每个 stage 都以 root source lib/*.sh，这些文件与 stage 脚本同属供应链，
-# 必须在任何 stage 启动前完成属主与权限校验。
+# 必须在任何 stage 启动前完成属主与权限校验。目录内的每一个条目都要过门禁：
+# dotglob 让点文件无法绕过通配，nullglob 让空目录退化为计数 0 而不是字面量。
 library_dir="${stage_dir}/lib"
 safe_owned_directory "$library_dir" "$expected_stage_uid" ||
   stop_orchestrator unsafe-library-file 30
-for library_file in "$library_dir"/*.sh; do
-  [[ -e "$library_file" ]] || stop_orchestrator unsafe-library-file 30
+library_file_count=0
+shopt -s dotglob nullglob
+for library_file in "$library_dir"/*; do
+  library_file_count=$((library_file_count + 1))
   safe_owned_file "$library_file" "$expected_stage_uid" ||
     stop_orchestrator unsafe-library-file 30
 done
+shopt -u dotglob nullglob
+(( library_file_count > 0 )) || stop_orchestrator unsafe-library-file 30
 readonly library_dir
 
 for stage in "${STAGES[@]}"; do

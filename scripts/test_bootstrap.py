@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,32 @@ INSTALL_CILIUM = ROOT / 'scripts/bootstrap/60-install-cilium.sh'
 FINAL_VERIFY = ROOT / 'scripts/bootstrap/90-verify.sh'
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
+
+SHELL_SOURCE_STATEMENT = re.compile(
+    r'(?:^|[;&|(){}]|\b(?:then|else|do)\s)\s*(?:source|\.)\s+(\S+)'
+)
+SHELL_DIRECTORY_ASSIGNMENT = re.compile(
+    r'^[a-z_][a-z0-9_]*=\$\(cd .*&& pwd -P\)$'
+)
+
+
+def shell_source_words(text: str) -> list[str]:
+    """收集脚本中每条 source/. 语句的目标词，整行注释不计入。"""
+    words: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith('#'):
+            continue
+        words.extend(SHELL_SOURCE_STATEMENT.findall(line))
+    return words
+
+
+def shell_directory_assignments(text: str) -> list[str]:
+    """收集脚本自身的目录推导赋值（cd … && pwd -P），保持原始顺序。"""
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if SHELL_DIRECTORY_ASSIGNMENT.match(line.strip())
+    ]
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -2102,13 +2129,12 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         """重建 stage 目录下的被 source 库，用于复原被破坏的 fixture。"""
         if self.library_dir.is_symlink() or self.library_dir.is_file():
             self.library_dir.unlink()
-        if not self.library_dir.is_dir():
-            self.library_dir.mkdir()
+        elif self.library_dir.is_dir():
+            shutil.rmtree(self.library_dir)
+        self.library_dir.mkdir()
         self.library_dir.chmod(0o700)
         for name in self.library_names:
             library_file = self.library_dir / name
-            if library_file.is_symlink() or library_file.exists():
-                library_file.unlink()
             library_file.write_text(
                 f'# fixture library {name}\n', encoding='utf-8'
             )
@@ -2657,6 +2683,18 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
             for library_file in self.library_dir.iterdir():
                 library_file.unlink()
 
+        def world_writable_dotfile() -> None:
+            hidden = self.library_dir / '.hidden.sh'
+            hidden.write_text('# hidden\n', encoding='utf-8')
+            hidden.chmod(0o666)
+
+        def nested_directory() -> None:
+            (self.library_dir / 'nested').mkdir(mode=0o700)
+
+        def library_and_stage_unsafe() -> None:
+            self.library_dir.chmod(0o777)
+            (self.stage_dir / '00-preflight.sh').chmod(0o777)
+
         cases = (
             ('world-writable-directory', world_writable_directory),
             ('group-writable-directory', group_writable_directory),
@@ -2666,6 +2704,9 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
             ('symlinked-directory', symlinked_directory),
             ('missing-directory', missing_directory),
             ('empty-directory', empty_directory),
+            ('world-writable-dotfile', world_writable_dotfile),
+            ('nested-directory', nested_directory),
+            ('library-and-stage-unsafe', library_and_stage_unsafe),
         )
         for label, tamper in cases:
             with self.subTest(case=label):
@@ -2675,6 +2716,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
                     result = self.run_orchestrator('--check')
                 finally:
                     self.write_fake_library()
+                    self.write_fake_stages()
 
                 self.assertEqual(result.returncode, 30, result.stdout)
                 self.assertIn('REASON=unsafe-library-file', result.stdout)
@@ -2684,6 +2726,85 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
                     '门禁必须在任何 stage 启动前停机',
                 )
                 self.assertEqual(list(self.state_dir.iterdir()), [])
+
+    def expand_shell_word(
+        self, assignments: list[str], word: str, script_source: str
+    ) -> str:
+        """用脚本自身的目录推导逐字展开一个词，真实执行 cd/pwd -P。"""
+        program = '\n'.join(
+            ['set -Eeuo pipefail', *assignments, "printf '%s' " + word]
+        )
+        environment = os.environ.copy()
+        environment['BOOTSTRAP_REAL_SCRIPT_SOURCE'] = script_source
+        result = self.run_command(
+            ['/bin/bash', '-c', program], env=environment
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_real_stages_source_only_files_under_the_gated_library_dir(
+        self,
+    ) -> None:
+        """fixture 不 source 任何文件，这里用真实 stage 钉住门禁的前提。"""
+        bootstrap_dir = BOOTSTRAP_ALL.parent
+        real_library_dir = bootstrap_dir / 'lib'
+        orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        declaration = re.search(
+            r'^library_dir=(\S+)$', orchestrator, re.MULTILINE
+        )
+        self.assertIsNotNone(declaration, '编排器未声明 library_dir')
+        assert declaration is not None
+        gated_dir = self.expand_shell_word(
+            ['stage_dir=$BOOTSTRAP_REAL_SCRIPT_SOURCE'],
+            declaration.group(1),
+            str(bootstrap_dir),
+        )
+        self.assertEqual(gated_dir, str(real_library_dir))
+
+        stage_scripts = sorted(bootstrap_dir.glob('[0-9]*.sh'))
+        self.assertEqual(
+            [script.name for script in stage_scripts],
+            sorted(self.stage_names.values()),
+            '真实 stage 脚本集合与编排器的 stage 映射不一致',
+        )
+        sourced: set[str] = set()
+        for script in stage_scripts:
+            body = script.read_text(encoding='utf-8')
+            assignments = [
+                line.replace(
+                    '${BASH_SOURCE[0]}', '${BOOTSTRAP_REAL_SCRIPT_SOURCE}'
+                )
+                for line in shell_directory_assignments(body)
+            ]
+            words = shell_source_words(body)
+            self.assertTrue(words, f'{script.name} 没有 source 任何文件')
+            for word in words:
+                target = Path(
+                    self.expand_shell_word(assignments, word, str(script))
+                )
+                self.assertEqual(
+                    str(target.parent),
+                    gated_dir,
+                    f'{script.name} source 了门禁目录之外的 {target}',
+                )
+                self.assertTrue(
+                    target.is_file() and not target.is_symlink(),
+                    f'{script.name} source 的 {target} 不是普通文件',
+                )
+                sourced.add(target.name)
+        self.assertEqual(
+            sorted(sourced),
+            sorted(path.name for path in real_library_dir.glob('*.sh')),
+            '被 source 的文件集合必须与门禁目录内容一致',
+        )
+        for library_file in sorted(real_library_dir.iterdir()):
+            self.assertEqual(
+                shell_source_words(
+                    library_file.read_text(encoding='utf-8')
+                ),
+                [],
+                f'{library_file.name} 再次 source 了文件，门禁前提被破坏',
+            )
 
 
 class ArtifactStageTest(BootstrapTestCase):
