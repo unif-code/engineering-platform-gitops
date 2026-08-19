@@ -155,11 +155,11 @@ class RepositoryProfileContractTest(unittest.TestCase):
                 r'重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，'
                 r'不读取或维护 progress file',
             ),
-            'current-server-resumes-at-40-after-gate': (
+            'current-server-completed-all-stages': (
                 'runbook',
-                r'当前暂停中的服务器已完成 stage `00`～`30`。GitHub '
+                r'当前服务器已完成全部 stage `00`～`90`。GitHub '
                 r'`validation-gate` 成功后重跑 orchestrator，它必须依据各 stage 的'
-                r'检查结果跳过这些已完成 stage，并从 stage `40` 继续',
+                r'检查结果跳过这些已完成 stage，并直接抵达 stage `90`',
             ),
             'individual-stages-emergency-only': (
                 'runbook',
@@ -273,14 +273,14 @@ class RepositoryProfileContractTest(unittest.TestCase):
                 '不重跑同一条命令也可恢复：orchestrator 不根据真实主机状态重建进度，'
                 '而是读取 progress file',
             ),
-            'current-server-resumes-at-40-after-gate': (
-                '当前暂停中的服务器已完成 stage `00`～`30`。GitHub '
+            'current-server-completed-all-stages': (
+                '当前服务器已完成全部 stage `00`～`90`。GitHub '
                 '`validation-gate` 成功后重跑\n'
                 'orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，'
-                '并从 stage `40` 继续',
-                '当前暂停中的服务器尚未完成 stage `00`～`30`。GitHub '
+                '并直接抵达 stage `90`',
+                '当前服务器尚未完成全部 stage `00`～`90`。GitHub '
                 '`validation-gate` 成功前重跑\n'
-                'orchestrator，它必须从 stage `00` 继续，不能从 stage `40` 继续',
+                'orchestrator，它必须从 stage `00` 继续，不能直接抵达 stage `90`',
             ),
             'individual-stages-emergency-only': (
                 '下表保留为诊断和人工应急入口，不是正常 bootstrap 路径',

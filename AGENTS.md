@@ -18,6 +18,8 @@
 - 【运维】命令必须先给出完整命令并等待服务器回执；证据不得记录敏感值。
 - 本地提交前运行受影响的 focused tests 和 `./scripts/validate-fast.sh`；普通 push 后必须等待 GitHub `validation-gate` 全部通过，才可继续服务器部署或验收。
 - `./scripts/validate.sh` 保留为人工完整顺序验证入口，不再要求每次本地提交运行；提交历史保持线性并使用 Conventional Commits。
+- CI 钉死 shellcheck `0.9.0`；本地版本不同会出现「本地绿、CI 红」。`validate-static.sh` 会打印实际版本，需要完全对齐时运行 `python3 -m venv /tmp/sc && /tmp/sc/bin/pip install shellcheck-py==0.9.0.6` 并用该 venv 的 shellcheck 复核。
+- 服务器执行统一用 `scripts/bootstrap/run-approved.sh <approved-sha> --check|--apply`：它内建 SHA/origin/分支/干净树/ff-only/umask/helm 残留门禁，并以 `env -i` 干净环境启动 bootstrap，避免交互 shell 遗留变量触发 `untrusted-environment-override`。
 
 ## Codex 原生记忆
 

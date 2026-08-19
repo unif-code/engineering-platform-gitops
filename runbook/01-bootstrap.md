@@ -5,9 +5,24 @@
 > **STOP GATE**：旧 Docker/Caddy 清退、全新 Kubernetes CRI runtime、稳定 DNS 与维护路径均完成并取得证据前，本页不得把任何运行时判定标为通过。
 
 执行人：`root`
-执行时间（含时区）：`2026-08-10 10:36:55 CST`（审计采集时间）
+执行时间（含时区）：`2026-08-10 10:36:55 CST`（审计采集时间）；bootstrap 全流程完成 `2026-08-19 10:12 CST`
 服务器标识：`retail-test-workflow`
-GitOps commit / PR：  
+GitOps commit / PR：bootstrap 完成于 `a3eb3945c733b77f2594c9ff10e99dcd8587cd4d`
+
+## 当前状态：bootstrap 已完成
+
+`2026-08-19` 在 `a3eb394` 上执行 `--apply`，编排器全部 8 个 stage 通过：
+
+| Stage | 结果 |
+| --- | --- |
+| 00 preflight | `PASS_PREFLIGHT`（证据 `/root/dev-infra-evidence/07-preflight-20260819T021035Z.txt`，SHA-256 `74a80a473e0f571abe6a087d92f30e1f83db6b564f8ab0b2f501a6f21534bf51`） |
+| 10–60 | `ALREADY_COMPLIANT` |
+| 90 verify | `PASS_BOOTSTRAP_VERIFIED`（证据 `/root/dev-infra-evidence/14-verify-20260819T021224Z.txt`，SHA-256 `dde4cfdc04d199a44b2c0855468c01e5358a82a62fec1f52d540b6427215f75f`） |
+
+编排器汇总：`RESULT=PASS_BOOTSTRAP_ALL`、`REASON=bootstrap-complete`、`NEXT_STAGE=NONE`、`EXIT_CODE=0`。
+
+集群构成：kubeadm 单节点控制面（`clusterName=engineering-platform-dev`）、containerd 2.3.1 + runc、
+Kubernetes 1.36.3 四包 hold、Cilium 1.20.0（kube-proxy replacement、Gateway API v1.6.1 standard、Envoy DaemonSet）。
 
 ## 可恢复的一次性执行合同
 
@@ -17,7 +32,28 @@ agent 审核回执前不得执行下一条。不得把 Secret、Token、私钥�
 
 ### 正常路径
 
-先执行只读检查并等待服务器回执：
+服务器执行统一使用一行式入口（内建全部门禁，并以 `env -i` 干净环境启动编排器）：
+
+```bash
+scripts/bootstrap/run-approved.sh <approved-sha> --check
+```
+
+它按序校验：40 位 SHA 形态、`--apply` 必须 root、仓库非软链、origin 为
+`unif-code/engineering-platform-gitops.git`、当前分支 `main`、工作树干净、
+`fetch` 后 `origin/main` 等于已批准 SHA、`merge --ff-only` 后本地 HEAD 等于该 SHA、
+`/root/.helm-kubeconfig.*` 无残留；任一不满足即以固定退出码停止（90/91/92/93/94/95/96/97/98）。
+`approved-sha` 必须是 GitHub `validation-gate` 已全绿的提交。
+
+审核完整回执并明确批准 mutation 后，另行执行：
+
+```bash
+scripts/bootstrap/run-approved.sh <approved-sha> --apply
+```
+
+历史上手工粘贴的等价门禁脚本已由该入口取代：粘贴长脚本曾多次因终端丢字符导致
+`APPROVED_SHA` 截断或行断裂，也曾遗漏 `merge --ff-only`（`exit 97`）。
+
+保留的底层入口（仅在明确需要绕过门禁诊断时使用）：
 
 ```bash
 ./scripts/bootstrap/bootstrap-all.sh --check
@@ -34,8 +70,8 @@ agent 审核回执前不得执行下一条。不得把 Secret、Token、私钥�
 stage 执行 apply，并要求 apply 后的 post-check 回到 compliant；否则立即停止。运行失败后，
 重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，不读取或维护 progress file。
 
-当前暂停中的服务器已完成 stage `00`～`30`。GitHub `validation-gate` 成功后重跑
-orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，并从 stage `40` 继续。
+当前服务器已完成全部 stage `00`～`90`。GitHub `validation-gate` 成功后重跑
+orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，并直接抵达 stage `90`。
 
 ### 单阶段诊断和人工应急入口
 
@@ -56,6 +92,60 @@ orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 sta
 固定退出码：`0` 表示当前阶段按输出判定完成或需要获批 APPLY；`10` 为前置条件失败，
 `20` 为供应链不匹配，`30` 为未知/漂移状态，`40` 为 APPLY 失败，`50` 为部署后
 验证失败。任何非零退出码都必须停止。
+
+## 排错：已知 STOP 与处置
+
+`--check`/`--apply` 的 STOP 一律 fail-closed，先看 `REASON=` 再对照下表。以下条目均为
+`2026-08-19` 打通全流程期间实际遇到并已修复的情形；除标注「运维动作」外，代码侧已容忍。
+
+| REASON | 含义 | 处置 |
+| --- | --- | --- |
+| `untrusted-environment-override` | 调用方环境里存在被禁止的变量。输出的 `VARS=` 列出违规变量名 | 用 `run-approved.sh` 执行即可（`env -i` 干净环境）。若手工执行，先 `unset` `VARS=` 列出的变量 |
+| `host-not-registered` / `host-config-*` | `bootstrap/hosts/<hostname>/` 缺失或不合规 | 确认主机名与目录名一致；目录 `0755`、四个文件 `0644` 且 root 拥有（合并时用 `umask 022`） |
+| `host-pins-invalid` | `pins.sha256` 形态错误 | 改过 host 目录的 yaml 后运行 `scripts/bootstrap/pin-host.sh bootstrap/hosts/<hostname>` |
+| `helm-kubeconfig-residue` | 上次运行被信号中断，`/root/.helm-kubeconfig.*` 有残留（内含已校验的 admin.conf 字节） | 人工检查后删除该目录，再重跑；脚本只检测不自动删除 |
+| `kubelet-swap-config-drift` | kubelet configz 不可达，通常因 `serverTLSBootstrap` 的 serving CSR 未批准 | 见下节「kubelet serving CSR 人工批准」 |
+| `cidr-overlap-or-invalid` | Pod/Service CIDR 与本机地址或路由重叠 | 若重叠项在 CNI 网卡（`cilium_host`/`lxc*`）且完全落在 Pod CIDR 内，属正常，已被豁免；其余为真实冲突，需调整网络规划 |
+| `partial-kubernetes-contract` | `/opt/cni/bin` 条目集或包 payload 不符 | 允许的集合只有「kubernetes-cni 包清单」或「包清单 + 锁定的 `cilium-cni`」；其他多余文件需人工核实来源 |
+| `control-plane-runtime-set-drift` | 4 个控制面容器未各恰好一个 Running 于 kube-system | 检查 `crictl ps`；装完 CNI 后额外的 cilium/coredns 容器属正常，已被容忍 |
+| `cilium-post-install-state-invalid` | helm 装完后 Cilium 工作负载在超时窗口内未就绪 | 脚本在装后有界轮询（默认 10 分钟）；仍超时说明 Pod 真的没起来，查 `kubectl -n kube-system get pods` |
+
+### kubelet serving CSR 人工批准（运维动作）
+
+`bootstrap/hosts/<hostname>/kubeadm-init.yaml` 设 `serverTLSBootstrap: true`，kubelet 因此通过 CSR
+申请服务端证书，而核心 Kubernetes 不自动批准 `kubernetes.io/kubelet-serving`。未批准时 kubelet
+无服务端证书，apiserver 代理到 kubelet 报 `tls: internal error`，Stage 90 停在 `kubelet-swap-config-drift`。
+
+批准前必须逐条核对（与 Stage 90 `csr_summaries_are_safe` 的判据一致）：
+
+- requester 为 `system:node:<hostname>`
+- usages 恰好 `digital signature` + `server auth`（ECDSA serving 证书不请求 `key encipherment`）
+- SAN 恰好 `DNS:<hostname>` + `IP Address:<node-ip>`
+
+只读核对：
+
+```bash
+KC=/etc/kubernetes/admin.conf
+for c in $(kubectl --kubeconfig $KC get csr -o name); do
+  u=$(kubectl --kubeconfig $KC get "$c" -o jsonpath='{.spec.username}')
+  g=$(kubectl --kubeconfig $KC get "$c" -o jsonpath='{.spec.usages}')
+  s=$(kubectl --kubeconfig $KC get "$c" -o jsonpath='{.spec.request}' \
+      | base64 -d | openssl req -noout -text \
+      | grep -A1 'Subject Alternative Name' | tail -1 | sed 's/^ *//')
+  echo "$c | $u | $g | $s"
+done
+```
+
+核对无误后批准（kubelet 每次重试可能换密钥，全批可确保命中当前私钥）：
+
+```bash
+kubectl --kubeconfig /etc/kubernetes/admin.conf get csr -o name \
+  | xargs -r kubectl --kubeconfig /etc/kubernetes/admin.conf certificate approve
+```
+
+`2026-08-19` 本机批准 20 条，`conditions` 全为 `Approved`，configz 恢复可达
+（`failSwapOn=False`、`memorySwap={'swapBehavior': 'NoSwap'}`）。禁止为绕过该步骤给
+metrics-server 添加 `--kubelet-insecure-tls`。
 
 ## 旧 Docker/containerd 审计与清退决定
 
