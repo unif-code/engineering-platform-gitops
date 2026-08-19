@@ -522,6 +522,70 @@ class CidrCheckTest(BootstrapTestCase):
         self.assertIn('RESULT=STOP_CIDR_OVERLAP', result.stdout)
 
 
+    def test_exempts_cni_owned_entries_inside_pod_cidr(self) -> None:
+        """装完 Cilium 后 cilium_host 上的 PodCIDR 段路由/地址是设计使然，不是冲突。"""
+        result = self.run_cidr(
+            *self.base_arguments(),
+            '--cni-device', 'cilium_host', '--cni-device', 'lxc*',
+            '--address', '10.93.1.27/24@ens160',
+            '--address', '172.21.0.168/32@cilium_host',
+            '--route', '10.93.1.0/24@ens160',
+            '--route', '172.21.0.0/24@cilium_host',
+            '--route', '172.21.0.5/32@lxc9f2a',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_CIDRS', result.stdout)
+
+    def test_cni_exemption_is_narrow(self) -> None:
+        cases = {
+            'no-cni-device-declared': (
+                ['--address', '172.21.0.168/32@cilium_host'],
+                'STOP_CIDR_OVERLAP', 'pod-overlaps-local-address',
+            ),
+            'foreign-device-inside-pod-cidr': (
+                ['--cni-device', 'cilium_host', '--address', '172.21.5.1/24@ens160'],
+                'STOP_CIDR_OVERLAP', 'pod-overlaps-local-address',
+            ),
+            'cni-device-but-service-cidr': (
+                ['--cni-device', 'cilium_host', '--route', '172.20.0.0/24@cilium_host'],
+                'STOP_CIDR_OVERLAP', 'service-overlaps-local-route',
+            ),
+            # Pod CIDR 的超网即使在 CNI 网卡上也不豁免（豁免只给完全落在 Pod CIDR 内的条目）。
+            # 用不与 Service CIDR 相交的超网，确保命中的是 Pod 检查而不是更早的 Service 检查。
+            'cni-device-supernet-of-pod-cidr': (
+                ['--service-cidr', '10.96.0.0/12', '--pod-cidr', '172.21.0.0/16',
+                 '--cni-device', 'cilium_host', '--route', '172.0.0.0/8@cilium_host'],
+                'STOP_CIDR_OVERLAP', 'pod-overlaps-local-route',
+            ),
+            'device-without-tag-is-not-exempt': (
+                ['--cni-device', 'cilium_host', '--route', '172.21.0.0/24'],
+                'STOP_CIDR_OVERLAP', 'pod-overlaps-local-route',
+            ),
+            'invalid-device-name': (
+                ['--cni-device', 'cilium_host', '--address', '172.21.0.1/32@bad name'],
+                'STOP_CIDR_INVALID', None,
+            ),
+            'empty-device-name': (
+                ['--cni-device', 'cilium_host', '--address', '172.21.0.1/32@'],
+                'STOP_CIDR_INVALID', None,
+            ),
+            'invalid-cni-pattern': (
+                ['--cni-device', 'cilium host', '--address', '172.21.0.1/32@cilium_host'],
+                'STOP_CIDR_INVALID', None,
+            ),
+        }
+        for name, (extra, expected_result, expected_reason) in cases.items():
+            with self.subTest(case=name):
+                arguments = extra if '--pod-cidr' in extra else [*self.base_arguments(), *extra]
+                result = self.run_cidr(*arguments)
+
+                self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+                self.assertIn(f'RESULT={expected_result}', result.stdout)
+                if expected_reason:
+                    self.assertIn(f'REASON={expected_reason}', result.stdout)
+
+
 class PreflightTest(BootstrapTestCase):
     cleanup_digest = (
         'a68a3d2ff340bcdcb4265853107a3a2c22a9f7328728473d81d9be2d1486e635'
@@ -956,6 +1020,40 @@ class PreflightTest(BootstrapTestCase):
         result, _ = self.run_preflight(
             FAKE_IP_ROUTES='172.21.8.0/24 dev ens160 scope link'
         )
+
+        self.assertEqual(result.returncode, 10)
+        self.assertIn('RESULT=STOP_CIDR_OVERLAP', result.stdout)
+
+    def test_accepts_cilium_owned_pod_cidr_entries_after_install(self) -> None:
+        """装完 Cilium 后（真机 ip 输出）preflight 必须仍然通过，否则永远到不了 Stage 90。"""
+        routes = (
+            'local default dev lo table 2004 proto kernel scope host \n'
+            'default via 10.93.1.1 dev ens160 proto static \n'
+            '10.93.1.0/24 dev ens160 proto kernel scope link src 10.93.1.27 \n'
+            '172.21.0.0/24 via 172.21.0.168 dev cilium_host proto kernel src 172.21.0.168 \n'
+            '172.21.0.168 dev cilium_host proto kernel scope link \n'
+            'local 10.93.1.27 dev ens160 table local proto kernel scope host src 10.93.1.27 \n'
+            'local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 \n'
+            'local 172.21.0.168 dev cilium_host table local proto kernel scope host src 172.21.0.168 '
+        )
+        addresses = (
+            '1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n'
+            '2: ens160    inet 10.93.1.27/24 brd 10.93.1.255 scope global ens160\\       valid_lft forever preferred_lft forever\n'
+            '28264: cilium_host    inet 172.21.0.168/32 scope global cilium_host\\       valid_lft forever preferred_lft forever'
+        )
+        result, host = self.run_preflight(FAKE_IP_ROUTES=routes, FAKE_IP_ADDRESS=addresses)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_PREFLIGHT', result.stdout)
+        self.assertIn('POD_CIDR=172.21.0.0/16', self.evidence_text(host))
+
+    def test_foreign_route_inside_pod_cidr_still_stops_after_install(self) -> None:
+        """豁免只给 CNI 网卡：外部网卡上落进 Pod 段的路由仍是真冲突。"""
+        routes = (
+            '172.21.0.0/24 via 172.21.0.168 dev cilium_host proto kernel src 172.21.0.168 \n'
+            '172.21.8.0/24 dev ens160 scope link'
+        )
+        result, _ = self.run_preflight(FAKE_IP_ROUTES=routes)
 
         self.assertEqual(result.returncode, 10)
         self.assertIn('RESULT=STOP_CIDR_OVERLAP', result.stdout)
@@ -7272,6 +7370,33 @@ class KubeadmInitTest(BootstrapTestCase):
         return self.run_command(
             ['/bin/bash', str(KUBEADM_INIT), mode], env=environment
         )
+
+    def test_cidr_gate_receives_device_tagged_entries_and_cni_devices(self) -> None:
+        environment, _, command_log = self.make_environment()
+        environment['FAKE_IP_ADDRESS'] = (
+            '2: ens160 inet 10.93.1.27/24 scope global ens160\n'
+            '28264: cilium_host inet 172.21.0.168/32 scope global cilium_host'
+        )
+        environment['FAKE_IP_ROUTES'] = (
+            '10.93.1.0/24 dev ens160 src 10.93.1.27\n'
+            '172.21.0.0/24 via 172.21.0.168 dev cilium_host proto kernel src 172.21.0.168'
+        )
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cidr_lines = [
+            line for line in command_log.read_text(encoding='utf-8').splitlines()
+            if line.startswith('cidr ')
+        ]
+        self.assertTrue(cidr_lines)
+        for line in cidr_lines:
+            self.assertIn('--address 10.93.1.27/24@ens160', line)
+            self.assertIn('--address 172.21.0.168/32@cilium_host', line)
+            self.assertIn('--route 10.93.1.0/24@ens160', line)
+            self.assertIn('--route 172.21.0.0/24@cilium_host', line)
+            self.assertIn('--cni-device cilium_host', line)
+            self.assertIn('--cni-device lxc*', line)
 
     def test_config_pin_and_host_values_come_from_host_directory(self) -> None:
         """CONFIG digest 与主机值必须来自 host 目录，而不是脚本字面量。"""

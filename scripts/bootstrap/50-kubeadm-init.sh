@@ -276,6 +276,7 @@ host_and_dependency_gates() {
   local address_output swap_file swap_output swap_lines swap_name swap_bytes
   local route_output cidr_output
   local -a cidr_arguments
+  local cni_device
 
   os_release=$(ubuntu_os_release_path) ||
     complete STOP_PRECONDITION os-release-unsafe "$EXIT_PRECONDITION" NONE
@@ -311,12 +312,20 @@ host_and_dependency_gates() {
 
   route_output=$(ip -o -4 route show table all 2>/dev/null) || complete STOP_PRECONDITION route-unreadable "$EXIT_PRECONDITION" NONE
   cidr_arguments=(--service-cidr "$HOST_SERVICE_CIDR" --pod-cidr "$HOST_POD_CIDR")
+  for cni_device in "${CNI_HOST_DEVICES[@]}"; do
+    cidr_arguments+=(--cni-device "$cni_device")
+  done
+  # 地址/路由带上网卡名（前缀@网卡），让 CIDR 检查能识别 CNI 自建条目。
   while IFS= read -r address; do
     [[ -n "$address" ]] && cidr_arguments+=(--address "$address")
-  done < <(printf '%s\n' "$address_output" | awk '{print $4}')
+  done < <(printf '%s\n' "$address_output" | awk 'NF >= 4 {print $4 "@" $2}')
   while IFS= read -r route; do
     [[ -n "$route" ]] && cidr_arguments+=(--route "$route")
-  done < <(printf '%s\n' "$route_output" | awk '$1 != "default" && $1 ~ /\// {print $1}')
+  done < <(printf '%s\n' "$route_output" | awk '$1 != "default" && $1 ~ /\// {
+    device = ""
+    for (i = 1; i <= NF; i++) if ($i == "dev") device = $(i + 1)
+    print (device != "" ? $1 "@" device : $1)
+  }')
   if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
     cidr_output=$("$cidr_script" "${cidr_arguments[@]}" 2>/dev/null) || complete STOP_PRECONDITION cidr-gate-failed "$EXIT_PRECONDITION" NONE
   else

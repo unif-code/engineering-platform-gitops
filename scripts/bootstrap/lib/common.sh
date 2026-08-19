@@ -9,6 +9,10 @@ PHASE=${PHASE:-}
 EVIDENCE_FILE=
 EVIDENCE_OPEN=false
 
+# 已安装 Cilium 在宿主机上建立的网卡：CIDR 重叠检查只对这些网卡上、且落在 Pod CIDR
+# 内的地址/路由豁免（装完 CNI 后 PodCIDR 段路由是设计使然，不是冲突）。
+readonly -a CNI_HOST_DEVICES=(cilium_host cilium_net cilium_vxlan 'lxc*')
+
 parse_mode() {
   MODE=CHECK
   if [[ $# -eq 0 || ( $# -eq 1 && "$1" == "--check" ) ]]; then
