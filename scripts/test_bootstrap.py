@@ -1733,8 +1733,11 @@ class RunApprovedTest(BootstrapTestCase):
 
     def git(self, *arguments: str, cwd: Path) -> None:
         completed = subprocess.run(
+            # 固定注入上游 git 的默认分支 master：fixture 必须自己显式声明 main，
+            # 否则裸仓 HEAD 指向不存在的 master，clone 成功却得到空工作树（CI 曾如此）。
             ['/usr/bin/git', '-c', 'user.name=t', '-c', 'user.email=t@t',
-             '-c', 'commit.gpgsign=false', *arguments],
+             '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=master',
+             *arguments],
             cwd=cwd, capture_output=True, text=True, check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -1746,7 +1749,7 @@ class RunApprovedTest(BootstrapTestCase):
         directory = self.temporary_directory()
         bare = directory / origin_name
         bare.parent.mkdir(parents=True, exist_ok=True)
-        self.git('init', '--bare', str(bare), cwd=directory)
+        self.git('init', '--bare', '--initial-branch', 'main', str(bare), cwd=directory)
         seed = directory / 'seed'
         self.git('init', '--initial-branch', 'main', str(seed), cwd=directory)
         scripts = seed / 'scripts/bootstrap'
@@ -1766,6 +1769,10 @@ class RunApprovedTest(BootstrapTestCase):
         self.git('push', '-q', 'origin', 'main', cwd=seed)
         clone = directory / 'clone'
         self.git('clone', '-q', str(bare), str(clone), cwd=directory)
+        self.assertTrue(
+            (clone / 'scripts/bootstrap/run-approved.sh').is_file(),
+            'clone 必须包含入口脚本；空工作树说明裸仓 HEAD 指向了错误的默认分支',
+        )
         (seed / 'approved.txt').write_text('approved\n', encoding='utf-8')
         self.git('add', '-A', cwd=seed)
         self.git('commit', '-q', '-m', 'approved', cwd=seed)
