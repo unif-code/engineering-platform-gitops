@@ -489,6 +489,8 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertNotIn('kubelet_operator_override_is_pristine()', stage40)
         self.assertNotIn('[[ -s "$default_file" ]]', stage50)
         # validator 调用的路径事实谓词由共享库提供，两个消费 stage 都必须 source 它。
+        # 字面量与下面 PathFactsTest 里的那条同源：Task 3 把 stage 挪进
+        # stages/<NN-name>/run.sh 后 ${script_dir} 语义改变，两处必须一起改。
         facts_source_line = 'source "${script_dir}/lib/path-facts.sh"'
         facts_source = PATH_FACTS.read_text(encoding='utf-8')
         self.assertIn(facts_source_line, stage40)
@@ -614,32 +616,45 @@ class PathFactsTest(BootstrapTestCase):
     def test_drift_seams_stay_inert_without_test_mode(self) -> None:
         """两条测试缝都不得在 BOOTSTRAP_TEST_MODE 之外改变判定。"""
         directory = self.temporary_directory()
-        target = directory / 'probe'
-        target.write_text('x', encoding='utf-8')
+        user_owned = directory / 'probe'
+        user_owned.write_text('x', encoding='utf-8')
         marker = directory / 'marker'
         marker.write_text('x', encoding='utf-8')
+        # 根目录在 macOS 与 Linux 上都是 0:0，正好等于生产期望值，基线判真；
+        # 缝一旦泄漏到 BOOTSTRAP_TEST_MODE 之外就把期望抬成 1:0，判定会翻成假。
+        # 只有这个属主为 root 的探针能杀掉泄漏变异，用户自有的探针基线本就判假。
+        root_owned = Path('/')
 
-        seams = {
-            'immediate': {'BOOTSTRAP_TEST_OWNER_DRIFT_PATH': str(target)},
-            'deferred': {
-                'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH': str(target),
-                'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER': str(marker),
-            },
-        }
-        for name, seam in seams.items():
-            with self.subTest(seam=name):
-                baseline = self.run_facts(
-                    'owned_by_expected "$1"; printf "%s\\n" "$?"',
-                    str(target),
-                )
-                seamed = self.run_facts(
-                    'owned_by_expected "$1"; printf "%s\\n" "$?"',
-                    str(target),
-                    env=seam,
-                )
+        probes = (
+            ('root-owned', root_owned, '0\n'),
+            ('user-owned', user_owned, '1\n'),
+        )
+        for probe_name, probe, expected in probes:
+            seams = {
+                'immediate': {'BOOTSTRAP_TEST_OWNER_DRIFT_PATH': str(probe)},
+                'deferred': {
+                    'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH': str(probe),
+                    'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER': str(marker),
+                },
+            }
+            for name, seam in seams.items():
+                with self.subTest(probe=probe_name, seam=name):
+                    baseline = self.run_facts(
+                        'owned_by_expected "$1"; printf "%s\\n" "$?"',
+                        str(probe),
+                    )
+                    seamed = self.run_facts(
+                        'owned_by_expected "$1"; printf "%s\\n" "$?"',
+                        str(probe),
+                        env=seam,
+                    )
 
-                self.assertEqual(baseline.stdout, '1\n', baseline.stderr)
-                self.assertEqual(seamed.stdout, baseline.stdout, seamed.stderr)
+                    self.assertEqual(
+                        baseline.stdout, expected, baseline.stderr
+                    )
+                    self.assertEqual(
+                        seamed.stdout, baseline.stdout, seamed.stderr
+                    )
 
     def test_every_stage_delegates_path_facts_to_the_shared_library(
         self,
@@ -649,6 +664,8 @@ class PathFactsTest(BootstrapTestCase):
         self.assertFalse(PATH_FACTS.is_symlink())
 
         shared = PATH_FACTS.read_text(encoding='utf-8')
+        # 与 CommonLibraryTest 里的 facts_source_line 同源的硬编码字面量：
+        # Task 3 重排 stage 目录时 ${script_dir} 语义改变，两处必须一起改。
         source_line = 'source "${script_dir}/lib/path-facts.sh"'
         declarations = (
             'path_owner()',
@@ -1833,8 +1850,11 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 
     def test_production_rejects_all_test_overrides_before_lookup(self) -> None:
         """捕获 production 接受 TEST_ROOT/LOCK/owner seam 或先执行不可信命令的缺陷。"""
+        # 六个 source lib/path-facts.sh 的 stage 都要覆盖：漂移缝在库里是并集，
+        # 安全性完全依赖入口守卫拦在 source 之前。
         for script in (
             PREPARE_KERNEL, INSTALL_CONTAINERD, INSTALL_KUBERNETES, KUBEADM_INIT,
+            INSTALL_CILIUM, FINAL_VERIFY,
         ):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
