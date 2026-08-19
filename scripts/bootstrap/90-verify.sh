@@ -49,6 +49,8 @@ source "${script_dir}/lib/admin-conf.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/path-facts.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/cni-manifest.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
@@ -123,27 +125,6 @@ containerd_gate_is_exact() {
     printf '__EXIT_CODE__=%s\n' "$?"
   )
   [[ "$captured" == "${CONTAINERD_TRANSCRIPT}"$'\n__EXIT_CODE__=0' ]]
-}
-
-path_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
-}
-
-path_owner() {
-  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
-}
-
-path_size() {
-  stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null
-}
-
-owned_by_expected() {
-  local expected_uid=0 expected_gid=0
-  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 ]]; then
-    expected_uid=$EUID
-    expected_gid=${GROUPS[0]}
-  fi
-  [[ "$(path_owner "$1")" == "${expected_uid}:${expected_gid}" ]]
 }
 
 safe_directory() {

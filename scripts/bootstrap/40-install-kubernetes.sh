@@ -38,6 +38,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/path-facts.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/cni-manifest.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
@@ -69,27 +71,6 @@ complete() {
   local result=$1 reason=$2 code=$3 next=$4
   finish_phase "$result" "$reason" "$code" "$next"
   exit "$code"
-}
-
-path_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
-}
-
-path_owner() {
-  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
-}
-
-path_size() {
-  stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null
-}
-
-owned_by_expected() {
-  local expected_uid=0 expected_gid=0
-  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 ]]; then
-    expected_uid=$EUID
-    expected_gid=${GROUPS[0]}
-  fi
-  [[ "$(path_owner "$1")" == "${expected_uid}:${expected_gid}" ]]
 }
 
 managed_parent_safe() {

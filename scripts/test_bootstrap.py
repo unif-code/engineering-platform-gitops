@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMMON = ROOT / 'scripts/bootstrap/lib/common.sh'
 HOST_CONFIG = ROOT / 'scripts/bootstrap/lib/host-config.sh'
+PATH_FACTS = ROOT / 'scripts/bootstrap/lib/path-facts.sh'
 CIDR_CHECK = ROOT / 'scripts/bootstrap/check_cidrs.py'
 PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
 STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
@@ -487,12 +488,206 @@ class CommonLibraryTest(BootstrapTestCase):
             self.assertIn(declaration, shared_source)
         self.assertNotIn('kubelet_operator_override_is_pristine()', stage40)
         self.assertNotIn('[[ -s "$default_file" ]]', stage50)
-        self.assertIn(
-            '# shellcheck disable=SC2317,SC2329\npath_size()', stage50
-        )
+        # validator 调用的路径事实谓词由共享库提供，两个消费 stage 都必须 source 它。
+        facts_source_line = 'source "${script_dir}/lib/path-facts.sh"'
+        facts_source = PATH_FACTS.read_text(encoding='utf-8')
+        self.assertIn(facts_source_line, stage40)
+        self.assertIn(facts_source_line, stage50)
+        for predicate in ('path_mode', 'path_size', 'owned_by_expected'):
+            self.assertIn(f'{predicate} ', shared_source, predicate)
+            self.assertIn(f'{predicate}()', facts_source, predicate)
+            self.assertNotIn(f'{predicate}()', stage40, predicate)
+            self.assertNotIn(f'{predicate}()', stage50, predicate)
         self.assertIn(
             '"$repo_root"/scripts/bootstrap/lib/*.sh', static
         )
+
+
+class PathFactsTest(BootstrapTestCase):
+    """lib/path-facts.sh 的路径事实谓词与其测试缝。"""
+
+    STAGES = (
+        PREPARE_KERNEL,
+        INSTALL_CONTAINERD,
+        INSTALL_KUBERNETES,
+        KUBEADM_INIT,
+        INSTALL_CILIUM,
+        FINAL_VERIFY,
+    )
+
+    def run_facts(
+        self, body: str, *arguments: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """在干净环境里 source lib 后执行 body，位置参数从 $1 开始。"""
+        environment = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+        environment.update(env or {})
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                f'set -u\nsource "$0"\n{body}',
+                str(PATH_FACTS),
+                *arguments,
+            ],
+            env=environment,
+        )
+
+    def test_path_facts_report_owner_mode_and_size(self) -> None:
+        """三个机械谓词必须复述 stat 的属主、八进制权限与字节数。"""
+        directory = self.temporary_directory()
+        target = directory / 'probe'
+        target.write_bytes(b'0123456789')
+        target.chmod(0o640)
+
+        result = self.run_facts(
+            'path_owner "$1"\npath_mode "$1"\npath_size "$1"', str(target)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout, f'{os.getuid()}:{os.getgid()}\n640\n10\n'
+        )
+
+    def test_path_facts_fail_on_missing_path(self) -> None:
+        """缺失路径必须失败而不是打印空事实。"""
+        directory = self.temporary_directory()
+        missing = directory / 'absent'
+
+        for predicate in ('path_owner', 'path_mode', 'path_size'):
+            with self.subTest(predicate=predicate):
+                result = self.run_facts(f'{predicate} "$1"', str(missing))
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_owned_by_expected_demands_root_outside_test_mode(self) -> None:
+        """没有 BOOTSTRAP_TEST_MODE 时期望值恒为 0:0，非 root 拥有的路径必须判否。"""
+        directory = self.temporary_directory()
+        target = directory / 'probe'
+        target.write_text('x', encoding='utf-8')
+
+        result = self.run_facts('owned_by_expected "$1"', str(target))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_owned_by_expected_honours_both_drift_seams(self) -> None:
+        """并集实现必须同时支持即时漂移与标记触发的延迟漂移。"""
+        directory = self.temporary_directory()
+        target = directory / 'probe'
+        target.write_text('x', encoding='utf-8')
+        other = directory / 'other'
+        other.write_text('x', encoding='utf-8')
+        marker = directory / 'marker'
+        body = (
+            'owned_by_expected "$1" && echo BASELINE_OK\n'
+            'BOOTSTRAP_TEST_OWNER_DRIFT_PATH="$1" owned_by_expected "$1" ||\n'
+            '  echo IMMEDIATE_DRIFT\n'
+            'BOOTSTRAP_TEST_OWNER_DRIFT_PATH="$2" owned_by_expected "$1" &&\n'
+            '  echo IMMEDIATE_UNRELATED_OK\n'
+            'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH="$1" '
+            'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER="$3" '
+            'owned_by_expected "$1" && echo DEFERRED_INACTIVE\n'
+            ': >"$3"\n'
+            'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH="$1" '
+            'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER="$3" '
+            'owned_by_expected "$1" || echo DEFERRED_ACTIVE\n'
+            'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH="$2" '
+            'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER="$3" '
+            'owned_by_expected "$1" && echo DEFERRED_UNRELATED_OK\n'
+        )
+
+        result = self.run_facts(
+            body,
+            str(target),
+            str(other),
+            str(marker),
+            env={'BOOTSTRAP_TEST_MODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'BASELINE_OK\nIMMEDIATE_DRIFT\nIMMEDIATE_UNRELATED_OK\n'
+            'DEFERRED_INACTIVE\nDEFERRED_ACTIVE\nDEFERRED_UNRELATED_OK\n',
+        )
+
+    def test_drift_seams_stay_inert_without_test_mode(self) -> None:
+        """两条测试缝都不得在 BOOTSTRAP_TEST_MODE 之外改变判定。"""
+        directory = self.temporary_directory()
+        target = directory / 'probe'
+        target.write_text('x', encoding='utf-8')
+        marker = directory / 'marker'
+        marker.write_text('x', encoding='utf-8')
+
+        seams = {
+            'immediate': {'BOOTSTRAP_TEST_OWNER_DRIFT_PATH': str(target)},
+            'deferred': {
+                'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH': str(target),
+                'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER': str(marker),
+            },
+        }
+        for name, seam in seams.items():
+            with self.subTest(seam=name):
+                baseline = self.run_facts(
+                    'owned_by_expected "$1"; printf "%s\\n" "$?"',
+                    str(target),
+                )
+                seamed = self.run_facts(
+                    'owned_by_expected "$1"; printf "%s\\n" "$?"',
+                    str(target),
+                    env=seam,
+                )
+
+                self.assertEqual(baseline.stdout, '1\n', baseline.stderr)
+                self.assertEqual(seamed.stdout, baseline.stdout, seamed.stderr)
+
+    def test_every_stage_delegates_path_facts_to_the_shared_library(
+        self,
+    ) -> None:
+        """六个 stage 必须只 source 共享库，不得保留本地副本。"""
+        self.assertTrue(PATH_FACTS.is_file(), 'lib/path-facts.sh is missing')
+        self.assertFalse(PATH_FACTS.is_symlink())
+
+        shared = PATH_FACTS.read_text(encoding='utf-8')
+        source_line = 'source "${script_dir}/lib/path-facts.sh"'
+        declarations = (
+            'path_owner()',
+            'path_mode()',
+            'path_size()',
+            'owned_by_expected()',
+        )
+        for declaration in declarations:
+            self.assertIn(declaration, shared, declaration)
+
+        for stage in self.STAGES:
+            with self.subTest(stage=stage.name):
+                body = stage.read_text(encoding='utf-8')
+                self.assertIn(source_line, body)
+                self.assertIn(
+                    'for test_override in "${!BOOTSTRAP_TEST_@}"',
+                    body,
+                    '生产守卫的前缀通配必须保留',
+                )
+                for declaration in declarations:
+                    self.assertNotIn(declaration, body, declaration)
+
+    def test_shared_library_carries_the_union_of_the_test_seams(self) -> None:
+        """测试缝只允许在共享库里出现一次，stage 不得各自留一份。"""
+        shared = PATH_FACTS.read_text(encoding='utf-8')
+        seams = (
+            'BOOTSTRAP_TEST_OWNER_DRIFT_PATH',
+            'BOOTSTRAP_TEST_DEFERRED_OWNER_DRIFT_PATH',
+            'BOOTSTRAP_TEST_OWNER_DRIFT_AFTER_MARKER',
+        )
+        for seam in seams:
+            with self.subTest(seam=seam):
+                self.assertEqual(shared.count(seam), 1, seam)
+                for stage in self.STAGES:
+                    self.assertNotIn(
+                        seam,
+                        stage.read_text(encoding='utf-8'),
+                        f'{stage.name} 仍保留 {seam}',
+                    )
 
 
 class CidrCheckTest(BootstrapTestCase):

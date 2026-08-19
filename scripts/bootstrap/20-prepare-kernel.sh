@@ -24,6 +24,8 @@ fi
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/path-facts.sh"
 
 # PHASE 由公共 evidence helper 间接读取。
 # shellcheck disable=SC2034
@@ -47,28 +49,6 @@ complete() {
   local next=$4
   finish_phase "$result" "$reason" "$code" "$next"
   exit "$code"
-}
-
-path_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
-}
-
-path_owner() {
-  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
-}
-
-owned_by_expected() {
-  local path=$1
-  local expected_uid=0
-  local expected_gid=0
-  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 ]]; then
-    expected_uid=$EUID
-    expected_gid=${GROUPS[0]}
-    if [[ "${BOOTSTRAP_TEST_OWNER_DRIFT_PATH:-}" == "$path" ]]; then
-      expected_uid=$((expected_uid + 1))
-    fi
-  fi
-  [[ "$(path_owner "$path")" == "${expected_uid}:${expected_gid}" ]]
 }
 
 require_managed_parent() {

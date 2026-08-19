@@ -46,6 +46,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/path-facts.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/host-config.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/admin-conf.sh"
@@ -106,23 +108,6 @@ python_isolated() {
 
 tar_safe() {
   TAR_OPTIONS='' "$TAR_BINARY" "$@"
-}
-
-path_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
-}
-
-path_owner() {
-  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null
-}
-
-owned_by_expected() {
-  local expected_uid=0 expected_gid=0
-  if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 && "$EUID" -ne 0 ]]; then
-    expected_uid=$EUID
-    expected_gid=${GROUPS[0]}
-  fi
-  [[ "$(path_owner "$1")" == "${expected_uid}:${expected_gid}" ]]
 }
 
 safe_directory() {
