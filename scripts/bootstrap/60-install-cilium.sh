@@ -3,38 +3,24 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
-if [[ -n "${APT_CONFIG+x}" || -n "${KUBECONFIG+x}" ||
-      -n "${GNUPGHOME+x}" || -n "${HELM_NAMESPACE+x}" ||
-      -n "${HELM_DRIVER+x}" || -n "${HELM_KUBECONTEXT+x}" ||
-      -n "${HELM_CONFIG_HOME+x}" || -n "${HELM_CACHE_HOME+x}" ||
-      -n "${HELM_DATA_HOME+x}" || -n "${DPKG_ADMINDIR+x}" ||
-      -n "${DPKG_ROOT+x}" || -n "${DPKG_FORCE+x}" ||
-      -n "${DPKG_FRONTEND_LOCKED+x}" || -n "${KUBECACHEDIR+x}" ||
-      -n "${KUBECTL_EXTERNAL_DIFF+x}" || -n "${TAR_OPTIONS+x}" ||
-      -n "${BASH_ENV+x}" || -n "${ENV+x}" ]]; then
-  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
+# 逐个收集违规变量名并在拒绝时列出（只列名不列值），便于运维定位后 unset。
+untrusted_environment=
+for untrusted_name in APT_CONFIG KUBECONFIG GNUPGHOME HELM_NAMESPACE HELM_DRIVER \
+    HELM_KUBECONTEXT HELM_CONFIG_HOME HELM_CACHE_HOME HELM_DATA_HOME \
+    DPKG_ADMINDIR DPKG_ROOT DPKG_FORCE DPKG_FRONTEND_LOCKED \
+    KUBECACHEDIR KUBECTL_EXTERNAL_DIFF TAR_OPTIONS BASH_ENV ENV; do
+  [[ -z "${!untrusted_name+x}" ]] ||
+    untrusted_environment="${untrusted_environment:+${untrusted_environment},}${untrusted_name}"
+done
+for untrusted_name in "${!HELM_@}" "${!PYTHON@}" "${!OPENSSL_@}" "${!KUBECTL_@}"; do
+  [[ ",${untrusted_environment}," == *",${untrusted_name},"* ]] ||
+    untrusted_environment="${untrusted_environment:+${untrusted_environment},}${untrusted_name}"
+done
+if [[ -n "$untrusted_environment" ]]; then
+  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\nVARS=%s\n' \
+    "$untrusted_environment" >&2
   exit 10
 fi
-for untrusted_helm_variable in "${!HELM_@}"; do
-  : "$untrusted_helm_variable"
-  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
-  exit 10
-done
-for untrusted_python_variable in "${!PYTHON@}"; do
-  : "$untrusted_python_variable"
-  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
-  exit 10
-done
-for untrusted_openssl_variable in "${!OPENSSL_@}"; do
-  : "$untrusted_openssl_variable"
-  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
-  exit 10
-done
-for untrusted_kubectl_variable in "${!KUBECTL_@}"; do
-  : "$untrusted_kubectl_variable"
-  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
-  exit 10
-done
 
 if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
   if [[ "$EUID" -eq 0 ]]; then

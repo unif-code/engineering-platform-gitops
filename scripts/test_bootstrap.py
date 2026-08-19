@@ -1519,6 +1519,78 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
             environment.pop(variable, None)
         return environment, command_log
 
+    def clean_watched_environment(self, environment: dict[str, str]) -> None:
+        """删除 stage 硬化块监视的全部变量，让注入用例保持封闭。"""
+        watched = (
+            'APT_CONFIG', 'KUBECONFIG', 'GNUPGHOME', 'DPKG_ADMINDIR',
+            'DPKG_ROOT', 'DPKG_FORCE', 'DPKG_FRONTEND_LOCKED', 'KUBECACHEDIR',
+            'KUBECTL_EXTERNAL_DIFF', 'TAR_OPTIONS', 'BASH_ENV', 'ENV',
+            'CONTAINER_RUNTIME_ENDPOINT', 'IMAGE_SERVICE_ENDPOINT',
+        )
+        for name in tuple(environment):
+            if name in watched or name.startswith(
+                ('HELM_', 'PYTHON', 'OPENSSL_', 'KUBECTL_')
+            ):
+                del environment[name]
+
+    def test_environment_rejection_names_offending_variables(self) -> None:
+        """拒绝不可信环境时必须列出违规变量名（只列名不列值），便于运维定位 unset。"""
+        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+            with self.subTest(script=script.name):
+                environment, command_log = self.production_environment()
+                self.clean_watched_environment(environment)
+                environment['KUBECACHEDIR'] = '/dev/null'
+                environment['PYTHONDONTWRITEBYTECODE'] = '1'
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn(
+                    'REASON=untrusted-environment-override', result.stderr
+                )
+                self.assertIn(
+                    'VARS=KUBECACHEDIR,PYTHONDONTWRITEBYTECODE', result.stderr
+                )
+                self.assertNotIn('/dev/null', result.stderr)
+                self.assertFalse(command_log.exists())
+
+    def test_environment_rejection_lists_fixed_names_in_kubernetes_stages(self) -> None:
+        for script in (INSTALL_KUBERNETES, KUBEADM_INIT):
+            with self.subTest(script=script.name):
+                environment, command_log = self.production_environment()
+                self.clean_watched_environment(environment)
+                environment['APT_CONFIG'] = '/tmp/unapproved-apt.conf'
+                environment['KUBECONFIG'] = '/tmp/unapproved-kubeconfig'
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn('VARS=APT_CONFIG,KUBECONFIG', result.stderr)
+                self.assertNotIn('unapproved', result.stderr)
+                self.assertFalse(command_log.exists())
+
+    def test_environment_rejection_deduplicates_fixed_and_prefix_names(self) -> None:
+        """KUBECTL_EXTERNAL_DIFF 同时命中固定清单与 KUBECTL_ 前缀，只能列出一次。"""
+        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+            with self.subTest(script=script.name):
+                environment, _ = self.production_environment()
+                self.clean_watched_environment(environment)
+                environment['KUBECTL_EXTERNAL_DIFF'] = 'diff'
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn('VARS=KUBECTL_EXTERNAL_DIFF', result.stderr)
+                self.assertEqual(
+                    result.stderr.count('KUBECTL_EXTERNAL_DIFF'), 1
+                )
+
     def test_production_fixes_safe_path_before_command_lookup(self) -> None:
         """捕获 production 从调用者 PATH 执行伪造 id/systemctl/python3 的缺陷。"""
         self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')

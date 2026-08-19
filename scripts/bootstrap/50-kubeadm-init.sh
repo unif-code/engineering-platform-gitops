@@ -3,10 +3,16 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
-if [[ -n "${APT_CONFIG+x}" || -n "${KUBECONFIG+x}" ||
-      -n "${DPKG_ADMINDIR+x}" || -n "${DPKG_ROOT+x}" ||
-      -n "${DPKG_FORCE+x}" || -n "${DPKG_FRONTEND_LOCKED+x}" ]]; then
-  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\n' >&2
+# 逐个收集违规变量名并在拒绝时列出（只列名不列值），便于运维定位后 unset。
+untrusted_environment=
+for untrusted_name in APT_CONFIG KUBECONFIG DPKG_ADMINDIR DPKG_ROOT \
+    DPKG_FORCE DPKG_FRONTEND_LOCKED; do
+  [[ -z "${!untrusted_name+x}" ]] ||
+    untrusted_environment="${untrusted_environment:+${untrusted_environment},}${untrusted_name}"
+done
+if [[ -n "$untrusted_environment" ]]; then
+  printf 'RESULT=STOP_PRECONDITION\nREASON=untrusted-environment-override\nVARS=%s\n' \
+    "$untrusted_environment" >&2
   exit 10
 fi
 
