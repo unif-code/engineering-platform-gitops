@@ -533,8 +533,23 @@ bootstrap_dir=$(cd "${script_dir}/../.." && pwd -P)
 source "${bootstrap_dir}/lib/common.sh"
 ```
 
-原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`；`host_path`
-等使用 `script_dir` 定位仓库根的地方同样要顺延一层。
+原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`。
+
+`script_dir` **不只用于 source**，以下引用必须一并顺延（迁移前实测得出）：
+
+| 位置 | 现状 | 迁移后 |
+| --- | --- | --- |
+| `00`/`10`/`30` | `repo_root=$(cd "${script_dir}/../.." && pwd -P)` | `../../..` |
+| `00:185` | `python3 "${script_dir}/check_cidrs.py"` | `${bootstrap_dir}/check_cidrs.py` |
+| `50:565-568` | `${script_dir}/{20,30,40}-*.sh`、`check_cidrs.py` | `${bootstrap_dir}/stages/<NN-name>/run.sh`、`${bootstrap_dir}/check_cidrs.py` |
+| `90:120-122` | `cd "$script_dir"`、`${script_dir}/30-install-containerd.sh` | `cd "$bootstrap_dir"`、`${bootstrap_dir}/stages/30-install-containerd/run.sh` |
+
+**Ruling R1（预检裁定）：** 移动 20/30/40 时，`50` 与 `90` 此刻仍是平铺文件，
+但它们按路径引用被移动方，因此**必须在同一个提交内**更新其引用，否则本任务落地即红。
+
+**Ruling R2（预检裁定）：** `check_cidrs.py` 留在 `scripts/bootstrap/`，不随 stage 进目录。
+本地 fixture 因 `BOOTSTRAP_TEST_ROOT` 隔离可能掩盖路径推导错误，验证步骤必须包含
+一次真实路径断言（`test -x` 目标脚本、`test -f` check_cidrs.py），不得只依赖 fixture。
 
 - [ ] **Step 3: 拆出 `gates.sh`**
 
@@ -585,8 +600,23 @@ bootstrap_dir=$(cd "${script_dir}/../.." && pwd -P)
 source "${bootstrap_dir}/lib/common.sh"
 ```
 
-原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`；`host_path`
-等使用 `script_dir` 定位仓库根的地方同样要顺延一层。
+原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`。
+
+`script_dir` **不只用于 source**，以下引用必须一并顺延（迁移前实测得出）：
+
+| 位置 | 现状 | 迁移后 |
+| --- | --- | --- |
+| `00`/`10`/`30` | `repo_root=$(cd "${script_dir}/../.." && pwd -P)` | `../../..` |
+| `00:185` | `python3 "${script_dir}/check_cidrs.py"` | `${bootstrap_dir}/check_cidrs.py` |
+| `50:565-568` | `${script_dir}/{20,30,40}-*.sh`、`check_cidrs.py` | `${bootstrap_dir}/stages/<NN-name>/run.sh`、`${bootstrap_dir}/check_cidrs.py` |
+| `90:120-122` | `cd "$script_dir"`、`${script_dir}/30-install-containerd.sh` | `cd "$bootstrap_dir"`、`${bootstrap_dir}/stages/30-install-containerd/run.sh` |
+
+**Ruling R1（预检裁定）：** 移动 20/30/40 时，`50` 与 `90` 此刻仍是平铺文件，
+但它们按路径引用被移动方，因此**必须在同一个提交内**更新其引用，否则本任务落地即红。
+
+**Ruling R2（预检裁定）：** `check_cidrs.py` 留在 `scripts/bootstrap/`，不随 stage 进目录。
+本地 fixture 因 `BOOTSTRAP_TEST_ROOT` 隔离可能掩盖路径推导错误，验证步骤必须包含
+一次真实路径断言（`test -x` 目标脚本、`test -f` check_cidrs.py），不得只依赖 fixture。
 
 - [ ] **Step 3: 拆出 `gates.sh`**
 
@@ -644,8 +674,23 @@ bootstrap_dir=$(cd "${script_dir}/../.." && pwd -P)
 source "${bootstrap_dir}/lib/common.sh"
 ```
 
-原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`；`host_path`
-等使用 `script_dir` 定位仓库根的地方同样要顺延一层。
+原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`。
+
+`script_dir` **不只用于 source**，以下引用必须一并顺延（迁移前实测得出）：
+
+| 位置 | 现状 | 迁移后 |
+| --- | --- | --- |
+| `00`/`10`/`30` | `repo_root=$(cd "${script_dir}/../.." && pwd -P)` | `../../..` |
+| `00:185` | `python3 "${script_dir}/check_cidrs.py"` | `${bootstrap_dir}/check_cidrs.py` |
+| `50:565-568` | `${script_dir}/{20,30,40}-*.sh`、`check_cidrs.py` | `${bootstrap_dir}/stages/<NN-name>/run.sh`、`${bootstrap_dir}/check_cidrs.py` |
+| `90:120-122` | `cd "$script_dir"`、`${script_dir}/30-install-containerd.sh` | `cd "$bootstrap_dir"`、`${bootstrap_dir}/stages/30-install-containerd/run.sh` |
+
+**Ruling R1（预检裁定）：** 移动 20/30/40 时，`50` 与 `90` 此刻仍是平铺文件，
+但它们按路径引用被移动方，因此**必须在同一个提交内**更新其引用，否则本任务落地即红。
+
+**Ruling R2（预检裁定）：** `check_cidrs.py` 留在 `scripts/bootstrap/`，不随 stage 进目录。
+本地 fixture 因 `BOOTSTRAP_TEST_ROOT` 隔离可能掩盖路径推导错误，验证步骤必须包含
+一次真实路径断言（`test -x` 目标脚本、`test -f` check_cidrs.py），不得只依赖 fixture。
 
 - [ ] **Step 3: 拆出 `gates.sh`**
 
@@ -696,8 +741,23 @@ bootstrap_dir=$(cd "${script_dir}/../.." && pwd -P)
 source "${bootstrap_dir}/lib/common.sh"
 ```
 
-原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`；`host_path`
-等使用 `script_dir` 定位仓库根的地方同样要顺延一层。
+原文件里每一处 `${script_dir}/lib/` 都要改成 `${bootstrap_dir}/lib/`。
+
+`script_dir` **不只用于 source**，以下引用必须一并顺延（迁移前实测得出）：
+
+| 位置 | 现状 | 迁移后 |
+| --- | --- | --- |
+| `00`/`10`/`30` | `repo_root=$(cd "${script_dir}/../.." && pwd -P)` | `../../..` |
+| `00:185` | `python3 "${script_dir}/check_cidrs.py"` | `${bootstrap_dir}/check_cidrs.py` |
+| `50:565-568` | `${script_dir}/{20,30,40}-*.sh`、`check_cidrs.py` | `${bootstrap_dir}/stages/<NN-name>/run.sh`、`${bootstrap_dir}/check_cidrs.py` |
+| `90:120-122` | `cd "$script_dir"`、`${script_dir}/30-install-containerd.sh` | `cd "$bootstrap_dir"`、`${bootstrap_dir}/stages/30-install-containerd/run.sh` |
+
+**Ruling R1（预检裁定）：** 移动 20/30/40 时，`50` 与 `90` 此刻仍是平铺文件，
+但它们按路径引用被移动方，因此**必须在同一个提交内**更新其引用，否则本任务落地即红。
+
+**Ruling R2（预检裁定）：** `check_cidrs.py` 留在 `scripts/bootstrap/`，不随 stage 进目录。
+本地 fixture 因 `BOOTSTRAP_TEST_ROOT` 隔离可能掩盖路径推导错误，验证步骤必须包含
+一次真实路径断言（`test -x` 目标脚本、`test -f` check_cidrs.py），不得只依赖 fixture。
 
 - [ ] **Step 3: 拆出 `gates.sh`**
 
