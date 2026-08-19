@@ -1936,6 +1936,11 @@ class RunApprovedTest(BootstrapTestCase):
 class BootstrapOrchestratorTest(BootstrapTestCase):
     commit = '0123456789abcdef0123456789abcdef01234567'
     canary = 'SECRET_CANARY_ORCHESTRATOR_DO_NOT_LOG'
+    library_names = (
+        'common.sh',
+        'host-config.sh',
+        'os-release.sh',
+    )
     stage_names = {
         '00': '00-preflight.sh',
         '10': '10-stage-artifacts.sh',
@@ -1954,6 +1959,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
     def setUp(self) -> None:
         self.fixture_root = self.temporary_directory().resolve()
         self.stage_dir = self.fixture_root / 'stages'
+        self.library_dir = self.stage_dir / 'lib'
         self.state_dir = self.fixture_root / 'state'
         self.fake_bin = self.fixture_root / 'bin'
         for directory in (self.stage_dir, self.state_dir, self.fake_bin):
@@ -1966,6 +1972,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.lock_file = self.lock_dir / 'bootstrap.lock'
         self.command_log.write_text('', encoding='utf-8')
         self.write_fake_stages()
+        self.write_fake_library()
         self.write_fake_commands()
 
         self.base_environment = os.environ.copy()
@@ -2090,6 +2097,22 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         '''
         for name in self.stage_names.values():
             self.write_executable(self.stage_dir / name, source)
+
+    def write_fake_library(self) -> None:
+        """重建 stage 目录下的被 source 库，用于复原被破坏的 fixture。"""
+        if self.library_dir.is_symlink() or self.library_dir.is_file():
+            self.library_dir.unlink()
+        if not self.library_dir.is_dir():
+            self.library_dir.mkdir()
+        self.library_dir.chmod(0o700)
+        for name in self.library_names:
+            library_file = self.library_dir / name
+            if library_file.is_symlink() or library_file.exists():
+                library_file.unlink()
+            library_file.write_text(
+                f'# fixture library {name}\n', encoding='utf-8'
+            )
+            library_file.chmod(0o644)
 
     def write_fake_commands(self) -> None:
         self.write_executable(
@@ -2598,6 +2621,69 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 10)
         self.assertIn('REASON=unsafe-repository-path', result.stdout)
+
+    def test_library_files_are_gated_before_any_stage_runs(self) -> None:
+        """每个 stage 都以 root source lib/*.sh，属主与权限必须先过门禁。"""
+        common = self.library_dir / 'common.sh'
+        planted = self.fixture_root / 'planted-common.sh'
+        planted.write_text('# planted\n', encoding='utf-8')
+        planted.chmod(0o644)
+
+        def world_writable_directory() -> None:
+            self.library_dir.chmod(0o777)
+
+        def group_writable_directory() -> None:
+            self.library_dir.chmod(0o770)
+
+        def world_writable_file() -> None:
+            common.chmod(0o666)
+
+        def group_writable_file() -> None:
+            common.chmod(0o664)
+
+        def symlinked_file() -> None:
+            common.unlink()
+            common.symlink_to(planted)
+
+        def symlinked_directory() -> None:
+            relocated = self.fixture_root / 'relocated-lib'
+            shutil.move(str(self.library_dir), str(relocated))
+            self.library_dir.symlink_to(relocated, target_is_directory=True)
+
+        def missing_directory() -> None:
+            shutil.rmtree(self.library_dir)
+
+        def empty_directory() -> None:
+            for library_file in self.library_dir.iterdir():
+                library_file.unlink()
+
+        cases = (
+            ('world-writable-directory', world_writable_directory),
+            ('group-writable-directory', group_writable_directory),
+            ('world-writable-file', world_writable_file),
+            ('group-writable-file', group_writable_file),
+            ('symlinked-file', symlinked_file),
+            ('symlinked-directory', symlinked_directory),
+            ('missing-directory', missing_directory),
+            ('empty-directory', empty_directory),
+        )
+        for label, tamper in cases:
+            with self.subTest(case=label):
+                self.reset_fixture()
+                tamper()
+                try:
+                    result = self.run_orchestrator('--check')
+                finally:
+                    self.write_fake_library()
+
+                self.assertEqual(result.returncode, 30, result.stdout)
+                self.assertIn('REASON=unsafe-library-file', result.stdout)
+                self.assertEqual(
+                    self.command_log.read_text(encoding='utf-8'),
+                    '',
+                    '门禁必须在任何 stage 启动前停机',
+                )
+                self.assertEqual(list(self.state_dir.iterdir()), [])
 
 
 class ArtifactStageTest(BootstrapTestCase):

@@ -383,6 +383,18 @@ else
 fi
 readonly expected_stage_uid
 
+# 每个 stage 都以 root source lib/*.sh，这些文件与 stage 脚本同属供应链，
+# 必须在任何 stage 启动前完成属主与权限校验。
+library_dir="${stage_dir}/lib"
+safe_owned_directory "$library_dir" "$expected_stage_uid" ||
+  stop_orchestrator unsafe-library-file 30
+for library_file in "$library_dir"/*.sh; do
+  [[ -e "$library_file" ]] || stop_orchestrator unsafe-library-file 30
+  safe_owned_file "$library_file" "$expected_stage_uid" ||
+    stop_orchestrator unsafe-library-file 30
+done
+readonly library_dir
+
 for stage in "${STAGES[@]}"; do
   stage_script=$(stage_path "$stage") || stop_orchestrator invalid-stage-map 30
   if ! safe_owned_file "$stage_script" "$expected_stage_uid" ||
