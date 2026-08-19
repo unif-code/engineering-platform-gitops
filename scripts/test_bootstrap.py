@@ -1781,7 +1781,24 @@ class RunApprovedTest(BootstrapTestCase):
             ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=seed,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        return clone, head
+        return clone, head, seed
+
+    def publish_validated(self, seed: Path, sha: str) -> None:
+        """模拟 CI 在 validation-gate 全绿后发布 validated 分支。"""
+        self.git('push', '-q', '--force', 'origin', f'{sha}:refs/heads/validated', cwd=seed)
+
+    def side_commit(self, seed: Path) -> str:
+        """制造一个不在 main 历史上的提交。"""
+        self.git('checkout', '-q', '-b', 'side', cwd=seed)
+        (seed / 'side.txt').write_text('side\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'side', cwd=seed)
+        sha = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=seed,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.git('checkout', '-q', 'main', cwd=seed)
+        return sha
 
     def run_wrapper(
         self, clone: Path, *arguments: str, extra_env: dict[str, str] | None = None
@@ -1795,7 +1812,7 @@ class RunApprovedTest(BootstrapTestCase):
         )
 
     def test_gates_then_launches_bootstrap_in_clean_environment(self) -> None:
-        clone, approved = self.make_gated_repo()
+        clone, approved, _ = self.make_gated_repo()
 
         result = self.run_wrapper(
             clone, approved, '--check',
@@ -1813,8 +1830,66 @@ class RunApprovedTest(BootstrapTestCase):
         ).stdout.strip()
         self.assertEqual(head, approved)
 
+    def test_defaults_to_ci_published_validated_ref(self) -> None:
+        """不带 SHA 时使用 CI 发布的 origin/validated，运维无需手工转述 40 位字符。"""
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+
+        result = self.run_wrapper(clone, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'APPROVED_SHA={approved}', result.stdout)
+        self.assertIn('source=origin/validated', result.stdout)
+        self.assertIn('FAKE_MODE=--check', result.stdout)
+        head = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=clone,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(head, approved)
+
+    def test_uses_validated_even_when_main_moved_ahead(self) -> None:
+        """main 上有尚未通过 CI 的新提交时，只部署 validated 指向的那个绿提交。"""
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        (seed / 'unvalidated.txt').write_text('later\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'not yet validated', cwd=seed)
+        self.git('push', '-q', 'origin', 'main', cwd=seed)
+
+        result = self.run_wrapper(clone, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        head = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=clone,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(head, approved, 'must deploy validated, not the newer main tip')
+
+    def test_stops_when_validated_ref_is_unavailable_or_off_main(self) -> None:
+        clone, _, seed = self.make_gated_repo()
+        result = self.run_wrapper(clone, '--check')
+        self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
+        self.assertIn('STOP: validated ref unavailable', result.stdout)
+        self.assertNotIn('FAKE_MODE', result.stdout)
+
+        self.publish_validated(seed, self.side_commit(seed))
+        result = self.run_wrapper(clone, '--check')
+        self.assertEqual(result.returncode, 100, result.stdout + result.stderr)
+        self.assertIn('STOP: validated ref is not on origin/main history', result.stdout)
+        self.assertNotIn('FAKE_MODE', result.stdout)
+
+    def test_explicit_sha_reports_its_source(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+
+        result = self.run_wrapper(clone, approved, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'APPROVED_SHA={approved}', result.stdout)
+        self.assertIn('source=argument', result.stdout)
+
     def test_refuses_invalid_arguments(self) -> None:
-        clone, approved = self.make_gated_repo()
+        clone, approved, _ = self.make_gated_repo()
         for arguments, code in (
             (('not-a-sha', '--check'), 90),
             ((approved, '--force'), 2),
@@ -1827,7 +1902,7 @@ class RunApprovedTest(BootstrapTestCase):
 
     def test_apply_requires_root(self) -> None:
         self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
-        clone, approved = self.make_gated_repo()
+        clone, approved, _ = self.make_gated_repo()
 
         result = self.run_wrapper(clone, approved, '--apply')
 
@@ -1836,7 +1911,7 @@ class RunApprovedTest(BootstrapTestCase):
         self.assertNotIn('FAKE_MODE', result.stdout)
 
     def test_stops_on_dirty_worktree_origin_name_and_sha_mismatch(self) -> None:
-        clone, approved = self.make_gated_repo()
+        clone, approved, _ = self.make_gated_repo()
         (clone / 'dirty.txt').write_text('dirty\n', encoding='utf-8')
         result = self.run_wrapper(clone, approved, '--check')
         self.assertEqual(result.returncode, 95, result.stdout)
@@ -1851,7 +1926,7 @@ class RunApprovedTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 96, result.stdout)
         self.assertIn('STOP: origin/main SHA mismatch', result.stdout)
 
-        wrong_clone, wrong_approved = self.make_gated_repo(origin_name='wrong-name.git')
+        wrong_clone, wrong_approved, _ = self.make_gated_repo(origin_name='wrong-name.git')
         result = self.run_wrapper(wrong_clone, wrong_approved, '--check')
         self.assertEqual(result.returncode, 93, result.stdout)
         self.assertIn('STOP: unexpected origin', result.stdout)

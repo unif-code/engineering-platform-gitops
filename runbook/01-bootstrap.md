@@ -35,20 +35,31 @@ agent 审核回执前不得执行下一条。不得把 Secret、Token、私钥�
 服务器执行统一使用一行式入口（内建全部门禁，并以 `env -i` 干净环境启动编排器）：
 
 ```bash
-scripts/bootstrap/run-approved.sh <approved-sha> --check
+scripts/bootstrap/run-approved.sh --check
 ```
 
-它按序校验：40 位 SHA 形态、`--apply` 必须 root、仓库非软链、origin 为
+不带 SHA 时，入口取 CI 发布的 `origin/validated`——`validate.yml` 的
+`publish-validated` 只在 `push` 到 `main` 且 `validation-gate` 全绿后，把该引用指向
+被验证的那个提交。运维因此无需转述 40 位字符；引用缺失或不在 `origin/main`
+历史上（例如被回滚）时 fail-closed，绝不部署未过门禁的提交。
+
+它按序校验：SHA 形态（显式传参时）、`--apply` 必须 root、仓库非软链、origin 为
 `unif-code/engineering-platform-gitops.git`、当前分支 `main`、工作树干净、
-`fetch` 后 `origin/main` 等于已批准 SHA、`merge --ff-only` 后本地 HEAD 等于该 SHA、
-`/root/.helm-kubeconfig.*` 无残留；任一不满足即以固定退出码停止（90/91/92/93/94/95/96/97/98）。
-`approved-sha` 必须是 GitHub `validation-gate` 已全绿的提交。
+`origin/main` 等于已批准 SHA（显式传参）或 `origin/validated` 可解析且在
+`origin/main` 历史上（默认）、`merge --ff-only` 后本地 HEAD 等于该 SHA、
+`/root/.helm-kubeconfig.*` 无残留；任一不满足即以固定退出码停止
+（90/91/92/93/94/95/96/97/98/99/100）。输出的
+`APPROVED_SHA=<sha> (source=origin/validated|argument)` 记录本轮部署的提交来源。
 
 审核完整回执并明确批准 mutation 后，另行执行：
 
 ```bash
-scripts/bootstrap/run-approved.sh <approved-sha> --apply
+scripts/bootstrap/run-approved.sh --apply
 ```
+
+需要部署某个更早的已批准提交（而非最新绿提交）时，仍可显式传参：
+`scripts/bootstrap/run-approved.sh <approved-sha> --check`，此时该 SHA 必须等于
+`origin/main`。
 
 历史上手工粘贴的等价门禁脚本已由该入口取代：粘贴长脚本曾多次因终端丢字符导致
 `APPROVED_SHA` 截断或行断裂，也曾遗漏 `merge --ff-only`（`exit 97`）。

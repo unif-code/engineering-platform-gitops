@@ -97,3 +97,31 @@ jobs:
           test "$PLAN_RESULT" = success
           test "$TESTS_RESULT" = success
           test "$STATIC_RESULT" = success
+
+  publish-validated:
+    # validation-gate 全绿的 main 提交才发布到 validated；服务器 run-approved.sh 不带
+    # SHA 时只部署这个引用，避免运维手工转述 40 位字符时出错或误装未过门禁的提交。
+    needs: [validation-gate]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Point validated at the gated commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATED_SHA: ${{ github.sha }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$TARGET_REPOSITORY/git/ref/heads/validated" >/dev/null 2>&1
+          then
+            gh api --method PATCH \
+              "repos/$TARGET_REPOSITORY/git/refs/heads/validated" \
+              --raw-field sha="$GATED_SHA" --field force=false >/dev/null
+          else
+            gh api --method POST "repos/$TARGET_REPOSITORY/git/refs" \
+              --raw-field ref=refs/heads/validated \
+              --raw-field sha="$GATED_SHA" >/dev/null
+          fi
+          printf 'VALIDATED_SHA=%s\n' "$GATED_SHA"

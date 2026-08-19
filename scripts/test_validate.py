@@ -839,7 +839,8 @@ class ValidationCatalogTest(unittest.TestCase):
         self.assertEqual(document['on']['pull_request']['branches'], ['main'])
         self.assertIn('workflow_dispatch', document['on'])
         self.assertEqual(
-            set(document['jobs']), {'plan', 'tests', 'static', 'validation-gate'}
+            set(document['jobs']),
+            {'plan', 'tests', 'static', 'validation-gate', 'publish-validated'},
         )
         self.assertEqual(
             set(document['jobs']['validation-gate']['needs']),
@@ -872,6 +873,70 @@ class ValidationCatalogTest(unittest.TestCase):
             workflow_text,
         )
         self.assertNotRegex(workflow_text, r'uses:\s+[^\s]+@(main|master|v\d+)\s*$')
+
+    def test_github_workflow_publishes_validated_ref_least_privilege(self) -> None:
+        """捕获 validated 引用被未过门禁的提交、非 main 事件或过宽权限污染的缺陷。"""
+        workflow_path = validator.ROOT / '.github/workflows/validate.yml'
+        document = yaml.load(
+            workflow_path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader
+        )
+        publish = document['jobs']['publish-validated']
+        self.assertEqual(set(publish['needs']), {'validation-gate'})
+        self.assertEqual(
+            publish['if'],
+            "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+        )
+        self.assertEqual(publish['permissions'], {'contents': 'write'})
+        for name, job in document['jobs'].items():
+            if name == 'publish-validated':
+                continue
+            self.assertNotIn(
+                'permissions', job, f'{name} must inherit read-only permissions'
+            )
+        step = publish['steps'][0]
+        self.assertEqual(len(publish['steps']), 1, 'write-token job stays minimal')
+        self.assertNotIn('uses', step, 'never check out source under a write token')
+        self.assertEqual(
+            step['env'],
+            {
+                'GH_TOKEN': '${{ github.token }}',
+                'GATED_SHA': '${{ github.sha }}',
+                'TARGET_REPOSITORY': '${{ github.repository }}',
+            },
+        )
+        command = step['run']
+        self.assertIn('refs/heads/validated', command)
+        self.assertIn('"$GATED_SHA"', command)
+        self.assertNotIn('github.ref_name', command)
+        self.assertIn('force=false', command)
+
+    def test_every_workflow_declares_read_only_default_permissions(self) -> None:
+        """仓库默认令牌放开为写之后，捕获任何 workflow 静默继承写权限的缺陷。"""
+        workflow_directory = validator.ROOT / '.github/workflows'
+        workflows = sorted(
+            path
+            for path in workflow_directory.iterdir()
+            if path.suffix in {'.yml', '.yaml'}
+        )
+        self.assertTrue(workflows)
+        for path in workflows:
+            document = yaml.load(
+                path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader
+            )
+            self.assertEqual(
+                document.get('permissions'),
+                {'contents': 'read'},
+                f'{path.name} must pin read-only default permissions',
+            )
+            for name, job in document['jobs'].items():
+                declared = job.get('permissions')
+                if declared is None:
+                    continue
+                self.assertEqual(
+                    (path.name, name, declared),
+                    ('validate.yml', 'publish-validated', {'contents': 'write'}),
+                    'only the validated-ref publisher may hold a write token',
+                )
 
     def test_static_workflow_pins_python_validation_dependency(self) -> None:
         """捕获 static 验证依赖 runner 预装 PyYAML 的缺陷。"""
