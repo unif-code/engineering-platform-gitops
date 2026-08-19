@@ -20,6 +20,12 @@
 - `--check` 零写入；唯一文档化例外是 Stage 60/90 的瞬态 helm kubeconfig。
 - 语义差异只能依据服务器实测证据或真实工具输出裁决，**不得依据现有 fixture**。
 - 禁止提交 Secret、Token、私钥、kubeconfig 或密码库导出内容。
+- **每新增一个测试类，必须同步登记到 `scripts/validation_catalog.py`**（`contracts` 分片
+  与 `FAST_SELECTORS`）。`run_validation.py` 先跑 `--validate-catalog`，未登记的类会让
+  CI 以 `missing=[...]` 硬失败——本地跑单个类却完全正常，是典型的"本地绿、CI 红"。
+- 既有断言的**位置**可以随被测对象迁移而重锚，但重锚后的断言不得比原断言弱：
+  必须仍能捕获原断言覆盖的缺陷类，并用变异证明。仅当原断言钉住的事实本身
+  因迁移而消失（如已不再需要的 shellcheck 抑制）时，方可删除该部分。
 - 生产环境测试变量守卫是 `for test_override in "${!BOOTSTRAP_TEST_@}"` 前缀通配，与变量名无关——上提测试缝不会新增覆盖面，但不得删除该守卫。
 
 ---
