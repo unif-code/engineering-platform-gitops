@@ -27,6 +27,7 @@ KUBEADM_INIT = ROOT / 'scripts/bootstrap/50-kubeadm-init.sh'
 INSTALL_CILIUM = ROOT / 'scripts/bootstrap/60-install-cilium.sh'
 FINAL_VERIFY = ROOT / 'scripts/bootstrap/90-verify.sh'
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
+RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
 
 
 class BootstrapTestCase(unittest.TestCase):
@@ -1720,6 +1721,134 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 self.assertEqual(result.returncode, 10, result.stderr)
                 self.assertIn('REASON=test-root-must-be-isolated', result.stderr)
                 self.assertFalse(command_log.exists())
+
+
+class RunApprovedTest(BootstrapTestCase):
+    """一行式运维入口：门禁 + 干净环境启动 bootstrap-all。"""
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def git(self, *arguments: str, cwd: Path) -> None:
+        completed = subprocess.run(
+            ['/usr/bin/git', '-c', 'user.name=t', '-c', 'user.email=t@t',
+             '-c', 'commit.gpgsign=false', *arguments],
+            cwd=cwd, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def make_gated_repo(
+        self, *, origin_name: str = 'unif-code/engineering-platform-gitops.git'
+    ) -> tuple[Path, str]:
+        """返回 (落后一个提交的 clone, 已批准的 origin/main SHA)。"""
+        directory = self.temporary_directory()
+        bare = directory / origin_name
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        self.git('init', '--bare', str(bare), cwd=directory)
+        seed = directory / 'seed'
+        self.git('init', '--initial-branch', 'main', str(seed), cwd=directory)
+        scripts = seed / 'scripts/bootstrap'
+        scripts.mkdir(parents=True)
+        (scripts / 'run-approved.sh').write_bytes(RUN_APPROVED.read_bytes())
+        (scripts / 'run-approved.sh').chmod(0o755)
+        self.write_executable(
+            scripts / 'bootstrap-all.sh',
+            '#!/bin/bash\n'
+            'printf \'FAKE_MODE=%s\\n\' "$1"\n'
+            'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
+            'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
+        )
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'seed', cwd=seed)
+        self.git('remote', 'add', 'origin', str(bare), cwd=seed)
+        self.git('push', '-q', 'origin', 'main', cwd=seed)
+        clone = directory / 'clone'
+        self.git('clone', '-q', str(bare), str(clone), cwd=directory)
+        (seed / 'approved.txt').write_text('approved\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'approved', cwd=seed)
+        self.git('push', '-q', 'origin', 'main', cwd=seed)
+        head = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=seed,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return clone, head
+
+    def run_wrapper(
+        self, clone: Path, *arguments: str, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(extra_env or {})
+        return subprocess.run(
+            ['/bin/bash', str(clone / 'scripts/bootstrap/run-approved.sh'), *arguments],
+            cwd=clone, capture_output=True, text=True, check=False,
+            env=environment,
+        )
+
+    def test_gates_then_launches_bootstrap_in_clean_environment(self) -> None:
+        clone, approved = self.make_gated_repo()
+
+        result = self.run_wrapper(
+            clone, approved, '--check',
+            extra_env={'KUBECACHEDIR': '/dev/null', 'PYTHONDONTWRITEBYTECODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAKE_MODE=--check', result.stdout)
+        self.assertIn('KUBECACHEDIR_SEEN=ABSENT', result.stdout)
+        self.assertIn('PYTHON_SEEN=ABSENT', result.stdout)
+        self.assertIn('COMMAND_EXIT_CODE=0', result.stdout)
+        head = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=clone,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(head, approved)
+
+    def test_refuses_invalid_arguments(self) -> None:
+        clone, approved = self.make_gated_repo()
+        for arguments, code in (
+            (('not-a-sha', '--check'), 90),
+            ((approved, '--force'), 2),
+            ((approved,), 2),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_wrapper(clone, *arguments)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertNotIn('FAKE_MODE', result.stdout)
+
+    def test_apply_requires_root(self) -> None:
+        self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
+        clone, approved = self.make_gated_repo()
+
+        result = self.run_wrapper(clone, approved, '--apply')
+
+        self.assertEqual(result.returncode, 91, result.stdout)
+        self.assertIn('STOP: --apply must run as root', result.stdout)
+        self.assertNotIn('FAKE_MODE', result.stdout)
+
+    def test_stops_on_dirty_worktree_origin_name_and_sha_mismatch(self) -> None:
+        clone, approved = self.make_gated_repo()
+        (clone / 'dirty.txt').write_text('dirty\n', encoding='utf-8')
+        result = self.run_wrapper(clone, approved, '--check')
+        self.assertEqual(result.returncode, 95, result.stdout)
+        self.assertIn('STOP: worktree is not clean', result.stdout)
+        (clone / 'dirty.txt').unlink()
+
+        stale = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=clone,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        result = self.run_wrapper(clone, stale, '--check')
+        self.assertEqual(result.returncode, 96, result.stdout)
+        self.assertIn('STOP: origin/main SHA mismatch', result.stdout)
+
+        wrong_clone, wrong_approved = self.make_gated_repo(origin_name='wrong-name.git')
+        result = self.run_wrapper(wrong_clone, wrong_approved, '--check')
+        self.assertEqual(result.returncode, 93, result.stdout)
+        self.assertIn('STOP: unexpected origin', result.stdout)
+        self.assertNotIn('FAKE_MODE', result.stdout)
 
 
 class BootstrapOrchestratorTest(BootstrapTestCase):

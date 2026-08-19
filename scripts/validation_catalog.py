@@ -25,6 +25,7 @@ SHARDS = {
         'test_bootstrap.PreflightTest',
         'test_bootstrap.BootstrapEntrySecurityTest',
         'test_bootstrap.BootstrapOrchestratorTest',
+        'test_bootstrap.RunApprovedTest',
     ),
     'artifacts': ('test_bootstrap.ArtifactStageTest',),
     'kernel': ('test_bootstrap.KernelStageTest',),
@@ -58,6 +59,7 @@ FAST_SELECTORS = (
     'test_bootstrap.BootstrapOrchestratorTest.test_structured_output_and_postcheck_fail_closed',
     'test_bootstrap.BootstrapOrchestratorTest.test_apply_requires_main_clean_repo_and_exclusive_lock',
     'test_bootstrap.BootstrapOrchestratorTest.test_gnu_stat_fallback_discards_failed_probe_stdout',
+    'test_bootstrap.RunApprovedTest',
 )
 
 
