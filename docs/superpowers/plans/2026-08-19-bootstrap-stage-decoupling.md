@@ -207,6 +207,18 @@ git commit -am "refactor(bootstrap): share path fact predicates across stages"
 
 `python_isolated`、`tar_safe`、`safe_directory` 三者在 60/90 字节一致。`safe_file` 目前只存在于 90，是 90 用来抽掉「正规文件 + 非符号链接 + 模式匹配 + 属主符合」四项检查的通用判定；一并上提，供 Task 5/6 使用。
 
+**先决改动（Task 1 复评的前瞻发现，必须在本任务内先做）：**
+
+`scripts/test_bootstrap.py:2800-2807` 有一条断言「lib/ 下的文件不 source 任何东西」。
+本任务是第一个引入**跨 lib 依赖**的任务（`exec-safety.sh` 的 `safe_file` 消费
+`path_owner`），一旦 `exec-safety.sh` source `path-facts.sh`，该断言就会变红，
+而门禁前提其实仍然成立。
+
+- 放宽为：任何 `source` 目标的父目录必须等于被门禁覆盖的 lib 目录（而非「不得 source」）。
+- 同时修 `scripts/test_bootstrap.py:33-35` 的 `source` 正则：当前漏掉
+  `if source`、`elif source`、`while .`、`! source`、`command source` 等形态，
+  会让门禁前提断言**失败开放**（今天仓库里不存在这些写法，但不能留口子）。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -562,6 +574,14 @@ source "${script_dir}/gates.sh"
 
 `gates.sh` 必须可被测试单独 source 且无副作用（顶层只有函数定义与 `readonly` 常量）。
 
+**已知会变红的两处（Task 1 复评实测，必须在本步一并处理）：**
+
+1. `source "${script_dir}/gates.sh"` 会触发门禁前提断言——`gates.sh` 不在 `lib/` 下。
+   须把允许集扩展为「`lib/` 下的文件，或本 stage 目录下的 `gates.sh`」，并为 `gates.sh`
+   补上与 lib 同级的属主/权限门禁（Task 12 覆盖三层，此处先保证不失败开放）。
+2. 迁移后 `scripts/bootstrap/[0-9]*.sh` 通配为空，任何依赖该通配枚举 stage 的测试
+   都会**静默通过 0 个文件**。须改为从 `STAGE_SCRIPTS` 表枚举，并断言数量为 8。
+
 - [ ] **Step 4: 写 `stages/50-kubeadm-init/README.md`**
 
 三节：本 stage 做什么、会停在哪些 `REASON`（逐条给出处置）、证据文件路径。
@@ -628,6 +648,14 @@ source "${script_dir}/gates.sh"
 ```
 
 `gates.sh` 必须可被测试单独 source 且无副作用（顶层只有函数定义与 `readonly` 常量）。
+
+**已知会变红的两处（Task 1 复评实测，必须在本步一并处理）：**
+
+1. `source "${script_dir}/gates.sh"` 会触发门禁前提断言——`gates.sh` 不在 `lib/` 下。
+   须把允许集扩展为「`lib/` 下的文件，或本 stage 目录下的 `gates.sh`」，并为 `gates.sh`
+   补上与 lib 同级的属主/权限门禁（Task 12 覆盖三层，此处先保证不失败开放）。
+2. 迁移后 `scripts/bootstrap/[0-9]*.sh` 通配为空，任何依赖该通配枚举 stage 的测试
+   都会**静默通过 0 个文件**。须改为从 `STAGE_SCRIPTS` 表枚举，并断言数量为 8。
 
 - [ ] **Step 4: 写 `stages/40-install-kubernetes/README.md`**
 
@@ -703,6 +731,14 @@ source "${script_dir}/gates.sh"
 
 `gates.sh` 必须可被测试单独 source 且无副作用（顶层只有函数定义与 `readonly` 常量）。
 
+**已知会变红的两处（Task 1 复评实测，必须在本步一并处理）：**
+
+1. `source "${script_dir}/gates.sh"` 会触发门禁前提断言——`gates.sh` 不在 `lib/` 下。
+   须把允许集扩展为「`lib/` 下的文件，或本 stage 目录下的 `gates.sh`」，并为 `gates.sh`
+   补上与 lib 同级的属主/权限门禁（Task 12 覆盖三层，此处先保证不失败开放）。
+2. 迁移后 `scripts/bootstrap/[0-9]*.sh` 通配为空，任何依赖该通配枚举 stage 的测试
+   都会**静默通过 0 个文件**。须改为从 `STAGE_SCRIPTS` 表枚举，并断言数量为 8。
+
 - [ ] **Step 4: 写 `stages/60-install-cilium/README.md`**
 
 三节：本 stage 做什么、会停在哪些 `REASON`（逐条给出处置）、证据文件路径。
@@ -769,6 +805,14 @@ source "${script_dir}/gates.sh"
 ```
 
 `gates.sh` 必须可被测试单独 source 且无副作用（顶层只有函数定义与 `readonly` 常量）。
+
+**已知会变红的两处（Task 1 复评实测，必须在本步一并处理）：**
+
+1. `source "${script_dir}/gates.sh"` 会触发门禁前提断言——`gates.sh` 不在 `lib/` 下。
+   须把允许集扩展为「`lib/` 下的文件，或本 stage 目录下的 `gates.sh`」，并为 `gates.sh`
+   补上与 lib 同级的属主/权限门禁（Task 12 覆盖三层，此处先保证不失败开放）。
+2. 迁移后 `scripts/bootstrap/[0-9]*.sh` 通配为空，任何依赖该通配枚举 stage 的测试
+   都会**静默通过 0 个文件**。须改为从 `STAGE_SCRIPTS` 表枚举，并断言数量为 8。
 
 - [ ] **Step 4: 写 `stages/90-verify/README.md`**
 
