@@ -465,6 +465,8 @@ class CommonLibraryTest(BootstrapTestCase):
         static = (ROOT / 'scripts/validate-static.sh').read_text(
             encoding='utf-8'
         )
+        # 第三处硬编码 source 字面量（另两处在 CommonLibraryTest 与 PathFactsTest）：
+        # Task 10 迁移 stage 40/50 后 ${script_dir} 语义改变，三处必须一起改。
         source_line = 'source "${script_dir}/lib/kubelet-default.sh"'
         call = (
             'kubelet_default_conffile_is_pristine '
@@ -489,8 +491,9 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertNotIn('kubelet_operator_override_is_pristine()', stage40)
         self.assertNotIn('[[ -s "$default_file" ]]', stage50)
         # validator 调用的路径事实谓词由共享库提供，两个消费 stage 都必须 source 它。
-        # 字面量与下面 PathFactsTest 里的那条同源：Task 3 把 stage 挪进
-        # stages/<NN-name>/run.sh 后 ${script_dir} 语义改变，两处必须一起改。
+        # 硬编码 source 字面量，共三处：本行、PathFactsTest 里的同源行，以及
+        # 上面 kubelet-default.sh 的那条。Task 10 把 stage 40/50 挪进
+        # stages/<NN-name>/run.sh 后 ${script_dir} 语义改变，三处必须一起改。
         facts_source_line = 'source "${script_dir}/lib/path-facts.sh"'
         facts_source = PATH_FACTS.read_text(encoding='utf-8')
         self.assertIn(facts_source_line, stage40)
@@ -660,12 +663,14 @@ class PathFactsTest(BootstrapTestCase):
         self,
     ) -> None:
         """六个 stage 必须只 source 共享库，不得保留本地副本。"""
+        self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
         self.assertTrue(PATH_FACTS.is_file(), 'lib/path-facts.sh is missing')
         self.assertFalse(PATH_FACTS.is_symlink())
 
         shared = PATH_FACTS.read_text(encoding='utf-8')
         # 与 CommonLibraryTest 里的 facts_source_line 同源的硬编码字面量：
-        # Task 3 重排 stage 目录时 ${script_dir} 语义改变，两处必须一起改。
+        # Task 10 把 stage 40/50 挪进目录后 ${script_dir} 语义改变，
+        # 连同 kubelet-default.sh 那条共三处，必须一起改。
         source_line = 'source "${script_dir}/lib/path-facts.sh"'
         declarations = (
             'path_owner()',

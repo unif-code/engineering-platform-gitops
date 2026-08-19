@@ -672,6 +672,17 @@ source "${script_dir}/gates.sh"
 改 `scripts/test_bootstrap.py` 的 `STAGE_SCRIPTS['40']` 与
 `bootstrap-all.sh` 中 `stage_path` 的对应 `40)` 分支。
 
+**另有三处硬编码 `source "${script_dir}/lib/<name>.sh"` 字面量断言，必须一并改**
+（`${script_dir}` 语义随 stage 进目录而改变，测试里断言的字面量也要跟着变）：
+
+| 位置 | 断言的 source 行 |
+| --- | --- |
+| `test_bootstrap.py` `CommonLibraryTest` | `lib/path-facts.sh` |
+| `test_bootstrap.py` `PathFactsTest` | `lib/path-facts.sh` |
+| `test_bootstrap.py` kubelet 用例 | `lib/kubelet-default.sh` |
+
+源码中三处均有注释指向本任务。漏改任一处，对应断言会在迁移后变红。
+
 - [ ] **Step 6: 全量验证**
 
 Run: `python3 scripts/run_validation.py --profile full 2>&1 | tail -5`
