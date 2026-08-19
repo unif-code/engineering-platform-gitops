@@ -7536,6 +7536,72 @@ class KubeadmInitTest(BootstrapTestCase):
         self.assertEqual(self.tree_snapshot(host), before)
         self.assertNotIn('kubeadm init', command_log.read_text(encoding='utf-8'))
 
+    def test_check_tolerates_post_cni_workload_containers_when_initialized(self) -> None:
+        """装完 Cilium 后 crictl ps 里多了 cilium-agent/operator/envoy 与 coredns（真机 9 个）；
+        resume 判定只要求 4 个控制面容器各恰好一个且 Running 于 kube-system。"""
+        environment, host, command_log = self.make_environment()
+        self.assertEqual(self.run_stage(environment, '--apply').returncode, 0)
+        payload = json.loads(environment['FAKE_CRICTL_JSON'])
+        for name in ('coredns', 'coredns', 'cilium-envoy', 'cilium-operator', 'cilium-agent'):
+            payload['containers'].insert(0, {
+                'metadata': {'name': name}, 'state': 'CONTAINER_RUNNING',
+                'labels': {'io.kubernetes.pod.namespace': 'kube-system'},
+            })
+        environment['FAKE_CRICTL_JSON'] = json.dumps(payload)
+        command_log.write_text('', encoding='utf-8')
+
+        checked = self.run_stage(environment, '--check')
+
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', checked.stdout)
+        self.assertNotIn('kubeadm init', command_log.read_text(encoding='utf-8'))
+
+    def test_check_still_requires_each_control_plane_container_exactly_once(self) -> None:
+        for drift in ('missing-etcd', 'duplicate-apiserver', 'apiserver-outside-kube-system', 'apiserver-not-running'):
+            with self.subTest(drift=drift):
+                environment, _, _ = self.make_environment()
+                self.assertEqual(self.run_stage(environment, '--apply').returncode, 0)
+                payload = json.loads(environment['FAKE_CRICTL_JSON'])
+                containers = payload['containers']
+                # 同时带上真机的 5 个额外容器，确保豁免不会掩盖控制面漂移。
+                for name in ('coredns', 'cilium-envoy', 'cilium-operator', 'cilium-agent'):
+                    containers.append({
+                        'metadata': {'name': name}, 'state': 'CONTAINER_RUNNING',
+                        'labels': {'io.kubernetes.pod.namespace': 'kube-system'},
+                    })
+                apiserver = next(c for c in containers if c['metadata']['name'] == 'kube-apiserver')
+                if drift == 'missing-etcd':
+                    containers[:] = [c for c in containers if c['metadata']['name'] != 'etcd']
+                elif drift == 'duplicate-apiserver':
+                    containers.append(json.loads(json.dumps(apiserver)))
+                elif drift == 'apiserver-outside-kube-system':
+                    apiserver['labels']['io.kubernetes.pod.namespace'] = 'default'
+                else:
+                    apiserver['state'] = 'CONTAINER_EXITED'
+                environment['FAKE_CRICTL_JSON'] = json.dumps(payload)
+
+                checked = self.run_stage(environment, '--check')
+
+                self.assertEqual(checked.returncode, 30, checked.stdout)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', checked.stdout)
+                self.assertIn('REASON=control-plane-runtime-set-drift', checked.stdout)
+
+    def test_post_init_verification_still_requires_exactly_the_control_plane(self) -> None:
+        """刚 init 完的即时校验保持强断言：除 4 个控制面容器外不得有其他 Running 容器。"""
+        environment, _, _ = self.make_environment()
+        payload = json.loads(environment['FAKE_CRICTL_JSON'])
+        payload['containers'].append({
+            'metadata': {'name': 'unexpected'}, 'state': 'CONTAINER_RUNNING',
+            'labels': {'io.kubernetes.pod.namespace': 'kube-system'},
+        })
+        environment['FAKE_CRICTL_JSON'] = json.dumps(payload)
+
+        applied = self.run_stage(environment, '--apply')
+
+        self.assertEqual(applied.returncode, 50, applied.stdout)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', applied.stdout)
+        self.assertIn('REASON=control-plane-runtime-set-drift', applied.stdout)
+
     def test_apply_on_exact_initialized_state_never_reinitializes(self) -> None:
         environment, _, command_log = self.make_environment()
         self.assertEqual(self.run_stage(environment, '--apply').returncode, 0)

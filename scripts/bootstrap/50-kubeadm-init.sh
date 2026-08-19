@@ -388,11 +388,15 @@ fresh_pre_init_gates() {
   host_and_dependency_gates
 }
 
+# 参数 exact：刚 init 完的即时校验，运行中容器必须恰好是 4 个控制面容器（此时 CNI 未装，
+# 不可能有别的）。参数 initialized：resume 判定，4 个控制面容器各恰好一个且 Running 于
+# kube-system；其他运行中容器（Cilium、CoreDNS、后续 GitOps 工作负载）不属于本 stage 合同。
 control_plane_json_is_exact() {
   python3 -c '
 import json
 import sys
 
+mode = sys.argv[1]
 expected = ["etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"]
 try:
     document = json.load(sys.stdin)
@@ -401,9 +405,11 @@ except (TypeError, ValueError):
 if not isinstance(document, dict) or set(document) != {"containers"}:
     raise SystemExit(1)
 containers = document["containers"]
-if not isinstance(containers, list) or len(containers) != 4:
+if not isinstance(containers, list):
     raise SystemExit(1)
-names = []
+if mode == "exact" and len(containers) != 4:
+    raise SystemExit(1)
+control_plane = []
 for container in containers:
     if not isinstance(container, dict):
         raise SystemExit(1)
@@ -414,12 +420,15 @@ for container in containers:
     name = metadata.get("name")
     if not isinstance(name, str) or container.get("state") != "CONTAINER_RUNNING":
         raise SystemExit(1)
-    if labels.get("io.kubernetes.pod.namespace") != "kube-system":
+    if name in expected:
+        if labels.get("io.kubernetes.pod.namespace") != "kube-system":
+            raise SystemExit(1)
+        control_plane.append(name)
+    elif mode == "exact":
         raise SystemExit(1)
-    names.append(name)
-if sorted(names) != expected:
+if sorted(control_plane) != expected:
     raise SystemExit(1)
-' >/dev/null 2>&1
+' "$1" >/dev/null 2>&1
 }
 
 kubectl_query_is_empty() {
@@ -433,7 +442,7 @@ kubectl_query_is_empty() {
 }
 
 initialized_control_plane_gate() {
-  local failure_result=$1 failure_code=$2 listener kubernetes_root
+  local failure_result=$1 failure_code=$2 runtime_set_mode=$3 listener kubernetes_root
   local expected_manifests_with_keep
 
   managed_kubernetes_clients_gate
@@ -502,7 +511,7 @@ initialized_control_plane_gate() {
   set -e
   (( crictl_exit == 0 )) ||
     complete "$failure_result" control-plane-runtime-query-failed "$failure_code" NONE
-  if ! printf '%s' "$control_plane_output" | control_plane_json_is_exact; then
+  if ! printf '%s' "$control_plane_output" | control_plane_json_is_exact "$runtime_set_mode"; then
     complete "$failure_result" control-plane-runtime-set-drift "$failure_code" NONE
   fi
 
@@ -574,7 +583,7 @@ case "$state" in
     fresh_pre_init_gates
     ;;
   CANDIDATE)
-    initialized_control_plane_gate STOP_UNKNOWN_STATE "$EXIT_UNKNOWN_STATE"
+    initialized_control_plane_gate STOP_UNKNOWN_STATE "$EXIT_UNKNOWN_STATE" initialized
     complete ALREADY_COMPLIANT control-plane-initialized 0 \
       '60-install-cilium.sh --check'
     ;;
@@ -616,7 +625,7 @@ if ! "$kubeadm_binary" init --config "$config_snapshot" >/dev/null 2>&1; then
   complete STOP_APPLY_FAILED kubeadm-init-failed "$EXIT_APPLY_FAILED" NONE
 fi
 config_file_is_safe "$config_snapshot" 600 || complete STOP_UNKNOWN_STATE kubeadm-config-snapshot-drift "$EXIT_UNKNOWN_STATE" NONE
-initialized_control_plane_gate STOP_VERIFY_FAILED "$EXIT_VERIFY_FAILED"
+initialized_control_plane_gate STOP_VERIFY_FAILED "$EXIT_VERIFY_FAILED" exact
 
 evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 12-kubeadm "$evidence_dir" || complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
