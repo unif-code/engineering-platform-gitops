@@ -548,7 +548,7 @@ deb_dependency_contract_is_exact() {
 }
 
 cni_directory_state() {
-  local root=$1 logical_root=/opt/cni/bin actual_names expected_names
+  local root=$1 logical_root=/opt/cni/bin actual_names entry_set_kind
   local name mode size digest target actual_digest ownership
   if [[ ! -e "$root" && ! -L "$root" ]]; then
     printf 'MISSING\n'
@@ -562,8 +562,12 @@ cni_directory_state() {
     printf 'UNKNOWN\n'
     return
   }
-  expected_names=$(cni_manifest | awk -F '\t' '{print $1}' | sort)
-  if [[ "$actual_names" != "$expected_names" ]]; then
+  entry_set_kind=$(cni_entry_set_kind "$actual_names") || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  # 装完 Cilium 后 agent 会写入 cilium-cni；只按锁定的 mode/size/digest 与非包归属放行。
+  if [[ "$entry_set_kind" == with-cilium ]] && ! cilium_cni_entry_is_exact "$root"; then
     printf 'UNKNOWN\n'
     return
   fi

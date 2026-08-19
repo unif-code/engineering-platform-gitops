@@ -237,13 +237,16 @@ managed_clients_are_exact() {
 }
 
 cni_payload_is_exact() {
-  local actual_names expected_names name mode size digest target actual_digest ownership
+  local actual_names entry_set_kind name mode size digest target actual_digest ownership
   safe_directory "$(host_path /opt)" 755 || return 1
   safe_directory "$(host_path /opt/cni)" 755 || return 1
   safe_directory "$cni_root" 755 || return 1
   actual_names=$(find "$cni_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's#.*/##' | sort) || return 1
-  expected_names=$(cni_manifest | awk -F '\t' '{print $1}' | sort) || return 1
-  [[ "$actual_names" == "$expected_names" ]] || return 1
+  entry_set_kind=$(cni_entry_set_kind "$actual_names") || return 1
+  # 装完 Cilium 后 agent 会写入 cilium-cni；只按锁定的 mode/size/digest 与非包归属放行。
+  if [[ "$entry_set_kind" == with-cilium ]]; then
+    cilium_cni_entry_is_exact "$cni_root" || return 1
+  fi
   while IFS=$'\t' read -r name mode size digest; do
     target="${cni_root}/${name}"
     safe_file "$target" "$mode" || return 1

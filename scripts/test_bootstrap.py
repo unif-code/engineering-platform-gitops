@@ -4242,6 +4242,10 @@ class KubernetesInstallTest(BootstrapTestCase):
             '4cd72d8cef4499d3dc410874287b40e8b4241e0772938c5820cbee37986c1d93',
         ),
     }
+    # 已安装 Cilium 由 agent 写入的 CNI 插件：不属于 kubernetes-cni 包，装 CNI 后才出现。
+    cilium_cni_manifest = {
+        'cilium-cni': (0o755, 17270840, '6b7c1300294f522f5731629c9c53c756c2c55f6aace656fe08e95418769796ce'),
+    }
     cni_manifest = {
         'LICENSE': (0o644, 11357, 'b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1'),
         'README.md': (0o644, 2343, '43c32d29316a4a9fe23af500917bd89e51d6a84fa0dcbfcc75b5fbd834c3145a'),
@@ -4336,6 +4340,14 @@ class KubernetesInstallTest(BootstrapTestCase):
             ''.join(
                 f'{name}\t{mode:o}\t{size}\t{digest}\n'
                 for name, (mode, size, digest) in self.cni_manifest.items()
+            ),
+            encoding='utf-8',
+        )
+        cilium_cni_manifest = directory / 'cilium-cni-manifest.tsv'
+        cilium_cni_manifest.write_text(
+            ''.join(
+                f'{name}\t{mode:o}\t{size}\t{digest}\n'
+                for name, (mode, size, digest) in self.cilium_cni_manifest.items()
             ),
             encoding='utf-8',
         )
@@ -4895,6 +4907,10 @@ kubernetes-cni'
                       *) exit 64 ;;
                     esac
                     ;;
+                  /opt/cni/bin/cilium-cni)
+                    [ "${FAKE_CILIUM_CNI_OWNED:-0}" = 1 ] || exit 1
+                    owner=kubernetes-cni
+                    ;;
                   /opt/cni/bin/*) owner=kubernetes-cni ;;
                   *) exit 1 ;;
                 esac
@@ -5088,6 +5104,7 @@ kubernetes-cni'
                 ;;
               *)
                 digest=$(awk -F '\t' -v name="${1##*/}" '$1 == name {print $4}' "$FAKE_CNI_MANIFEST")
+                [ -n "$digest" ] || digest=$(awk -F '\t' -v name="${1##*/}" '$1 == name {print $4}' "$FAKE_CILIUM_CNI_MANIFEST")
                 [ -n "$digest" ] || exec /usr/bin/shasum -a 256 "$@"
                 ;;
             esac
@@ -5176,6 +5193,7 @@ kubernetes-cni'
                     directory / 'kubelet-show-drifted'
                 ),
                 'FAKE_CNI_MANIFEST': str(cni_manifest),
+                'FAKE_CILIUM_CNI_MANIFEST': str(cilium_cni_manifest),
                 'FAKE_CNI_ROOT': str(host / 'opt/cni/bin'),
                 'FAKE_PACKAGES_INDEX': str(packages_index),
                 'FAKE_APT_CONFIG_CHECK': str(fake_bin / 'validate-apt-config'),
@@ -5271,6 +5289,16 @@ kubernetes-cni'
             path.touch()
             os.truncate(path, size)
             path.chmod(mode)
+
+    def install_cilium_cni_plugin(
+        self, host: Path, *, mode: int = 0o755, size: int | None = None
+    ) -> Path:
+        name, (_, default_size, _) = next(iter(self.cilium_cni_manifest.items()))
+        path = host / 'opt/cni/bin' / name
+        path.touch()
+        os.truncate(path, default_size if size is None else size)
+        path.chmod(mode)
+        return path
 
     def install_official_kubelet_default_conffile(self, host: Path) -> Path:
         target = host / 'etc/default/kubelet'
@@ -5883,6 +5911,49 @@ kubernetes-cni'
                 self.assertFalse(
                     (host / 'etc/apt/sources.list.d/kubernetes.list').exists()
                 )
+
+    def test_accepts_cilium_cni_plugin_alongside_package_payload(self) -> None:
+        """装完 Cilium 后 /opt/cni/bin 多出 agent 写入的 cilium-cni，Stage 40 必须仍判 COMPLIANT。"""
+        environment, host, _ = self.make_environment()
+        self.install_repository_contract(host)
+        environment['FAKE_INSTALLED_STATE'] = 'exact'
+        Path(environment['FAKE_PACKAGES_HELD']).touch()
+        self.install_cni_contract(host)
+        self.install_cilium_cni_plugin(host)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+
+    def test_cilium_cni_plugin_exemption_is_exact(self) -> None:
+        """cilium-cni 只按钉死的 mode/size/digest、root 属主、非包归属放行；其他一律 fail closed。"""
+        for drift in ('mode', 'size', 'symlink', 'package-owned', 'other-extra'):
+            with self.subTest(drift=drift):
+                environment, host, _ = self.make_environment()
+                self.install_repository_contract(host)
+                environment['FAKE_INSTALLED_STATE'] = 'exact'
+                Path(environment['FAKE_PACKAGES_HELD']).touch()
+                self.install_cni_contract(host)
+                if drift == 'mode':
+                    self.install_cilium_cni_plugin(host, mode=0o775)
+                elif drift == 'size':
+                    self.install_cilium_cni_plugin(host, size=1)
+                elif drift == 'symlink':
+                    outside = host.parent / 'cilium-cni-outside'
+                    outside.write_bytes(b'')
+                    (host / 'opt/cni/bin/cilium-cni').symlink_to(outside)
+                elif drift == 'package-owned':
+                    self.install_cilium_cni_plugin(host)
+                    environment['FAKE_CILIUM_CNI_OWNED'] = '1'
+                else:
+                    (host / 'opt/cni/bin/unapproved').write_bytes(b'')
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 30, result.stdout)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertIn('REASON=partial-kubernetes-contract', result.stdout)
 
     def test_rejects_unknown_or_partial_cni_directory_before_mutation(self) -> None:
         for drift in ('unknown', 'partial', 'extra'):
@@ -11098,6 +11169,8 @@ class FinalVerifyTest(BootstrapTestCase):
     operator_image = CiliumInstallTest.operator_image
     envoy_image = CiliumInstallTest.envoy_image
     desired_values_object = CiliumInstallTest.desired_values_object
+    # 已安装 Cilium 由 agent 写入的 CNI 插件（Stage 90 运行时默认已存在）。
+    cilium_cni_record = ('cilium-cni', '755', '17270840', '6b7c1300294f522f5731629c9c53c756c2c55f6aace656fe08e95418769796ce')
     cni_records = (
         ('LICENSE', '644', '11357', 'b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1'),
         ('README.md', '644', '2343', '43c32d29316a4a9fe23af500917bd89e51d6a84fa0dcbfcc75b5fbd834c3145a'),
@@ -11572,10 +11645,10 @@ class FinalVerifyTest(BootstrapTestCase):
 
         cni_manifest = directory / 'cni-manifest.tsv'
         cni_manifest.write_text(
-            ''.join('\t'.join(record) + '\n' for record in self.cni_records),
+            ''.join('\t'.join(record) + '\n' for record in (*self.cni_records, self.cilium_cni_record)),
             encoding='utf-8',
         )
-        for name, mode, _, _ in self.cni_records:
+        for name, mode, _, _ in (*self.cni_records, self.cilium_cni_record):
             target = host / 'opt/cni/bin' / name
             target.write_text(name + '\n', encoding='utf-8')
             target.chmod(int(mode, 8))
@@ -11678,6 +11751,10 @@ class FinalVerifyTest(BootstrapTestCase):
               /usr/bin/kubeadm) package=kubeadm ;;
               /usr/bin/kubectl) package=kubectl ;;
               /usr/bin/kubelet) package=kubelet ;;
+              /opt/cni/bin/cilium-cni)
+                [ "${FAKE_CILIUM_CNI_OWNED:-0}" = 1 ] || exit 1
+                package=kubernetes-cni
+                ;;
               /opt/cni/bin/*) package=kubernetes-cni ;;
               *) exit 1 ;;
             esac
@@ -12818,6 +12895,34 @@ class FinalVerifyTest(BootstrapTestCase):
 
         self.assertIn('awk', required_commands.split())
         self.assertIn('grep', required_commands.split())
+
+    def test_accepts_cni_payload_with_or_without_cilium_plugin(self) -> None:
+        for present in (True, False):
+            with self.subTest(cilium_cni_present=present):
+                environment, host, _ = self.make_environment()
+                if not present:
+                    (host / 'opt/cni/bin/cilium-cni').unlink()
+
+                result = self.run_stage(environment)
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
+
+    def test_rejects_cilium_cni_plugin_drift(self) -> None:
+        for drift in ('mode', 'digest', 'package-owned'):
+            with self.subTest(drift=drift):
+                environment, host, _ = self.make_environment()
+                if drift == 'mode':
+                    (host / 'opt/cni/bin/cilium-cni').chmod(0o775)
+                elif drift == 'digest':
+                    environment['FAKE_CNI_DIGEST_DRIFT'] = 'cilium-cni'
+                else:
+                    environment['FAKE_CILIUM_CNI_OWNED'] = '1'
+
+                result = self.run_stage(environment)
+
+                self.assert_stops_without_evidence(result, host)
+                self.assertIn('REASON=cni-payload-drift', result.stdout)
 
     def test_rejects_cri_version_or_api_endpoint_health_drift(self) -> None:
         cases = (

@@ -26,3 +26,42 @@ vlan	755	5267679	5f6973d15ad2b0d44d1dc0e59982ed05e34e4709630ecd367f766202f9034ac
 vrf	755	4685012	3f3363182c4777bd0d3ead028147f9ecebd60bb32f2d47b7c181877a00ae049b
 EOF
 }
+
+# 已安装 Cilium（镜像 digest 在 values 中锁定）由 agent 写入 /opt/cni/bin 的 CNI 插件：
+# 装 CNI 之前不存在，装完后必须精确匹配；它不属于任何 dpkg 包。
+cilium_cni_manifest() {
+  cat <<'EOF'
+cilium-cni	755	17270840	6b7c1300294f522f5731629c9c53c756c2c55f6aace656fe08e95418769796ce
+EOF
+}
+
+# /opt/cni/bin 的条目集只允许两种：kubernetes-cni 清单，或清单 + cilium-cni。
+# 返回 0 且输出 with-cilium/without-cilium；其他集合返回 1。
+cni_entry_set_kind() {
+  local actual=$1 expected
+  expected=$(cni_manifest | awk -F '\t' '{print $1}' | sort)
+  if [[ "$actual" == "$expected" ]]; then
+    printf 'without-cilium\n'
+    return 0
+  fi
+  expected=$( { cni_manifest; cilium_cni_manifest; } | awk -F '\t' '{print $1}' | sort)
+  if [[ "$actual" == "$expected" ]]; then
+    printf 'with-cilium\n'
+    return 0
+  fi
+  return 1
+}
+
+# cilium-cni 必须是 root 拥有的 0755 常规非软链文件、size/sha256 精确、且不属于任何 dpkg 包。
+# 依赖调用 stage 提供 path_mode / path_size / owned_by_expected / sha256_file。
+cilium_cni_entry_is_exact() {
+  local root=$1 name mode size digest target actual_digest
+  IFS=$'\t' read -r name mode size digest < <(cilium_cni_manifest)
+  target="${root}/${name}"
+  [[ -f "$target" && ! -L "$target" && "$(path_mode "$target")" == "$mode" ]] || return 1
+  owned_by_expected "$target" || return 1
+  [[ "$(path_size "$target")" == "$size" ]] || return 1
+  actual_digest=$(sha256_file "$target") || return 1
+  [[ "$actual_digest" == "$digest" ]] || return 1
+  ! dpkg-query -S "/opt/cni/bin/${name}" >/dev/null 2>&1
+}
