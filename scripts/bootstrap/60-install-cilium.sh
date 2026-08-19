@@ -79,6 +79,10 @@ readonly CILIUM_CHART_SHA256=c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12
 readonly PYTHON_BINARY=/usr/bin/python3
 readonly TAR_BINARY=/usr/bin/tar
 readonly FIELD_MANAGER=engineering-platform-bootstrap
+# helm --atomic 对 DaemonSet/Deployment 的就绪判定允许 desired - ready <= maxUnavailable，
+# 单节点 + Cilium 默认 maxUnavailable 下 0 个就绪也会返回；装完后必须有界轮询直到 COMPLIANT。
+readonly POST_INSTALL_READY_TIMEOUT_SECONDS=600
+readonly POST_INSTALL_READY_INTERVAL_SECONDS=10
 readonly HELM_MEMBER=linux-amd64/helm
 readonly -a GATEWAY_OBJECTS=(
   customresourcedefinition.apiextensions.k8s.io/backendtlspolicies.gateway.networking.k8s.io
@@ -1149,7 +1153,7 @@ parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
 # helm kubeconfig 临时目录必须在任何退出路径（含被信号杀死）上被清掉。
 trap 'cleanup_helm_kubeconfig || :' EXIT
-for required_command in awk chmod cmp date dirname dpkg dpkg-query grep hostname id install ln mktemp rm rmdir stat sync; do
+for required_command in awk chmod cmp date dirname dpkg dpkg-query grep hostname id install ln mktemp rm rmdir sleep stat sync; do
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE
@@ -1176,11 +1180,18 @@ helm_archive="${staged_root}/${HELM_ARCHIVE_NAME}"
 gateway_manifest="${staged_root}/${GATEWAY_MANIFEST_NAME}"
 cilium_chart="${staged_root}/${CILIUM_CHART_NAME}"
 values_source=$VALUES_FILE
+post_install_timeout=$POST_INSTALL_READY_TIMEOUT_SECONDS
+post_install_interval=$POST_INSTALL_READY_INTERVAL_SECONDS
 if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
   values_source=${BOOTSTRAP_TEST_VALUES_FILE:-$values_source}
   [[ "$values_source" == /* && -O "$values_source" ]] ||
     complete STOP_PRECONDITION test-values-file-unsafe "$EXIT_PRECONDITION" NONE
+  post_install_timeout=${BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT:-$post_install_timeout}
+  post_install_interval=${BOOTSTRAP_TEST_POST_INSTALL_INTERVAL:-$post_install_interval}
+  [[ "$post_install_timeout" =~ ^[0-9]{1,5}$ && "$post_install_interval" =~ ^[0-9]{1,4}$ ]] ||
+    complete STOP_PRECONDITION test-post-install-wait-unsafe "$EXIT_PRECONDITION" NONE
 fi
+readonly post_install_timeout post_install_interval
 kubectl_binary=$(host_path /usr/bin/kubectl)
 helm_binary=$(host_path /usr/local/bin/helm)
 admin_conf=$(host_path /etc/kubernetes/admin.conf)
@@ -1290,8 +1301,15 @@ admin_conf_gate || complete STOP_VERIFY_FAILED admin-conf-post-install-drift "$E
 api_endpoint_is_exact || complete STOP_VERIFY_FAILED api-endpoint-post-install-drift "$EXIT_VERIFY_FAILED" NONE
 helm_state=$(helm_binary_state)
 [[ "$helm_state" == COMPLIANT ]] || complete STOP_VERIFY_FAILED helm-post-install-drift "$EXIT_VERIFY_FAILED" NONE
-load_cluster_state "$helm_state"
-[[ "$CLUSTER_STATE" == COMPLIANT ]] || complete STOP_VERIFY_FAILED cilium-post-install-state-invalid "$EXIT_VERIFY_FAILED" NONE
+# 有界轮询：每轮完整重跑 load_cluster_state；超时仍未 COMPLIANT 才 fail-closed。
+post_install_deadline=$(( SECONDS + post_install_timeout ))
+while :; do
+  load_cluster_state "$helm_state"
+  [[ "$CLUSTER_STATE" != COMPLIANT ]] || break
+  (( SECONDS < post_install_deadline )) ||
+    complete STOP_VERIFY_FAILED cilium-post-install-state-invalid "$EXIT_VERIFY_FAILED" NONE
+  sleep "$post_install_interval"
+done
 
 cleanup_apply_state || complete STOP_UNKNOWN_STATE apply-temporary-cleanup-unsafe "$EXIT_UNKNOWN_STATE" NONE
 trap - EXIT

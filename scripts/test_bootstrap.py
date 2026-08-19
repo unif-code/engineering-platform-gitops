@@ -9694,7 +9694,15 @@ operator:
                 if state == 'partial':
                     path = os.environ['FAKE_CILIUM_PARTIAL_JSON']
                 elif Path(os.environ['FAKE_CILIUM_MARKER']).exists():
-                    path = os.environ['FAKE_CILIUM_EXACT_JSON']
+                    # 真实 rollout：helm --atomic 返回后 DaemonSet/Deployment 仍可能未就绪，
+                    # 前 N 次查询按 partial 回答，之后才 exact。
+                    counter = Path(os.environ['FAKE_CILIUM_QUERY_COUNTER'])
+                    seen = int(counter.read_text()) if counter.exists() else 0
+                    counter.write_text(str(seen + 1))
+                    if seen < int(os.environ.get('FAKE_CILIUM_READY_AFTER_QUERIES', '0')):
+                        path = os.environ['FAKE_CILIUM_PARTIAL_JSON']
+                    else:
+                        path = os.environ['FAKE_CILIUM_EXACT_JSON']
                 else:
                     # 真实 kubectl：按名字 get 且全部不存在时，--ignore-not-found 不打印任何字节。
                     raise SystemExit(0)
@@ -9753,6 +9761,7 @@ operator:
                 'FAKE_GATEWAY_MARKER': str(gateway_marker),
                 'FAKE_RELEASE_MARKER': str(release_marker),
                 'FAKE_CILIUM_MARKER': str(cilium_marker),
+                'FAKE_CILIUM_QUERY_COUNTER': str(directory / 'cilium-query-count'),
                 'FAKE_KUBE_PROXY_MARKER': str(directory / 'kube-proxy-present'),
                 'FAKE_KUBE_PROXY_COUNTER': str(directory / 'kube-proxy-count'),
                 'FAKE_API_COUNTER': str(directory / 'api-count'),
@@ -10210,6 +10219,40 @@ operator:
         self.assertEqual(
             list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')),
             [],
+        )
+
+    def test_apply_waits_for_cilium_rollout_before_verifying(self) -> None:
+        """helm --atomic 不保证 DaemonSet/Deployment 已就绪（maxUnavailable ≥ desired 时
+        0 个就绪也算就绪）；装完后必须有界轮询直到 COMPLIANT，而不是一次性检查。"""
+        environment, _, command_log, _ = self.make_environment()
+        environment['FAKE_CILIUM_READY_AFTER_QUERIES'] = '2'
+        environment['BOOTSTRAP_TEST_POST_INSTALL_INTERVAL'] = '0'
+        environment['BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT'] = '30'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_INSTALLED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        install_index = commands.index(' install cilium ')
+        after_install = commands[install_index:]
+        self.assertGreaterEqual(
+            after_install.count('get daemonset/cilium deployment/cilium-operator'), 3
+        )
+
+    def test_apply_stops_when_cilium_never_becomes_ready(self) -> None:
+        environment, host, _, _ = self.make_environment()
+        environment['FAKE_CILIUM_READY_AFTER_QUERIES'] = '1000'
+        environment['BOOTSTRAP_TEST_POST_INSTALL_INTERVAL'] = '0'
+        environment['BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 50, result.stdout)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+        self.assertIn('REASON=cilium-post-install-state-invalid', result.stdout)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')), []
         )
 
     def test_apply_regates_inputs_and_cluster_after_gateway_mutation(self) -> None:
