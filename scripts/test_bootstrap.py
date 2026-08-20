@@ -2211,33 +2211,55 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 self.addCleanup(os.environ.pop, name, None)
             os.environ[name] = value
 
-    # stage 的不可信环境守卫拒绝 20 多个具名变量与 HELM_/PYTHON/OPENSSL_/KUBECTL_
-    # 四组前缀通配，且排在测试变量守卫之前。用例环境若继承调用者的 shell，就必须
-    # 维护一份与之等价的擦除清单——两份手工名单必然漂移，漂移的那一刻这里的判定
-    # 就从"生产拒绝测试变量"悄悄变成"生产拒绝调用者的某个变量"。
-    HOSTILE_AMBIENT = {
-        'PYTHONDONTWRITEBYTECODE': '1',
-        'PYTHONPATH': '/tmp/unapproved-python',
-        'TAR_OPTIONS': '--to-command=/bin/sh',
-        'BASH_ENV': '/tmp/unapproved-bash-env.sh',
-        'ENV': '/tmp/unapproved-env.sh',
-        'HELM_CACHE_HOME': '/tmp/unapproved-helm',
-        'OPENSSL_CONF': '/tmp/unapproved-openssl.cnf',
-        'KUBECTL_EXTERNAL_DIFF': '/bin/sh',
-        'KUBECACHEDIR': '/tmp/unapproved-kube-cache',
-        'CONTAINER_RUNTIME_ENDPOINT': 'unix:///tmp/unapproved.sock',
-        'APT_CONFIG': '/tmp/unapproved-apt.conf',
-        'KUBECONFIG': '/tmp/unapproved-kubeconfig',
-        'BOOTSTRAP_TEST_LOCK_FILE': '/tmp/unapproved.lock',
-    }
+    # 敌意变量集从 stage 源码解析，不手工维护第二份名单。手写清单与 stage 的拒绝
+    # 清单是两份要同步的东西，必然漂移——那正是本组用例要根治的缺陷形态，不能在
+    # 更高一层重演。stage 拒绝 20 个具名变量与 5 组前缀通配，逐 stage 还不同。
+    UNTRUSTED_GUARD_BLOCK = re.compile(r'for untrusted_name in ((?:.|\n)*?); do')
+    UNTRUSTED_PREFIX = re.compile(r'\$\{!([A-Z_]+)@\}')
+
+    @classmethod
+    def untrusted_environment_probe(cls) -> dict[str, str]:
+        """把每个 stage 会拒绝的变量名各造一个探针值。
+
+        前缀通配按 `<前缀>PROBE` 造名（`${!PYTHON@}` -> PYTHONPROBE），落在通配范围内。
+        """
+        names: set[str] = set()
+        for script in sorted(BOOTSTRAP_ALL.parent.glob('[0-9]*.sh')):
+            body = script.read_text(encoding='utf-8')
+            for block in cls.UNTRUSTED_GUARD_BLOCK.findall(body):
+                names.update(
+                    re.findall(r'\b[A-Z][A-Z0-9_]+\b', block.replace('\\\n', ' '))
+                )
+            for prefix in cls.UNTRUSTED_PREFIX.findall(body):
+                names.add(f'{prefix}PROBE')
+        return {
+            name: f'/tmp/unapproved-{name.lower()}' for name in sorted(names)
+        }
+
+    def test_untrusted_guard_parse_is_not_vacuous(self) -> None:
+        """解析若失灵会让下面两条用例静默空转，这里先钉住解析结果本身。"""
+        probe = self.untrusted_environment_probe()
+
+        self.assertGreaterEqual(len(probe), 20, probe)
+        for name in (
+            'APT_CONFIG', 'KUBECONFIG', 'GNUPGHOME', 'TAR_OPTIONS',
+            'BASH_ENV', 'ENV', 'KUBECACHEDIR', 'IMAGE_SERVICE_ENDPOINT',
+            'HELM_DRIVER', 'DPKG_ROOT',
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, probe)
+        for prefix in ('HELM_', 'PYTHON', 'OPENSSL_', 'KUBECTL_', 'BOOTSTRAP_TEST_'):
+            with self.subTest(prefix=prefix):
+                self.assertIn(f'{prefix}PROBE', probe)
 
     def test_production_environment_admits_no_ambient_variable(self) -> None:
         """捕获用例环境继承调用者 shell 的缺陷：白名单之外一个都不许进来。"""
-        self.ambient_environment(**self.HOSTILE_AMBIENT)
+        probe = self.untrusted_environment_probe()
+        self.ambient_environment(**probe)
 
         environment, _ = self.production_environment()
 
-        for name in self.HOSTILE_AMBIENT:
+        for name in probe:
             with self.subTest(variable=name):
                 self.assertNotIn(name, environment)
 
@@ -2254,7 +2276,7 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         """
         for script in (INSTALL_CILIUM, FINAL_VERIFY):
             with self.subTest(script=script.name):
-                self.ambient_environment(**self.HOSTILE_AMBIENT)
+                self.ambient_environment(**self.untrusted_environment_probe())
                 environment, command_log = self.production_environment()
                 environment['BOOTSTRAP_TEST_ROOT'] = '/'
 
