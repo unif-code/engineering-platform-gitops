@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from typing import Iterator
 from pathlib import Path
 
 import yaml
@@ -864,6 +865,48 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
 
 
 class ValidationCatalogTest(unittest.TestCase):
+    def test_github_workflow_never_exports_python_env_to_the_suite(self) -> None:
+        """捕获 CI 用环境变量而非 -B 关闭字节码写入的缺陷。
+
+        job 级 `env: PYTHONDONTWRITEBYTECODE` 会被导出并继承进用例派生的 stage
+        子进程，撞上 stage 60/90 的 `${!PYTHON@}` 不可信环境守卫（它排在测试变量
+        守卫之前），把 BootstrapEntrySecurityTest 的两个子用例判成假红——2026-08-19
+        的 3f080d4 就是这样让 tests (contracts) 全红的。三个本地入口已改用 -B，
+        CI 是同一缺陷的第四个调用方。
+        """
+        workflow_path = validator.ROOT / '.github/workflows/validate.yml'
+        workflow_text = workflow_path.read_text(encoding='utf-8')
+        document = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+
+        def exported_names(node: object) -> Iterator[str]:
+            """逐层收集所有 env: 映射的键名。"""
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == 'env' and isinstance(value, dict):
+                        yield from value
+                    yield from exported_names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from exported_names(item)
+
+        # 断言的是"没有任何 job 把它设成环境变量"，不是"这个词不许出现"——
+        # 否则连解释为何用 -B 的注释都写不了。
+        self.assertNotIn(
+            'PYTHONDONTWRITEBYTECODE', sorted(set(exported_names(document)))
+        )
+        # 另一种泄漏形态：run: 里的前缀赋值，同样会被导出。
+        for line in workflow_text.splitlines():
+            with self.subTest(line=line.strip()):
+                self.assertNotIn('PYTHONDONTWRITEBYTECODE=', line)
+        suite_calls = [
+            line.strip() for line in workflow_text.splitlines()
+            if 'run_validation.py' in line
+        ]
+        self.assertTrue(suite_calls, 'workflow 未调用 run_validation.py')
+        for line in suite_calls:
+            with self.subTest(line=line):
+                self.assertIn('python3 -B scripts/run_validation.py', line)
+
     def test_github_workflow_has_dynamic_full_gate(self) -> None:
         """捕获 CI 未执行完整动态分片验证或未聚合其结果的缺陷。"""
         workflow_path = validator.ROOT / '.github/workflows/validate.yml'

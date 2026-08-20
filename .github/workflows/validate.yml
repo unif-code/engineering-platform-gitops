@@ -30,9 +30,9 @@ jobs:
             --disable-pip-version-check PyYAML==6.0.3
           echo "$RUNNER_TEMP/validation-venv/bin" >>"$GITHUB_PATH"
       - name: Validate validation catalog
-        run: python3 scripts/run_validation.py --validate-catalog
+        run: python3 -B scripts/run_validation.py --validate-catalog
       - id: matrix
-        run: echo "matrix=$(python3 scripts/run_validation.py --matrix)" >>"$GITHUB_OUTPUT"
+        run: echo "matrix=$(python3 -B scripts/run_validation.py --matrix)" >>"$GITHUB_OUTPUT"
 
   tests:
     needs: plan
@@ -51,9 +51,10 @@ jobs:
           "$RUNNER_TEMP/validation-venv/bin/python" -m pip install \
             --disable-pip-version-check PyYAML==6.0.3
           echo "$RUNNER_TEMP/validation-venv/bin" >>"$GITHUB_PATH"
-      - run: python3 scripts/run_validation.py --shard "${{ matrix.shard }}"
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
+      # 字节码写入用 -B 关掉，不用 job 级 env: PYTHONDONTWRITEBYTECODE——那会被导出
+      # 并继承进用例派生的 stage 子进程，撞上 stage 60/90 的 ${!PYTHON@} 不可信环境
+      # 守卫（它排在测试变量守卫之前），把两条子用例判成假红。-B 只作用于本进程。
+      - run: python3 -B scripts/run_validation.py --shard "${{ matrix.shard }}"
 
   static:
     runs-on: ubuntu-24.04
