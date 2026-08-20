@@ -48,6 +48,8 @@ source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/path-facts.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/exec-safety.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/host-config.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/admin-conf.sh"
@@ -100,20 +102,6 @@ complete() {
   local result=$1 reason=$2 code=$3 next=$4
   finish_phase "$result" "$reason" "$code" "$next"
   exit "$code"
-}
-
-python_isolated() {
-  "$PYTHON_BINARY" -I -B "$@"
-}
-
-tar_safe() {
-  TAR_OPTIONS='' "$TAR_BINARY" "$@"
-}
-
-safe_directory() {
-  local path=$1 expected_mode=$2
-  [[ -d "$path" && ! -L "$path" && "$(path_mode "$path")" == "$expected_mode" ]] &&
-    owned_by_expected "$path"
 }
 
 safe_file_with_digest() {

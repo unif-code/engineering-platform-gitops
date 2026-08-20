@@ -51,6 +51,8 @@ source "${script_dir}/lib/common.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/path-facts.sh"
 # shellcheck disable=SC1091
+source "${script_dir}/lib/exec-safety.sh"
+# shellcheck disable=SC1091
 source "${script_dir}/lib/cni-manifest.sh"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/dpkg-package-verification.sh"
@@ -103,14 +105,6 @@ complete() {
   exit "$code"
 }
 
-python_isolated() {
-  "$PYTHON_BINARY" -I -B "$@"
-}
-
-tar_safe() {
-  TAR_OPTIONS='' "$TAR_BINARY" "$@"
-}
-
 openssl_safe() {
   OPENSSL_CONF=/dev/null OPENSSL_MODULES=/nonexistent "$openssl_binary" "$@"
 }
@@ -125,18 +119,6 @@ containerd_gate_is_exact() {
     printf '__EXIT_CODE__=%s\n' "$?"
   )
   [[ "$captured" == "${CONTAINERD_TRANSCRIPT}"$'\n__EXIT_CODE__=0' ]]
-}
-
-safe_directory() {
-  local path=$1 expected_mode=$2
-  [[ -d "$path" && ! -L "$path" && "$(path_mode "$path")" == "$expected_mode" ]] &&
-    owned_by_expected "$path"
-}
-
-safe_file() {
-  local path=$1 expected_mode=$2
-  [[ -f "$path" && ! -L "$path" && "$(path_mode "$path")" == "$expected_mode" ]] &&
-    owned_by_expected "$path"
 }
 
 package_state_is_exact() {

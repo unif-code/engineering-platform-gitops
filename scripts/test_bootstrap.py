@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMON = ROOT / 'scripts/bootstrap/lib/common.sh'
 HOST_CONFIG = ROOT / 'scripts/bootstrap/lib/host-config.sh'
 PATH_FACTS = ROOT / 'scripts/bootstrap/lib/path-facts.sh'
+EXEC_SAFETY = ROOT / 'scripts/bootstrap/lib/exec-safety.sh'
 CIDR_CHECK = ROOT / 'scripts/bootstrap/check_cidrs.py'
 PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
 STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
@@ -471,8 +472,9 @@ class CommonLibraryTest(BootstrapTestCase):
         static = (ROOT / 'scripts/validate-static.sh').read_text(
             encoding='utf-8'
         )
-        # 第三处硬编码 source 字面量（另两处在 CommonLibraryTest 与 PathFactsTest）：
-        # Task 10 迁移 stage 40/50 后 ${script_dir} 语义改变，三处必须一起改。
+        # 硬编码 source 字面量之一（其余在本类的 facts_source_line、
+        # PathFactsTest 与 ExecSafetyTest）：Task 10 迁移 stage 40/50 后
+        # ${script_dir} 语义改变，所有这类字面量必须一起改。
         source_line = 'source "${script_dir}/lib/kubelet-default.sh"'
         call = (
             'kubelet_default_conffile_is_pristine '
@@ -497,9 +499,9 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertNotIn('kubelet_operator_override_is_pristine()', stage40)
         self.assertNotIn('[[ -s "$default_file" ]]', stage50)
         # validator 调用的路径事实谓词由共享库提供，两个消费 stage 都必须 source 它。
-        # 硬编码 source 字面量，共三处：本行、PathFactsTest 里的同源行，以及
-        # 上面 kubelet-default.sh 的那条。Task 10 把 stage 40/50 挪进
-        # stages/<NN-name>/run.sh 后 ${script_dir} 语义改变，三处必须一起改。
+        # 硬编码 source 字面量之一：本行、上面 kubelet-default.sh 的那条、
+        # PathFactsTest 里的同源行，以及 ExecSafetyTest 的两条。Task 10 把 stage
+        # 挪进 stages/<NN-name>/run.sh 后 ${script_dir} 语义改变，全部要一起改。
         facts_source_line = 'source "${script_dir}/lib/path-facts.sh"'
         facts_source = PATH_FACTS.read_text(encoding='utf-8')
         self.assertIn(facts_source_line, stage40)
@@ -740,8 +742,8 @@ class PathFactsTest(BootstrapTestCase):
 
         shared = PATH_FACTS.read_text(encoding='utf-8')
         # 与 CommonLibraryTest 里的 facts_source_line 同源的硬编码字面量：
-        # Task 10 把 stage 40/50 挪进目录后 ${script_dir} 语义改变，
-        # 连同 kubelet-default.sh 那条共三处，必须一起改。
+        # Task 10 把 stage 挪进目录后 ${script_dir} 语义改变，连同
+        # kubelet-default.sh 那条与 ExecSafetyTest 的两条，必须一起改。
         source_line = 'source "${script_dir}/lib/path-facts.sh"'
         declarations = (
             'path_owner()',
@@ -781,6 +783,254 @@ class PathFactsTest(BootstrapTestCase):
                         stage.read_text(encoding='utf-8'),
                         f'{stage.name} 仍保留 {seam}',
                     )
+
+
+class ExecSafetyTest(BootstrapTestCase):
+    """lib/exec-safety.sh 的受控执行与路径安全谓词。"""
+
+    STAGES = (INSTALL_CILIUM, FINAL_VERIFY)
+
+    def run_exec_safety(
+        self, body: str, *arguments: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """只 source exec-safety.sh 后执行 body，位置参数从 $1 开始。
+
+        故意不 source path-facts.sh：safe_file/safe_directory 用到的 path_mode 与
+        owned_by_expected 必须由本库自己带进来，否则这里的每个用例都会以
+        command not found 变红。"""
+        environment = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+        environment.update(env or {})
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                f'set -u\nsource "$0"\n{body}',
+                str(EXEC_SAFETY),
+                *arguments,
+            ],
+            env=environment,
+        )
+
+    def recorder(self, directory: Path, name: str, body: str) -> Path:
+        """写一个复述自身参数的可执行探针，用来观察谓词实际发出的命令行。"""
+        path = directory / name
+        path.write_text(f'#!/bin/sh\n{body}\n', encoding='utf-8')
+        path.chmod(0o755)
+        return path
+
+    def probe_tree(self) -> dict[str, Path]:
+        """一棵覆盖类型、模式、符号链接三个维度的探针树。"""
+        directory = self.temporary_directory()
+        paths = {
+            'directory': directory / 'tight-dir',
+            'loose_directory': directory / 'loose-dir',
+            'directory_link': directory / 'dir-link',
+            'file': directory / 'tight-file',
+            'loose_file': directory / 'loose-file',
+            'file_link': directory / 'file-link',
+            'missing': directory / 'absent',
+            'spare': directory / 'spare',
+        }
+        paths['directory'].mkdir()
+        paths['directory'].chmod(0o700)
+        paths['loose_directory'].mkdir()
+        paths['loose_directory'].chmod(0o755)
+        paths['directory_link'].symlink_to(paths['directory'])
+        paths['file'].write_text('x', encoding='utf-8')
+        paths['file'].chmod(0o600)
+        paths['loose_file'].write_text('x', encoding='utf-8')
+        paths['loose_file'].chmod(0o644)
+        paths['file_link'].symlink_to(paths['file'])
+        return paths
+
+    def test_python_isolated_runs_the_pinned_interpreter_in_isolation(
+        self,
+    ) -> None:
+        """解释器必须是 stage 钉死的那个绝对路径，且始终带 -I -B。"""
+        directory = self.temporary_directory()
+        fake_python = self.recorder(
+            directory, 'fake-python', "printf 'ARGV=%s\\n' \"$*\""
+        )
+
+        result = self.run_exec_safety(
+            f'PYTHON_BINARY="{fake_python!s}"\n'
+            'python_isolated -c "import sys" extra'
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'ARGV=-I -B -c import sys extra\n')
+
+    def test_tar_safe_runs_the_pinned_tar_without_inherited_options(
+        self,
+    ) -> None:
+        """继承来的 TAR_OPTIONS 必须被清空，否则解包参数可被环境改写。"""
+        directory = self.temporary_directory()
+        fake_tar = self.recorder(
+            directory,
+            'fake-tar',
+            "printf 'OPTIONS=[%s] ARGV=%s\\n' \"${TAR_OPTIONS-unset}\" \"$*\"",
+        )
+
+        result = self.run_exec_safety(
+            f'TAR_BINARY="{fake_tar!s}"\ntar_safe -xOf archive member',
+            env={'TAR_OPTIONS': '--to-command=/bin/sh'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout, 'OPTIONS=[] ARGV=-xOf archive member\n'
+        )
+
+    def test_controlled_execution_fails_closed_without_the_pinned_binaries(
+        self,
+    ) -> None:
+        """PYTHON_BINARY/TAR_BINARY 缺失时必须报未绑定变量，不得退回 PATH。"""
+        marker = self.temporary_directory()
+        for predicate, decoy in (
+            ('python_isolated -c "pass"', 'python3'),
+            ('tar_safe --version', 'tar'),
+        ):
+            with self.subTest(predicate=predicate):
+                self.recorder(
+                    marker, decoy, f"printf 'PATH_FALLBACK_{decoy}\\n'"
+                )
+
+                result = self.run_exec_safety(
+                    predicate, env={'PATH': f'{marker}:/usr/bin:/bin'}
+                )
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn('PATH_FALLBACK', result.stdout)
+                self.assertIn('unbound variable', result.stderr)
+
+    def test_safe_file_demands_regular_file_mode_and_owner(self) -> None:
+        """四项检查各自都必须能单独判否：类型、模式、属主，以及缺失路径。"""
+        paths = self.probe_tree()
+        body = (
+            'safe_file "$1" 600 && echo REGULAR_ACCEPTED\n'
+            'safe_file "$2" 755 || echo DIRECTORY_REJECTED\n'
+            'safe_file "$3" 600 || echo WRONG_MODE_REJECTED\n'
+            'BOOTSTRAP_TEST_OWNER_DRIFT_PATH="$1" safe_file "$1" 600 ||\n'
+            '  echo WRONG_OWNER_REJECTED\n'
+            'safe_file "$4" 600 || echo MISSING_REJECTED\n'
+        )
+
+        result = self.run_exec_safety(
+            body,
+            str(paths['file']),
+            str(paths['loose_directory']),
+            str(paths['loose_file']),
+            str(paths['missing']),
+            env={'BOOTSTRAP_TEST_MODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'REGULAR_ACCEPTED\nDIRECTORY_REJECTED\nWRONG_MODE_REJECTED\n'
+            'WRONG_OWNER_REJECTED\nMISSING_REJECTED\n',
+        )
+
+    def test_safe_directory_demands_directory_mode_and_owner(self) -> None:
+        """目录判定同样要能单独判否：普通文件、错模式、错属主、缺失路径。"""
+        paths = self.probe_tree()
+        body = (
+            'safe_directory "$1" 700 && echo DIRECTORY_ACCEPTED\n'
+            'safe_directory "$2" 600 || echo REGULAR_FILE_REJECTED\n'
+            'safe_directory "$3" 700 || echo WRONG_MODE_REJECTED\n'
+            'BOOTSTRAP_TEST_OWNER_DRIFT_PATH="$1" safe_directory "$1" 700 ||\n'
+            '  echo WRONG_OWNER_REJECTED\n'
+            'safe_directory "$4" 700 || echo MISSING_REJECTED\n'
+        )
+
+        result = self.run_exec_safety(
+            body,
+            str(paths['directory']),
+            str(paths['file']),
+            str(paths['loose_directory']),
+            str(paths['missing']),
+            env={'BOOTSTRAP_TEST_MODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'DIRECTORY_ACCEPTED\nREGULAR_FILE_REJECTED\nWRONG_MODE_REJECTED\n'
+            'WRONG_OWNER_REJECTED\nMISSING_REJECTED\n',
+        )
+
+    def test_symlinks_are_rejected_by_the_link_check_alone(self) -> None:
+        """符号链接必须由 ! -L 单独判否，不能靠模式或属主顺带判否。
+
+        GNU stat 跟随符号链接、BSD stat 不跟随，两边 path_mode 报出的模式不同，
+        随手写死一个期望模式会让模式那一项先判否，去掉 ! -L 也照样红不了。这里
+        把期望模式取成 path_mode 实际报出的值，并用一个刚 chmod 成同一模式的真实
+        路径做正对照：对照判真说明模式与属主两项都成立，链接仍判否就只剩 ! -L。"""
+        paths = self.probe_tree()
+        body = (
+            'reported=$(path_mode "$1")\n'
+            'safe_file "$1" "$reported" || echo FILE_LINK_REJECTED\n'
+            'cp "$3" "$4" && chmod "$reported" "$4"\n'
+            'safe_file "$4" "$reported" && echo FILE_CONTROL_ACCEPTED\n'
+            'reported=$(path_mode "$2")\n'
+            'safe_directory "$2" "$reported" || echo DIR_LINK_REJECTED\n'
+            'chmod "$reported" "$5"\n'
+            'safe_directory "$5" "$reported" && echo DIR_CONTROL_ACCEPTED\n'
+        )
+
+        result = self.run_exec_safety(
+            body,
+            str(paths['file_link']),
+            str(paths['directory_link']),
+            str(paths['file']),
+            str(paths['spare']),
+            str(paths['loose_directory']),
+            env={'BOOTSTRAP_TEST_MODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'FILE_LINK_REJECTED\nFILE_CONTROL_ACCEPTED\n'
+            'DIR_LINK_REJECTED\nDIR_CONTROL_ACCEPTED\n',
+        )
+
+    def test_both_consuming_stages_delegate_to_the_shared_library(
+        self,
+    ) -> None:
+        """60/90 必须只 source 共享库，不得保留本地副本。"""
+        self.assertTrue(EXEC_SAFETY.is_file(), 'lib/exec-safety.sh is missing')
+        self.assertFalse(EXEC_SAFETY.is_symlink())
+        self.assertEqual(EXEC_SAFETY.stat().st_mode & 0o777, 0o644)
+
+        shared = EXEC_SAFETY.read_text(encoding='utf-8')
+        # 硬编码 source 字面量，与 CommonLibraryTest/PathFactsTest 的几处同源：
+        # Task 10 把 stage 挪进 stages/<NN-name>/run.sh 后 ${script_dir} 语义
+        # 改变，所有这类字面量必须一起改。
+        source_line = 'source "${script_dir}/lib/exec-safety.sh"'
+        facts_source_line = 'source "${script_dir}/lib/path-facts.sh"'
+        declarations = (
+            'python_isolated()',
+            'tar_safe()',
+            'safe_directory()',
+            'safe_file()',
+        )
+        for declaration in declarations:
+            self.assertEqual(shared.count(declaration), 1, declaration)
+        # 跨 lib 依赖：safe_file/safe_directory 只在被调用时才需要 path_mode 与
+        # owned_by_expected，所以 stage 先 source 哪个库都不影响判定。本库仍显式
+        # source 兄弟库，只 source 它的消费者才不会拿到半个依赖。
+        self.assertIn('/path-facts.sh"', shared)
+
+        for stage in self.STAGES:
+            with self.subTest(stage=stage.name):
+                body = stage.read_text(encoding='utf-8')
+                self.assertIn(source_line, body)
+                self.assertIn(facts_source_line, body)
+                self.assertIn('readonly PYTHON_BINARY=/usr/bin/python3', body)
+                self.assertIn('readonly TAR_BINARY=/usr/bin/tar', body)
+                for declaration in declarations:
+                    self.assertNotIn(declaration, body, declaration)
 
 
 class CidrCheckTest(BootstrapTestCase):
@@ -3101,8 +3351,17 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         # path_mode/owned_by_expected）让那条断言过强：source 兄弟库并不会引入
         # 门禁没扫过的文件。这里改钉真正的前提——lib 里每条 source 的目标父目录
         # 必须仍是门禁目录本身，一旦指向目录之外就绕过了门禁，继续判死。
+        library_sourced: list[str] = []
         for library_file in sorted(real_library_dir.iterdir()):
-            self.sourced_names_inside_gate(library_file, gated_dir)
+            library_sourced.extend(
+                self.sourced_names_inside_gate(library_file, gated_dir)
+            )
+        # 放宽后的那条断言只有在真的存在跨 lib 依赖时才被求值：exec-safety.sh
+        # source path-facts.sh 就是它。少了这条守卫，跨 lib 依赖一旦被拆掉，
+        # 上面的循环会退回空转，而放宽本身还留在原地。
+        self.assertTrue(
+            library_sourced, '放宽后的断言需要真实的跨 lib 依赖来喂，否则空转'
+        )
 
 
 class ArtifactStageTest(BootstrapTestCase):
