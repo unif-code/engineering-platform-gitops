@@ -744,6 +744,7 @@ set -eu
   printf 'python3'
   printf '\\t%s' "$@"
   printf '\\n'
+  printf 'PYTHONDONTWRITEBYTECODE=%s\\n' "${PYTHONDONTWRITEBYTECODE-unset}"
 } >>"$VALIDATE_COMMAND_LOG"
 case " $* " in
   *"run_validation.py --profile "*) exit "${FAKE_RUNNER_EXIT:-0}" ;;
@@ -783,10 +784,13 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
                 'FAKE_RUNNER_EXIT': str(runner_exit),
                 'FAKE_SHELLCHECK_EXIT': str(shellcheck_exit),
                 'PATH': f'{self.fake_bin}:/usr/bin:/bin',
-                'PYTHONDONTWRITEBYTECODE': '1',
                 'VALIDATE_COMMAND_LOG': str(self.command_log),
             }
         )
+        # 入口必须自己保证不把 PYTHONDONTWRITEBYTECODE 交给套件；调用者环境里若
+        # 已有一个（例如本套件正被打了补丁前的 validate-fast.sh 启动），就看不出
+        # 入口是否泄漏，因此显式移除。
+        environment.pop('PYTHONDONTWRITEBYTECODE', None)
         return subprocess.run(
             ['/bin/bash', str(self.root / 'scripts' / entrypoint)],
             cwd=self.root,
@@ -816,6 +820,39 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
         self.assertIn('run_validation.py\t--profile\tfull', command_log)
         self.assertIn('shellcheck\t', command_log)
         self.assertNotIn('--apply', command_log)
+
+    def test_entrypoints_never_export_python_env_to_the_suite(self) -> None:
+        """捕获入口用环境变量而非 -B 关闭字节码写入的缺陷。
+
+        `PYTHONDONTWRITEBYTECODE=1 python3 …` 是前缀赋值，会被导出并一路继承进
+        用例派生的 stage 子进程。stage 60/90 的不可信环境守卫含 `${!PYTHON@}`
+        前缀通配且排在测试变量守卫之前，于是
+        `BootstrapEntrySecurityTest.test_production_rejects_all_test_overrides_before_lookup`
+        在本地恒红两条、而 CI 全绿（CI 直接调 run_validation.py，不经过入口）。
+        `-B` 效果相同但只作用于本进程、不进环境。
+        """
+        for entrypoint in ('validate.sh', 'validate-fast.sh', 'validate-static.sh'):
+            with self.subTest(entrypoint=entrypoint):
+                self.command_log.write_text('', encoding='utf-8')
+
+                result = self.run_validate(entrypoint)
+
+                command_log = self.read_command_log()
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                python_calls = [
+                    line for line in command_log.splitlines()
+                    if line.startswith('python3\t')
+                ]
+                self.assertTrue(python_calls, '入口没有调用 python3')
+                for line in python_calls:
+                    self.assertEqual(
+                        line.split('\t')[1], '-B',
+                        f'{entrypoint} 的 python3 调用缺少 -B: {line}',
+                    )
+                self.assertNotIn('PYTHONDONTWRITEBYTECODE=1', command_log)
+                self.assertIn('PYTHONDONTWRITEBYTECODE=unset', command_log)
 
     def test_fast_entrypoint_runs_fast_profile_without_apply(self) -> None:
         result = self.run_validate('validate-fast.sh')

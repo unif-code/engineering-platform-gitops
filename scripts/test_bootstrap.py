@@ -2049,6 +2049,10 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
         path.chmod(0o755)
 
+    # mktemp 仍落在系统临时区（macOS 上是每用户目录）；TMPDIR 不在任何 stage 的
+    # 不可信清单里，放行不影响守卫判定。
+    PRODUCTION_ENVIRONMENT_ALLOWLIST = ('TMPDIR',)
+
     def production_environment(self) -> tuple[dict[str, str], Path]:
         directory = self.temporary_directory()
         fake_bin = directory / 'fake-bin'
@@ -2066,23 +2070,21 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 printf '%s\\n' '{output}'
                 ''',
             )
-        environment = os.environ.copy()
+        # 白名单而非黑名单。stage 的不可信环境清单逐 stage 不同（60/90 还带
+        # HELM_/PYTHON/OPENSSL_/KUBECTL_ 四组前缀通配），任何"继承后再擦掉"的写法
+        # 都要与那几份清单保持同步，漏一个就把生产模式用例变成假红。这里只放 stage
+        # 自身用得到的变量，其余一律不进，于是不需要跟任何清单同步。
+        environment = {
+            name: os.environ[name]
+            for name in self.PRODUCTION_ENVIRONMENT_ALLOWLIST
+            if name in os.environ
+        }
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
                 'FAKE_COMMAND_LOG': str(command_log),
             }
         )
-        for name in tuple(environment):
-            if name.startswith('BOOTSTRAP_TEST_'):
-                del environment[name]
-        environment.pop('APT_CONFIG', None)
-        environment.pop('KUBECONFIG', None)
-        environment.pop('GNUPGHOME', None)
-        for variable in (
-            'DPKG_ADMINDIR', 'DPKG_ROOT', 'DPKG_FORCE', 'DPKG_FRONTEND_LOCKED'
-        ):
-            environment.pop(variable, None)
         return environment, command_log
 
     def clean_watched_environment(self, environment: dict[str, str]) -> None:
@@ -2198,6 +2200,72 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 
                 self.assertEqual(result.returncode, 10, result.stderr)
                 self.assertIn('REASON=test-override-in-production', result.stderr)
+                self.assertFalse(command_log.exists())
+
+    def ambient_environment(self, **variables: str) -> None:
+        """把变量塞进本进程环境并在用例结束后精确还原（原本存在的恢复原值）。"""
+        for name, value in variables.items():
+            if name in os.environ:
+                self.addCleanup(os.environ.__setitem__, name, os.environ[name])
+            else:
+                self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = value
+
+    # stage 的不可信环境守卫拒绝 20 多个具名变量与 HELM_/PYTHON/OPENSSL_/KUBECTL_
+    # 四组前缀通配，且排在测试变量守卫之前。用例环境若继承调用者的 shell，就必须
+    # 维护一份与之等价的擦除清单——两份手工名单必然漂移，漂移的那一刻这里的判定
+    # 就从"生产拒绝测试变量"悄悄变成"生产拒绝调用者的某个变量"。
+    HOSTILE_AMBIENT = {
+        'PYTHONDONTWRITEBYTECODE': '1',
+        'PYTHONPATH': '/tmp/unapproved-python',
+        'TAR_OPTIONS': '--to-command=/bin/sh',
+        'BASH_ENV': '/tmp/unapproved-bash-env.sh',
+        'ENV': '/tmp/unapproved-env.sh',
+        'HELM_CACHE_HOME': '/tmp/unapproved-helm',
+        'OPENSSL_CONF': '/tmp/unapproved-openssl.cnf',
+        'KUBECTL_EXTERNAL_DIFF': '/bin/sh',
+        'KUBECACHEDIR': '/tmp/unapproved-kube-cache',
+        'CONTAINER_RUNTIME_ENDPOINT': 'unix:///tmp/unapproved.sock',
+        'APT_CONFIG': '/tmp/unapproved-apt.conf',
+        'KUBECONFIG': '/tmp/unapproved-kubeconfig',
+        'BOOTSTRAP_TEST_LOCK_FILE': '/tmp/unapproved.lock',
+    }
+
+    def test_production_environment_admits_no_ambient_variable(self) -> None:
+        """捕获用例环境继承调用者 shell 的缺陷：白名单之外一个都不许进来。"""
+        self.ambient_environment(**self.HOSTILE_AMBIENT)
+
+        environment, _ = self.production_environment()
+
+        for name in self.HOSTILE_AMBIENT:
+            with self.subTest(variable=name):
+                self.assertNotIn(name, environment)
+
+    def test_ambient_environment_cannot_flip_the_production_verdict(
+        self,
+    ) -> None:
+        """捕获调用者环境改写守卫次序的缺陷。
+
+        `validate-fast.sh` 与 `validate.sh` 曾以 `PYTHONDONTWRITEBYTECODE=1 python3 …`
+        前缀赋值启动套件，该变量被导出后一路继承进 stage 子进程，撞上 60/90 的
+        `${!PYTHON@}` 通配，REASON 从 test-override-in-production 变成
+        untrusted-environment-override——本地恒红两条而 CI 全绿。用例环境必须与
+        调用者的 shell 无关，否则任何人导出 KUBECONFIG 或 HELM_* 都会重演。
+        """
+        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+            with self.subTest(script=script.name):
+                self.ambient_environment(**self.HOSTILE_AMBIENT)
+                environment, command_log = self.production_environment()
+                environment['BOOTSTRAP_TEST_ROOT'] = '/'
+
+                result = self.run_command(
+                    ['/bin/bash', str(script), '--check'], env=environment
+                )
+
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn(
+                    'REASON=test-override-in-production', result.stderr
+                )
                 self.assertFalse(command_log.exists())
 
     def test_kubernetes_stages_reject_apt_and_kubeconfig_environment(self) -> None:
