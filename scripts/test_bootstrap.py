@@ -31,8 +31,14 @@ FINAL_VERIFY = ROOT / 'scripts/bootstrap/90-verify.sh'
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
 
+# 命令位置的完整枚举：行首、分隔符之后、复合命令关键字之后，再加上 `!`/`command`/
+# `builtin` 这类可叠加的命令前缀。少一种写法就等于失败开放——那条 source 既不会被
+# 展开校验，也不会被计入必须与门禁目录内容一致的集合。目标词不吃 `;&|`，一行里的
+# 多条 source 才不会被第一条吞掉。
 SHELL_SOURCE_STATEMENT = re.compile(
-    r'(?:^|[;&|(){}]|\b(?:then|else|do)\s)\s*(?:source|\.)\s+(\S+)'
+    r'(?:^|[;&|(){}]|\b(?:if|elif|then|else|while|until|do|time)\s)'
+    r'(?:\s*(?:!|command|builtin)(?=\s))*'
+    r'\s*(?:source|\.)\s+([^\s;&|]+)'
 )
 SHELL_DIRECTORY_ASSIGNMENT = re.compile(
     r'^[a-z_][a-z0-9_]*=\$\(cd .*&& pwd -P\)$'
@@ -506,6 +512,71 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertIn(
             '"$repo_root"/scripts/bootstrap/lib/*.sh', static
         )
+
+
+class ShellSourceStatementTest(BootstrapTestCase):
+    """source 语句识别正则本身的分类契约。
+
+    门禁前提的两条断言（真实 stage 只 source 门禁目录内的文件、lib 只 source
+    兄弟库）都以这条正则作为唯一入口，漏识别一种写法就等于失败开放：那条 source
+    既不会被展开校验，也不会被计入必须与门禁目录内容一致的集合。仓库今天没有下面
+    这些复合形态，这个用例负责让它们无法在未被识别的情况下混进来。"""
+
+    MATCHING = (
+        ('source /lib/plain.sh', ['/lib/plain.sh']),
+        ('  . /lib/dot.sh', ['/lib/dot.sh']),
+        ('source "${script_dir}/lib/quoted.sh"',
+         ['"${script_dir}/lib/quoted.sh"']),
+        ('if source /lib/if.sh; then :; fi', ['/lib/if.sh']),
+        ('if ! source /lib/negated-if.sh; then :; fi',
+         ['/lib/negated-if.sh']),
+        ('elif source /lib/elif.sh; then :; fi', ['/lib/elif.sh']),
+        ('while . /lib/while.sh; do :; done', ['/lib/while.sh']),
+        ('until source /lib/until.sh; do :; done', ['/lib/until.sh']),
+        ('! source /lib/negated.sh', ['/lib/negated.sh']),
+        ('command source /lib/command.sh', ['/lib/command.sh']),
+        ('builtin . /lib/builtin.sh', ['/lib/builtin.sh']),
+        ('time source /lib/time.sh', ['/lib/time.sh']),
+        ('then source /lib/then.sh', ['/lib/then.sh']),
+        ('else source /lib/else.sh', ['/lib/else.sh']),
+        ('do source /lib/do.sh', ['/lib/do.sh']),
+        ('probe && source /lib/and.sh', ['/lib/and.sh']),
+        ('probe || . /lib/or.sh', ['/lib/or.sh']),
+        ('probe; source /lib/semicolon.sh', ['/lib/semicolon.sh']),
+        ('probe | source /lib/pipe.sh', ['/lib/pipe.sh']),
+        ('{ source /lib/brace.sh; }', ['/lib/brace.sh']),
+        ('( . /lib/subshell.sh )', ['/lib/subshell.sh']),
+        ('probe "$(source /lib/substitution.sh)"',
+         ['/lib/substitution.sh)"']),
+        ('source /lib/first.sh; source /lib/second.sh',
+         ['/lib/first.sh', '/lib/second.sh']),
+    )
+
+    NON_MATCHING = (
+        '# source /lib/whole-line-comment.sh',
+        'probe --flag # source /lib/trailing-comment.sh',
+        'message="use source with care"',
+        "printf 'source of truth'",
+        'resource /lib/prefix-word.sh',
+        'my_source /lib/suffix-word.sh',
+        'sourced=1',
+        './lib/relative.sh',
+        'cd ..',
+        'probe --source /lib/long-flag.sh',
+        'echo sources',
+    )
+
+    def test_every_command_position_source_form_is_recognised(self) -> None:
+        """命令位置上的每种 source/. 写法都必须被识别并取到目标词。"""
+        for line, expected in self.MATCHING:
+            with self.subTest(line=line):
+                self.assertEqual(shell_source_words(line), expected)
+
+    def test_source_lookalikes_are_not_recognised(self) -> None:
+        """注释、字符串与同形词不得被误判成 source 语句。"""
+        for line in self.NON_MATCHING:
+            with self.subTest(line=line):
+                self.assertEqual(shell_source_words(line), [])
 
 
 class PathFactsTest(BootstrapTestCase):
@@ -2962,6 +3033,34 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
+    def sourced_names_inside_gate(
+        self, script: Path, gated_dir: str
+    ) -> list[str]:
+        """逐字展开脚本里每条 source 的目标，钉在门禁目录内，返回文件名。"""
+        body = script.read_text(encoding='utf-8')
+        assignments = [
+            line.replace(
+                '${BASH_SOURCE[0]}', '${BOOTSTRAP_REAL_SCRIPT_SOURCE}'
+            )
+            for line in shell_directory_assignments(body)
+        ]
+        names: list[str] = []
+        for word in shell_source_words(body):
+            target = Path(
+                self.expand_shell_word(assignments, word, str(script))
+            )
+            self.assertEqual(
+                str(target.parent),
+                gated_dir,
+                f'{script.name} source 了门禁目录之外的 {target}',
+            )
+            self.assertTrue(
+                target.is_file() and not target.is_symlink(),
+                f'{script.name} source 的 {target} 不是普通文件',
+            )
+            names.append(target.name)
+        return names
+
     def test_real_stages_source_only_files_under_the_gated_library_dir(
         self,
     ) -> None:
@@ -2989,42 +3088,21 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         )
         sourced: set[str] = set()
         for script in stage_scripts:
-            body = script.read_text(encoding='utf-8')
-            assignments = [
-                line.replace(
-                    '${BASH_SOURCE[0]}', '${BOOTSTRAP_REAL_SCRIPT_SOURCE}'
-                )
-                for line in shell_directory_assignments(body)
-            ]
-            words = shell_source_words(body)
-            self.assertTrue(words, f'{script.name} 没有 source 任何文件')
-            for word in words:
-                target = Path(
-                    self.expand_shell_word(assignments, word, str(script))
-                )
-                self.assertEqual(
-                    str(target.parent),
-                    gated_dir,
-                    f'{script.name} source 了门禁目录之外的 {target}',
-                )
-                self.assertTrue(
-                    target.is_file() and not target.is_symlink(),
-                    f'{script.name} source 的 {target} 不是普通文件',
-                )
-                sourced.add(target.name)
+            names = self.sourced_names_inside_gate(script, gated_dir)
+            self.assertTrue(names, f'{script.name} 没有 source 任何文件')
+            sourced.update(names)
         self.assertEqual(
             sorted(sourced),
             sorted(path.name for path in real_library_dir.glob('*.sh')),
             '被 source 的文件集合必须与门禁目录内容一致',
         )
+        # 原断言是「lib 下的文件不 source 任何东西」，用来保证门禁扫过的那一层
+        # 就是全部被求值的代码。跨 lib 依赖（exec-safety.sh 要 path-facts.sh 的
+        # path_mode/owned_by_expected）让那条断言过强：source 兄弟库并不会引入
+        # 门禁没扫过的文件。这里改钉真正的前提——lib 里每条 source 的目标父目录
+        # 必须仍是门禁目录本身，一旦指向目录之外就绕过了门禁，继续判死。
         for library_file in sorted(real_library_dir.iterdir()):
-            self.assertEqual(
-                shell_source_words(
-                    library_file.read_text(encoding='utf-8')
-                ),
-                [],
-                f'{library_file.name} 再次 source 了文件，门禁前提被破坏',
-            )
+            self.sourced_names_inside_gate(library_file, gated_dir)
 
 
 class ArtifactStageTest(BootstrapTestCase):
