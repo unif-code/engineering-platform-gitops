@@ -76,6 +76,7 @@ class BootstrapTestCase(unittest.TestCase):
         command: list[str],
         *,
         env: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command,
@@ -84,6 +85,7 @@ class BootstrapTestCase(unittest.TestCase):
             capture_output=True,
             check=False,
             text=True,
+            timeout=timeout,
         )
 
     HOST_TEMPLATE_DIR = ROOT / 'bootstrap/hosts/retail-test-workflow'
@@ -2251,6 +2253,35 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         for prefix in ('HELM_', 'PYTHON', 'OPENSSL_', 'KUBECTL_', 'BOOTSTRAP_TEST_'):
             with self.subTest(prefix=prefix):
                 self.assertIn(f'{prefix}PROBE', probe)
+
+    def test_every_bootstrap_entry_enables_fail_closed_shell_flags(self) -> None:
+        """捕获入口脚本丢掉 -E/-e/-u/pipefail、或把它放在第一条命令之后的缺陷。
+
+        九个 lib 都不自设 flag，靠 source 它们的 shell 继承。lib/exec-safety.sh 的
+        fail-closed 保证——PYTHON_BINARY 缺失时报未绑定变量，而不是拿空命令继续——
+        就建立在这个前提上，而此前没有任何用例钉住它。钉「第一条可执行语句」而不是
+        行号：flag 必须在任何命令与任何 source 之前生效，注释与空行不算。
+        """
+        scripts = sorted(BOOTSTRAP_ALL.parent.glob('*.sh'))
+        self.assertGreaterEqual(len(scripts), 8, '入口脚本集合异常')
+        for script in scripts:
+            with self.subTest(script=script.name):
+                # 只钉 flag，不钉 shebang：00-50 用 #!/usr/bin/env bash、60/90 用
+                # #!/bin/bash -p，差异是有依据的——bootstrap-all.sh 以
+                # `/usr/bin/env -u BASH_ENV -u ENV /bin/bash -p "$script"` 调用每个
+                # stage，脚本当参数传入，自身 shebang 不参与；保护边界在调用侧。
+                # 60/90 因为 runbook 里会被单独执行才自带 -p。
+                lines = script.read_text(encoding='utf-8').splitlines()
+                executable = [
+                    line for line in lines[1:]
+                    if line.strip() and not line.lstrip().startswith('#')
+                ]
+                self.assertTrue(executable, f'{script.name} 没有可执行语句')
+                self.assertEqual(
+                    executable[0],
+                    'set -Eeuo pipefail',
+                    f'{script.name} 的第一条可执行语句不是 fail-closed flag',
+                )
 
     def test_production_environment_admits_no_ambient_variable(self) -> None:
         """捕获用例环境继承调用者 shell 的缺陷：白名单之外一个都不许进来。"""
@@ -11190,10 +11221,15 @@ operator:
         return environment, host, command_log, values
 
     def run_stage(
-        self, environment: dict[str, str], mode: str = '--check'
+        self,
+        environment: dict[str, str],
+        mode: str = '--check',
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return self.run_command(
-            ['/bin/bash', '-p', str(INSTALL_CILIUM), mode], env=environment
+            ['/bin/bash', '-p', str(INSTALL_CILIUM), mode],
+            env=environment,
+            timeout=timeout,
         )
 
     def test_fake_ln_extracts_last_argument_under_posix_shell(self) -> None:
@@ -11661,7 +11697,12 @@ operator:
         environment['BOOTSTRAP_TEST_POST_INSTALL_INTERVAL'] = '0'
         environment['BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT'] = '1'
 
-        result = self.run_stage(environment, '--apply')
+        # 墙钟上限：截止判定一旦失效（比较写反、或被整条删掉），轮询会无限自旋，
+        # 这条用例就从"判红"退化成"永久挂起"——挂起的测试与恒绿的测试是同一类问题，
+        # 本地挂到无穷、CI 挂到 job 的 45 分钟超时且不指向具体用例。实测过：把
+        # `(( SECONDS < post_install_deadline ))` 改成恒真后，本用例 100 秒不返回。
+        # 600 秒远高于实测最坏 stage_wall（231 秒），不会被机器负载误触发。
+        result = self.run_stage(environment, '--apply', timeout=600)
 
         self.assertEqual(result.returncode, 50, result.stdout)
         self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
