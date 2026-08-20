@@ -11603,12 +11603,28 @@ operator:
         0 个就绪也算就绪）；装完后必须有界轮询直到 COMPLIANT，而不是一次性检查。"""
         environment, _, command_log, _ = self.make_environment()
         environment['FAKE_CILIUM_READY_AFTER_QUERIES'] = '2'
-        environment['BOOTSTRAP_TEST_POST_INSTALL_INTERVAL'] = '0'
-        environment['BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT'] = '30'
+        # 预算按实测取，不靠拍脑袋。轮询本身是墙钟判定（deadline = SECONDS + 预算），
+        # 而本用例要求的三轮 load_cluster_state 空载实测约 13 秒（把预算逐档压下去，
+        # 12 秒判红、16 秒判绿）；同一条 stage 的总耗时随机器负载在 59～231 秒之间
+        # 摆动，约 4 倍。原值 30 秒只有约 2 倍余量，一次双套件互抢的全量跑就把它吃穿，
+        # 报 cilium-post-install-state-invalid，看上去像回归其实是负载。
+        # 180 秒对实测值有约 14 倍余量，对最坏观测仍有约 3 倍。
+        # 间隔从 0 改为 1：正常路径只多 2 秒，而实现若回归成永不就绪，轮询由热自旋
+        # 变成每秒一次，超时前不会派生上千个子进程。
+        environment['BOOTSTRAP_TEST_POST_INSTALL_INTERVAL'] = '1'
+        environment['BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT'] = '180'
 
         result = self.run_stage(environment, '--apply')
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.returncode,
+            0,
+            '若 REASON=cilium-post-install-state-invalid，说明 180 秒预算被耗尽，'
+            '两种可能：实现退化成不再轮询或永不就绪；或机器负载把预算吃穿'
+            '（三轮轮询空载约 13 秒）。先数命令日志里 install 之后的 '
+            'get daemonset/cilium 次数——少于 3 次是回归，够 3 次就是负载。\n'
+            + result.stdout + result.stderr,
+        )
         self.assertIn('RESULT=PASS_CILIUM_INSTALLED', result.stdout)
         commands = command_log.read_text(encoding='utf-8')
         install_index = commands.index(' install cilium ')
