@@ -64,7 +64,9 @@ REASON，不存在把多个分量坍缩成一句的问题。只有 60 的 `load_
 **Files:** `scripts/bootstrap/bootstrap-all.sh`、`scripts/test_bootstrap.py`
 
 **Steps:**
-- [x] stage 运行期间起心跳子进程，每 15 秒在 stderr 打一行累计耗时
+- [x] stage 运行期间起心跳子进程，稳态 15 秒一行累计耗时
+- [x] 首拍取 `min(5, 间隔)`：5 秒内报活，之后回稳态（依据服务器回执的真实量级）
+- [x] 用例：间隔 9 秒、stage 7 秒 → 恰好一拍且值为 5；首拍不提前则 7 秒内一拍都没有
 - [x] stage 返回即 kill + wait 回收；另设 EXIT trap 兜住信号打断
 - [x] 结束行附带累计耗时 `(Ns)`
 - [x] 测试缝挂既有 `BOOTSTRAP_ORCHESTRATOR_TEST_*` 白名单，形状 `^[1-9][0-9]{0,3}$`
