@@ -58,3 +58,18 @@ REASON，不存在把多个分量坍缩成一句的问题。只有 60 的 `load_
 - [x] 用例：单个子状态为 UNKNOWN 时，输出能指认是哪一个
 - [x] 用例：不泄漏 canary
 - [ ] 变异：删掉某一个子状态的输出，对应用例必须变红
+
+### Task 4: 长 stage 的存活心跳（A-4，服务器实测后追加）
+
+**Files:** `scripts/bootstrap/bootstrap-all.sh`、`scripts/test_bootstrap.py`
+
+**Steps:**
+- [x] stage 运行期间起心跳子进程，每 15 秒在 stderr 打一行累计耗时
+- [x] stage 返回即 kill + wait 回收；另设 EXIT trap 兜住信号打断
+- [x] 结束行附带累计耗时 `(Ns)`
+- [x] 测试缝挂既有 `BOOTSTRAP_ORCHESTRATOR_TEST_*` 白名单，形状 `^[1-9][0-9]{0,3}$`
+- [x] 用例：慢 stage 出现 `... Ns elapsed`，且结束行带 `(Ns)`
+- [x] 用例：心跳**行数有界**——没被 kill 掉会变成孤儿一路刷进后续 stage，
+      这条才是并发代码的真正区分点
+- [x] 用例：心跳不渗进 stdout；间隔形状非法一律 `invalid-test-heartbeat` 退 10；
+      生产侧该前缀一律 `test-override-in-production` 退 10

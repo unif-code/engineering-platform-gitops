@@ -78,6 +78,32 @@ stage 输出，保持既有的不泄漏契约）。
 
 Stage 90 的复合判定同理。
 
+### A-4 长 stage 的存活心跳
+
+服务器实测（2026-08-21）：进度行落地后，运维仍会在 `[5/8] stage 40 check ...` 上
+干等几分钟而看不到任何反馈。原因是 `run_stage` 用 `captured=$(…)` 把 stage 输出
+**整体捕获后再校验**，运行期间一个字节都不会流出来。改成流式输出会破坏
+「捕获后校验」这一供应链契约，不可取。
+
+因此在 stage 运行期间起一个心跳子进程，每 `PROGRESS_HEARTBEAT_DEFAULT`（15）秒
+在 stderr 打一行累计耗时；stage 返回即 kill 并 wait 回收，另设 EXIT trap 兜住信号
+打断的情况：
+
+```
+[5/8] stage 40 check ...
+[5/8] stage 40 check ... 15s elapsed
+[5/8] stage 40 check ... 30s elapsed
+[5/8] stage 40 check -> PASS_KUBERNETES_CHECK (37s)
+```
+
+每次一整行而非原地刷新（`\r`）：日志要能 grep，进度条会毁掉这一点，这与本设计
+把「彩色输出、进度条」划在范围外是同一条理由。结束行附带累计耗时，事后也能看出
+哪个 stage 慢。
+
+心跳间隔需要可调才能测（生产 15 秒的用例跑不动），测试缝挂在既有的
+`BOOTSTRAP_ORCHESTRATOR_TEST_*` 白名单上——生产侧任何该前缀变量一律 exit 10，
+不新增暴露面。值进了 `sleep` 与算术，故先以 `^[1-9][0-9]{0,3}$` 钉死形状。
+
 ## Scope
 
 不在范围内：
