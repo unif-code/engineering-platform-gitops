@@ -7,6 +7,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd "${script_dir}/../.." && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/archive.sh"
 
 readonly ARTIFACT_SET=pcs-2026-08-10.1
 readonly MINIMUM_AVAILABLE_KIB=1048576
@@ -60,114 +62,6 @@ artifact_basename() {
   local base=${path##*/}
   [[ -n "$base" && "$base" != . && "$base" != .. && "$base" != *$'\n'* ]] || return 1
   printf '%s\n' "$base"
-}
-
-approved_record() {
-  local name=$1
-
-  case "$name" in
-    containerd)
-      printf '%s\t%s\t%s\t%s\n' 2.3.1 'https://github.com/containerd/containerd/releases/download/v2.3.1/containerd-2.3.1-linux-amd64.tar.gz' 628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054 /usr/local/bin
-      ;;
-    runc)
-      printf '%s\t%s\t%s\t%s\n' 1.3.6 'https://github.com/opencontainers/runc/releases/download/v1.3.6/runc.amd64' 3f3921dbbee7723e9868f97e88e51ffc910206e3ba55646e74d93d24ea76023c /usr/local/sbin/runc
-      ;;
-    crictl)
-      printf '%s\t%s\t%s\t%s\n' 1.36.0 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz' 83855e114566a8a8c44c548d515670f51de3a5e1da8b2effb59870e2f10c25a3 /usr/local/bin/crictl
-      ;;
-    helm)
-      printf '%s\t%s\t%s\t%s\n' 3.21.0 'https://get.helm.sh/helm-v3.21.0-linux-amd64.tar.gz' 0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36 /usr/local/bin/helm
-      ;;
-    gateway-api)
-      printf '%s\t%s\t%s\t%s\n' 1.6.1 'https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.1/standard-install.yaml' 24d931f22abd8e40c973264319ead7cfa09d0fb7716b7ab1ee2ff174cb063a73 'kubernetes://gateway-api/standard'
-      ;;
-    cilium-chart)
-      printf '%s\t%s\t%s\t%s\n' 1.20.0 'https://helm.cilium.io/cilium-1.20.0.tgz' c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883 'kubernetes://kube-system/cilium'
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-array_contains() {
-  local needle=$1
-  local value
-  shift
-  for value in "$@"; do
-    [[ "$value" == "$needle" ]] && return 0
-  done
-  return 1
-}
-
-safe_archive_member() {
-  local member=$1
-  [[ -n "$member" && "$member" != /* && "$member" != *$'\n'* ]] || return 1
-  case "/${member}/" in
-    */../*) return 1 ;;
-  esac
-}
-
-safe_symlink_target() {
-  local target=$1
-  [[ -n "$target" && "$target" != /* && "$target" != *$'\n'* ]] || return 1
-  case "/${target}/" in
-    */../*) return 1 ;;
-  esac
-}
-
-require_archive_member() {
-  local listing=$1
-  local expected=$2
-  grep -Fqx -- "$expected" <<<"$listing"
-}
-
-require_regular_archive_member() {
-  local archive=$1
-  local expected=$2
-  local detail
-
-  detail=$(tar -tvzf "$archive" "$expected" 2>/dev/null) || return 1
-  [[ "$detail" != *$'\n'* && "$detail" == -* ]]
-}
-
-validate_archive() {
-  local name=$1
-  local archive=$2
-  local listing
-  local verbose_listing
-  local member
-  local line
-  local link_target
-
-  listing=$(tar -tzf "$archive" 2>/dev/null) || return 1
-  while IFS= read -r member; do
-    safe_archive_member "$member" || return 1
-  done <<<"$listing"
-
-  verbose_listing=$(tar -tvzf "$archive" 2>/dev/null) || return 1
-  while IFS= read -r line; do
-    if [[ "$line" == l* ]]; then
-      [[ "$line" == *' -> '* ]] || return 1
-      link_target=${line##* -> }
-      safe_symlink_target "$link_target" || return 1
-    fi
-  done <<<"$verbose_listing"
-
-  case "$name" in
-    containerd)
-      require_archive_member "$listing" bin/containerd || return 1
-      require_archive_member "$listing" bin/ctr || return 1
-      require_archive_member "$listing" bin/containerd-shim-runc-v2 || return 1
-      ;;
-    crictl)
-      require_archive_member "$listing" crictl || return 1
-      require_regular_archive_member "$archive" crictl || return 1
-      ;;
-    helm)
-      require_archive_member "$listing" linux-amd64/helm || return 1
-      ;;
-  esac
 }
 
 artifact_state() {

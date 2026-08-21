@@ -20,6 +20,7 @@ COMMON = ROOT / 'scripts/bootstrap/lib/common.sh'
 HOST_CONFIG = ROOT / 'scripts/bootstrap/lib/host-config.sh'
 PATH_FACTS = ROOT / 'scripts/bootstrap/lib/path-facts.sh'
 EXEC_SAFETY = ROOT / 'scripts/bootstrap/lib/exec-safety.sh'
+ARCHIVE_LIB = ROOT / 'scripts/bootstrap/lib/archive.sh'
 CIDR_CHECK = ROOT / 'scripts/bootstrap/check_cidrs.py'
 PREFLIGHT = ROOT / 'scripts/bootstrap/00-preflight.sh'
 STAGE_ARTIFACTS = ROOT / 'scripts/bootstrap/10-stage-artifacts.sh'
@@ -1033,6 +1034,281 @@ class ExecSafetyTest(BootstrapTestCase):
                 self.assertIn('readonly TAR_BINARY=/usr/bin/tar', body)
                 for declaration in declarations:
                     self.assertNotIn(declaration, body, declaration)
+
+
+class ArchiveLibraryTest(BootstrapTestCase):
+    """lib/archive.sh：stage 10 与 30 两份 validate_archive 的并集契约。
+
+    两份实现能力不同而非写法不同（见账本 R13）：30 认硬链接条目并对每个期望成员
+    做正规文件检查、未知族 fail-closed；10 多认 helm 族但缺 `*)` 默认分支。合并后
+    必须同时具备，且不得给 helm 加上任何实现从未施加过的检查（无服务器实测证据）。
+    """
+
+    def run_archive(
+        self, body: str, *arguments: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        environment = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+        environment.update(env or {})
+        return self.run_command(
+            ['/bin/bash', '-c', f'set -u\nsource "$0"\n{body}',
+             str(ARCHIVE_LIB), *arguments],
+            env=environment,
+        )
+
+    def write_archive(
+        self, path: Path, members: list[tuple[str, str, str]]
+    ) -> Path:
+        """按 (类型, 名字, 内容或链接目标) 建归档；类型取 file/symlink/hardlink/dir。"""
+        with tarfile.open(path, 'w:gz') as archive:
+            for kind, name, payload in members:
+                entry = tarfile.TarInfo(name)
+                if kind == 'file':
+                    entry.mode = 0o755
+                    entry.size = len(payload)
+                    archive.addfile(entry, io.BytesIO(payload.encode()))
+                    continue
+                if kind == 'symlink':
+                    entry.type = tarfile.SYMTYPE
+                elif kind == 'hardlink':
+                    entry.type = tarfile.LNKTYPE
+                else:
+                    entry.type = tarfile.DIRTYPE
+                entry.linkname = payload
+                entry.size = 0
+                archive.addfile(entry)
+        return path
+
+    def containerd_members(self) -> list[tuple[str, str, str]]:
+        return [
+            ('file', 'bin/containerd', 'containerd\n'),
+            ('file', 'bin/ctr', 'ctr\n'),
+            ('file', 'bin/containerd-shim-runc-v2', 'shim\n'),
+        ]
+
+    def test_hardlink_entries_are_validated_like_symlinks(self) -> None:
+        """硬链接条目的目标必须同样受检——只认符号链接会漏掉整整一类逃逸。"""
+        directory = self.temporary_directory()
+        escaping = self.write_archive(
+            directory / 'hardlink-escape.tgz',
+            self.containerd_members()
+            + [('hardlink', 'bin/escape', '../../../etc/passwd')],
+        )
+        contained = self.write_archive(
+            directory / 'hardlink-inside.tgz',
+            self.containerd_members()
+            + [('hardlink', 'bin/alias', 'bin/ctr')],
+        )
+
+        result = self.run_archive(
+            'validate_archive containerd "$1" || echo HARDLINK_ESCAPE_REJECTED\n'
+            'validate_archive containerd "$2" && echo HARDLINK_INSIDE_ACCEPTED\n',
+            str(escaping), str(contained),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'HARDLINK_ESCAPE_REJECTED\nHARDLINK_INSIDE_ACCEPTED\n',
+        )
+
+    def test_symlink_entries_and_member_paths_may_not_escape(self) -> None:
+        """符号链接目标与成员路径两条老断言都必须保留。"""
+        directory = self.temporary_directory()
+        link_escape = self.write_archive(
+            directory / 'symlink-escape.tgz',
+            self.containerd_members()
+            + [('symlink', 'bin/escape', '../../../etc/shadow')],
+        )
+        path_escape = self.write_archive(
+            directory / 'path-escape.tgz',
+            self.containerd_members() + [('file', '../evil', 'x')],
+        )
+        absolute = self.write_archive(
+            directory / 'absolute.tgz',
+            self.containerd_members() + [('file', '/etc/evil', 'x')],
+        )
+
+        # 纯否定断言在"函数根本不存在"时也会成立（命令未找到同样返回非零），
+        # 因此每组都配一个必须判真的对照，逼出实现真的存在且工作。
+        contained = self.write_archive(
+            directory / 'symlink-inside.tgz',
+            self.containerd_members()
+            + [('symlink', 'bin/alias', 'containerd')],
+        )
+
+        result = self.run_archive(
+            'validate_archive containerd "$1" || echo SYMLINK_REJECTED\n'
+            'validate_archive containerd "$2" || echo RELATIVE_REJECTED\n'
+            'validate_archive containerd "$3" || echo ABSOLUTE_REJECTED\n'
+            'validate_archive containerd "$4" && echo SAFE_SYMLINK_ACCEPTED\n',
+            str(link_escape), str(path_escape), str(absolute), str(contained),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'SYMLINK_REJECTED\nRELATIVE_REJECTED\nABSOLUTE_REJECTED\n'
+            'SAFE_SYMLINK_ACCEPTED\n',
+        )
+
+    def test_unknown_archive_family_fails_closed(self) -> None:
+        """未知族必须判否。stage 10 原实现缺 `*)` 分支会静默放行，属潜伏 fail-open。"""
+        directory = self.temporary_directory()
+        archive = self.write_archive(
+            directory / 'good.tgz', self.containerd_members()
+        )
+
+        result = self.run_archive(
+            'validate_archive containerd "$1" && echo KNOWN_ACCEPTED\n'
+            'validate_archive gateway-api "$1" || echo UNKNOWN_REJECTED\n'
+            'validate_archive "" "$1" || echo EMPTY_REJECTED\n',
+            str(archive),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'KNOWN_ACCEPTED\nUNKNOWN_REJECTED\nEMPTY_REJECTED\n',
+        )
+
+    def test_expected_members_must_be_regular_files(self) -> None:
+        """期望成员被替换成目录或指向合法目标的符号链接时都必须判否。"""
+        directory = self.temporary_directory()
+        as_symlink = self.write_archive(
+            directory / 'member-symlink.tgz',
+            [
+                ('file', 'bin/containerd', 'containerd\n'),
+                ('symlink', 'bin/ctr', 'containerd'),
+                ('file', 'bin/containerd-shim-runc-v2', 'shim\n'),
+            ],
+        )
+        as_directory = self.write_archive(
+            directory / 'member-directory.tgz',
+            [
+                ('file', 'bin/containerd', 'containerd\n'),
+                ('dir', 'bin/ctr', ''),
+                ('file', 'bin/containerd-shim-runc-v2', 'shim\n'),
+            ],
+        )
+
+        # 同上：配一个全为正规文件的对照，否则实现缺席时本用例也会绿。
+        regular = self.write_archive(
+            directory / 'member-regular.tgz', self.containerd_members()
+        )
+
+        result = self.run_archive(
+            'validate_archive containerd "$1" || echo SYMLINK_MEMBER_REJECTED\n'
+            'validate_archive containerd "$2" || echo DIRECTORY_MEMBER_REJECTED\n'
+            'validate_archive containerd "$3" && echo REGULAR_MEMBER_ACCEPTED\n',
+            str(as_symlink), str(as_directory), str(regular),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'SYMLINK_MEMBER_REJECTED\nDIRECTORY_MEMBER_REJECTED\n'
+            'REGULAR_MEMBER_ACCEPTED\n',
+        )
+
+    def test_every_family_keeps_its_required_members(self) -> None:
+        """三个族都必须保留：合并若丢掉 helm，它会落进 `*)` 而被判否。"""
+        directory = self.temporary_directory()
+        helm_good = self.write_archive(
+            directory / 'helm.tgz', [('file', 'linux-amd64/helm', 'helm\n')]
+        )
+        helm_bad = self.write_archive(
+            directory / 'helm-missing.tgz', [('file', 'linux-amd64/tiller', 'x')]
+        )
+        crictl_good = self.write_archive(
+            directory / 'crictl.tgz', [('file', 'crictl', 'crictl\n')]
+        )
+        crictl_bad = self.write_archive(
+            directory / 'crictl-missing.tgz', [('file', 'other', 'x')]
+        )
+        containerd_bad = self.write_archive(
+            directory / 'containerd-missing.tgz',
+            [('file', 'bin/containerd', 'containerd\n')],
+        )
+
+        result = self.run_archive(
+            'validate_archive helm "$1" && echo HELM_ACCEPTED\n'
+            'validate_archive helm "$2" || echo HELM_MISSING_REJECTED\n'
+            'validate_archive crictl "$3" && echo CRICTL_ACCEPTED\n'
+            'validate_archive crictl "$4" || echo CRICTL_MISSING_REJECTED\n'
+            'validate_archive containerd "$5" || echo CONTAINERD_MISSING_REJECTED\n',
+            str(helm_good), str(helm_bad), str(crictl_good),
+            str(crictl_bad), str(containerd_bad),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'HELM_ACCEPTED\nHELM_MISSING_REJECTED\nCRICTL_ACCEPTED\n'
+            'CRICTL_MISSING_REJECTED\nCONTAINERD_MISSING_REJECTED\n',
+        )
+
+    def test_approved_record_covers_every_artifact_and_the_test_seam(
+        self,
+    ) -> None:
+        """六个制品各一条四字段记录，未知名判否；30 的 lock 文件测试缝必须保留。"""
+        directory = self.temporary_directory()
+        lock = directory / 'approved.lock'
+        lock.write_text(
+            'containerd\t9.9.9\thttps://example.invalid/c.tgz\tdeadbeef\t/tmp/c\n',
+            encoding='utf-8',
+        )
+
+        result = self.run_archive(
+            'for name in containerd runc crictl helm gateway-api cilium-chart; do\n'
+            '  record=$(approved_record "$name") || { echo "MISSING_$name"; continue; }\n'
+            '  printf "%s\\t%s\\n" "$name" "$(printf "%s" "$record" | awk -F "\\t" "{print NF}")"\n'
+            'done\n'
+            'approved_record nonesuch || echo UNKNOWN_REJECTED\n'
+            'BOOTSTRAP_TEST_MODE=1 BOOTSTRAP_TEST_APPROVED_LOCK_FILE="$1" '
+            'approved_record containerd\n',
+            str(lock),
+            env={'BOOTSTRAP_TEST_MODE': '0'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        for name in (
+            'containerd', 'runc', 'crictl', 'helm', 'gateway-api', 'cilium-chart'
+        ):
+            with self.subTest(artifact=name):
+                self.assertIn(f'{name}\t4', lines)
+        self.assertIn('UNKNOWN_REJECTED', lines)
+        self.assertIn(
+            '9.9.9\thttps://example.invalid/c.tgz\tdeadbeef\t/tmp/c', lines
+        )
+
+    def test_both_stages_delegate_to_the_shared_library(self) -> None:
+        """10/30 必须只 source 共享库，不得保留本地副本。"""
+        self.assertTrue(ARCHIVE_LIB.is_file(), 'lib/archive.sh is missing')
+        self.assertFalse(ARCHIVE_LIB.is_symlink())
+        self.assertEqual(ARCHIVE_LIB.stat().st_mode & 0o777, 0o644)
+
+        shared = ARCHIVE_LIB.read_text(encoding='utf-8')
+        source_line = 'source "${script_dir}/lib/archive.sh"'
+        declarations = (
+            'array_contains()',
+            'safe_archive_member()',
+            'safe_symlink_target()',
+            'approved_record()',
+            'validate_archive()',
+            'regular_archive_member()',
+        )
+        for declaration in declarations:
+            self.assertEqual(shared.count(declaration), 1, declaration)
+        for stage in (STAGE_ARTIFACTS, INSTALL_CONTAINERD):
+            with self.subTest(stage=stage.name):
+                body = stage.read_text(encoding='utf-8')
+                self.assertIn(source_line, body)
+                for declaration in declarations:
+                    self.assertNotIn(declaration, body, declaration)
+                # 10 私有的两个包装随并集吸收，不得留下孤儿定义。
+                self.assertNotIn('require_archive_member()', body)
+                self.assertNotIn('require_regular_archive_member()', body)
 
 
 class CidrCheckTest(BootstrapTestCase):
