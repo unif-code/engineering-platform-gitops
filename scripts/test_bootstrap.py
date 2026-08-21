@@ -67,10 +67,80 @@ def shell_directory_assignments(text: str) -> list[str]:
 
 
 class BootstrapTestCase(unittest.TestCase):
+    # mktemp 仍落在系统临时区（macOS 上是每用户目录）；TMPDIR 不在任何 stage 的
+    # 不可信清单里，放行不影响守卫判定。白名单之外一律不进子进程环境。
+    PRODUCTION_ENVIRONMENT_ALLOWLIST = ('TMPDIR',)
+
+    # 敌意变量集从 stage 源码解析，不手工维护第二份名单。手写清单与 stage 的拒绝
+    # 清单是两份要同步的东西，必然漂移——那正是本组用例要根治的缺陷形态，不能在
+    # 更高一层重演。stage 拒绝 20 个具名变量与 5 组前缀通配，逐 stage 还不同。
+    UNTRUSTED_GUARD_BLOCK = re.compile(r'for untrusted_name in ((?:.|\n)*?); do')
+    UNTRUSTED_PREFIX = re.compile(r'\$\{!([A-Z_]+)@\}')
+
+    @classmethod
+    def untrusted_environment_guard(cls) -> tuple[frozenset[str], tuple[str, ...]]:
+        """解析出 stage 拒绝的具名变量集合与前缀通配集合。
+
+        返回两者而不是把前缀展开成示例名：判断"某个变量名会不会被 stage 拒绝"
+        必须做前缀匹配。早先只返回示例名集合，于是拿它去和实际环境求交，
+        PYTHONPATH 这种真实泄漏会漏判——集合里只有合成的 PYTHONPROBE。
+        """
+        names: set[str] = set()
+        prefixes: set[str] = set()
+        for script in sorted(BOOTSTRAP_ALL.parent.glob('[0-9]*.sh')):
+            body = script.read_text(encoding='utf-8')
+            for block in cls.UNTRUSTED_GUARD_BLOCK.findall(body):
+                names.update(
+                    re.findall(r'\b[A-Z][A-Z0-9_]+\b', block.replace('\\\n', ' '))
+                )
+            prefixes.update(cls.UNTRUSTED_PREFIX.findall(body))
+        return frozenset(names), tuple(sorted(prefixes))
+
+    @classmethod
+    def environment_names_stages_reject(cls, seen: object) -> list[str]:
+        """从一组变量名里挑出 stage 会判死的那些（具名命中或落在前缀通配内）。"""
+        names, prefixes = cls.untrusted_environment_guard()
+        return sorted(
+            name for name in seen
+            if name in names or any(name.startswith(p) for p in prefixes)
+        )
+
+    @classmethod
+    def untrusted_environment_probe(cls) -> dict[str, str]:
+        """把每个 stage 会拒绝的变量名各造一个探针值。
+
+        前缀通配按 `<前缀>PROBE` 造名（`${!PYTHON@}` -> PYTHONPROBE），落在通配范围内。
+        """
+        names: set[str] = set()
+        for script in sorted(BOOTSTRAP_ALL.parent.glob('[0-9]*.sh')):
+            body = script.read_text(encoding='utf-8')
+            for block in cls.UNTRUSTED_GUARD_BLOCK.findall(body):
+                names.update(
+                    re.findall(r'\b[A-Z][A-Z0-9_]+\b', block.replace('\\\n', ' '))
+                )
+            for prefix in cls.UNTRUSTED_PREFIX.findall(body):
+                names.add(f'{prefix}PROBE')
+        return {
+            name: f'/tmp/unapproved-{name.lower()}' for name in sorted(names)
+        }
+
     def temporary_directory(self) -> Path:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         return Path(directory.name)
+
+    # 子进程环境一律从白名单起手构造，绝不整体继承调用者的 shell。stage 的不可信环境
+    # 守卫按**名字前缀**判死（60/90 有 HELM_/PYTHON/OPENSSL_/KUBECTL_ 四组通配），
+    # 「继承后再擦具名黑名单」原理上覆盖不了前缀，调用者 shell 里一个
+    # PYTHONUNBUFFERED 就能让整个分片以 untrusted-environment-override 假红。
+    def sanitized_environment(self, **overrides: str) -> dict[str, str]:
+        environment = {
+            name: os.environ[name]
+            for name in self.PRODUCTION_ENVIRONMENT_ALLOWLIST
+            if name in os.environ
+        }
+        environment.update(overrides)
+        return environment
 
     def run_command(
         self,
@@ -1004,7 +1074,10 @@ class ExecSafetyTest(BootstrapTestCase):
         """60/90 必须只 source 共享库，不得保留本地副本。"""
         self.assertTrue(EXEC_SAFETY.is_file(), 'lib/exec-safety.sh is missing')
         self.assertFalse(EXEC_SAFETY.is_symlink())
-        self.assertEqual(EXEC_SAFETY.stat().st_mode & 0o777, 0o644)
+        # 与 bootstrap-all.sh 的 safe_owned_file 同义：它只拒绝组/他人可写
+        # （mode & 0022）。早先钉死 0644 比门禁更严，且依赖 clone 时的 umask，
+        # 在 umask 077/027 下会无故变红（独立评审实测门禁对 0600/0755 均放行）。
+        self.assertEqual(EXEC_SAFETY.stat().st_mode & 0o022, 0)
 
         shared = EXEC_SAFETY.read_text(encoding='utf-8')
         # 硬编码 source 字面量，与 CommonLibraryTest/PathFactsTest 的几处同源：
@@ -1286,7 +1359,10 @@ class ArchiveLibraryTest(BootstrapTestCase):
         """10/30 必须只 source 共享库，不得保留本地副本。"""
         self.assertTrue(ARCHIVE_LIB.is_file(), 'lib/archive.sh is missing')
         self.assertFalse(ARCHIVE_LIB.is_symlink())
-        self.assertEqual(ARCHIVE_LIB.stat().st_mode & 0o777, 0o644)
+        # 与 bootstrap-all.sh 的 safe_owned_file 同义：它只拒绝组/他人可写
+        # （mode & 0022）。早先钉死 0644 比门禁更严，且依赖 clone 时的 umask，
+        # 在 umask 077/027 下会无故变红（独立评审实测门禁对 0600/0755 均放行）。
+        self.assertEqual(ARCHIVE_LIB.stat().st_mode & 0o022, 0)
 
         shared = ARCHIVE_LIB.read_text(encoding='utf-8')
         source_line = 'source "${script_dir}/lib/archive.sh"'
@@ -1588,7 +1664,7 @@ class PreflightTest(BootstrapTestCase):
             ''',
         )
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': os.pathsep.join((str(fake_bin), str(support_bin))),
@@ -2003,7 +2079,7 @@ class KernelStageTest(BootstrapTestCase):
             ''',
         )
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
@@ -2327,10 +2403,6 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
         path.chmod(0o755)
 
-    # mktemp 仍落在系统临时区（macOS 上是每用户目录）；TMPDIR 不在任何 stage 的
-    # 不可信清单里，放行不影响守卫判定。
-    PRODUCTION_ENVIRONMENT_ALLOWLIST = ('TMPDIR',)
-
     def production_environment(self) -> tuple[dict[str, str], Path]:
         directory = self.temporary_directory()
         fake_bin = directory / 'fake-bin'
@@ -2348,43 +2420,17 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 printf '%s\\n' '{output}'
                 ''',
             )
-        # 白名单而非黑名单。stage 的不可信环境清单逐 stage 不同（60/90 还带
-        # HELM_/PYTHON/OPENSSL_/KUBECTL_ 四组前缀通配），任何"继承后再擦掉"的写法
-        # 都要与那几份清单保持同步，漏一个就把生产模式用例变成假红。这里只放 stage
-        # 自身用得到的变量，其余一律不进，于是不需要跟任何清单同步。
-        environment = {
-            name: os.environ[name]
-            for name in self.PRODUCTION_ENVIRONMENT_ALLOWLIST
-            if name in os.environ
-        }
-        environment.update(
-            {
-                'PATH': f'{fake_bin}:/usr/bin:/bin',
-                'FAKE_COMMAND_LOG': str(command_log),
-            }
+        environment = self.sanitized_environment(
+            PATH=f'{fake_bin}:/usr/bin:/bin',
+            FAKE_COMMAND_LOG=str(command_log),
         )
         return environment, command_log
-
-    def clean_watched_environment(self, environment: dict[str, str]) -> None:
-        """删除 stage 硬化块监视的全部变量，让注入用例保持封闭。"""
-        watched = (
-            'APT_CONFIG', 'KUBECONFIG', 'GNUPGHOME', 'DPKG_ADMINDIR',
-            'DPKG_ROOT', 'DPKG_FORCE', 'DPKG_FRONTEND_LOCKED', 'KUBECACHEDIR',
-            'KUBECTL_EXTERNAL_DIFF', 'TAR_OPTIONS', 'BASH_ENV', 'ENV',
-            'CONTAINER_RUNTIME_ENDPOINT', 'IMAGE_SERVICE_ENDPOINT',
-        )
-        for name in tuple(environment):
-            if name in watched or name.startswith(
-                ('HELM_', 'PYTHON', 'OPENSSL_', 'KUBECTL_')
-            ):
-                del environment[name]
 
     def test_environment_rejection_names_offending_variables(self) -> None:
         """拒绝不可信环境时必须列出违规变量名（只列名不列值），便于运维定位 unset。"""
         for script in (INSTALL_CILIUM, FINAL_VERIFY):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
-                self.clean_watched_environment(environment)
                 environment['KUBECACHEDIR'] = '/dev/null'
                 environment['PYTHONDONTWRITEBYTECODE'] = '1'
 
@@ -2406,7 +2452,6 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         for script in (INSTALL_KUBERNETES, KUBEADM_INIT):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
-                self.clean_watched_environment(environment)
                 environment['APT_CONFIG'] = '/tmp/unapproved-apt.conf'
                 environment['KUBECONFIG'] = '/tmp/unapproved-kubeconfig'
 
@@ -2424,7 +2469,6 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         for script in (INSTALL_CILIUM, FINAL_VERIFY):
             with self.subTest(script=script.name):
                 environment, _ = self.production_environment()
-                self.clean_watched_environment(environment)
                 environment['KUBECTL_EXTERNAL_DIFF'] = 'diff'
 
                 result = self.run_command(
@@ -2489,31 +2533,6 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 self.addCleanup(os.environ.pop, name, None)
             os.environ[name] = value
 
-    # 敌意变量集从 stage 源码解析，不手工维护第二份名单。手写清单与 stage 的拒绝
-    # 清单是两份要同步的东西，必然漂移——那正是本组用例要根治的缺陷形态，不能在
-    # 更高一层重演。stage 拒绝 20 个具名变量与 5 组前缀通配，逐 stage 还不同。
-    UNTRUSTED_GUARD_BLOCK = re.compile(r'for untrusted_name in ((?:.|\n)*?); do')
-    UNTRUSTED_PREFIX = re.compile(r'\$\{!([A-Z_]+)@\}')
-
-    @classmethod
-    def untrusted_environment_probe(cls) -> dict[str, str]:
-        """把每个 stage 会拒绝的变量名各造一个探针值。
-
-        前缀通配按 `<前缀>PROBE` 造名（`${!PYTHON@}` -> PYTHONPROBE），落在通配范围内。
-        """
-        names: set[str] = set()
-        for script in sorted(BOOTSTRAP_ALL.parent.glob('[0-9]*.sh')):
-            body = script.read_text(encoding='utf-8')
-            for block in cls.UNTRUSTED_GUARD_BLOCK.findall(body):
-                names.update(
-                    re.findall(r'\b[A-Z][A-Z0-9_]+\b', block.replace('\\\n', ' '))
-                )
-            for prefix in cls.UNTRUSTED_PREFIX.findall(body):
-                names.add(f'{prefix}PROBE')
-        return {
-            name: f'/tmp/unapproved-{name.lower()}' for name in sorted(names)
-        }
-
     def test_untrusted_guard_parse_is_not_vacuous(self) -> None:
         """解析若失灵会让下面两条用例静默空转，这里先钉住解析结果本身。"""
         probe = self.untrusted_environment_probe()
@@ -2548,8 +2567,12 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                 # stage，脚本当参数传入，自身 shebang 不参与；保护边界在调用侧。
                 # 60/90 因为 runbook 里会被单独执行才自带 -p。
                 lines = script.read_text(encoding='utf-8').splitlines()
+                # 只跳过真正的 shebang。早先写成无条件丢掉第 1 行，等于把它变成
+                # 盲区：把 shebang 换成 `PATH=/attacker/bin:$PATH` 这种真会执行的
+                # 命令，用例照样绿（独立评审实测）。
+                body = lines[1:] if lines and lines[0].startswith('#!') else lines
                 executable = [
-                    line for line in lines[1:]
+                    line for line in body
                     if line.strip() and not line.lstrip().startswith('#')
                 ]
                 self.assertTrue(executable, f'{script.name} 没有可执行语句')
@@ -2558,6 +2581,41 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
                     'set -Eeuo pipefail',
                     f'{script.name} 的第一条可执行语句不是 fail-closed flag',
                 )
+
+    def test_no_test_harness_inherits_the_caller_environment(self) -> None:
+        """捕获任何子进程环境构造器整体继承调用者 shell 的缺陷。
+
+        stage 的不可信环境守卫按**名字前缀**判死（60/90 有 HELM_/PYTHON/OPENSSL_/
+        KUBECTL_ 四组通配），"继承后再擦具名黑名单"原理上覆盖不了前缀。此前
+        production_environment 已改白名单，但 CiliumInstallTest 与 FinalVerifyTest
+        的构造器仍在继承，调用者 shell 里一个 PYTHONUNBUFFERED 就让这两个最慢的
+        分片共 81 条用例以 untrusted-environment-override 假红（独立评审实测）。
+        这条断言钉的是模式本身，防止任何一处重新长回来。
+        """
+        # 分片拼出被禁的写法，否则本用例自身的源码就会命中自己。
+        forbidden = 'os.environ' + '.copy()'
+        modules = {
+            'test_bootstrap.py': ROOT / 'scripts/test_bootstrap.py',
+            'test_validate.py': ROOT / 'scripts/test_validate.py',
+        }
+        for name, path in modules.items():
+            with self.subTest(module=name):
+                offenders = [
+                    number
+                    for number, line in enumerate(
+                        path.read_text(encoding='utf-8').splitlines(), 1
+                    )
+                    if forbidden in line and 'forbidden =' not in line
+                ]
+                self.assertEqual(
+                    offenders, [], f'{name} 这些行整体继承了调用者环境'
+                )
+        # 非空转守卫：统一构造器必须真的被广泛使用，否则上面那条断言可以靠
+        # "把所有构造器都删掉" 来满足。
+        harness = modules['test_bootstrap.py'].read_text(encoding='utf-8')
+        self.assertGreaterEqual(
+            harness.count('self.sanitized_environment('), 12, harness.count('self.sanitized_environment(')
+        )
 
     def test_production_environment_admits_no_ambient_variable(self) -> None:
         """捕获用例环境继承调用者 shell 的缺陷：白名单之外一个都不许进来。"""
@@ -2768,7 +2826,7 @@ class RunApprovedTest(BootstrapTestCase):
     def run_wrapper(
         self, clone: Path, *arguments: str, extra_env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(extra_env or {})
         return subprocess.run(
             ['/bin/bash', str(clone / 'scripts/bootstrap/run-approved.sh'), *arguments],
@@ -2940,7 +2998,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.write_fake_library()
         self.write_fake_commands()
 
-        self.base_environment = os.environ.copy()
+        self.base_environment = self.sanitized_environment()
         for name in tuple(self.base_environment):
             if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_'):
                 del self.base_environment[name]
@@ -3399,7 +3457,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
                 result = self.run_orchestrator(*arguments)
                 self.assertEqual(result.returncode, 10)
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment['BOOTSTRAP_ORCHESTRATOR_TEST_STAGE_DIR'] = str(
             self.stage_dir
         )
@@ -3433,7 +3491,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
     def test_production_apply_requires_actual_root(self) -> None:
         self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         for name in tuple(environment):
             if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_') or name.startswith('GIT_'):
                 del environment[name]
@@ -3454,7 +3512,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         )
         for variable, value in cases:
             with self.subTest(variable=variable, value=value):
-                environment = os.environ.copy()
+                environment = self.sanitized_environment()
                 for name in tuple(environment):
                     if name.startswith('BOOTSTRAP_ORCHESTRATOR_TEST_') or name.startswith('GIT_'):
                         del environment[name]
@@ -3672,7 +3730,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         program = '\n'.join(
             ['set -Eeuo pipefail', *assignments, "printf '%s' " + word]
         )
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment['BOOTSTRAP_REAL_SCRIPT_SOURCE'] = script_source
         result = self.run_command(
             ['/bin/bash', '-c', program], env=environment
@@ -3928,7 +3986,7 @@ class ArtifactStageTest(BootstrapTestCase):
             ''',
         )
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
@@ -4880,7 +4938,7 @@ esac
             esac
             ''',
         )
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
@@ -6615,7 +6673,7 @@ kubernetes-cni'
             ''',
         )
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
@@ -8835,7 +8893,7 @@ class KubeadmInitTest(BootstrapTestCase):
             ''',
         )
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.pop('APT_CONFIG', None)
         environment.pop('KUBECONFIG', None)
         for variable in (
@@ -11444,7 +11502,7 @@ operator:
             ''',
         )
 
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
@@ -11948,7 +12006,9 @@ operator:
         environment['BOOTSTRAP_TEST_POST_INSTALL_INTERVAL'] = '1'
         environment['BOOTSTRAP_TEST_POST_INSTALL_TIMEOUT'] = '180'
 
-        result = self.run_stage(environment, '--apply')
+        # 与姊妹用例同理：就绪判定若回归成永不 COMPLIANT，这里同样会无界自旋，
+        # 从"判红"退化成"永久挂起"。上限远高于实测最坏 stage_wall（231 秒）。
+        result = self.run_stage(environment, '--apply', timeout=600)
 
         self.assertEqual(
             result.returncode,
@@ -13672,7 +13732,7 @@ class FinalVerifyTest(BootstrapTestCase):
         crictl_backup = directory / 'crictl.backup'
         crictl_backup.write_bytes((host / 'usr/local/bin/crictl').read_bytes())
         crictl_backup.chmod(0o600)
-        environment = os.environ.copy()
+        environment = self.sanitized_environment()
         environment.update(
             {
                 'PATH': f'{fake_bin}:/usr/bin:/bin',

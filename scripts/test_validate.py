@@ -13,6 +13,7 @@ from pathlib import Path
 
 import yaml
 import validate as validator
+from test_bootstrap import BootstrapTestCase
 
 from validate import (
     INSECURE_TLS,
@@ -745,7 +746,7 @@ set -eu
   printf 'python3'
   printf '\\t%s' "$@"
   printf '\\n'
-  printf 'PYTHONDONTWRITEBYTECODE=%s\\n' "${PYTHONDONTWRITEBYTECODE-unset}"
+  printf 'ENV_NAMES=%s\\n' "$(env | sed 's/=.*//' | sort | tr '\\n' ',')"
 } >>"$VALIDATE_COMMAND_LOG"
 case " $* " in
   *"run_validation.py --profile "*) exit "${FAKE_RUNNER_EXIT:-0}" ;;
@@ -779,19 +780,17 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
         runner_exit: int = 0,
         shellcheck_exit: int = 0,
     ) -> subprocess.CompletedProcess[str]:
-        environment = os.environ.copy()
-        environment.update(
-            {
-                'FAKE_RUNNER_EXIT': str(runner_exit),
-                'FAKE_SHELLCHECK_EXIT': str(shellcheck_exit),
-                'PATH': f'{self.fake_bin}:/usr/bin:/bin',
-                'VALIDATE_COMMAND_LOG': str(self.command_log),
-            }
-        )
-        # 入口必须自己保证不把 PYTHONDONTWRITEBYTECODE 交给套件；调用者环境里若
-        # 已有一个（例如本套件正被打了补丁前的 validate-fast.sh 启动），就看不出
-        # 入口是否泄漏，因此显式移除。
-        environment.pop('PYTHONDONTWRITEBYTECODE', None)
+        # 从白名单起手，绝不整体继承调用者的 shell：入口必须自己保证不把任何
+        # stage 会拒绝的变量交给套件，而调用者环境里若已有同名变量（例如本套件
+        # 正被打补丁前的 validate-fast.sh 启动），就看不出入口是否泄漏。
+        environment = {
+            'FAKE_RUNNER_EXIT': str(runner_exit),
+            'FAKE_SHELLCHECK_EXIT': str(shellcheck_exit),
+            'PATH': f'{self.fake_bin}:/usr/bin:/bin',
+            'VALIDATE_COMMAND_LOG': str(self.command_log),
+        }
+        if 'TMPDIR' in os.environ:
+            environment['TMPDIR'] = os.environ['TMPDIR']
         return subprocess.run(
             ['/bin/bash', str(self.root / 'scripts' / entrypoint)],
             cwd=self.root,
@@ -842,18 +841,41 @@ exit "${FAKE_SHELLCHECK_EXIT:-0}"
                 self.assertEqual(
                     result.returncode, 0, result.stdout + result.stderr
                 )
+                lines = command_log.splitlines()
                 python_calls = [
-                    line for line in command_log.splitlines()
-                    if line.startswith('python3\t')
+                    (lines[index], lines[index + 1])
+                    for index in range(len(lines) - 1)
+                    if lines[index].startswith('python3\t')
+                    and lines[index + 1].startswith('ENV_NAMES=')
                 ]
                 self.assertTrue(python_calls, '入口没有调用 python3')
-                for line in python_calls:
-                    self.assertEqual(
-                        line.split('\t')[1], '-B',
-                        f'{entrypoint} 的 python3 调用缺少 -B: {line}',
-                    )
-                self.assertNotIn('PYTHONDONTWRITEBYTECODE=1', command_log)
-                self.assertIn('PYTHONDONTWRITEBYTECODE=unset', command_log)
+                # 按**名字**判定而不是盯某个具名变量的某个值：stage 守卫按名字
+                # （含 HELM_/PYTHON/OPENSSL_/KUBECTL_ 四组前缀通配）判死，与值无关。
+                # 早先只记录 PYTHONDONTWRITEBYTECODE 且断言它等于某值，于是改泄漏
+                # PYTHONPATH、或把值写成 =0，两条用例都照绿（独立评审实测）。
+                names, prefixes = (
+                    BootstrapTestCase.untrusted_environment_guard()
+                )
+                self.assertGreaterEqual(len(names), 20, '守卫清单解析异常')
+                self.assertGreaterEqual(len(prefixes), 5, '前缀通配解析异常')
+                for argv, env_names in python_calls:
+                    with self.subTest(call=argv):
+                        self.assertEqual(
+                            argv.split('\t')[1], '-B',
+                            f'{entrypoint} 的 python3 调用缺少 -B: {argv}',
+                        )
+                        seen = set(
+                            env_names[len('ENV_NAMES='):].strip(',').split(',')
+                        )
+                        # 前缀匹配，不是集合求交：守卫按 PYTHON*/HELM_* 这样的
+                        # 前缀判死，示例名集合抓不到 PYTHONPATH 这类真实泄漏。
+                        self.assertEqual(
+                            BootstrapTestCase.environment_names_stages_reject(
+                                seen
+                            ),
+                            [],
+                            f'{entrypoint} 把 stage 会拒绝的变量交给了套件',
+                        )
 
     def test_fast_entrypoint_runs_fast_profile_without_apply(self) -> None:
         result = self.run_validate('validate-fast.sh')
@@ -891,9 +913,13 @@ class ValidationCatalogTest(unittest.TestCase):
 
         # 断言的是"没有任何 job 把它设成环境变量"，不是"这个词不许出现"——
         # 否则连解释为何用 -B 的注释都写不了。
-        self.assertNotIn(
-            'PYTHONDONTWRITEBYTECODE', sorted(set(exported_names(document)))
-        )
+        exported = sorted(set(exported_names(document)))
+        # 非空转守卫：这条 YAML 递归是唯一能抓"run: 带 -B 但 job 级 env: 仍设了它"
+        # 这一形态的探测器。解析一旦失灵（把 'env' 键名写错即可），缺陷原样加回去
+        # 也会绿（独立评审实测）。先钉住它确实解析到了东西。
+        self.assertIn('PLAN_RESULT', exported, exported)
+        self.assertGreaterEqual(len(exported), 5, exported)
+        self.assertNotIn('PYTHONDONTWRITEBYTECODE', exported)
         # 另一种泄漏形态：run: 里的前缀赋值，同样会被导出。
         for line in workflow_text.splitlines():
             with self.subTest(line=line.strip()):
