@@ -3786,7 +3786,56 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         diagnostics = result.stdout + result.stderr
         self.assertIn('stage-40-stdout-stop', diagnostics)
         self.assertIn('stage-40-stderr-stop', diagnostics)
+        # 停在 40 的 stage 自身不得出现摘要行——它没有成功，没有结果可记。
         self.assertNotIn('STAGE_40_', diagnostics)
+        # 但 00–30 已经跑完并记账了。裸 exit 会把这些连同尾块一起丢掉，
+        # 而它们正是运维定位问题时唯一的证据（证据路径与 digest 都在里面）。
+        self.assertIn('STAGE_00_RESULT=PASS_PREFLIGHT', result.stdout)
+        self.assertIn('STAGE_30_RESULT=PASS_CONTAINERD_INSTALLED', result.stdout)
+        self.assertIn('STAGE_30_EVIDENCE=', result.stdout)
+        self.assertIn('STAGE_30_SHA256=', result.stdout)
+        self.assertIn('PHASE=bootstrap-all', result.stdout)
+        self.assertIn('RESULT=STOP_STAGE', result.stdout)
+        self.assertIn('REASON=stage-40-check-stopped', result.stdout)
+        self.assertIn('EXIT_CODE=20', result.stdout)
+        self.assertNotIn(self.canary, diagnostics)
+
+    def test_stage_exit_code_propagates_with_summary_intact(self) -> None:
+        """stage 的原始退出码必须原样传递，且不因补打摘要而被覆盖。"""
+        for code in (10, 50):
+            with self.subTest(code=code):
+                self.environment = self.base_environment.copy()
+                self.environment['FAKE_STAGE_STOP'] = f'40:{code}'
+
+                result = self.run_orchestrator('--apply')
+
+                self.assertEqual(result.returncode, code)
+                self.assertIn(f'EXIT_CODE={code}', result.stdout)
+                self.assertIn('RESULT=STOP_STAGE', result.stdout)
+                self.assertIn('STAGE_00_RESULT=PASS_PREFLIGHT', result.stdout)
+                self.assertNotIn('STAGE_40_', result.stdout + result.stderr)
+
+    def test_progress_is_on_stderr_and_stdout_stays_a_contract(self) -> None:
+        """进度给人看，走 stderr；stdout 是逐字段的机器契约，一个字节都不掺。"""
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in (
+            '[1/8] stage 00 check ...',
+            '[1/8] stage 00 check -> PASS_PREFLIGHT',
+            '[5/8] stage 40 check -> PASS_KUBERNETES_CHECK',
+            '[5/8] stage 40 apply ...',
+            '[5/8] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
+            '[5/8] stage 40 postcheck -> ALREADY_COMPLIANT',
+            '[8/8] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
+        ):
+            self.assertIn(line, result.stderr)
+        # 进度行一旦漏进 stdout，下游解析与既有逐字段断言都会被打乱。
+        for index in range(1, 9):
+            self.assertNotIn(f'[{index}/8]', result.stdout)
+        # 进度行只回显编排器自己掌握的事实，不含 stage 自由文本与终端控制序列。
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+        self.assertNotIn('\x1b', result.stdout + result.stderr)
 
     def test_zero_exit_with_malformed_result_stops_unknown(self) -> None:
         self.environment['FAKE_STAGE_MALFORMED'] = '40:duplicate-result'
@@ -12523,6 +12572,61 @@ operator:
                     commands = command_log.read_text(encoding='utf-8')
                     self.assertNotIn(' install ', commands)
                 self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_unknown_cluster_state_names_the_blocking_component(self) -> None:
+        """复合判定停止时必须说清是哪一个分量。
+
+        2026-08-21 服务器上七个子状态坍缩成一句
+        gateway-cilium-cluster-state-unknown，且停止时一个分量都没记录
+        （log_evidence 全在判定全绿之后），定位只能另跑一轮只读普查。
+        """
+        environment, host, _, _ = self.make_environment()
+        self.install_full_cluster_contract(environment, host)
+        Path(environment['FAKE_SECRET_EXACT_JSON']).write_text(
+            self.helm_secret_json(upgraded=True), encoding='utf-8'
+        )
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn(
+            'REASON=gateway-cilium-cluster-state-unknown', result.stdout
+        )
+        self.assertIn('CLUSTER_STATE=UNKNOWN', result.stdout)
+        # 阻塞点被指名，其余分量如实为 COMPLIANT——两边都要，否则报告没有定位价值：
+        # 全报 UNKNOWN 和全不报一样没用。
+        self.assertIn('HELM_SECRET_STATE=UNKNOWN', result.stdout)
+        for component in (
+            'KUBE_PROXY_STATE', 'HELM_BINARY_STATE', 'GATEWAY_STATE',
+            'CILIUM_WORKLOAD_STATE', 'ENVOY_DAEMONSET_STATE',
+            'ENVOY_PODS_STATE', 'CILIUM_CONFIG_STATE', 'HELM_RELEASE_STATE',
+        ):
+            self.assertIn(f'{component}=COMPLIANT', result.stdout)
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
+
+    def test_early_return_reports_components_as_unqueried(self) -> None:
+        """kube_proxy 判定失败会让 load_cluster_state 提前 return，其余分量根本没查。
+
+        报告必须如实说 UNKNOWN，而不是沿用上一轮的值——也不能因为变量未绑定而
+        撞上 set -u。这里其余分量在 fixture 里本来都是好的，报告仍须说 UNKNOWN：
+        「没查」与「查了但不对」是两回事，混同会把运维引向错误的方向。
+        """
+        environment, host, _, _ = self.make_environment()
+        self.install_full_cluster_contract(environment, host)
+        environment['FAKE_KUBE_PROXY_DAEMONSET'] = 'daemonset.apps/kube-proxy\n'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('CLUSTER_STATE=UNKNOWN', result.stdout)
+        self.assertIn('KUBE_PROXY_STATE=UNKNOWN', result.stdout)
+        for component in (
+            'GATEWAY_STATE', 'HELM_SECRET_STATE', 'CILIUM_WORKLOAD_STATE',
+            'ENVOY_DAEMONSET_STATE', 'ENVOY_PODS_STATE',
+            'CILIUM_CONFIG_STATE', 'HELM_RELEASE_STATE',
+        ):
+            self.assertIn(f'{component}=UNKNOWN', result.stdout)
+        self.assertNotIn(self.canary, result.stdout + result.stderr)
 
     def test_rejects_invalid_official_helm_storage_labels(self) -> None:
         for mutation in (
