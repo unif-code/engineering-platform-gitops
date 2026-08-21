@@ -32,7 +32,7 @@
 - [x] 用例：stage 40 停止时，`STAGE_40_` 仍**不**出现（既有断言原样保留）
 - [x] 用例：stage 的原始退出码原样传递（取 10/50 两个边界值；20 由既有用例覆盖）
 - [x] 用例：尾块 `PHASE=bootstrap-all` 与 `EXIT_CODE=` 在失败路径上存在
-- [ ] 变异：把失败路径改回裸 exit，上面第一条必须变红
+- [x] 变异：**已由真实 CI 实验证明**——run 32455632083 在 errexit 泄漏未修时跑过，红在 `AssertionError: 'STAGE_00_RESULT=PASS_PREFLIGHT' not found in 'stage-40-stdout-stop\n…'`。该轮同时证明了原来那三行 `|| exit "$rc"` 是死代码。
 
 ### Task 2: 每 stage 一行进度到 stderr（A-1）
 
@@ -43,7 +43,7 @@
 - [ ] 用例：stdout 逐字节与改动前一致（用既有全绿 fixture 做基线比对）
 - [x] 用例：进度行出现在 stderr 且含 stage 编号与序号
 - [x] 用例：进度行不含 canary、不含 ANSI 转义
-- [ ] 变异：把进度写到 stdout，stdout 基线用例必须变红
+- [x] 变异（两轮）：① 进度全改 stdout → 红在 stderr 断言；② stderr 照旧但**额外**漏一份到 stdout → 红在 `'[1/8]' unexpectedly found in …`。第二轮单独证明了 stdout 守卫本身不是空转（第一轮先被 stderr 断言拦下，证不到这一点）。
 
 ### Task 3: 复合判定停止时输出子状态（A-3）
 
@@ -55,6 +55,6 @@ REASON，不存在把多个分量坍缩成一句的问题。只有 60 的 `load_
 **Steps:**
 - [x] `CLUSTER_STATE=UNKNOWN` 时输出七个子状态各一行
 - [x] 值域限定 `COMPLIANT|MISSING|UNKNOWN`，不含集群自由文本
-- [ ] 用例：单个子状态为 UNKNOWN 时，输出能指认是哪一个
-- [ ] 用例：不泄漏 canary
+- [x] 用例：单个子状态为 UNKNOWN 时，输出能指认是哪一个
+- [x] 用例：不泄漏 canary
 - [ ] 变异：删掉某一个子状态的输出，对应用例必须变红

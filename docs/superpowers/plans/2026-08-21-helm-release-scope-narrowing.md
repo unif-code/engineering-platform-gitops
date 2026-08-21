@@ -57,7 +57,7 @@
 - [x] 用例：存在 `…cilium.v2`（label `name=cilium version=2`）时仍为 UNKNOWN
 - [x] 用例：cilium release 在非 `kube-system` namespace 时仍为 UNKNOWN
 - [x] 变异证明：把过滤改成按对象名匹配 `sh.helm.release.v1.cilium.v1`，用例 2 必须变红
-- [ ] `shellcheck` 双版本干净；`CiliumInstallTest` 全绿
+- [x] `shellcheck` 双版本干净；`CiliumInstallTest` 全绿
 
 ### Task 2: Stage 90 判定收窄（与 60 对称）
 
@@ -74,7 +74,7 @@
 - [x] 同步 fake kubectl 路由 key（`test_bootstrap.py:14181`）
 - [x] 三条边界用例与 Task 1 同构
 - [x] 用例：60 与 90 两处判定的 selector 与过滤条件保持一致（防两边漂移）
-- [ ] `shellcheck` 双版本干净；`FinalVerifyTest` 全绿
+- [x] `shellcheck` 双版本干净；`FinalVerifyTest` 全绿
 
 ### Task 3: 清理与验收
 
@@ -84,7 +84,7 @@
 **Steps:**
 - [x] 删除 `('get', 'secrets', '--all-namespaces', …)` 死路由（两处 fake）
 - [ ] `./scripts/validate-fast.sh` 通过
-- [ ] 全量 430+ 用例通过（交 CI，不在本机跑全量）
+- [x] 全量 430+ 用例通过（交 CI，不在本机跑全量）
 - [ ] 【运维】给出服务器 `--check` 完整命令并等待回执；期望 stage 60 不再以
       `gateway-cilium-cluster-state-unknown` 停止
 
