@@ -17,6 +17,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CURRENT_PCS = ROOT / 'pcs/candidate-2.md'
 MANIFEST_ROOTS = (ROOT / 'clusters', ROOT / 'infrastructure', ROOT / 'apps')
 EXACT_VERSION = re.compile(r'^v?\d+\.\d+\.\d+$')
 FLOATING_IMAGE = re.compile(r':(?:latest|main|master)$')
@@ -1228,7 +1229,7 @@ def validate_metrics_server() -> None:
     if not required_dependencies.issubset(dependencies):
         fail('observability-controller 必须等待 cert-manager-config 与 foundation')
 
-    pcs = (ROOT / 'pcs/candidate-1.md').read_text(encoding='utf-8')
+    pcs = CURRENT_PCS.read_text(encoding='utf-8')
     pcs_contracts = (
         'Metrics Server',
         '0.8.1',

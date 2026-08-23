@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from typing import Iterator
 from pathlib import Path
 
@@ -183,6 +184,26 @@ class RepositoryProfileContractTest(unittest.TestCase):
                 re.compile(pattern),
                 label,
             )
+
+    def test_metrics_server_reads_current_pcs_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            current_pcs = Path(directory) / 'candidate-2.md'
+            current_pcs.write_text(
+                'current candidate without metrics facts\n', encoding='utf-8'
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                validate_metrics_server()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn(
+            'PCS 缺少 Metrics Server 供应链事实：Metrics Server',
+            stderr.getvalue(),
+        )
 
     def test_metrics_server_contract(self) -> None:
         validate_metrics_server()
