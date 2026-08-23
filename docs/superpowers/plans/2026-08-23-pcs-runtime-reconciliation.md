@@ -29,7 +29,7 @@
 **Files:**
 - Create: `pcs/candidate-2.md`
 - Modify: `scripts/validate.py:12-25,1231`
-- Modify: `scripts/test_validate.py:180-190`
+- Modify: `scripts/test_validate.py:1-12,180-205`
 
 **Interfaces:**
 - Consumes: Candidate 1 的完整组件锁定表、docs 基线 `2026-08-23.1` 和四仓 Source Commit。
@@ -37,15 +37,29 @@
 
 - [ ] **Step 1: 写入会失败的当前 PCS 路径测试**
 
-在 `ProfileValidationTest` 的 `test_metrics_server_contract` 前新增：
+在 import 区新增 `from unittest import mock`，并在 `ProfileValidationTest` 的 `test_metrics_server_contract` 前新增：
 
 ```python
 def test_metrics_server_reads_current_pcs_candidate(self) -> None:
-    self.assertEqual(
-        validator.CURRENT_PCS.relative_to(validator.ROOT),
-        Path('pcs/candidate-2.md'),
+    with tempfile.TemporaryDirectory() as directory:
+        current_pcs = Path(directory) / 'candidate-2.md'
+        current_pcs.write_text('current candidate without metrics facts\n')
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            validate_metrics_server()
+
+    self.assertEqual(raised.exception.code, 1)
+    self.assertIn(
+        'PCS 缺少 Metrics Server 供应链事实：Metrics Server',
+        stderr.getvalue(),
     )
 ```
+
+该测试运行真实 `validate_metrics_server()`；若生产代码仍硬编码 Candidate 1，临时 Candidate 2 不会触发失败，测试就无法通过。
 
 - [ ] **Step 2: 运行测试并确认失败原因**
 
@@ -55,7 +69,7 @@ Run:
 (cd scripts && python3 -B -m unittest test_validate.ProfileValidationTest.test_metrics_server_reads_current_pcs_candidate -v)
 ```
 
-Expected: FAIL，唯一原因是 `validate` 尚无 `CURRENT_PCS`。
+Expected: FAIL，唯一原因是 `validate` 尚无 `CURRENT_PCS`，`mock.patch.object` 无法建立替换。
 
 - [ ] **Step 3: 创建完整 Candidate 2**
 
