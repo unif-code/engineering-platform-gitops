@@ -24,6 +24,15 @@ GitOps commit / PR：bootstrap 完成于 `a3eb3945c733b77f2594c9ff10e99dcd8587cd
 集群构成：kubeadm 单节点控制面（`clusterName=engineering-platform-dev`）、containerd 2.3.1 + runc、
 Kubernetes 1.36.3 四包 hold、Cilium 1.20.0（kube-proxy replacement、Gateway API v1.6.1 standard、Envoy DaemonSet）。
 
+### 2026-08-21 最新复核
+
+| 证据 | 结果 |
+| --- | --- |
+| `/root/dev-infra-evidence/07-preflight-20260821T071118Z.txt` | `PASS_PREFLIGHT`；SHA-256 `9d8a287936c14362899d26846cd92a3a0927fa392af1c74efda599c2f774fe20` |
+| `/root/dev-infra-evidence/14-verify-20260821T073936Z.txt` | `PASS_BOOTSTRAP_VERIFIED`；SHA-256 `0c0b06a4b19c8cfe5169357be572dad77acdf227aeccdd6aa7ae82003a9d1daa` |
+
+最后一次运行时只存在 Kubernetes/Cilium 基础组件和 GitLab Runner；Flux CRD、`flux-system`、`platform`、MinIO、CNPG、cert-manager、monitoring 及 frontend/backend 工作负载均不存在。因此本页只证明 bootstrap，不证明 GitOps 或应用已部署。
+
 ## 可恢复的一次性执行合同
 
 每轮只执行一条【运维】命令，并回填完整
@@ -66,16 +75,7 @@ scripts/bootstrap/run-approved.sh --apply
 停在旧提交上，此时**不带 SHA 会静默部署旧版本**（入口只校验它在 `origin/main` 历史上，
 不校验它是不是最新）。
 
-截至 2026-08-21，`unif-code` 组织的 GitHub Actions 免费额度已用尽，私有仓所有 job 在
-2 秒内失败，`validation-gate` 与 `publish-validated` 均未运行，`origin/validated` 停在
-stage 目录迁移之前。因此当前一律显式传 SHA：
-
-```bash
-scripts/bootstrap/run-approved.sh <origin/main 的完整 40 位 SHA> --check
-```
-
-额度重置或开启 spending limit 后，`validation-gate` 恢复、`origin/validated` 重新推进，
-再回到不带 SHA 的默认路径。
+截至事实采样，`origin/main` 为 `1c5034b9a9c29ab72fde63644c57fa88604c45b6`，`origin/validated` 为 `696e9849e4f22501394324a4001e3c0b7091fe66`。当前 main 尚无可推动 `validated` 的成功验证结果，因此不得执行服务器部署。显式 SHA 入口只解决引用落后或回滚时的精确选版，不能绕过“目标 SHA 已通过 validation-gate”的人工授权前置。
 
 历史上手工粘贴的等价门禁脚本已由该入口取代：粘贴长脚本曾多次因终端丢字符导致
 `APPROVED_SHA` 截断或行断裂，也曾遗漏 `merge --ff-only`（`exit 97`）。

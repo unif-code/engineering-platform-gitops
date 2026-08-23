@@ -1,7 +1,9 @@
 # Platform Compatibility Set Candidate 2
 
-状态：`BLOCKED CANDIDATE`  
-环境：`DEV` / `NON_HA`  
+状态：`BLOCKED CANDIDATE`
+
+环境：`DEV` / `NON_HA`
+
 基线：`2026-08-23.1`
 
 基础设施与运维架构：`engineering-platform-docs/architecture/09-infrastructure-operations.md`
@@ -10,7 +12,8 @@
 
 治理例外（DEV-001 / DEV-002 / DEV-004）：`engineering-platform-docs/architecture/deviations.md`
 
-容量 Profile：`DEV-002` / `SINGLE_USER_MINIMAL`  
+容量 Profile：`DEV-002` / `SINGLE_USER_MINIMAL`
+
 目标平台：`linux/amd64`（已由服务器基线确认 `uname -m=x86_64`）
 
 任何版本、Chart、Manifest 或 Image 变化都必须建立新的 PCS Candidate。候选 digest 只允许来自官方 Registry/Chart index 或 CI provenance，实际 digest 只允许来自部署 Image ID；不得填写猜测值。候选值仍需在部署后与实际 Image ID 比对。
