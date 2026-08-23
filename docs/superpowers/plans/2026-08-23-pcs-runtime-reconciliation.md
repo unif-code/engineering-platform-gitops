@@ -37,7 +37,7 @@
 
 - [ ] **Step 1: 写入会失败的当前 PCS 路径测试**
 
-在 import 区新增 `from unittest import mock`，并在 `ProfileValidationTest` 的 `test_metrics_server_contract` 前新增：
+在 import 区新增 `from unittest import mock`，并在 `RepositoryProfileContractTest` 的 `test_metrics_server_contract` 前新增：
 
 ```python
 def test_metrics_server_reads_current_pcs_candidate(self) -> None:
@@ -66,7 +66,7 @@ def test_metrics_server_reads_current_pcs_candidate(self) -> None:
 Run:
 
 ```bash
-(cd scripts && python3 -B -m unittest test_validate.ProfileValidationTest.test_metrics_server_reads_current_pcs_candidate -v)
+(cd scripts && python3 -B -m unittest test_validate.RepositoryProfileContractTest.test_metrics_server_reads_current_pcs_candidate -v)
 ```
 
 Expected: FAIL，唯一原因是 `validate` 尚无 `CURRENT_PCS`，`mock.patch.object` 无法建立替换。
@@ -135,7 +135,7 @@ Run:
 
 ```bash
 (cd scripts && python3 -B -m unittest \
-  test_validate.ProfileValidationTest.test_metrics_server_reads_current_pcs_candidate \
+  test_validate.RepositoryProfileContractTest.test_metrics_server_reads_current_pcs_candidate \
   test_validate.RepositoryProfileContractTest.test_metrics_server_contract -v)
 ```
 
