@@ -1243,6 +1243,69 @@ def validate_metrics_server() -> None:
             fail(f'PCS 缺少 Metrics Server 供应链事实：{expected}')
 
 
+def validate_rejected_chainguard_minio_candidate() -> None:
+    pcs = CURRENT_PCS.read_text(encoding='utf-8')
+    required_facts = (
+        '已拒绝的 MinIO 替代候选',
+        '候选结论：`REJECTED`',
+        'sha256:cc18cac5456a3718bde96c368beaed53b9b876233f28c5f68b8fb667b9a528a7',
+        'sha256:c9680a1ad80b56c67b2b9e44cc480a8fd0fb4362dab01f68b8bfbccae9d77596',
+        'minio 0.20260717.120751-r9',
+        'sha256:b456af84dd3aa6883e67a74e2cc9aca9b1e060197dcd040d73bdec9e8c6b99fb',
+        'sha256:043d0ad5c2b297c0f0382dcac9b9436483d9f4a1d16cecdcc9471affb5e643e4',
+        'mc 0.20250813.083541-r21',
+        'libcrypto3 3.6.3-r5',
+        'CVE-2026-5450',
+        'CVE-2026-54876',
+        '未做风险批准',
+    )
+    for expected in required_facts:
+        if expected not in pcs:
+            fail(f'PCS 缺少 MinIO 被拒候选事实：{expected}')
+
+    deployment = document_by_identity(
+        ROOT / 'infrastructure/minio/deployment.yaml',
+        'Deployment',
+        'minio',
+    )
+    bootstrap = document_by_identity(
+        ROOT / 'infrastructure/minio/bootstrap-job.yaml',
+        'Job',
+        'minio-bootstrap-v1',
+    )
+    active_images = {
+        value_at(
+            deployment,
+            (
+                'spec',
+                'template',
+                'spec',
+                'containers',
+                ('name', 'minio'),
+                'image',
+            ),
+        ),
+        value_at(
+            bootstrap,
+            (
+                'spec',
+                'template',
+                'spec',
+                'containers',
+                ('name', 'mc'),
+                'image',
+            ),
+        ),
+    }
+    rejected_digests = (
+        'sha256:c9680a1ad80b56c67b2b9e44cc480a8fd0fb4362dab01f68b8bfbccae9d77596',
+        'sha256:043d0ad5c2b297c0f0382dcac9b9436483d9f4a1d16cecdcc9471affb5e643e4',
+    )
+    for image in active_images:
+        if any(digest in image for digest in rejected_digests):
+            fail(f'MinIO 清单引用了未获风险批准的 Chainguard 候选：{image}')
+
+
 def resource_id(document: dict[str, Any]) -> tuple[str, str, str, str] | None:
     api_version = document.get('apiVersion')
     kind = document.get('kind')
@@ -1384,6 +1447,7 @@ def main() -> None:
     validate_single_user_storage()
     validate_single_user_resources()
     validate_metrics_server()
+    validate_rejected_chainguard_minio_candidate()
     print('GitOps manifests validated successfully.')
 
 

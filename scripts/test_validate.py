@@ -208,6 +208,79 @@ class RepositoryProfileContractTest(unittest.TestCase):
     def test_metrics_server_contract(self) -> None:
         validate_metrics_server()
 
+    def test_rejected_chainguard_minio_candidate_contract(self) -> None:
+        validator.validate_rejected_chainguard_minio_candidate()
+
+    def test_rejected_chainguard_minio_candidate_cannot_be_activated(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            minio = root / 'infrastructure/minio'
+            minio.mkdir(parents=True)
+            current_pcs = root / 'candidate-2.md'
+            current_pcs.write_text(
+                validator.CURRENT_PCS.read_text(encoding='utf-8'),
+                encoding='utf-8',
+            )
+            (minio / 'deployment.yaml').write_text(
+                yaml.safe_dump(
+                    {
+                        'apiVersion': 'apps/v1',
+                        'kind': 'Deployment',
+                        'metadata': {'name': 'minio'},
+                        'spec': {
+                            'template': {
+                                'spec': {
+                                    'containers': [
+                                        {
+                                            'name': 'minio',
+                                            'image': 'cgr.dev/chainguard/minio@sha256:'
+                                            'c9680a1ad80b56c67b2b9e44cc480a8fd0fb4362d'
+                                            'ab01f68b8bfbccae9d77596',
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding='utf-8',
+            )
+            (minio / 'bootstrap-job.yaml').write_text(
+                yaml.safe_dump(
+                    {
+                        'apiVersion': 'batch/v1',
+                        'kind': 'Job',
+                        'metadata': {'name': 'minio-bootstrap-v1'},
+                        'spec': {
+                            'template': {
+                                'spec': {
+                                    'containers': [
+                                        {'name': 'mc', 'image': 'safe@example'}
+                                    ]
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding='utf-8',
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(validator, 'ROOT', root),
+                mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                validator.validate_rejected_chainguard_minio_candidate()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn(
+            'MinIO 清单引用了未获风险批准的 Chainguard 候选',
+            stderr.getvalue(),
+        )
+
     def test_single_user_resource_contract(self) -> None:
         self.assertEqual(validate_single_user_resources(), (1115, 2720))
 

@@ -53,6 +53,24 @@
 | Application | engineering-platform-backend | Source `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` | 当前 Source Commit 无候选 image | `BLOCKED` | 历史 commit `1d627b9` 的 digest `sha256:c77fb2d88a61659fa8c2b5074a4ea3103002698085e578652d999d2e2b45e8d7` 不得作为当前候选；无工作负载 |
 | Application | engineering-platform frontend | Source `c392c6fc7a82a26f1eb4be22c35c6cda00e5d75c` / tag `sha-c392c6f` / CI run `32549901199` | `ghcr.io/unif-code/engineering-platform@sha256:ee548974e159916ba7ca0fafe8bb30d72722a34625ffbce31d6e495324d06c0c` | OCI `sha256:ee548974e159916ba7ca0fafe8bb30d72722a34625ffbce31d6e495324d06c0c`；linux/amd64 manifest `NOT_VERIFIED`；运行 Image ID `NOT_EXECUTED` | OCI 制品已产生；工作负载未部署 |
 
+## 已拒绝的 MinIO 替代候选
+
+采样日期：`2026-08-23`
+
+候选结论：`REJECTED`（不进入 Deployment，不构成 DEV 风险批准）。
+
+| 组件 | 精确候选 | 已验证的供应链事实 |
+| --- | --- | --- |
+| MinIO Server | `cgr.dev/chainguard/minio`；index `sha256:cc18cac5456a3718bde96c368beaed53b9b876233f28c5f68b8fb667b9a528a7`；linux/amd64 `sha256:c9680a1ad80b56c67b2b9e44cc480a8fd0fb4362dab01f68b8bfbccae9d77596` | Cosign keyless signature、SPDX SBOM 与 SLSA provenance 均验证通过；签名身份为 `https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main`；provenance 包含 `minio 0.20260717.120751-r9`、`glibc 2.43-r15` |
+| MinIO Client | `cgr.dev/chainguard/minio-client`；index `sha256:b456af84dd3aa6883e67a74e2cc9aca9b1e060197dcd040d73bdec9e8c6b99fb`；linux/amd64 `sha256:043d0ad5c2b297c0f0382dcac9b9436483d9f4a1d16cecdcc9471affb5e643e4` | Cosign keyless signature、SPDX SBOM 与 SLSA provenance 均验证通过；同一签名身份；provenance 包含 `mc 0.20250813.083541-r21`；精确 SPDX 包含 `libcrypto3 3.6.3-r5` 与 `go.etcd.io/etcd/client/pkg/v3 v3.5.19` |
+
+拒绝原因：
+
+- [Chainguard MinIO 漏洞页](https://images.chainguard.dev/directory/image/minio/vulnerabilities) 的当前公开视图在 `glibc-2.43 2.43-r15` 上仍列出 Critical `CVE-2026-5450` 以及 High `CVE-2026-5928`、`CVE-2026-4437`、`CVE-2026-4046`。
+- [Chainguard MinIO Client 漏洞页](https://images.chainguard.dev/directory/image/minio-client/vulnerabilities) 的公开视图列出 High `CVE-2026-54876`、`CVE-2026-14456` 与 `CVE-2026-73500`，但页面包版本为 `libcrypto3 3.6.3-r4`，与精确摘要签名 SPDX 的 `libcrypto3 3.6.3-r5` 不一致，不能作为精确摘要的确定性扫描结论。
+- `chainctl images advisories list` 对精确摘要要求 Chainguard 登录令牌；本次只读核验未登录、未写入凭据。独立 Grype 精确摘要扫描未取得完整漏洞数据库，结果为 `NOT_VERIFIED`。
+- 因供应商公开视图、精确签名 SBOM 与可用公告解析之间尚未形成一致证据，按 fail-closed 处理。当前 GitOps 清单继续保留原始阻塞引用，不切换到上述摘要；未做风险批准，也未执行服务器部署或激活。
+
 ## Bootstrap 证据
 
 | 证据 | 结果 |
