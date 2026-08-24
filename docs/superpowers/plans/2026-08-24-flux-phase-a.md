@@ -48,6 +48,8 @@ flux install \
 | notification | `50m / 128Mi` | `200m / 256Mi` |
 
 8. 生成来源、CLI archive SHA-256、Controller 版本、OCI index 与 linux/amd64 manifest 均有唯一固定值；清单不得退回 tag 或浮动引用。
+9. Phase A 不存在指向 `cluster-admin` 的 Flux binding；`crd-controller` binding 只绑定四个已安装 Controller，不为 image automation 或 source-watcher 预留潜伏授权；不聚合 `flux-edit`/`flux-view` 到 Kubernetes 内置角色，也不授予未启用 Workload Identity 所需的 ServiceAccount token 创建权。
+10. 不保留官方宽松默认 NetworkPolicy。Phase A 使用双向 default deny，仅放行 DNS、Cilium `kube-apiserver` entity 和四个 Controller 间发送事件所需的同 Namespace 流量；没有监控或 webhook 入站，也没有 Git/OCI/Helm/公网出站。
 
 ## Task 1: Add fail-closed Phase A contract tests
 
@@ -56,7 +58,7 @@ flux install \
 - Modify: `scripts/test_validate.py`
 - Modify: `scripts/validation_catalog.py`
 
-Add `FluxPhaseAContractTest` covering the eight invariants above, exact four Deployment identities, exact image digests, exact security args, PSS labels, resources, inactive sync and root isolation. Add mutation tests for a fifth Controller, a tag-only image, reintroduced sync resource, missing security arg and an infrastructure Namespace.
+Add `FluxPhaseAContractTest` covering the ten invariants above, exact four Deployment identities, exact image digests, exact security args, PSS labels, resources, inactive sync and root isolation. Add mutation tests for a fifth Controller, a tag-only image, reintroduced sync resource, missing security arg, an infrastructure Namespace, `cluster-admin`, unused Controller subjects/API Groups, aggregate user roles and fail-open network rules.
 
 Run the focused selector before implementation and preserve the RED output:
 
@@ -74,7 +76,9 @@ python3 -B -m unittest test_validate.FluxPhaseAContractTest -v
 - Keep inactive: `clusters/dev/flux-system/gotk-sync.yaml`
 - Create: `clusters/dev/flux-system/README.md`
 
-Download only the fixed v2.9.3 CLI archive, verify its SHA-256 before extraction, and export the four-component bundle. Do not use the upstream seven-controller `install.yaml`. Remove `gotk-sync.yaml` from active Kustomize resources. Use Kustomize image transforms to replace the generated tags with the four fixed linux/amd64 digests. Add PSS labels, security args, rollout strategy and current resource patches. Record generation provenance and all index/manifest digests in the README.
+Download only the fixed v2.9.3 CLI archive, verify its SHA-256 before extraction, and export the four-component bundle. Do not use the upstream seven-controller `install.yaml`. Remove `gotk-sync.yaml` from active Kustomize resources. Use Kustomize image transforms to replace the generated tags with the four fixed linux/amd64 digests. Add PSS labels, security args, rollout strategy and current resource patches.
+
+Delete the generated `cluster-reconciler-flux-system` binding for Phase A. Narrow the CRD Controller binding and rules to the four installed Controllers/API Groups, remove aggregate `flux-edit`/`flux-view` roles and unused ServiceAccount token creation. Replace the three generated permissive NetworkPolicies with reviewed default-deny, DNS, Kubernetes API and internal event policies; because the architecture fixes Cilium, API egress uses a Cilium policy targeting `kube-apiserver` rather than an unstable Kubernetes `ipBlock`/Service NAT assumption. Record generation provenance, security deltas and all index/manifest digests in the README.
 
 ## Task 3: Teach validation the Phase A state
 
@@ -115,9 +119,9 @@ This task remains `BLOCKED` while GitHub does not allocate a Runner or `origin/v
 
 1. Run `run-approved.sh --check` to synchronize and re-verify the server checkout.
 2. Verify the fixed linux/amd64 Flux CLI archive and run `flux check --pre`.
-3. Render and inspect exact object identities; run client and server-side dry-run.
+3. Render and inspect exact object identities/RBAC/network policy; run client and server-side dry-run.
 4. Apply only `clusters/dev/flux-system` with field manager `engineering-platform-flux-phase-a`; never use `--force-conflicts` or `--prune`.
-5. Wait for all four rollouts and prove GitRepository/Kustomization/HelmRelease plus downstream Namespace inventories are empty.
+5. Wait for all four rollouts; prove Controller identities cannot directly create Deployment/ClusterRole; prove GitRepository/Kustomization/HelmRelease plus downstream Namespace inventories are empty and non-approved ingress/egress is denied.
 6. Save `/root/dev-infra-evidence/15-flux-phase-a-<UTC>.txt` and its SHA-256.
 7. Commit the new Runtime facts across PCS, runbooks and validator fixtures; V0.1 remains `BLOCKED` because sync, infrastructure and applications are still inactive.
 
