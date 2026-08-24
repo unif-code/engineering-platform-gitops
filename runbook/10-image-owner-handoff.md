@@ -1,29 +1,56 @@
 # 应用 Image Owner Handoff
 
-检查时间：`2026-08-23`
+检查时间：`2026-08-24 03:42Z`（当前 Runtime 审计采样）
 状态：`BLOCKED`
 
 只读检查确认：
 
 - frontend 当前 Source Commit 为 `da72238abc87a19c07a5cac96e41d88d5f6bf2d3`，已有 Dockerfile、nginx 80 启动合同和 main image workflow；CI run `32683635240` 与 publish-image job `97305929974` 已 `success`。
-- 当前 OCI index digest 已确认为 `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1`；构建日志中的 child manifest `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` 尚未独立确认 `linux/amd64` 身份，运行 Image ID 也仍为 `NOT_VERIFIED`。
+- 当前 OCI index digest 已确认为 `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1`；workflow 的 `build --platform linux/amd64`、导出 manifest 日志与独立 attestation manifest 已确认 `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` 为可部署 linux/amd64 manifest，运行 Image ID 仍为 `NOT_VERIFIED`。
 - backend `engineering-platform-backend` 位于 `647d509bca1bbf9ff0f6ab719d5905d8f836e92f`，已有 Dockerfile、Alembic migrations 和 uvicorn 8000 启动合同；当前 Source Commit 尚无成功 image digest。
 - backend 历史 commit `1d627b9` 的 digest `sha256:c77fb2d88a61659fa8c2b5074a4ea3103002698085e578652d999d2e2b45e8d7` 只作历史记录，不进入当前 handoff。
-- 最后一次 DEV Runtime 观测没有 platform Namespace、migration Job 或 frontend/backend 工作负载，所有运行 Smoke 均未执行。
+- `2026-08-24 03:42Z` 的当前 DEV Runtime inventory 没有 platform Namespace、migration Job 或 frontend/backend 工作负载，所有运行 Smoke 均未执行；`2026-08-22 16:58 +08:00` 仅保留为历史观察。
 
 因此当前不得生成带猜测 digest 的 Deployment。进入应用 Desired State 前的回执为：
+
+## 当前 DEV Runtime 观测
+
+本节记录服务器 GitOps `main` 的只读 `run-approved --check` 回执；frontend 的可部署 manifest 事实不等同于 Runtime Image ID。
+
+| 字段 | 值 |
+| --- | --- |
+| 采样时间 | `2026-08-24 03:42Z` |
+| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
+| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
+| REASON | `bootstrap-check-complete` |
+| STAGE_00 | `PASS_PREFLIGHT` |
+| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
+| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
+| STAGE_10-60 | `ALREADY_COMPLIANT` |
+| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
+| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
+| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
+| NEXT_STAGE | `NONE` |
+| EXIT_CODE | `0` |
+| COMMAND_EXIT_CODE | `0` |
+| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
+| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
+| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
 
 ## 当前 frontend 候选
 
 | 字段 | 值 |
 | --- | --- |
 | Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
+| CI run | `32683635240` |
+| publish-image job | `97305929974` |
+| Image tag | `sha-da72238` |
 | CI provenance | `VERIFIED` |
 | Artifact / OCI index digest | `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` |
-| linux/amd64 manifest digest | `NOT_VERIFIED`（candidate：`sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`） |
+| linux/amd64 manifest digest | `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` |
 | Runtime Image ID | `NOT_VERIFIED` |
 
-run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。child manifest 仍必须由 Registry/workflow 独立确认 `linux/amd64` 身份；此前不得创建应用 Deployment 或填写运行 Image ID。
+run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow、CI log 与独立 attestation 已确认 child manifest 的 linux/amd64 身份；可创建使用该 digest 的应用 Deployment，但运行 Image ID 必须在部署后回填。
 
 ## 2026-08-22 frontend 历史证据
 
@@ -41,7 +68,7 @@ run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认�
 | CI run URL | `https://github.com/unif-code/engineering-platform/actions/runs/32683635240`（`success`；publish-image job `97305929974`） | 当前 Source Commit 无成功 run |
 | Image tag `sha-<short-sha>` | `sha-da72238` | `NOT_AVAILABLE` |
 | OCI index digest | `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` | `NOT_AVAILABLE` |
-| `linux/amd64` manifest digest | `NOT_VERIFIED`（candidate：`sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`） | `NOT_AVAILABLE` |
+| `linux/amd64` manifest digest | `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` | `NOT_AVAILABLE` |
 | Runtime Image ID | `NOT_VERIFIED` | `NOT_AVAILABLE` |
 | 启动命令 / 监听端口 | nginx / 80 | `uvicorn control_plane.app.bootstrap.app:create_app --factory --host 0.0.0.0 --port 8000` |
 | Migration | 不适用 | `alembic upgrade heads`，`NOT_EXECUTED` |

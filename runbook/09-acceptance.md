@@ -8,6 +8,30 @@ PCS Candidate：`pcs/candidate-2.md`
 
 验收时间（含时区）：`NOT_EXECUTED`
 
+## 当前 DEV Runtime 观测
+
+`2026-08-24 03:42Z` 的只读 `run-approved --check` 已验证 bootstrap；Runtime inventory 没有 `flux-system`、`platform` 或 `openbao`，GitRepository 查询为空，因此以下验收项继续 fail-closed 为 `BLOCKED`。
+
+| 字段 | 值 |
+| --- | --- |
+| 采样时间 | `2026-08-24 03:42Z` |
+| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
+| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
+| REASON | `bootstrap-check-complete` |
+| STAGE_00 | `PASS_PREFLIGHT` |
+| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
+| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
+| STAGE_10-60 | `ALREADY_COMPLIANT` |
+| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
+| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
+| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
+| NEXT_STAGE | `NONE` |
+| EXIT_CODE | `0` |
+| COMMAND_EXIT_CODE | `0` |
+| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
+| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
+| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
+
 | # | 验收标准 | 证据 | 状态 |
 | --- | --- | --- | --- |
 | 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（DEV 尚无 Flux CRD 或 `flux-system`） |
@@ -24,8 +48,9 @@ PCS Candidate：`pcs/candidate-2.md`
 - [ ] MinIO 供应链风险已由批准 Decision 或内部构建 digest 关闭。
 - [x] Docker/containerd 共存路径已由用户批准并有运行证据。
 - [ ] `dev-cp.unif.internal` 稳定解析已落地。
-- [ ] frontend 当前 Source Commit 的 CI provenance、OCI index digest 与 nginx / 80 启动契约已核验。
-- [ ] frontend 当前 `linux/amd64` manifest digest 与 backend 当前 Source Commit image digest 已核验。
+- [x] frontend 当前 Source Commit 的 CI provenance、OCI index digest 与 nginx / 80 启动契约已核验。
+- [x] frontend 当前 `linux/amd64` manifest digest 已由 workflow、CI log 与 attestation 核验。
+- [ ] backend 当前 Source Commit image digest 已核验。
 - [ ] frontend/backend Deployment 实际 Image ID 与 GitOps digest 已对齐。
 - [ ] kubelet serving certificate、metrics-server APIService 与 `kubectl top` 均通过安全 TLS 验证。
 

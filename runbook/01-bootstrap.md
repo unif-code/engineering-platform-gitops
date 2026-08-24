@@ -9,7 +9,33 @@
 服务器标识：`retail-test-workflow`
 GitOps commit / PR：bootstrap 完成于 `a3eb3945c733b77f2594c9ff10e99dcd8587cd4d`
 
-## 当前状态：bootstrap 已完成
+## 当前状态：2026-08-24 bootstrap check 已验证
+
+在服务器 GitOps `main` 的 `1c5034b9a9c29ab72fde63644c57fa88604c45b6` 上，外部 Chrome 堡垒机 root 会话于 `2026-08-24 03:42Z` 只读执行 `run-approved --check`。8 个 stage 均为通过或 `ALREADY_COMPLIANT`；这证明最新 bootstrap 检查通过，不证明 Flux、平台基础设施或应用已部署。
+
+## 当前 DEV Runtime 观测
+
+| 字段 | 值 |
+| --- | --- |
+| 采样时间 | `2026-08-24 03:42Z` |
+| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
+| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
+| REASON | `bootstrap-check-complete` |
+| STAGE_00 | `PASS_PREFLIGHT` |
+| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
+| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
+| STAGE_10-60 | `ALREADY_COMPLIANT` |
+| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
+| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
+| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
+| NEXT_STAGE | `NONE` |
+| EXIT_CODE | `0` |
+| COMMAND_EXIT_CODE | `0` |
+| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
+| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
+| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
+
+### 2026-08-19 历史 bootstrap apply
 
 `2026-08-19` 在 `a3eb394` 上执行 `--apply`，编排器全部 8 个 stage 通过：
 

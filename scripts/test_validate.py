@@ -286,10 +286,22 @@ class RepositoryProfileContractTest(unittest.TestCase):
         root: Path,
         *,
         frontend_source: str = 'da72238abc87a19c07a5cac96e41d88d5f6bf2d3',
-        frontend_provenance: str = 'NOT_VERIFIED',
-        frontend_artifact: str = 'NOT_VERIFIED',
-        frontend_manifest: str = 'NOT_VERIFIED',
+        frontend_ci_run: str = '32683635240',
+        frontend_publish_job: str = '97305929974',
+        frontend_tag: str = 'sha-da72238',
+        frontend_provenance: str = 'VERIFIED',
+        frontend_artifact: str = (
+            'sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1'
+        ),
+        frontend_manifest: str = (
+            'sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
+        ),
         frontend_image_id: str = 'NOT_VERIFIED',
+        docs_architecture_commit: str = (
+            'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
+        ),
+        flux_status: str = 'BLOCKED',
+        minio_status: str = 'BLOCKED',
         backup_status: str = 'BLOCKED',
         capacity_status: str = 'BLOCKED',
     ) -> Path:
@@ -297,11 +309,20 @@ class RepositoryProfileContractTest(unittest.TestCase):
         historical_digest = (
             'sha256:ee548974e159916ba7ca0fafe8bb30d72722a34625ffbce31d6e495324d06c0c'
         )
-        current = f'''## 当前 frontend 候选
+        current = f'''## 事实采样
+
+| 事实 | 值 |
+| --- | --- |
+| docs 架构事实提交 | `{docs_architecture_commit}` |
+
+## 当前 frontend 候选
 
 | 字段 | 值 |
 | --- | --- |
 | Source Commit | `{frontend_source}` |
+| CI run | `{frontend_ci_run}` |
+| publish-image job | `{frontend_publish_job}` |
+| Image tag | `{frontend_tag}` |
 | CI provenance | `{frontend_provenance}` |
 | Artifact / OCI index digest | `{frontend_artifact}` |
 | linux/amd64 manifest digest | `{frontend_manifest}` |
@@ -318,8 +339,8 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
 | 依赖 | 状态 |
 | --- | --- |
-| Flux | `BLOCKED` |
-| MinIO | `BLOCKED` |
+| Flux | `{flux_status}` |
+| MinIO | `{minio_status}` |
 '''
         for relative_path in (
             'pcs/candidate-2.md',
@@ -330,6 +351,56 @@ class RepositoryProfileContractTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(current, encoding='utf-8')
 
+        pcs = root / 'pcs/candidate-2.md'
+        pcs.write_text(
+            pcs.read_text(encoding='utf-8')
+            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}` | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；Runtime Image ID `{frontend_image_id}` | verified facts |\n''',
+            encoding='utf-8',
+        )
+        handoff = root / 'runbook/10-image-owner-handoff.md'
+        handoff.write_text(
+            handoff.read_text(encoding='utf-8')
+            + f'''\n| 字段 | frontend | backend |\n| --- | --- | --- |\n| Source commit（完整 40 位 SHA） | `{frontend_source}` | `NOT_AVAILABLE` |\n| CI run URL | `{frontend_ci_run}` / publish-image job `{frontend_publish_job}` | `NOT_AVAILABLE` |\n| Image tag `sha-<short-sha>` | `{frontend_tag}` | `NOT_AVAILABLE` |\n| OCI index digest | `{frontend_artifact}` | `NOT_AVAILABLE` |\n| `linux/amd64` manifest digest | `{frontend_manifest}` | `NOT_AVAILABLE` |\n| Runtime Image ID | `{frontend_image_id}` | `NOT_AVAILABLE` |\n''',
+            encoding='utf-8',
+        )
+
+        runtime = '''## 当前 DEV Runtime 观测
+
+| 字段 | 值 |
+| --- | --- |
+| 采样时间 | `2026-08-24 03:42Z` |
+| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
+| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
+| REASON | `bootstrap-check-complete` |
+| STAGE_00 | `PASS_PREFLIGHT` |
+| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
+| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
+| STAGE_10-60 | `ALREADY_COMPLIANT` |
+| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
+| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
+| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
+| NEXT_STAGE | `NONE` |
+| EXIT_CODE | `0` |
+| COMMAND_EXIT_CODE | `0` |
+| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
+| Pod inventory | gitlab-runner and kube-system control plane/Cilium/CoreDNS only |
+| Inactive inventory | flux-system/platform/openbao absent; GitRepository query empty |
+'''
+        for relative_path in (
+            'pcs/candidate-2.md',
+            'runbook/01-bootstrap.md',
+            'runbook/06-apps.md',
+            'runbook/10-image-owner-handoff.md',
+        ):
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                (path.read_text(encoding='utf-8') if path.exists() else '')
+                + '\n'
+                + runtime,
+                encoding='utf-8',
+            )
+
         acceptance = root / 'runbook/09-acceptance.md'
         acceptance.write_text(
             f'''| # | 验收标准 | 证据 | 状态 |
@@ -338,7 +409,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
 | 3 | PG PITR 与 etcd 隔离 restore 各完成一次 | restore drill | {backup_status}（依赖 Flux 与 MinIO） |
 | 4 | 三 bucket Versioning/Object Lock | MinIO verify | BLOCKED（MinIO 供应链阻塞） |
 | 6 | 容量与重启证据 | capacity drill | {capacity_status}（依赖 Flux 与 MinIO） |
-''',
+''' + '\n' + runtime,
             encoding='utf-8',
         )
         return root / 'pcs/candidate-2.md'
@@ -388,7 +459,9 @@ class RepositoryProfileContractTest(unittest.TestCase):
             root = Path(directory)
             self.write_release_fact_documents(
                 root,
+                frontend_provenance='NOT_VERIFIED',
                 frontend_artifact='sha256:unverified-artifact',
+                frontend_manifest='NOT_VERIFIED',
                 frontend_image_id='sha256:unverified-image-id',
             )
             stderr = self.assert_main_rejects_release_fact_documents(root)
@@ -409,7 +482,160 @@ class RepositoryProfileContractTest(unittest.TestCase):
             )
             stderr = self.assert_main_rejects_release_fact_documents(root)
 
-        self.assertIn('当前 frontend OCI index digest 必须匹配已发布 provenance', stderr)
+        self.assertIn(
+            '当前 frontend Artifact / OCI index digest 与当前审计快照不一致',
+            stderr,
+        )
+
+    def test_verified_frontend_manifest_requires_confirmed_amd64_digest(self) -> None:
+        # Would fail if a build-log value can remain unbound after independent review.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(
+                root,
+                frontend_manifest='NOT_VERIFIED',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('当前 frontend linux/amd64 manifest digest 与当前审计快照不一致', stderr)
+
+    def test_current_frontend_release_facts_reject_single_document_mutations(
+        self,
+    ) -> None:
+        # Would fail if any one document can drift from the confirmed release facts.
+        mutations = (
+            (
+                'pcs/candidate-2.md',
+                'Source Commit',
+                'da72238abc87a19c07a5cac96e41d88d5f6bf2d3',
+                'bad-source',
+                '当前 frontend Source Commit',
+            ),
+            ('runbook/06-apps.md', 'CI run', '32683635240', '00000000000', '当前 frontend CI run'),
+            (
+                'runbook/10-image-owner-handoff.md',
+                'publish-image job',
+                '97305929974',
+                '00000000000',
+                '当前 frontend publish-image job',
+            ),
+            ('pcs/candidate-2.md', 'Image tag', 'sha-da72238', 'sha-bad', '当前 frontend Image tag'),
+            (
+                'runbook/06-apps.md',
+                'Artifact / OCI index digest',
+                'sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1',
+                'sha256:bad-index',
+                '当前 frontend Artifact / OCI index digest',
+            ),
+            (
+                'pcs/candidate-2.md',
+                'docs 架构事实提交',
+                'd6d846a612c974991f4d0ffc0685d06adf2ddfe7',
+                '6267120f345e7ad967daf08fb244c6018054281d',
+                '当前 docs 架构事实提交',
+            ),
+        )
+        for relative_path, field, expected, mutation, error in mutations:
+            with self.subTest(field=field, document=relative_path):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    path = root / relative_path
+                    current = path.read_text(encoding='utf-8')
+                    path.write_text(
+                        current.replace(
+                            f'| {field} | `{expected}` |',
+                            f'| {field} | `{mutation}` |',
+                            1,
+                        ),
+                        encoding='utf-8',
+                    )
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(error, stderr)
+
+    def test_frontend_component_and_handoff_summary_rows_reject_drift(self) -> None:
+        # Would fail if duplicated release facts drift outside the dedicated table.
+        mutations = (
+            (
+                'pcs/candidate-2.md',
+                '| Application | engineering-platform frontend |',
+                'da72238abc87a19c07a5cac96e41d88d5f6bf2d3',
+                'bad-source',
+                'PCS frontend 组件表',
+            ),
+            (
+                'runbook/10-image-owner-handoff.md',
+                '| Image tag `sha-<short-sha>` |',
+                'sha-da72238',
+                'sha-bad',
+                'Image Owner Handoff 汇总表',
+            ),
+        )
+        documents = (
+            'pcs/candidate-2.md',
+            'runbook/01-bootstrap.md',
+            'runbook/06-apps.md',
+            'runbook/09-acceptance.md',
+            'runbook/10-image-owner-handoff.md',
+        )
+        for relative_path, row_prefix, expected, mutation, error in mutations:
+            with self.subTest(document=relative_path, row=row_prefix):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for source_relative_path in documents:
+                        source = validator.ROOT / source_relative_path
+                        target = root / source_relative_path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy(source, target)
+                    path = root / relative_path
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                    for index, line in enumerate(lines):
+                        if line.startswith(row_prefix):
+                            lines[index] = line.replace(expected, mutation, 1)
+                            break
+                    else:
+                        self.fail(f'missing summary row: {row_prefix}')
+                    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(error, stderr)
+
+    def test_current_runtime_observation_rejects_single_document_drift(self) -> None:
+        # Would fail if a stale runtime sample can coexist with the latest check.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(root)
+            path = root / 'runbook/06-apps.md'
+            path.write_text(
+                path.read_text(encoding='utf-8').replace(
+                    '| 采样时间 | `2026-08-24 03:42Z` |',
+                    '| 采样时间 | `2026-08-22 16:58 +08:00` |',
+                    1,
+                ),
+                encoding='utf-8',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('当前 DEV Runtime 观测 采样时间 与当前审计快照不一致', stderr)
+
+    def test_current_runtime_observation_rejects_acceptance_drift(self) -> None:
+        # Would fail if the acceptance checklist can retain a stale runtime sample.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(root)
+            path = root / 'runbook/09-acceptance.md'
+            path.write_text(
+                path.read_text(encoding='utf-8').replace(
+                    '| 采样时间 | `2026-08-24 03:42Z` |',
+                    '| 采样时间 | `2026-08-22 16:58 +08:00` |',
+                    1,
+                ),
+                encoding='utf-8',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('当前 DEV Runtime 观测 采样时间 与当前审计快照不一致', stderr)
 
     def test_blocked_flux_and_minio_block_backup_restore_and_capacity_acceptance(
         self,
@@ -426,6 +652,82 @@ class RepositoryProfileContractTest(unittest.TestCase):
             stderr = self.assert_main_rejects_release_fact_documents(root)
 
         self.assertIn('Flux/MinIO 仍 BLOCKED 时，PG PITR', stderr)
+
+    def test_unknown_storage_dependency_never_allows_pending_acceptance(
+        self,
+    ) -> None:
+        # Would fail if an unknown storage dependency bypasses the blocked gate.
+        for dependency, statuses in (
+            ('Flux', {'flux_status': 'NOT_VERIFIED'}),
+            ('MinIO', {'minio_status': 'NOT_VERIFIED'}),
+        ):
+            with self.subTest(dependency=dependency):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(
+                        root,
+                        backup_status='PENDING',
+                        capacity_status='PENDING',
+                        **statuses,
+                    )
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(
+                    '当前 Candidate Flux/MinIO 依赖状态必须均为 BLOCKED',
+                    stderr,
+                )
+
+    def test_rejected_chainguard_minio_index_candidate_cannot_be_activated(
+        self,
+    ) -> None:
+        # Would fail if an index digest escapes the rejected-candidate gate.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            minio = root / 'infrastructure/minio'
+            minio.mkdir(parents=True)
+            current_pcs = root / 'candidate-2.md'
+            current_pcs.write_text(
+                validator.CURRENT_PCS.read_text(encoding='utf-8'),
+                encoding='utf-8',
+            )
+            (minio / 'deployment.yaml').write_text(
+                yaml.safe_dump(
+                    {
+                        'apiVersion': 'apps/v1',
+                        'kind': 'Deployment',
+                        'metadata': {'name': 'minio'},
+                        'spec': {
+                            'template': {
+                                'spec': {
+                                    'containers': [
+                                        {
+                                            'name': 'minio',
+                                            'image': 'cgr.dev/chainguard/minio@sha256:'
+                                            'cc18cac5456a3718bde96c368beaed53b9b876233f28c5f68b8fb667b9a528a7',
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding='utf-8',
+            )
+            shutil.copy(
+                validator.ROOT / 'infrastructure/minio/bootstrap-job.yaml',
+                minio / 'bootstrap-job.yaml',
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(validator, 'ROOT', root),
+                mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                validator.validate_rejected_chainguard_minio_candidate()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn('MinIO 清单引用了未获风险批准的 Chainguard 候选', stderr.getvalue())
 
     def test_rejected_minio_candidate_requires_exact_digest_evidence_to_activate(
         self,

@@ -18,16 +18,64 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_PCS = ROOT / 'pcs/candidate-2.md'
+CURRENT_DOCS_ARCHITECTURE_COMMIT = 'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
 CURRENT_FRONTEND_SOURCE = 'da72238abc87a19c07a5cac96e41d88d5f6bf2d3'
+CURRENT_FRONTEND_CI_RUN = '32683635240'
+CURRENT_FRONTEND_PUBLISH_IMAGE_JOB = '97305929974'
+CURRENT_FRONTEND_TAG = 'sha-da72238'
 HISTORICAL_FRONTEND_SOURCE = 'c392c6fc7a82a26f1eb4be22c35c6cda00e5d75c'
 CURRENT_FRONTEND_OCI_INDEX_DIGEST = (
     'sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1'
+)
+CURRENT_FRONTEND_LINUX_AMD64_MANIFEST = (
+    'sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
 )
 NOT_VERIFIED = 'NOT_VERIFIED'
 CURRENT_FRONTEND_DOCUMENTS = (
     'pcs/candidate-2.md',
     'runbook/06-apps.md',
     'runbook/10-image-owner-handoff.md',
+)
+CURRENT_RUNTIME_DOCUMENTS = (
+    'pcs/candidate-2.md',
+    'runbook/01-bootstrap.md',
+    'runbook/06-apps.md',
+    'runbook/09-acceptance.md',
+    'runbook/10-image-owner-handoff.md',
+)
+CURRENT_RUNTIME_FACTS = (
+    ('采样时间', '2026-08-24 03:42Z'),
+    ('GIT_COMMIT', '1c5034b9a9c29ab72fde63644c57fa88604c45b6'),
+    ('RESULT', 'PASS_BOOTSTRAP_ALL_CHECK'),
+    ('REASON', 'bootstrap-check-complete'),
+    ('STAGE_00', 'PASS_PREFLIGHT'),
+    (
+        'STAGE_00 evidence',
+        '/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt',
+    ),
+    (
+        'STAGE_00 SHA256',
+        '14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a',
+    ),
+    ('STAGE_10-60', 'ALREADY_COMPLIANT'),
+    ('STAGE_90', 'PASS_BOOTSTRAP_VERIFIED'),
+    (
+        'STAGE_90 evidence',
+        '/root/dev-infra-evidence/14-verify-20260824T034246Z.txt',
+    ),
+    (
+        'STAGE_90 SHA256',
+        '0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5',
+    ),
+    ('NEXT_STAGE', 'NONE'),
+    ('EXIT_CODE', '0'),
+    ('COMMAND_EXIT_CODE', '0'),
+    (
+        'Namespace inventory',
+        'cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system',
+    ),
+    ('Pod inventory', 'gitlab-runner and kube-system control plane/Cilium/CoreDNS only'),
+    ('Inactive inventory', 'flux-system/platform/openbao absent; GitRepository query empty'),
 )
 MANIFEST_ROOTS = (ROOT / 'clusters', ROOT / 'infrastructure', ROOT / 'apps')
 EXACT_VERSION = re.compile(r'^v?\d+\.\d+\.\d+$')
@@ -1308,7 +1356,9 @@ def validate_rejected_chainguard_minio_candidate() -> None:
         ),
     }
     rejected_digests = (
+        'sha256:cc18cac5456a3718bde96c368beaed53b9b876233f28c5f68b8fb667b9a528a7',
         'sha256:c9680a1ad80b56c67b2b9e44cc480a8fd0fb4362dab01f68b8bfbccae9d77596',
+        'sha256:b456af84dd3aa6883e67a74e2cc9aca9b1e060197dcd040d73bdec9e8c6b99fb',
         'sha256:043d0ad5c2b297c0f0382dcac9b9436483d9f4a1d16cecdcc9471affb5e643e4',
     )
     for image in active_images:
@@ -1330,6 +1380,23 @@ def markdown_table_value(section: str, field: str) -> str:
     if match is None:
         fail(f'事实区段缺少字段：{field}')
     return match.group(1).strip().strip('`')
+
+
+def markdown_table_row(section: str, field: str) -> str:
+    pattern = re.compile(rf'^\|\s*{re.escape(field)}\s*\|.*$', re.MULTILINE)
+    match = pattern.search(section)
+    if match is None:
+        fail(f'事实区段缺少行：{field}')
+    return match.group(0)
+
+
+def validate_current_runtime_evidence() -> None:
+    for relative_path in CURRENT_RUNTIME_DOCUMENTS:
+        document = (ROOT / relative_path).read_text(encoding='utf-8')
+        runtime = markdown_section(document, '## 当前 DEV Runtime 观测')
+        for field, expected in CURRENT_RUNTIME_FACTS:
+            if markdown_table_value(runtime, field) != expected:
+                fail(f'当前 DEV Runtime 观测 {field} 与当前审计快照不一致')
 
 
 def validate_current_frontend_evidence() -> None:
@@ -1360,19 +1427,83 @@ def validate_current_frontend_evidence() -> None:
                         'NOT_VERIFIED'
                     )
         elif provenance == 'VERIFIED':
-            if (
-                markdown_table_value(current, 'Artifact / OCI index digest')
-                != CURRENT_FRONTEND_OCI_INDEX_DIGEST
-            ):
-                fail('当前 frontend OCI index digest 必须匹配已发布 provenance')
-            if not markdown_table_value(
-                current, 'linux/amd64 manifest digest'
-            ).startswith(NOT_VERIFIED):
-                fail('未独立确认的 frontend linux/amd64 manifest 必须为 NOT_VERIFIED')
+            verified_facts = (
+                ('Source Commit', CURRENT_FRONTEND_SOURCE),
+                ('CI run', CURRENT_FRONTEND_CI_RUN),
+                ('publish-image job', CURRENT_FRONTEND_PUBLISH_IMAGE_JOB),
+                ('Image tag', CURRENT_FRONTEND_TAG),
+                ('Artifact / OCI index digest', CURRENT_FRONTEND_OCI_INDEX_DIGEST),
+                (
+                    'linux/amd64 manifest digest',
+                    CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,
+                ),
+            )
+            for field, expected in verified_facts:
+                if markdown_table_value(current, field) != expected:
+                    fail(f'当前 frontend {field} 与当前审计快照不一致')
             if markdown_table_value(current, 'Runtime Image ID') != NOT_VERIFIED:
                 fail('当前 frontend Runtime Image ID 在未部署前必须为 NOT_VERIFIED')
         else:
             fail('当前 frontend CI provenance 状态必须为 VERIFIED 或 NOT_VERIFIED')
+
+
+def validate_current_frontend_summary_evidence() -> None:
+    pcs = CURRENT_PCS.read_text(encoding='utf-8')
+    component = re.search(
+        r'^\| Application \| engineering-platform frontend \|.*$',
+        pcs,
+        re.MULTILINE,
+    )
+    if component is None:
+        fail('PCS 缺少 frontend 组件表行')
+    component_facts = (
+        CURRENT_FRONTEND_SOURCE,
+        CURRENT_FRONTEND_CI_RUN,
+        CURRENT_FRONTEND_PUBLISH_IMAGE_JOB,
+        CURRENT_FRONTEND_TAG,
+        CURRENT_FRONTEND_OCI_INDEX_DIGEST,
+        CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,
+        NOT_VERIFIED,
+    )
+    if not all(expected in component.group(0) for expected in component_facts):
+        fail('PCS frontend 组件表与当前审计快照不一致')
+
+    handoff = (ROOT / 'runbook/10-image-owner-handoff.md').read_text(
+        encoding='utf-8'
+    )
+    table_header = '| 字段 | frontend | backend |'
+    table_start = handoff.find(table_header)
+    if table_start == -1:
+        fail('Image Owner Handoff 缺少汇总表')
+    summary = handoff[table_start:]
+    summary_facts = (
+        ('Source commit（完整 40 位 SHA）', (CURRENT_FRONTEND_SOURCE,)),
+        (
+            'CI run URL',
+            (CURRENT_FRONTEND_CI_RUN, CURRENT_FRONTEND_PUBLISH_IMAGE_JOB),
+        ),
+        ('Image tag `sha-<short-sha>`', (CURRENT_FRONTEND_TAG,)),
+        ('OCI index digest', (CURRENT_FRONTEND_OCI_INDEX_DIGEST,)),
+        (
+            '`linux/amd64` manifest digest',
+            (CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,),
+        ),
+        ('Runtime Image ID', (NOT_VERIFIED,)),
+    )
+    for field, expected_values in summary_facts:
+        row = markdown_table_row(summary, field)
+        if not all(expected in row for expected in expected_values):
+            fail(f'Image Owner Handoff 汇总表 {field} 与当前审计快照不一致')
+
+
+def validate_current_docs_architecture_commit() -> None:
+    pcs = CURRENT_PCS.read_text(encoding='utf-8')
+    facts = markdown_section(pcs, '## 事实采样')
+    if (
+        markdown_table_value(facts, 'docs 架构事实提交')
+        != CURRENT_DOCS_ARCHITECTURE_COMMIT
+    ):
+        fail('当前 docs 架构事实提交与已推送 main 不一致')
 
 
 def validate_blocked_storage_acceptance() -> None:
@@ -1381,7 +1512,7 @@ def validate_blocked_storage_acceptance() -> None:
     flux = markdown_table_value(dependencies, 'Flux')
     minio = markdown_table_value(dependencies, 'MinIO')
     if flux != 'BLOCKED' or minio != 'BLOCKED':
-        return
+        fail('当前 Candidate Flux/MinIO 依赖状态必须均为 BLOCKED')
 
     acceptance = (ROOT / 'runbook/09-acceptance.md').read_text(encoding='utf-8')
     required_rows = (
@@ -1540,7 +1671,10 @@ def main() -> None:
     validate_single_user_resources()
     validate_metrics_server()
     validate_rejected_chainguard_minio_candidate()
+    validate_current_runtime_evidence()
     validate_current_frontend_evidence()
+    validate_current_frontend_summary_evidence()
+    validate_current_docs_architecture_commit()
     validate_blocked_storage_acceptance()
     print('GitOps manifests validated successfully.')
 
