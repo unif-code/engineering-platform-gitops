@@ -11,7 +11,7 @@ GitOps commit / PR：bootstrap 完成于 `a3eb3945c733b77f2594c9ff10e99dcd8587cd
 
 ## 当前状态：2026-08-24 bootstrap check 已验证
 
-在服务器 GitOps `main` 的 `1c5034b9a9c29ab72fde63644c57fa88604c45b6` 上，外部 Chrome 堡垒机 root 会话于 `2026-08-24 03:42Z` 只读执行 `run-approved --check`。8 个 stage 均为通过或 `ALREADY_COMPLIANT`；这证明最新 bootstrap 检查通过，不证明 Flux、平台基础设施或应用已部署。
+在服务器 GitOps `main` 的 `1c5034b9a9c29ab72fde63644c57fa88604c45b6` 上，外部 Chrome 堡垒机 root 会话于 `2026-08-24 03:42Z` 执行 `run-approved --check`。该命令对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 同步服务器 Git checkout；8 个 stage 均为通过或 `ALREADY_COMPLIANT`。这证明最新 bootstrap 检查通过，不证明 Flux、平台基础设施或应用已部署。
 
 ## 当前 DEV Runtime 观测
 

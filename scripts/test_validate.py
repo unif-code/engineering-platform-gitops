@@ -401,6 +401,20 @@ class RepositoryProfileContractTest(unittest.TestCase):
                 encoding='utf-8',
             )
 
+        plan = root / 'docs/superpowers/plans/2026-08-23-pcs-runtime-reconciliation.md'
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text(
+            f'''# Current docs facts
+
+- docs 架构事实提交为 `{docs_architecture_commit}`。
+
+| 事实 | 值 |
+| --- | --- |
+| docs 架构事实提交 | `{docs_architecture_commit}` |
+''',
+            encoding='utf-8',
+        )
+
         acceptance = root / 'runbook/09-acceptance.md'
         acceptance.write_text(
             f'''| # | 验收标准 | 证据 | 状态 |
@@ -451,10 +465,8 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
         self.assertIn('当前 frontend Source Commit 不能复用历史', stderr)
 
-    def test_unproven_frontend_artifact_and_image_id_remain_fail_closed(
-        self,
-    ) -> None:
-        # Would fail if an unverified provenance record can authorize a digest.
+    def test_current_frontend_unproven_provenance_is_rejected(self) -> None:
+        # Would fail if a current candidate could erase already-bound provenance.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_release_fact_documents(
@@ -466,10 +478,30 @@ class RepositoryProfileContractTest(unittest.TestCase):
             )
             stderr = self.assert_main_rejects_release_fact_documents(root)
 
-        self.assertIn(
-            '当前 frontend Artifact / OCI index digest 在 provenance 未核验时必须为 NOT_VERIFIED',
-            stderr,
-        )
+        self.assertIn('当前 frontend CI provenance 必须为 VERIFIED', stderr)
+
+    def test_current_frontend_cannot_synchronously_downgrade_provenance(
+        self,
+    ) -> None:
+        # Would fail if all three dedicated tables can erase known provenance together.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(
+                root,
+                frontend_provenance='NOT_VERIFIED',
+                frontend_artifact='NOT_VERIFIED',
+                frontend_manifest='NOT_VERIFIED',
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(validator, 'ROOT', root),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                validator.validate_current_frontend_evidence()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn('当前 frontend CI provenance 必须为 VERIFIED', stderr.getvalue())
 
     def test_verified_frontend_provenance_binds_published_index_only(self) -> None:
         # Would fail if a successful CI run did not bind its published index digest.
@@ -553,6 +585,36 @@ class RepositoryProfileContractTest(unittest.TestCase):
                     stderr = self.assert_main_rejects_release_fact_documents(root)
 
                 self.assertIn(error, stderr)
+
+    def test_current_docs_architecture_plan_rejects_orphan_sha(self) -> None:
+        # Would fail if the current plan can retain the inaccessible sibling SHA.
+        mutations = (
+            'docs 架构事实提交为 `d6d846a612c974991f4d0ffc0685d06adf2ddfe7`',
+            '| docs 架构事实提交 | `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` |',
+        )
+        for expected in mutations:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    path = root / (
+                        'docs/superpowers/plans/'
+                        '2026-08-23-pcs-runtime-reconciliation.md'
+                    )
+                    path.write_text(
+                        path.read_text(encoding='utf-8').replace(
+                            expected,
+                            expected.replace(
+                                'd6d846a612c974991f4d0ffc0685d06adf2ddfe7',
+                                '6267120f345e7ad967daf08fb244c6018054281d',
+                            ),
+                            1,
+                        ),
+                        encoding='utf-8',
+                    )
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn('当前 docs 架构事实提交计划与已推送 main 不一致', stderr)
 
     def test_frontend_component_and_handoff_summary_rows_reject_drift(self) -> None:
         # Would fail if duplicated release facts drift outside the dedicated table.

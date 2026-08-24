@@ -19,6 +19,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_PCS = ROOT / 'pcs/candidate-2.md'
 CURRENT_DOCS_ARCHITECTURE_COMMIT = 'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
+CURRENT_DOCS_ARCHITECTURE_PLAN = (
+    'docs/superpowers/plans/2026-08-23-pcs-runtime-reconciliation.md'
+)
 CURRENT_FRONTEND_SOURCE = 'da72238abc87a19c07a5cac96e41d88d5f6bf2d3'
 CURRENT_FRONTEND_CI_RUN = '32683635240'
 CURRENT_FRONTEND_PUBLISH_IMAGE_JOB = '97305929974'
@@ -1414,37 +1417,24 @@ def validate_current_frontend_evidence() -> None:
         if current_source != CURRENT_FRONTEND_SOURCE:
             fail('当前 frontend Source Commit 与当前审计快照不一致')
 
-        provenance = markdown_table_value(current, 'CI provenance')
-        if provenance == NOT_VERIFIED:
-            for field in (
-                'Artifact / OCI index digest',
+        if markdown_table_value(current, 'CI provenance') != 'VERIFIED':
+            fail('当前 frontend CI provenance 必须为 VERIFIED')
+        verified_facts = (
+            ('Source Commit', CURRENT_FRONTEND_SOURCE),
+            ('CI run', CURRENT_FRONTEND_CI_RUN),
+            ('publish-image job', CURRENT_FRONTEND_PUBLISH_IMAGE_JOB),
+            ('Image tag', CURRENT_FRONTEND_TAG),
+            ('Artifact / OCI index digest', CURRENT_FRONTEND_OCI_INDEX_DIGEST),
+            (
                 'linux/amd64 manifest digest',
-                'Runtime Image ID',
-            ):
-                if markdown_table_value(current, field) != NOT_VERIFIED:
-                    fail(
-                        f'当前 frontend {field} 在 provenance 未核验时必须为 '
-                        'NOT_VERIFIED'
-                    )
-        elif provenance == 'VERIFIED':
-            verified_facts = (
-                ('Source Commit', CURRENT_FRONTEND_SOURCE),
-                ('CI run', CURRENT_FRONTEND_CI_RUN),
-                ('publish-image job', CURRENT_FRONTEND_PUBLISH_IMAGE_JOB),
-                ('Image tag', CURRENT_FRONTEND_TAG),
-                ('Artifact / OCI index digest', CURRENT_FRONTEND_OCI_INDEX_DIGEST),
-                (
-                    'linux/amd64 manifest digest',
-                    CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,
-                ),
-            )
-            for field, expected in verified_facts:
-                if markdown_table_value(current, field) != expected:
-                    fail(f'当前 frontend {field} 与当前审计快照不一致')
-            if markdown_table_value(current, 'Runtime Image ID') != NOT_VERIFIED:
-                fail('当前 frontend Runtime Image ID 在未部署前必须为 NOT_VERIFIED')
-        else:
-            fail('当前 frontend CI provenance 状态必须为 VERIFIED 或 NOT_VERIFIED')
+                CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,
+            ),
+        )
+        for field, expected in verified_facts:
+            if markdown_table_value(current, field) != expected:
+                fail(f'当前 frontend {field} 与当前审计快照不一致')
+        if markdown_table_value(current, 'Runtime Image ID') != NOT_VERIFIED:
+            fail('当前 frontend Runtime Image ID 在未部署前必须为 NOT_VERIFIED')
 
 
 def validate_current_frontend_summary_evidence() -> None:
@@ -1504,6 +1494,17 @@ def validate_current_docs_architecture_commit() -> None:
         != CURRENT_DOCS_ARCHITECTURE_COMMIT
     ):
         fail('当前 docs 架构事实提交与已推送 main 不一致')
+
+    plan = (ROOT / CURRENT_DOCS_ARCHITECTURE_PLAN).read_text(encoding='utf-8')
+    plan_facts = (
+        f'事实提交为 `{CURRENT_DOCS_ARCHITECTURE_COMMIT}`',
+        f'| docs 架构事实提交 | `{CURRENT_DOCS_ARCHITECTURE_COMMIT}` |',
+    )
+    if (
+        '6267120f345e7ad967daf08fb244c6018054281d' in plan
+        or not all(expected in plan for expected in plan_facts)
+    ):
+        fail('当前 docs 架构事实提交计划与已推送 main 不一致')
 
 
 def validate_blocked_storage_acceptance() -> None:
