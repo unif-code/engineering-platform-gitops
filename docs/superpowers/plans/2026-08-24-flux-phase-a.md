@@ -124,8 +124,8 @@ This task remains `BLOCKED` until the Phase A private commit has a reviewed publ
 
 1. Run `run-approved.sh <mapped-private-sha> --check` to synchronize and re-verify the server checkout.
 2. Verify the fixed linux/amd64 Flux CLI archive and run `flux check --pre`.
-3. Render and inspect exact object identities/RBAC/network policy; run client and server-side dry-run.
-4. Apply only `clusters/dev/flux-system` with field manager `engineering-platform-flux-phase-a`; never use `--force-conflicts` or `--prune`.
+3. Render and inspect exact object identities/RBAC/network policy; run the full client dry-run. On an empty cluster, extract the exact `flux-system` Namespace from the reviewed render, server-side dry-run it, and persist only that Namespace behind a separate mutation approval so later namespaced objects can be validated.
+4. After the Namespace is `Active`, run the full server-side dry-run and `kubectl diff`; only after reviewing that output apply `clusters/dev/flux-system` with field manager `engineering-platform-flux-phase-a`. Never use `--force-conflicts` or `--prune`.
 5. Wait for all four rollouts; prove Controller identities cannot directly create Deployment/ClusterRole; prove GitRepository/Kustomization/HelmRelease plus downstream Namespace inventories are empty and non-approved ingress/egress is denied.
 6. Save `/root/dev-infra-evidence/15-flux-phase-a-<UTC>.txt` and its SHA-256.
 7. Commit the new Runtime facts across PCS, runbooks and validator fixtures; V0.1 remains `BLOCKED` because sync, infrastructure and applications are still inactive.

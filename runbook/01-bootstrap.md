@@ -481,22 +481,118 @@ tar -xzf flux_2.9.3_linux_amd64.tar.gz flux
 期望：archive SHA-256 为 `OK`，CLI 为 `v2.9.3`，pre-install check 通过。任何下载、
 TLS、摘要或兼容性失败都必须停止，不允许改用浮动 URL、tag 或未登记镜像。
 
-### 渲染与 dry-run
+### 渲染与 client dry-run
 
 ```bash
+set -o errexit -o nounset -o pipefail
 cd /opt/uni-code/engineering-platform-gitops
-kubectl --kubeconfig=/etc/kubernetes/admin.conf kustomize \
-  clusters/dev/flux-system > /root/flux-phase-a-v2.9.3/rendered.yaml
-kubectl --kubeconfig=/etc/kubernetes/admin.conf apply --dry-run=client \
-  -k clusters/dev/flux-system
-kubectl --kubeconfig=/etc/kubernetes/admin.conf apply --server-side \
-  --dry-run=server \
-  --field-manager=engineering-platform-flux-phase-a \
-  -k clusters/dev/flux-system
-kubectl --kubeconfig=/etc/kubernetes/admin.conf diff --server-side \
-  --field-manager=engineering-platform-flux-phase-a \
+KC='/etc/kubernetes/admin.conf'
+RENDERED='/root/flux-phase-a-v2.9.3/rendered.yaml'
+FIELD_MANAGER='engineering-platform-flux-phase-a'
+
+kubectl --kubeconfig="$KC" kustomize \
+  clusters/dev/flux-system > "$RENDERED"
+kubectl --kubeconfig="$KC" apply --dry-run=client \
   -k clusters/dev/flux-system
 ```
+
+首次部署时 `flux-system` 尚不存在。API server 的 dry-run 不持久化前一个请求模拟创建的
+Namespace，因此不能把完整 bundle 的 server-side dry-run 当成单个事务：后续 namespaced
+对象会以 `namespaces "flux-system" not found` 失败。禁止以 `kubectl create namespace`、改写
+对象 namespace 或跳过 server-side 校验来绕过。
+
+### Namespace 分阶段持久化与完整 server dry-run
+
+以下命令先从已审阅的 `rendered.yaml` 精确提取唯一 `flux-system` Namespace 并做
+server-side dry-run。只有在单独获得写操作批准后，才允许持久化该 Namespace；这一步禁止
+创建 CRD、RBAC、Service、Deployment、Secret 或 sync CR。Namespace 进入 `Active` 后，才
+运行完整 bundle 的 server-side dry-run 和 diff：
+
+```bash
+set -o errexit -o nounset -o pipefail
+cd /opt/uni-code/engineering-platform-gitops
+KC='/etc/kubernetes/admin.conf'
+RENDERED='/root/flux-phase-a-v2.9.3/rendered.yaml'
+FIELD_MANAGER='engineering-platform-flux-phase-a'
+
+test -s "$RENDERED"
+cmp -s "$RENDERED" \
+  <(kubectl --kubeconfig="$KC" kustomize clusters/dev/flux-system)
+test -z "$(
+  kubectl --kubeconfig="$KC" get namespace flux-system \
+    --ignore-not-found -o name
+)"
+
+render_flux_namespace() {
+  python3 - "$RENDERED" <<'PY'
+import pathlib
+import sys
+import yaml
+
+documents = [
+    document
+    for document in yaml.safe_load_all(
+        pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+    )
+    if document
+]
+matches = [
+    document
+    for document in documents
+    if document.get("apiVersion") == "v1"
+    and document.get("kind") == "Namespace"
+    and document.get("metadata", {}).get("name") == "flux-system"
+]
+if len(matches) != 1:
+    raise SystemExit(
+        f"STOP: expected exactly one flux-system Namespace, found {len(matches)}"
+    )
+if matches[0].get("metadata", {}).get("namespace"):
+    raise SystemExit("STOP: Namespace unexpectedly has metadata.namespace")
+sys.stdout.write(yaml.safe_dump(matches[0], sort_keys=False))
+PY
+}
+
+render_flux_namespace |
+  kubectl --kubeconfig="$KC" apply --server-side \
+    --dry-run=server \
+    --field-manager="$FIELD_MANAGER" \
+    -f -
+
+render_flux_namespace |
+  kubectl --kubeconfig="$KC" apply --server-side \
+    --field-manager="$FIELD_MANAGER" \
+    -f -
+
+kubectl --kubeconfig="$KC" wait \
+  --for=jsonpath='{.status.phase}'=Active \
+  namespace/flux-system \
+  --timeout=60s
+
+kubectl --kubeconfig="$KC" apply --server-side \
+  --dry-run=server \
+  --field-manager="$FIELD_MANAGER" \
+  -k clusters/dev/flux-system
+
+DIFF_RC=0
+kubectl --kubeconfig="$KC" diff --server-side \
+  --field-manager="$FIELD_MANAGER" \
+  -k clusters/dev/flux-system || DIFF_RC=$?
+
+case "$DIFF_RC" in
+  0|1)
+    printf 'KUBECTL_DIFF_EXIT_CODE=%s\n' "$DIFF_RC"
+    ;;
+  *)
+    printf 'STOP: kubectl diff failed with exit code %s\n' "$DIFF_RC" >&2
+    exit "$DIFF_RC"
+    ;;
+esac
+```
+
+如果 Namespace 已持久化但后续校验中断，不得重跑上述 Namespace 创建入口，也不得自动删除；
+先只读核对 Namespace UID、labels 与内容，再从完整 server-side dry-run 继续。任何回滚删除都要
+单独审阅精确目标。
 
 `kubectl diff` 在存在预期新增对象时返回 `1`，这本身不是错误；必须人工审阅差异只含
 `flux-system`、四个 Controller、对应 CRD/Service/RBAC 与 Phase A 网络策略。若出现

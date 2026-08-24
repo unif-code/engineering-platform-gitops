@@ -2780,6 +2780,88 @@ def validate_flux_phase_a(root: Path = ROOT) -> None:
         )
 
 
+def validate_flux_phase_a_runbook(root: Path = ROOT) -> None:
+    runbook_path = root / 'runbook/01-bootstrap.md'
+    if not runbook_path.is_file():
+        fail('Flux Phase A runbook/01-bootstrap.md 不存在')
+
+    source = runbook_path.read_text(encoding='utf-8')
+    section_start = source.find('### 渲染与 client dry-run')
+    section_end = source.find('\n### Apply 与 rollout', section_start)
+    if section_start < 0 or section_end < 0:
+        fail('Flux Phase A runbook 缺少分阶段 dry-run 章节')
+
+    section = source[section_start:section_end]
+    without_continuations = re.sub(r'\\\s*\n\s*', ' ', section)
+    normalized = re.sub(r'\s+', ' ', without_continuations)
+    ordered_tokens = (
+        (
+            '完整 client dry-run',
+            'kubectl --kubeconfig="$KC" apply --dry-run=client '
+            '-k clusters/dev/flux-system',
+        ),
+        (
+            'Namespace server dry-run',
+            'render_flux_namespace | kubectl --kubeconfig="$KC" apply '
+            '--server-side --dry-run=server '
+            '--field-manager="$FIELD_MANAGER" -f -',
+        ),
+        (
+            'Namespace 持久化',
+            'render_flux_namespace | kubectl --kubeconfig="$KC" apply '
+            '--server-side --field-manager="$FIELD_MANAGER" -f -',
+        ),
+        (
+            'Namespace Active 等待',
+            'kubectl --kubeconfig="$KC" wait '
+            "--for=jsonpath='{.status.phase}'=Active "
+            'namespace/flux-system --timeout=60s',
+        ),
+        (
+            '完整 server dry-run',
+            'kubectl --kubeconfig="$KC" apply --server-side '
+            '--dry-run=server --field-manager="$FIELD_MANAGER" '
+            '-k clusters/dev/flux-system',
+        ),
+        (
+            '完整 server diff',
+            'kubectl --kubeconfig="$KC" diff --server-side '
+            '--field-manager="$FIELD_MANAGER" '
+            '-k clusters/dev/flux-system || DIFF_RC=$?',
+        ),
+    )
+    positions: list[int] = []
+    for label, token in ordered_tokens:
+        position = normalized.find(token)
+        if position < 0:
+            fail(f'Flux Phase A runbook 缺少 {label}')
+        positions.append(position)
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        fail(
+            'Flux Phase A runbook 执行顺序必须为 client dry-run、Namespace '
+            'server dry-run、Namespace 持久化、Active、完整 server dry-run/diff'
+        )
+
+    required_tokens = (
+        'get namespace flux-system --ignore-not-found -o name',
+        'document.get("apiVersion") == "v1"',
+        'document.get("kind") == "Namespace"',
+        'document.get("metadata", {}).get("name") == "flux-system"',
+        'if len(matches) != 1:',
+        'sys.stdout.write(yaml.safe_dump(matches[0], sort_keys=False))',
+    )
+    missing = [token for token in required_tokens if token not in normalized]
+    if missing:
+        fail(
+            'Flux Phase A runbook Namespace 提取/不存在前置条件不完整：'
+            f'{missing}'
+        )
+    if 'case "$DIFF_RC" in 0|1)' not in normalized:
+        fail('Flux Phase A runbook kubectl diff 必须仅接受返回码 0/1')
+    if 'kubectl create namespace flux-system' in normalized:
+        fail('Flux Phase A runbook 禁止绕过渲染清单直接创建 Namespace')
+
+
 def validate_flux_phase_a_probes(root: Path = ROOT) -> None:
     image = (
         'registry.k8s.io/e2e-test-images/busybox@sha256:'
@@ -3081,6 +3163,7 @@ def main() -> None:
     validate_active_root()
     validate_bootstrap_contracts()
     validate_flux_phase_a()
+    validate_flux_phase_a_runbook()
     validate_flux_phase_a_probes()
     validate_kustomize_builds()
     validate_documents()
