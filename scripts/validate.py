@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import re
 import subprocess
 import sys
@@ -193,9 +194,444 @@ INACTIVE_ENTRYPOINTS = (
     'clusters/dev/reconcile-rbac.yaml',
     'clusters/dev/infrastructure.yaml',
     'clusters/dev/apps.yaml',
-    'clusters/dev/flux-system/gotk-components.yaml',
     'clusters/dev/flux-system/gotk-sync.yaml',
 )
+
+FLUX_PHASE_A_RESOURCES = (
+    'gotk-components.yaml',
+    'phase-a-rbac.yaml',
+    'phase-a-network-policy.yaml',
+)
+FLUX_PHASE_A_COMPONENTS_SHA256 = (
+    'c6e84495c3b611978d053adc40aca1e2a12af38f6e239c44a6b6c1224e01cab7'
+)
+FLUX_PHASE_A_RENDERED_SHA256 = (
+    '77244b8af4c1d4f584e132c843f927035731f559e1b8bc583f2247f891647efc'
+)
+FLUX_PHASE_A_ROLLOUT_STRATEGY = {
+    'rollingUpdate': {'maxSurge': 1, 'maxUnavailable': 0},
+    'type': 'RollingUpdate',
+}
+FLUX_PHASE_A_CONTROLLERS = {
+    'source-controller': {
+        'tag': 'v1.9.3',
+        'digest': (
+            'sha256:'
+            'c6c82b3182f48b833252c71aefa0741957ca18296612bc6d2b9b5fb276f926e4'
+        ),
+        'resources': {
+            'limits': {'cpu': '400m', 'memory': '512Mi'},
+            'requests': {'cpu': '100m', 'memory': '256Mi'},
+        },
+        'args': (
+            '--events-addr=http://notification-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./',
+            '--watch-all-namespaces=false',
+            '--log-level=info',
+            '--log-encoding=json',
+            '--enable-leader-election',
+            '--storage-path=/data',
+            '--storage-adv-addr=source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local.',
+        ),
+        'forbidden_args': {'--default-service-account=default'},
+    },
+    'kustomize-controller': {
+        'tag': 'v1.9.4',
+        'digest': (
+            'sha256:'
+            '3e57aecb74419be93d09ba062cfc882bea405193c474009e0da1826de71a4ebd'
+        ),
+        'resources': {
+            'limits': {'cpu': '1000m', 'memory': '1Gi'},
+            'requests': {'cpu': '250m', 'memory': '512Mi'},
+        },
+        'args': (
+            '--events-addr=http://notification-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./',
+            '--watch-all-namespaces=false',
+            '--log-level=info',
+            '--log-encoding=json',
+            '--enable-leader-election',
+            '--default-service-account=default',
+            '--no-cross-namespace-refs=true',
+            '--no-remote-bases=true',
+        ),
+        'forbidden_args': {
+            '--default-decryption-service-account=default',
+            '--default-kubeconfig-service-account=default',
+        },
+    },
+    'helm-controller': {
+        'tag': 'v1.6.3',
+        'digest': (
+            'sha256:'
+            '22c0a585d0d9b1f792b9d5638144b7810e273d28e310da37740f01226bd044a2'
+        ),
+        'resources': {
+            'limits': {'cpu': '400m', 'memory': '512Mi'},
+            'requests': {'cpu': '100m', 'memory': '256Mi'},
+        },
+        'args': (
+            '--events-addr=http://notification-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./',
+            '--watch-all-namespaces=false',
+            '--log-level=info',
+            '--log-encoding=json',
+            '--enable-leader-election',
+            '--default-service-account=default',
+            '--no-cross-namespace-refs=true',
+        ),
+        'forbidden_args': {'--default-kubeconfig-service-account=default'},
+    },
+    'notification-controller': {
+        'tag': 'v1.9.2',
+        'digest': (
+            'sha256:'
+            'cb17eefffbc442412ba6f63336defd04c0fc387d5082d951998d1ff163a9180d'
+        ),
+        'resources': {
+            'limits': {'cpu': '200m', 'memory': '256Mi'},
+            'requests': {'cpu': '50m', 'memory': '128Mi'},
+        },
+        'args': (
+            '--watch-all-namespaces=false',
+            '--log-level=info',
+            '--log-encoding=json',
+            '--enable-leader-election',
+            '--no-cross-namespace-refs=true',
+        ),
+        'forbidden_args': {'--default-service-account=default'},
+    },
+}
+FLUX_PHASE_A_PSS_LABELS = {
+    'pod-security.kubernetes.io/audit': 'restricted',
+    'pod-security.kubernetes.io/audit-version': 'v1.36',
+    'pod-security.kubernetes.io/enforce': 'restricted',
+    'pod-security.kubernetes.io/enforce-version': 'v1.36',
+    'pod-security.kubernetes.io/warn': 'restricted',
+    'pod-security.kubernetes.io/warn-version': 'v1.36',
+}
+FLUX_PHASE_A_SECURITY_CONTEXT = {
+    'allowPrivilegeEscalation': False,
+    'capabilities': {'drop': ['ALL']},
+    'readOnlyRootFilesystem': True,
+    'runAsNonRoot': True,
+    'seccompProfile': {'type': 'RuntimeDefault'},
+}
+FLUX_PHASE_A_SUBJECTS = {
+    ('ServiceAccount', name, 'flux-system')
+    for name in FLUX_PHASE_A_CONTROLLERS
+}
+FLUX_PHASE_A_FORBIDDEN_API_GROUPS = {
+    'image.toolkit.fluxcd.io',
+    'source.extensions.fluxcd.io',
+}
+FLUX_PHASE_A_CRDS = {
+    'alerts.notification.toolkit.fluxcd.io',
+    'buckets.source.toolkit.fluxcd.io',
+    'externalartifacts.source.toolkit.fluxcd.io',
+    'gitrepositories.source.toolkit.fluxcd.io',
+    'helmcharts.source.toolkit.fluxcd.io',
+    'helmreleases.helm.toolkit.fluxcd.io',
+    'helmrepositories.source.toolkit.fluxcd.io',
+    'kustomizations.kustomize.toolkit.fluxcd.io',
+    'ocirepositories.source.toolkit.fluxcd.io',
+    'providers.notification.toolkit.fluxcd.io',
+    'receivers.notification.toolkit.fluxcd.io',
+}
+FLUX_PHASE_A_SERVICE_SPECS = {
+    'notification-controller': {
+        'ports': [
+            {
+                'name': 'http',
+                'port': 80,
+                'protocol': 'TCP',
+                'targetPort': 'http',
+            }
+        ],
+        'selector': {'app': 'notification-controller'},
+        'type': 'ClusterIP',
+    },
+    'source-controller': {
+        'ports': [
+            {
+                'name': 'http',
+                'port': 80,
+                'protocol': 'TCP',
+                'targetPort': 'http',
+            }
+        ],
+        'selector': {'app': 'source-controller'},
+        'type': 'ClusterIP',
+    },
+    'webhook-receiver': {
+        'ports': [
+            {
+                'name': 'http',
+                'port': 80,
+                'protocol': 'TCP',
+                'targetPort': 'http-webhook',
+            }
+        ],
+        'selector': {'app': 'notification-controller'},
+        'type': 'ClusterIP',
+    },
+}
+FLUX_PHASE_A_IDENTITIES = (
+    {
+        ('v1', 'Namespace', '', 'flux-system'),
+        (
+            'v1',
+            'ResourceQuota',
+            'flux-system',
+            'critical-pods-flux-system',
+        ),
+        (
+            'rbac.authorization.k8s.io/v1',
+            'ClusterRole',
+            '',
+            'flux-controller-api-health',
+        ),
+        (
+            'rbac.authorization.k8s.io/v1',
+            'ClusterRoleBinding',
+            '',
+            'flux-controller-api-health',
+        ),
+        (
+            'cilium.io/v2',
+            'CiliumNetworkPolicy',
+            'flux-system',
+            'allow-kube-apiserver-egress',
+        ),
+    }
+    | {
+        ('apiextensions.k8s.io/v1', 'CustomResourceDefinition', '', name)
+        for name in FLUX_PHASE_A_CRDS
+    }
+    | {
+        ('v1', 'ServiceAccount', 'flux-system', name)
+        for name in FLUX_PHASE_A_CONTROLLERS
+    }
+    | {
+        ('apps/v1', 'Deployment', 'flux-system', name)
+        for name in FLUX_PHASE_A_CONTROLLERS
+    }
+    | {
+        ('rbac.authorization.k8s.io/v1', kind, 'flux-system', name)
+        for name in FLUX_PHASE_A_CONTROLLERS
+        for kind in ('Role', 'RoleBinding')
+    }
+    | {
+        ('v1', 'Service', 'flux-system', name)
+        for name in FLUX_PHASE_A_SERVICE_SPECS
+    }
+    | {
+        ('networking.k8s.io/v1', 'NetworkPolicy', 'flux-system', name)
+        for name in (
+            'allow-controller-internal-egress',
+            'allow-controller-internal-ingress',
+            'allow-dns-egress',
+            'default-deny',
+        )
+    }
+)
+FLUX_PHASE_A_ROLE_RULES = {
+    'source-controller': [
+        {
+            'apiGroups': [''],
+            'resources': ['events'],
+            'verbs': ['create', 'patch'],
+        },
+        {
+            'apiGroups': [''],
+            'resources': ['secrets'],
+            'verbs': ['get', 'list', 'watch'],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': [
+                'buckets',
+                'gitrepositories',
+                'helmcharts',
+                'helmrepositories',
+                'ocirepositories',
+            ],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': [
+                'buckets/finalizers',
+                'gitrepositories/finalizers',
+                'helmcharts/finalizers',
+                'helmrepositories/finalizers',
+                'ocirepositories/finalizers',
+            ],
+            'verbs': ['create', 'delete', 'get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': [
+                'buckets/status',
+                'gitrepositories/status',
+                'helmcharts/status',
+                'helmrepositories/status',
+                'ocirepositories/status',
+            ],
+            'verbs': ['get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['coordination.k8s.io'],
+            'resources': ['leases'],
+            'verbs': ['create', 'get', 'update'],
+        },
+    ],
+    'kustomize-controller': [
+        {
+            'apiGroups': [''],
+            'resources': ['configmaps', 'secrets', 'serviceaccounts'],
+            'verbs': ['get', 'list', 'watch'],
+        },
+        {
+            'apiGroups': [''],
+            'resources': ['events'],
+            'verbs': ['create', 'patch'],
+        },
+        {
+            'apiGroups': ['kustomize.toolkit.fluxcd.io'],
+            'resources': ['kustomizations'],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        },
+        {
+            'apiGroups': ['kustomize.toolkit.fluxcd.io'],
+            'resources': ['kustomizations/finalizers'],
+            'verbs': ['create', 'delete', 'get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['kustomize.toolkit.fluxcd.io'],
+            'resources': ['kustomizations/status'],
+            'verbs': ['get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': ['buckets', 'gitrepositories', 'ocirepositories'],
+            'verbs': ['get', 'list', 'watch'],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': [
+                'buckets/status',
+                'gitrepositories/status',
+                'ocirepositories/status',
+            ],
+            'verbs': ['get'],
+        },
+        {
+            'apiGroups': ['coordination.k8s.io'],
+            'resources': ['leases'],
+            'verbs': ['create', 'get', 'update'],
+        },
+    ],
+    'helm-controller': [
+        {
+            'apiGroups': [''],
+            'resources': ['configmaps', 'secrets', 'serviceaccounts'],
+            'verbs': ['get', 'list', 'watch'],
+        },
+        {
+            'apiGroups': [''],
+            'resources': ['events'],
+            'verbs': ['create', 'patch'],
+        },
+        {
+            'apiGroups': ['helm.toolkit.fluxcd.io'],
+            'resources': ['helmreleases'],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        },
+        {
+            'apiGroups': ['helm.toolkit.fluxcd.io'],
+            'resources': ['helmreleases/finalizers'],
+            'verbs': ['create', 'delete', 'get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['helm.toolkit.fluxcd.io'],
+            'resources': ['helmreleases/status'],
+            'verbs': ['get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': ['helmcharts', 'ocirepositories'],
+            'verbs': ['get', 'list', 'watch'],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': ['helmcharts/status', 'ocirepositories/status'],
+            'verbs': ['get'],
+        },
+        {
+            'apiGroups': ['coordination.k8s.io'],
+            'resources': ['leases'],
+            'verbs': ['create', 'get', 'update'],
+        },
+    ],
+    'notification-controller': [
+        {
+            'apiGroups': [''],
+            'resources': ['secrets'],
+            'verbs': ['get', 'list', 'watch'],
+        },
+        {
+            'apiGroups': [''],
+            'resources': ['events'],
+            'verbs': ['create', 'patch'],
+        },
+        {
+            'apiGroups': ['notification.toolkit.fluxcd.io'],
+            'resources': ['alerts', 'providers', 'receivers'],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        },
+        {
+            'apiGroups': ['notification.toolkit.fluxcd.io'],
+            'resources': ['receivers/status'],
+            'verbs': ['get', 'patch', 'update'],
+        },
+        {
+            'apiGroups': ['coordination.k8s.io'],
+            'resources': ['leases'],
+            'verbs': ['create', 'get', 'update'],
+        },
+    ],
+}
 
 BOOTSTRAP_ARTIFACTS = {
     'containerd': (
@@ -883,10 +1319,10 @@ def validate_single_user_resources() -> Tuple[int, int]:
         load_documents(ROOT / 'clusters/dev/flux-system/kustomization.yaml')
     )
     flux_contracts = (
-        ('source-controller', '25m', '96Mi', '200m', '256Mi'),
-        ('kustomize-controller', '50m', '128Mi', '500m', '512Mi'),
-        ('helm-controller', '50m', '128Mi', '500m', '512Mi'),
-        ('notification-controller', '10m', '64Mi', '100m', '128Mi'),
+        ('source-controller', '100m', '256Mi', '400m', '512Mi'),
+        ('kustomize-controller', '250m', '512Mi', '1000m', '1Gi'),
+        ('helm-controller', '100m', '256Mi', '400m', '512Mi'),
+        ('notification-controller', '50m', '128Mi', '200m', '256Mi'),
     )
     patches = flux_kustomization.get('patches', [])
     for controller, request_cpu, request_memory, limit_cpu, limit_memory in flux_contracts:
@@ -1650,6 +2086,833 @@ def images(value: Any) -> Iterable[str]:
             yield from images(child)
 
 
+def load_yaml_mapping(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        fail(f'{label} 不存在')
+    try:
+        document = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except yaml.YAMLError as error:
+        fail(f'{label} YAML 解析失败：{error}')
+    if not isinstance(document, dict):
+        fail(f'{label} 顶层必须是 YAML mapping')
+    return document
+
+
+def parse_yaml_documents(source: str, label: str) -> list[dict[str, Any]]:
+    try:
+        raw_documents = list(yaml.safe_load_all(source))
+    except yaml.YAMLError as error:
+        fail(f'{label} YAML 解析失败：{error}')
+    documents: list[dict[str, Any]] = []
+    for document in raw_documents:
+        if document is None:
+            continue
+        if not isinstance(document, dict):
+            fail(f'{label} 顶层必须是 YAML mapping')
+        documents.append(document)
+    return documents
+
+
+def phase_a_resource(
+    documents: list[dict[str, Any]],
+    kind: str,
+    name: str,
+    namespace: str = '',
+) -> dict[str, Any]:
+    matches = []
+    for document in documents:
+        metadata = document.get('metadata', {})
+        if not isinstance(metadata, dict):
+            continue
+        if (
+            document.get('kind') == kind
+            and metadata.get('name') == name
+            and metadata.get('namespace', '') == namespace
+        ):
+            matches.append(document)
+    if len(matches) != 1:
+        fail(
+            'Flux Phase A 渲染资源必须唯一：'
+            f'{kind}/{namespace or "_cluster"}/{name}，实测 {len(matches)} 个'
+        )
+    return matches[0]
+
+
+def rbac_rule_key(rule: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
+    allowed = {
+        'apiGroups',
+        'nonResourceURLs',
+        'resourceNames',
+        'resources',
+        'verbs',
+    }
+    if set(rule) - allowed:
+        fail(f'Flux Phase A RBAC rule 含未批准字段：{sorted(set(rule) - allowed)}')
+
+    def values(name: str) -> tuple[str, ...]:
+        raw = rule.get(name, [])
+        if not isinstance(raw, list) or not all(
+            isinstance(value, str) for value in raw
+        ):
+            fail(f'Flux Phase A RBAC rule {name} 必须是字符串列表')
+        return tuple(sorted(raw))
+
+    return (
+        values('apiGroups'),
+        values('resources'),
+        values('verbs'),
+        values('nonResourceURLs'),
+        values('resourceNames'),
+    )
+
+
+def rbac_rule_set(rules: Any, label: str) -> set[tuple[tuple[str, ...], ...]]:
+    if not isinstance(rules, list) or not all(
+        isinstance(rule, dict) for rule in rules
+    ):
+        fail(f'{label} rules 必须是 mapping 列表')
+    normalized = {rbac_rule_key(rule) for rule in rules}
+    if len(normalized) != len(rules):
+        fail(f'{label} 含重复 RBAC rule')
+    return normalized
+
+
+def validate_flux_phase_a(root: Path = ROOT) -> None:
+    validate_active_root(root)
+    flux_directory = root / 'clusters/dev/flux-system'
+    kustomization = load_yaml_mapping(
+        flux_directory / 'kustomization.yaml',
+        'clusters/dev/flux-system/kustomization.yaml',
+    )
+    resources = kustomization.get('resources')
+    if resources != list(FLUX_PHASE_A_RESOURCES):
+        fail(
+            'Flux Phase A resources 必须精确为 gotk-components、'
+            'phase-a-rbac、phase-a-network-policy，且不得引用 gotk-sync；'
+            f'实测 {resources!r}'
+        )
+    for resource in FLUX_PHASE_A_RESOURCES:
+        if not (flux_directory / resource).is_file():
+            fail(f'Flux Phase A resources 缺少 {resource}')
+
+    components_path = flux_directory / 'gotk-components.yaml'
+    components_sha256 = hashlib.sha256(components_path.read_bytes()).hexdigest()
+    if components_sha256 != FLUX_PHASE_A_COMPONENTS_SHA256:
+        fail(
+            'Flux Phase A gotk-components bundle SHA-256 漂移：'
+            f'期望 {FLUX_PHASE_A_COMPONENTS_SHA256}，实测 {components_sha256}'
+        )
+
+    sync_path = flux_directory / 'gotk-sync.yaml'
+    if not sync_path.is_file():
+        fail('Flux Phase A gotk-sync.yaml 不存在')
+    sync_documents = parse_yaml_documents(
+        sync_path.read_text(encoding='utf-8'),
+        'clusters/dev/flux-system/gotk-sync.yaml',
+    )
+    if sync_documents:
+        fail('Flux Phase A gotk-sync.yaml 必须不含 YAML document，sync 保持关闭')
+
+    expected_digests = {
+        f'ghcr.io/fluxcd/{name}': contract['digest']
+        for name, contract in FLUX_PHASE_A_CONTROLLERS.items()
+    }
+    image_entries = kustomization.get('images')
+    if not isinstance(image_entries, list):
+        fail('Flux Phase A images 必须是四项 digest 映射')
+    actual_digests: dict[str, str] = {}
+    for entry in image_entries:
+        if not isinstance(entry, dict):
+            fail('Flux Phase A images 每项必须是 mapping')
+        name = entry.get('name')
+        digest = entry.get('digest')
+        if not isinstance(name, str) or not isinstance(digest, str):
+            fail('Flux Phase A images 每项必须包含 name 与 digest')
+        if 'newTag' in entry:
+            fail(f'Flux Phase A image {name} 禁止用 tag 替代 digest')
+        new_name = entry.get('newName', name)
+        if new_name != name or name in actual_digests:
+            fail(f'Flux Phase A image 映射无效或重复：{name}')
+        actual_digests[name] = digest
+    if actual_digests != expected_digests:
+        fail(
+            'Flux Phase A images digest 锁不一致：'
+            f'期望 {expected_digests!r}，实测 {actual_digests!r}'
+        )
+
+    rendered = subprocess.run(
+        ['kubectl', 'kustomize', str(flux_directory)],
+        cwd=root,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if rendered.returncode != 0:
+        fail(
+            'Flux Phase A 无法渲染：'
+            f'{rendered.stderr.strip() or rendered.stdout.strip()}'
+        )
+    documents = parse_yaml_documents(rendered.stdout, 'Flux Phase A rendered output')
+    if not documents:
+        fail('Flux Phase A rendered output 不能为空')
+
+    deployments: dict[str, dict[str, Any]] = {}
+    namespaces: set[str] = set()
+    service_accounts: list[tuple[str, str]] = []
+    identities: list[tuple[str, str, str, str]] = []
+    for document in documents:
+        metadata = document.get('metadata', {})
+        if not isinstance(metadata, dict):
+            fail('Flux Phase A rendered resource metadata 必须是 mapping')
+        api_version = document.get('apiVersion')
+        kind = document.get('kind')
+        name = metadata.get('name')
+        namespace = metadata.get('namespace', '')
+        if (
+            not isinstance(api_version, str)
+            or not isinstance(kind, str)
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(namespace, str)
+        ):
+            fail('Flux Phase A rendered resource identity 字段缺失或类型无效')
+        identities.append((api_version, kind, namespace, name))
+        if kind == 'Deployment':
+            if not isinstance(name, str) or name in deployments:
+                fail('Flux Phase A Deployment identity 重复或缺失')
+            deployments[name] = document
+        if kind == 'Namespace' and isinstance(name, str):
+            namespaces.add(name)
+        if kind == 'ServiceAccount' and isinstance(name, str):
+            service_accounts.append((str(namespace), name))
+        api_group = api_version.split('/', 1)[0]
+        if api_group.endswith('.toolkit.fluxcd.io') or api_group == (
+            'source.extensions.fluxcd.io'
+        ):
+            fail(
+                'Flux Phase A rendered output 禁止任何 Flux CR custom resource '
+                '实例（sync 保持关闭）：'
+                f'{kind}/{namespace or "_cluster"}/{name}'
+            )
+
+    actual_identities = set(identities)
+    if (
+        len(identities) != len(FLUX_PHASE_A_IDENTITIES)
+        or actual_identities != FLUX_PHASE_A_IDENTITIES
+    ):
+        duplicate_identities = sorted(
+            identity
+            for identity in actual_identities
+            if identities.count(identity) > 1
+        )
+        fail(
+            'Flux Phase A rendered resource identity inventory 必须精确为 '
+            f'39 objects；missing={sorted(FLUX_PHASE_A_IDENTITIES - actual_identities)}；'
+            f'extra={sorted(actual_identities - FLUX_PHASE_A_IDENTITIES)}；'
+            f'duplicates={duplicate_identities}'
+        )
+
+    if set(deployments) != set(FLUX_PHASE_A_CONTROLLERS):
+        fail(
+            'Flux Phase A Deployment controller 必须恰好为四项：'
+            f'实测 {sorted(deployments)}'
+        )
+    expected_service_accounts = {
+        ('flux-system', name) for name in FLUX_PHASE_A_CONTROLLERS
+    }
+    if (
+        len(service_accounts) != len(expected_service_accounts)
+        or set(service_accounts) != expected_service_accounts
+    ):
+        fail(
+            'Flux Phase A ServiceAccount controller 必须恰好为四项：'
+            f'实测 {sorted(service_accounts)}'
+        )
+    if namespaces != {'flux-system'}:
+        fail(
+            'Flux Phase A Namespace 只能包含 flux-system，'
+            f'不得激活下游 Namespace；实测 {sorted(namespaces)}'
+        )
+
+    for name, expected_spec in FLUX_PHASE_A_SERVICE_SPECS.items():
+        service = phase_a_resource(
+            documents, 'Service', name, 'flux-system'
+        )
+        if service.get('spec') != expected_spec:
+            fail(
+                f'Flux Phase A Service/{name} selector/ports/targetPort/'
+                'ClusterIP 不符合精确合同'
+            )
+
+    flux_namespace = phase_a_resource(documents, 'Namespace', 'flux-system')
+    labels = flux_namespace.get('metadata', {}).get('labels', {})
+    for label, expected in FLUX_PHASE_A_PSS_LABELS.items():
+        if not isinstance(labels, dict) or labels.get(label) != expected:
+            fail(
+                'Flux Phase A PSS Pod Security 必须固定 restricted v1.36：'
+                f'{label}={labels.get(label) if isinstance(labels, dict) else None!r}'
+            )
+
+    for name, contract in FLUX_PHASE_A_CONTROLLERS.items():
+        deployment = deployments[name]
+        metadata = deployment.get('metadata', {})
+        if not isinstance(metadata, dict) or metadata.get('namespace') != 'flux-system':
+            fail(f'Flux Phase A Deployment controller {name} 必须位于 flux-system')
+        strategy = deployment.get('spec', {}).get('strategy')
+        if strategy != FLUX_PHASE_A_ROLLOUT_STRATEGY:
+            fail(
+                f'Flux Phase A {name} rollout strategy 必须精确为 '
+                'RollingUpdate maxSurge=1/maxUnavailable=0'
+            )
+        try:
+            pod_spec = deployment['spec']['template']['spec']
+            containers = pod_spec['containers']
+        except (KeyError, TypeError):
+            fail(f'Flux Phase A Deployment controller {name} pod spec 缺失')
+        if pod_spec.get('serviceAccountName') != name:
+            fail(
+                f'Flux Phase A Deployment controller {name} '
+                'serviceAccountName 必须与 Controller 同名'
+            )
+        forbidden_pod_fields = [
+            field
+            for field in ('hostNetwork', 'hostPID', 'hostIPC')
+            if pod_spec.get(field) is not None and pod_spec.get(field) is not False
+        ]
+        if forbidden_pod_fields:
+            fail(
+                f'Flux Phase A Deployment controller {name} Pod 禁止 '
+                'hostNetwork/hostPID/hostIPC：'
+                f'{forbidden_pod_fields}'
+            )
+        if (
+            not isinstance(containers, list)
+            or len(containers) != 1
+            or not isinstance(containers[0], dict)
+            or containers[0].get('name') != 'manager'
+            or pod_spec.get('initContainers')
+        ):
+            fail(
+                f'Flux Phase A Deployment controller {name} 必须是单容器，'
+                '且恰有 manager container'
+            )
+        manager = containers[0]
+        if 'command' in manager:
+            fail(
+                f'Flux Phase A Deployment controller {name} manager container '
+                '禁止覆盖 command'
+            )
+        expected_image = f'ghcr.io/fluxcd/{name}@{contract["digest"]}'
+        if manager.get('image') != expected_image:
+            fail(
+                f'Flux Phase A {name} rendered image digest 不一致：'
+                f'{manager.get("image")!r}'
+            )
+        security_context = manager.get('securityContext')
+        if security_context != FLUX_PHASE_A_SECURITY_CONTEXT:
+            fail(
+                f'Flux Phase A {name} securityContext 必须完整精确，'
+                '禁止额外 privileged 等危险字段'
+            )
+        args = manager.get('args')
+        if not isinstance(args, list) or not all(
+            isinstance(argument, str) for argument in args
+        ):
+            fail(f'Flux Phase A {name} 多租户 args 参数必须是字符串列表')
+        args_by_flag: dict[str, str] = {}
+        for argument in args:
+            flag_name = argument.split('=', 1)[0]
+            if not flag_name.startswith('--') or flag_name in args_by_flag:
+                fail(
+                    f'Flux Phase A {name} arg flag 必须按名称唯一：'
+                    f'{flag_name}'
+                )
+            args_by_flag[flag_name] = argument
+        forbidden_flags = {
+            argument.split('=', 1)[0]
+            for argument in contract['forbidden_args']
+        }
+        present_forbidden_flags = sorted(forbidden_flags & set(args_by_flag))
+        workload_identity_gate = next(
+            (
+                argument
+                for argument in args
+                if argument.startswith('--feature-gates=')
+                and any(
+                    feature.startswith('ObjectLevelWorkloadIdentity=')
+                    for feature in argument.split('=', 1)[1].split(',')
+                )
+            ),
+            None,
+        )
+        if present_forbidden_flags or workload_identity_gate:
+            fail(
+                'Flux Phase A 未启用 ObjectLevelWorkloadIdentity feature gate，'
+                f'{name} 禁止 default service-account/feature-gates 参数：'
+                f'{present_forbidden_flags or [workload_identity_gate]}'
+            )
+        if args != list(contract['args']):
+            fail(
+                f'Flux Phase A {name} manager args 必须完整匹配严格 allowlist，'
+                '禁止未知 controller flag 或 feature gate'
+            )
+        if manager.get('resources') != contract['resources']:
+            fail(
+                f'Flux Phase A {name} resources 资源包络不一致：'
+                f'{manager.get("resources")!r}'
+            )
+
+    rbac_documents = [
+        document
+        for document in documents
+        if document.get('kind')
+        in {'Role', 'RoleBinding', 'ClusterRole', 'ClusterRoleBinding'}
+    ]
+    for document in rbac_documents:
+        kind = document.get('kind')
+        metadata = document.get('metadata', {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        name = str(metadata.get('name', ''))
+        role_ref = document.get('roleRef')
+        if (
+            isinstance(role_ref, dict)
+            and role_ref.get('name') == 'cluster-admin'
+        ):
+            fail(f'Flux Phase A RBAC roleRef.name 禁止 cluster-admin：{kind}/{name}')
+        if (
+            name == 'crd-controller-flux-system'
+            or name.startswith('cluster-reconciler')
+        ):
+            fail(f'Flux Phase A 禁止 generated cluster-wide RBAC：{kind}/{name}')
+        if kind == 'ClusterRole' and (
+            name.startswith('flux-edit') or name.startswith('flux-view')
+        ):
+            fail(f'Flux Phase A 禁止 flux-edit/flux-view aggregate 聚合 ClusterRole：{name}')
+        if kind not in {'Role', 'ClusterRole'}:
+            continue
+        rules = document.get('rules')
+        if not isinstance(rules, list):
+            fail(f'Flux Phase A RBAC {kind}/{name} rules 缺失')
+        for rule in rules:
+            if not isinstance(rule, dict):
+                fail(f'Flux Phase A RBAC {kind}/{name} rule 必须是 mapping')
+            api_groups = set(rule.get('apiGroups', []))
+            forbidden_groups = sorted(
+                api_groups & FLUX_PHASE_A_FORBIDDEN_API_GROUPS
+            )
+            if forbidden_groups:
+                fail(
+                    'Flux Phase A RBAC ClusterRole apiGroup 禁止 '
+                    f'image.toolkit/source.extensions：{forbidden_groups}'
+                )
+            resources_in_rule = set(rule.get('resources', []))
+            verbs = set(rule.get('verbs', []))
+            if 'serviceaccounts/token' in resources_in_rule and (
+                'create' in verbs or '*' in verbs
+            ):
+                fail(
+                    'Flux Phase A 无 Workload Identity，禁止 '
+                    'serviceaccounts/token create'
+                )
+
+    expected_rbac_inventory = {
+        *(
+            (kind, 'flux-system', name)
+            for name in FLUX_PHASE_A_CONTROLLERS
+            for kind in ('Role', 'RoleBinding')
+        ),
+        ('ClusterRole', '', 'flux-controller-api-health'),
+        ('ClusterRoleBinding', '', 'flux-controller-api-health'),
+    }
+    actual_rbac_inventory = {
+        (
+            str(document.get('kind', '')),
+            str(document.get('metadata', {}).get('namespace', '')),
+            str(document.get('metadata', {}).get('name', '')),
+        )
+        for document in rbac_documents
+    }
+    if actual_rbac_inventory != expected_rbac_inventory:
+        fail(
+            'Flux Phase A RBAC inventory 不符合最小权限合同：'
+            f'{sorted(actual_rbac_inventory)}'
+        )
+
+    for name, expected_rules in FLUX_PHASE_A_ROLE_RULES.items():
+        namespace_role = phase_a_resource(
+            documents, 'Role', name, 'flux-system'
+        )
+        if rbac_rule_set(
+            namespace_role.get('rules'),
+            f'Flux Phase A namespace Role/{name}',
+        ) != rbac_rule_set(expected_rules, f'expected namespace Role/{name}'):
+            fail(
+                f'Flux Phase A Role/{name} rules 超出精确 namespaced 权限合同；'
+                '禁止跨 Controller API group 写权限，Lease 仅 '
+                'create/get/update'
+            )
+
+    cluster_role = phase_a_resource(
+        documents, 'ClusterRole', 'flux-controller-api-health'
+    )
+    expected_cluster_rules = [
+        {'nonResourceURLs': ['/livez/ping'], 'verbs': ['head']}
+    ]
+    if rbac_rule_set(
+        cluster_role.get('rules'), 'Flux Phase A ClusterRole'
+    ) != rbac_rule_set(expected_cluster_rules, 'expected ClusterRole'):
+        fail(
+            'Flux Phase A api-health ClusterRole 只允许 /livez/ping head'
+        )
+
+    binding_contracts = [
+        (
+            'RoleBinding',
+            name,
+            'flux-system',
+            {'kind': 'Role', 'name': name},
+            {('ServiceAccount', name, 'flux-system')},
+        )
+        for name in FLUX_PHASE_A_CONTROLLERS
+    ]
+    binding_contracts.append(
+        (
+            'ClusterRoleBinding',
+            'flux-controller-api-health',
+            '',
+            {'kind': 'ClusterRole', 'name': 'flux-controller-api-health'},
+            FLUX_PHASE_A_SUBJECTS,
+        )
+    )
+    for kind, name, namespace, expected_ref, expected_subjects in binding_contracts:
+        binding = phase_a_resource(documents, kind, name, namespace)
+        role_ref = binding.get('roleRef')
+        if not isinstance(role_ref, dict) or (
+            role_ref.get('apiGroup') != 'rbac.authorization.k8s.io'
+            or role_ref.get('kind') != expected_ref['kind']
+            or role_ref.get('name') != expected_ref['name']
+        ):
+            fail(f'Flux Phase A RBAC {kind}/{name} roleRef 不符合最小权限合同')
+        subjects = binding.get('subjects')
+        if not isinstance(subjects, list):
+            fail(f'Flux Phase A {kind}/{name} ServiceAccount subjects 缺失')
+        actual_subjects = {
+            (
+                str(subject.get('kind', '')),
+                str(subject.get('name', '')),
+                str(subject.get('namespace', '')),
+            )
+            for subject in subjects
+            if isinstance(subject, dict)
+        }
+        if (
+            len(actual_subjects) != len(subjects)
+            or actual_subjects != expected_subjects
+        ):
+            fail(
+                f'Flux Phase A {kind}/{name} controller ServiceAccount '
+                f'subjects 不符合一对一/四 Controller 合同：'
+                f'{sorted(actual_subjects)}'
+            )
+
+    network_policies = [
+        document for document in documents if document.get('kind') == 'NetworkPolicy'
+    ]
+    cilium_policies = [
+        document
+        for document in documents
+        if document.get('kind') == 'CiliumNetworkPolicy'
+    ]
+    cilium_clusterwide_policies = [
+        document
+        for document in documents
+        if document.get('kind') == 'CiliumClusterwideNetworkPolicy'
+    ]
+    if cilium_clusterwide_policies:
+        fail(
+            'Flux Phase A 禁止 CiliumClusterwideNetworkPolicy clusterwide '
+            '网络权限'
+        )
+    network_inventory = {
+        (
+            str(document.get('metadata', {}).get('namespace', '')),
+            str(document.get('metadata', {}).get('name', '')),
+        )
+        for document in network_policies
+    }
+    cilium_inventory = {
+        (
+            str(document.get('metadata', {}).get('namespace', '')),
+            str(document.get('metadata', {}).get('name', '')),
+        )
+        for document in cilium_policies
+    }
+    expected_network_inventory = {
+        ('flux-system', 'default-deny'),
+        ('flux-system', 'allow-dns-egress'),
+        ('flux-system', 'allow-controller-internal-ingress'),
+        ('flux-system', 'allow-controller-internal-egress'),
+    }
+    if network_inventory != expected_network_inventory:
+        fail(
+            'Flux Phase A NetworkPolicy inventory 禁止 allow-egress、'
+            'allow-scraping metrics 与 allow-webhooks：'
+            f'{sorted(network_inventory)}'
+        )
+    if cilium_inventory != {
+        ('flux-system', 'allow-kube-apiserver-egress')
+    }:
+        fail(
+            'Flux Phase A Cilium NetworkPolicy 必须恰好包含 '
+            'kube-apiserver egress'
+        )
+
+    expected_flux_selector = {
+        'matchLabels': {'app.kubernetes.io/part-of': 'flux'}
+    }
+    expected_controller_selector = {
+        'matchExpressions': [
+            {
+                'key': 'app.kubernetes.io/component',
+                'operator': 'In',
+                'values': [
+                    'source-controller',
+                    'notification-controller',
+                ],
+            }
+        ]
+    }
+    expected_network_specs = {
+        'default-deny': {
+            'podSelector': {},
+            'policyTypes': ['Ingress', 'Egress'],
+        },
+        'allow-dns-egress': {
+            'podSelector': expected_flux_selector,
+            'policyTypes': ['Egress'],
+            'egress': [
+                {
+                    'to': [
+                        {
+                            'namespaceSelector': {
+                                'matchLabels': {
+                                    'kubernetes.io/metadata.name': 'kube-system'
+                                }
+                            },
+                            'podSelector': {'matchLabels': {'k8s-app': 'kube-dns'}},
+                        }
+                    ],
+                    'ports': [
+                        {'port': 53, 'protocol': 'TCP'},
+                        {'port': 53, 'protocol': 'UDP'},
+                    ],
+                }
+            ],
+        },
+        'allow-controller-internal-ingress': {
+            'podSelector': expected_controller_selector,
+            'policyTypes': ['Ingress'],
+            'ingress': [
+                {
+                    'from': [{'podSelector': expected_flux_selector}],
+                    'ports': [{'port': 9090, 'protocol': 'TCP'}],
+                }
+            ],
+        },
+        'allow-controller-internal-egress': {
+            'podSelector': expected_flux_selector,
+            'policyTypes': ['Egress'],
+            'egress': [
+                {
+                    'to': [{'podSelector': expected_controller_selector}],
+                    'ports': [{'port': 9090, 'protocol': 'TCP'}],
+                }
+            ],
+        },
+    }
+    for name, expected_spec in expected_network_specs.items():
+        policy = phase_a_resource(
+            documents, 'NetworkPolicy', name, 'flux-system'
+        )
+        if policy.get('spec') != expected_spec:
+            fail(
+                f'Flux Phase A NetworkPolicy {name} selector/ports '
+                '不符合 default-deny、DNS 或 controller 9090 合同'
+            )
+    cilium_policy = phase_a_resource(
+        documents,
+        'CiliumNetworkPolicy',
+        'allow-kube-apiserver-egress',
+        'flux-system',
+    )
+    expected_cilium_spec = {
+        'endpointSelector': {
+            'matchLabels': {'k8s:app.kubernetes.io/part-of': 'flux'}
+        },
+        'egress': [{'toEntities': ['kube-apiserver']}],
+    }
+    if cilium_policy.get('spec') != expected_cilium_spec:
+        fail(
+            'Flux Phase A Cilium NetworkPolicy endpointSelector 只能选择 Flux '
+            'Controller 并放行 kube-apiserver egress'
+        )
+
+    canonical_documents = sorted(
+        documents,
+        key=lambda document: (
+            str(document.get('apiVersion', '')),
+            str(document.get('kind', '')),
+            str(document.get('metadata', {}).get('namespace', '')),
+            str(document.get('metadata', {}).get('name', '')),
+        ),
+    )
+    canonical_payload = json.dumps(
+        canonical_documents,
+        ensure_ascii=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode('utf-8')
+    rendered_sha256 = hashlib.sha256(canonical_payload).hexdigest()
+    if rendered_sha256 != FLUX_PHASE_A_RENDERED_SHA256:
+        fail(
+            'Flux Phase A rendered bundle canonical SHA-256 漂移：'
+            f'期望 {FLUX_PHASE_A_RENDERED_SHA256}，实测 {rendered_sha256}'
+        )
+
+
+def validate_flux_phase_a_probes(root: Path = ROOT) -> None:
+    image = (
+        'registry.k8s.io/e2e-test-images/busybox@sha256:'
+        'caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb'
+    )
+
+    def expected_probe(
+        generate_name: str,
+        namespace: str,
+        app_name: str,
+        part_of: str,
+    ) -> dict[str, Any]:
+        return {
+            'apiVersion': 'v1',
+            'kind': 'Pod',
+            'metadata': {
+                'generateName': generate_name,
+                'namespace': namespace,
+                'labels': {
+                    'app.kubernetes.io/name': app_name,
+                    'app.kubernetes.io/component': 'network-probe',
+                    'app.kubernetes.io/part-of': part_of,
+                },
+            },
+            'spec': {
+                'automountServiceAccountToken': False,
+                'restartPolicy': 'Never',
+                'terminationGracePeriodSeconds': 0,
+                'nodeSelector': {
+                    'kubernetes.io/arch': 'amd64',
+                    'kubernetes.io/os': 'linux',
+                },
+                'securityContext': {
+                    'runAsNonRoot': True,
+                    'seccompProfile': {'type': 'RuntimeDefault'},
+                },
+                'containers': [
+                    {
+                        'name': 'probe',
+                        'image': image,
+                        'imagePullPolicy': 'IfNotPresent',
+                        'command': ['sh', '-c', 'sleep 3600'],
+                        'resources': {
+                            'requests': {'cpu': '10m', 'memory': '16Mi'},
+                            'limits': {'cpu': '50m', 'memory': '32Mi'},
+                        },
+                        'securityContext': {
+                            'allowPrivilegeEscalation': False,
+                            'capabilities': {'drop': ['ALL']},
+                            'readOnlyRootFilesystem': True,
+                            'runAsNonRoot': True,
+                            'runAsUser': 65534,
+                        },
+                    }
+                ],
+            },
+        }
+
+    expected_documents = {
+        'runbook/examples/flux-phase-a-network-probe.yaml': expected_probe(
+            'flux-phase-a-probe-',
+            'flux-system',
+            'flux-phase-a-probe',
+            'flux',
+        ),
+        'runbook/examples/flux-phase-a-external-network-probe.yaml': expected_probe(
+            'flux-phase-a-external-probe-',
+            'default',
+            'flux-phase-a-external-probe',
+            'flux-phase-a-verification',
+        ),
+    }
+    for relative, expected in expected_documents.items():
+        document = load_yaml_mapping(root / relative, relative)
+        if document != expected:
+            fail(
+                f'Flux Phase A 瞬态 probe {relative} 必须使用 generateName、'
+                '固定 namespace/labels/BusyBox digest、无 Token、Never、'
+                'non-root、只读 RootFS 与精确资源限制，且禁止 metadata.name'
+            )
+
+    runbook_path = root / 'runbook/01-bootstrap.md'
+    if not runbook_path.is_file():
+        fail('Flux Phase A probe runbook/01-bootstrap.md 不存在')
+    runbook = runbook_path.read_text(encoding='utf-8')
+    section_start = runbook.find('网络证据使用')
+    section_end = runbook.find('\n判定：', section_start)
+    if section_start < 0 or section_end < 0:
+        fail('Flux Phase A probe runbook 缺少完整网络证据章节')
+    section = runbook[section_start:section_end]
+    normalized = re.sub(r'\\\s*\n\s*', ' ', section)
+    required_tokens = (
+        'create -f runbook/examples/flux-phase-a-network-probe.yaml',
+        'create -f runbook/examples/flux-phase-a-external-network-probe.yaml',
+        "-o jsonpath='{.metadata.name}:{.metadata.uid}'",
+        'get pod "$pod_name" --ignore-not-found',
+        "-o jsonpath='{.metadata.uid}'",
+        'if [ "$current_uid" != "$expected_uid" ]',
+        'delete pod "$pod_name" --wait=true',
+        'trap cleanup_flux_phase_a_probes EXIT',
+        'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 1.1.1.1 443',
+        '"$FLUX_PHASE_A_SOURCE_POD_IP" 8080',
+        '"$FLUX_PHASE_A_NOTIFICATION_POD_IP" 9292',
+        'PASS: Flux traffic to source-controller metrics:8080 denied',
+        'PASS: Flux traffic to notification-controller receiver:9292 denied',
+        '正向七条命令必须成功',
+    )
+    missing_tokens = [
+        token for token in required_tokens if token not in normalized
+    ]
+    if missing_tokens or normalized.count(
+        "-o jsonpath='{.metadata.name}:{.metadata.uid}'"
+    ) != 2:
+        fail(
+            'Flux Phase A probe runbook 必须用 kubectl create 捕获两组 '
+            'name:uid、按 UID 归属清理，以 non-Flux 1.1.1.1:443 '
+            f'作为正对照，并覆盖 8080/9292 负测：{missing_tokens}'
+        )
+    forbidden_patterns = (
+        r'probes\.yaml',
+        r'\b(?:apply|replace)\b[^\n]*flux-phase-a-(?:external-)?network-probe\.yaml',
+        r'\bdelete\s+-f\s+[^\n]*flux-phase-a-(?:external-)?network-probe\.yaml',
+        r'\bdelete\s+pods?\b[^\n]*(?:\s-l\b|--selector)',
+        r'\|\|\s*true',
+    )
+    for pattern in forbidden_patterns:
+        if re.search(pattern, normalized):
+            fail(
+                'Flux Phase A probe runbook 禁止旧 probes.yaml、apply/replace、'
+                'delete -f、按标签删除探针或吞掉 kubectl 错误'
+            )
+
+
 def validate_kustomize_builds() -> None:
     kustomizations = sorted(
         path
@@ -1674,17 +2937,59 @@ def validate_kustomize_builds() -> None:
             )
 
 
+def scalar_strings(
+    value: Any,
+    path: tuple[str, ...] = (),
+) -> Iterable[tuple[tuple[str, ...], str]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from scalar_strings(child, (*path, str(key)))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from scalar_strings(child, (*path, str(index)))
+    elif isinstance(value, str):
+        yield path, value
+
+
+def validate_manifest_placeholders(
+    path: Path,
+    source: str,
+    documents: list[dict[str, Any]],
+) -> None:
+    generated_components = ROOT / 'clusters/dev/flux-system/gotk-components.yaml'
+    if path != generated_components:
+        if PLACEHOLDER.search(source):
+            fail(f'{path.relative_to(ROOT)} 含未关闭的占位符')
+        return
+
+    if re.search(r'(?:REPLACE_ME|TODO_DIGEST)', source):
+        fail(f'{path.relative_to(ROOT)} 含未关闭的占位符')
+    source_angle_tokens = sorted(re.findall(r'<[^>]+>', source))
+    allowed_angle_tokens: list[str] = []
+    for document in documents:
+        if document.get('kind') != 'CustomResourceDefinition':
+            continue
+        for value_path, value in scalar_strings(document):
+            if value_path and value_path[-1] == 'description':
+                allowed_angle_tokens.extend(re.findall(r'<[^>]+>', value))
+    if source_angle_tokens != sorted(allowed_angle_tokens):
+        fail(
+            f'{path.relative_to(ROOT)} 的尖括号占位符只允许出现在 '
+            'generated Flux CRD schema description'
+        )
+
+
 def validate_documents() -> None:
     found: set[tuple[str, str, str, str]] = set()
 
     for path in yaml_files():
         source = path.read_text(encoding='utf-8')
-        if PLACEHOLDER.search(source):
-            fail(f'{path.relative_to(ROOT)} 含未关闭的占位符')
+        documents = list(load_documents(path))
+        validate_manifest_placeholders(path, source, documents)
         if INSECURE_TLS.search(source):
             fail(f'{path.relative_to(ROOT)} 禁止跳过 TLS 证书校验')
 
-        for document in load_documents(path):
+        for document in documents:
             identity = resource_id(document)
             if identity is not None:
                 found.add(identity)
@@ -1717,7 +3022,19 @@ def validate_documents() -> None:
                 if FLOATING_IMAGE.search(image):
                     fail(f'{path.relative_to(ROOT)} 使用浮动镜像 {image}')
                 if '@sha256:' not in image:
-                    fail(f'{path.relative_to(ROOT)} 直接工作负载镜像未按 digest 固定：{image}')
+                    generated_components = (
+                        ROOT / 'clusters/dev/flux-system/gotk-components.yaml'
+                    )
+                    allowed_generated_images = {
+                        f'ghcr.io/fluxcd/{name}:{contract["tag"]}'
+                        for name, contract in FLUX_PHASE_A_CONTROLLERS.items()
+                    }
+                    if path == generated_components and image in allowed_generated_images:
+                        continue
+                    fail(
+                        f'{path.relative_to(ROOT)} 直接工作负载镜像未按 '
+                        f'digest 固定：{image}'
+                    )
 
     missing = sorted(REQUIRED_TASK4_RESOURCES - found)
     if missing:
@@ -1763,6 +3080,8 @@ def validate_documents() -> None:
 def main() -> None:
     validate_active_root()
     validate_bootstrap_contracts()
+    validate_flux_phase_a()
+    validate_flux_phase_a_probes()
     validate_kustomize_builds()
     validate_documents()
     validate_single_user_storage()

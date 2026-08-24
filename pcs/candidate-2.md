@@ -23,7 +23,9 @@
 | 事实 | 值 |
 | --- | --- |
 | docs 架构事实提交 | `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` |
-| GitOps main 采样提交 | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
+| GitOps private main 采样提交 | `72f360f0aa64b77747b3689a2f5372a10dd651f3` |
+| GitOps public validation mirror | `668035b25232216b094670e7dda956c14743b0b2`；CI run `32691520126`、`validation-gate`、`publish-validated` 均 `success` |
+| DEV server checkout | `1c5034b9a9c29ab72fde63644c57fa88604c45b6`（本次 runtime `--check` 采样） |
 | frontend Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
 | backend Source Commit | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |
 | DEV Runtime 当前观测时间 | `2026-08-24 03:42Z` |
@@ -64,9 +66,9 @@
 | Runtime | CoreDNS | `v1.14.2` | `registry.k8s.io/coredns/coredns:v1.14.2` | 运行版本 `v1.14.2`；实际 Image ID 待回填 | 两副本 Ready |
 | Network | Cilium | `1.20.0` | Helm `cilium/cilium` | Helm revision `1`、chart/app `1.20.0`；实际 Image ID 待回填 | kube-proxy replacement、Gateway API enabled；agent/operator/Envoy Ready |
 | Network | Gateway API CRD | `v1.6.1` Standard | upstream release manifest | CRD 已安装；Manifest digest 待回填 | GatewayClass `cilium` Accepted；平台 Gateway/HTTPRoute 不存在 |
-| GitOps | Flux | `v2.9.3` | bootstrap manifests | `BLOCKED` | Flux CRD、`flux-system` Namespace 与 Controller 均不存在；无 image automation |
+| GitOps | Flux | CLI `v2.9.3`；Controller `source v1.9.3` / `kustomize v1.9.4` / `helm v1.6.3` / `notification v1.9.2` | 四 Controller 官方生成 bundle + 项目 Phase A 收敛 overlay | linux/amd64 manifest：source `sha256:c6c82b3182f48b833252c71aefa0741957ca18296612bc6d2b9b5fb276f926e4`；kustomize `sha256:3e57aecb74419be93d09ba062cfc882bea405193c474009e0da1826de71a4ebd`；helm `sha256:22c0a585d0d9b1f792b9d5638144b7810e273d28e310da37740f01226bd044a2`；notification `sha256:cb17eefffbc442412ba6f63336defd04c0fc387d5082d951998d1ff163a9180d` | **BLOCKED：Phase A Desired State 已形成候选，但尚未取得该候选的公有镜像 CI、DEV rollout、RBAC/网络与 Image ID 证据；当前 Runtime 仍无 Flux CRD、Namespace 或 Controller** |
 | Storage | local-path-provisioner | `v0.0.31` | `docker.io/rancher/local-path-provisioner` | amd64 `sha256:5fb0394abf87407a27cc56db94334eb0c92d0b5de2636683a7ec51f38143dfc9` | **DEV-002 GAP**；平台 Desired State 未激活，运行补偿控制未验证 |
-| Storage | local-path helper | `1.36.1-1` | `registry.k8s.io/e2e-test-images/busybox` | amd64 `sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb` | platform provisioner helper Pod 未部署 |
+| Storage | local-path helper / Phase A 瞬态网络探针 | `1.36.1-1` | `registry.k8s.io/e2e-test-images/busybox` | index `sha256:a9155b13325b2abef48e71de77bb8ac015412a566829f621d06bfae5c699b1b9`；amd64 `sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb` | platform provisioner helper Pod 未部署；Phase A 探针只在验收窗口瞬态创建并删除，不进入 Desired State |
 | PKI | cert-manager | `v1.21.1` | Helm chart `v1.21.1` | Chart/运行 digest 待部署回填 | `dev-selfsigned` 仅限 DEV；CRD/Controller 未部署 |
 | Object Storage | MinIO Server | `RELEASE.2025-09-07T16-13-09Z` | `quay.io/minio/minio` | index `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`；amd64 `sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2` | **BLOCKED：精确摘要供应链证据或获批风险决定未满足；清单引用不代表获准或已部署** |
 | Object Storage | MinIO Client (`mc`) | `RELEASE.2025-08-13T08-35-41Z` | `quay.io/minio/mc` | index `sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727`；amd64 `sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780` | 初始化、验证与 etcd 上传工具；未部署 |
@@ -92,6 +94,31 @@
 | Runtime Image ID | `NOT_VERIFIED` |
 
 CI run `32683635240` 与 publish-image job `97305929974` 均已 `success`，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow 的 `build --platform linux/amd64`、导出 manifest 日志与独立 attestation manifest 均确认该 digest 为可部署的 `linux/amd64` manifest。当前候选不得复用带日期的历史制品观察；运行 Image ID 在工作负载部署前仍 fail-closed。
+
+## 当前 Flux Phase A 候选
+
+Phase A 只候选四个 Controller 基础层，不包含 Git Credential、`GitRepository`、Flux
+`Kustomization`、`HelmRelease`、image automation、infrastructure、apps 或业务
+Namespace。完整生成来源与安全收敛见 `clusters/dev/flux-system/README.md`。
+
+| 字段 | 值 |
+| --- | --- |
+| Flux CLI | `v2.9.3` |
+| CLI darwin/amd64 archive SHA-256 | `cfe276124801f2057b7960b5ac2fe5dc019cdf245d1e791ed947b9f4e97e06c2` |
+| CLI linux/amd64 archive SHA-256 | `eae4e8608c0ade2bf4e8dec1669dbb6b0c28b5822b252d97feccfb4fb1181fd2` |
+| 生成 bundle SHA-256 | `c6e84495c3b611978d053adc40aca1e2a12af38f6e239c44a6b6c1224e01cab7` |
+| Controller 范围 | `source-controller`、`kustomize-controller`、`helm-controller`、`notification-controller` |
+| 运行架构 | `linux/amd64`，四个镜像均固定到上表 manifest digest |
+| 瞬态网络探针 | 复用已锁定 `registry.k8s.io/e2e-test-images/busybox@sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb`；不进入 Desired State，验收结束必须删除 |
+| Git sync | `ACTIVE: false`；Phase A 渲染不得包含任何 sync CR |
+| 公有镜像 CI | `NOT_RUN`；私有候选提交产生后须脱敏镜像到 `engineering-platform-gitops-temp` |
+| Runtime | `NOT_DEPLOYED`；当前 DEV 无 `flux-system`、Flux CRD 或 Controller |
+
+供应链固定不等于激活批准。只有公有镜像仓 `validation-gate` 全绿且其
+`validated` 指向与私有候选一一对应的脱敏镜像提交，才可人工批准服务器以显式私有
+SHA 进入 Phase A；私有仓 `origin/validated` 落后时不得使用无参数入口。部署后还必须
+以 Pod Image ID、Rollout、RBAC negative check、NetworkPolicy 与空 sync inventory
+回填运行证据，届时本候选才可从 Flux `BLOCKED` 收敛。
 
 ## 2026-08-22 frontend 历史证据
 

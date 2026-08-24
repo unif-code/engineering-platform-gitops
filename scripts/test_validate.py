@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import contextlib
 import io
 import os
@@ -1145,7 +1146,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
         self.assertIn('MinIO 被拒候选缺少精确 digest 供应链证据', stderr.getvalue())
 
     def test_single_user_resource_contract(self) -> None:
-        self.assertEqual(validate_single_user_resources(), (1115, 2720))
+        self.assertEqual(validate_single_user_resources(), (1480, 3456))
 
     def test_single_user_storage_contract(self) -> None:
         validate_single_user_storage()
@@ -1322,6 +1323,1732 @@ class ActiveRootIsolationTest(unittest.TestCase):
         )
 
         validator.validate_active_root(validator.ROOT)
+
+
+class FluxPhaseAContractTest(unittest.TestCase):
+    CONTROLLERS = {
+        'source-controller': {
+            'tag': 'v1.9.3',
+            'digest': (
+                'sha256:'
+                'c6c82b3182f48b833252c71aefa0741957ca18296612bc6d2b9b5fb276f926e4'
+            ),
+            'resources': {
+                'limits': {'cpu': '400m', 'memory': '512Mi'},
+                'requests': {'cpu': '100m', 'memory': '256Mi'},
+            },
+            'args': (
+                '--events-addr=http://notification-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./',
+                '--watch-all-namespaces=false',
+                '--log-level=info',
+                '--log-encoding=json',
+                '--enable-leader-election',
+                '--storage-path=/data',
+                '--storage-adv-addr=source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local.',
+            ),
+        },
+        'kustomize-controller': {
+            'tag': 'v1.9.4',
+            'digest': (
+                'sha256:'
+                '3e57aecb74419be93d09ba062cfc882bea405193c474009e0da1826de71a4ebd'
+            ),
+            'resources': {
+                'limits': {'cpu': '1000m', 'memory': '1Gi'},
+                'requests': {'cpu': '250m', 'memory': '512Mi'},
+            },
+            'args': (
+                '--events-addr=http://notification-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./',
+                '--watch-all-namespaces=false',
+                '--log-level=info',
+                '--log-encoding=json',
+                '--enable-leader-election',
+                '--default-service-account=default',
+                '--no-cross-namespace-refs=true',
+                '--no-remote-bases=true',
+            ),
+        },
+        'helm-controller': {
+            'tag': 'v1.6.3',
+            'digest': (
+                'sha256:'
+                '22c0a585d0d9b1f792b9d5638144b7810e273d28e310da37740f01226bd044a2'
+            ),
+            'resources': {
+                'limits': {'cpu': '400m', 'memory': '512Mi'},
+                'requests': {'cpu': '100m', 'memory': '256Mi'},
+            },
+            'args': (
+                '--events-addr=http://notification-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./',
+                '--watch-all-namespaces=false',
+                '--log-level=info',
+                '--log-encoding=json',
+                '--enable-leader-election',
+                '--default-service-account=default',
+                '--no-cross-namespace-refs=true',
+            ),
+        },
+        'notification-controller': {
+            'tag': 'v1.9.2',
+            'digest': (
+                'sha256:'
+                'cb17eefffbc442412ba6f63336defd04c0fc387d5082d951998d1ff163a9180d'
+            ),
+            'resources': {
+                'limits': {'cpu': '200m', 'memory': '256Mi'},
+                'requests': {'cpu': '50m', 'memory': '128Mi'},
+            },
+            'args': (
+                '--watch-all-namespaces=false',
+                '--log-level=info',
+                '--log-encoding=json',
+                '--enable-leader-election',
+                '--no-cross-namespace-refs=true',
+            ),
+        },
+    }
+    PSS_LABELS = {
+        'pod-security.kubernetes.io/audit': 'restricted',
+        'pod-security.kubernetes.io/audit-version': 'v1.36',
+        'pod-security.kubernetes.io/enforce': 'restricted',
+        'pod-security.kubernetes.io/enforce-version': 'v1.36',
+        'pod-security.kubernetes.io/warn': 'restricted',
+        'pod-security.kubernetes.io/warn-version': 'v1.36',
+    }
+    SECURITY_CONTEXT = {
+        'allowPrivilegeEscalation': False,
+        'capabilities': {'drop': ['ALL']},
+        'readOnlyRootFilesystem': True,
+        'runAsNonRoot': True,
+        'seccompProfile': {'type': 'RuntimeDefault'},
+    }
+    CRDS = (
+        'alerts.notification.toolkit.fluxcd.io',
+        'buckets.source.toolkit.fluxcd.io',
+        'externalartifacts.source.toolkit.fluxcd.io',
+        'gitrepositories.source.toolkit.fluxcd.io',
+        'helmcharts.source.toolkit.fluxcd.io',
+        'helmreleases.helm.toolkit.fluxcd.io',
+        'helmrepositories.source.toolkit.fluxcd.io',
+        'kustomizations.kustomize.toolkit.fluxcd.io',
+        'ocirepositories.source.toolkit.fluxcd.io',
+        'providers.notification.toolkit.fluxcd.io',
+        'receivers.notification.toolkit.fluxcd.io',
+    )
+    SERVICES = {
+        'notification-controller': {
+            'ports': [
+                {
+                    'name': 'http',
+                    'port': 80,
+                    'protocol': 'TCP',
+                    'targetPort': 'http',
+                }
+            ],
+            'selector': {'app': 'notification-controller'},
+            'type': 'ClusterIP',
+        },
+        'source-controller': {
+            'ports': [
+                {
+                    'name': 'http',
+                    'port': 80,
+                    'protocol': 'TCP',
+                    'targetPort': 'http',
+                }
+            ],
+            'selector': {'app': 'source-controller'},
+            'type': 'ClusterIP',
+        },
+        'webhook-receiver': {
+            'ports': [
+                {
+                    'name': 'http',
+                    'port': 80,
+                    'protocol': 'TCP',
+                    'targetPort': 'http-webhook',
+                }
+            ],
+            'selector': {'app': 'notification-controller'},
+            'type': 'ClusterIP',
+        },
+    }
+    CONTROLLER_SERVICE_ACCOUNTS = tuple(CONTROLLERS)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rendered = subprocess.run(
+            [
+                'kubectl',
+                'kustomize',
+                str(validator.ROOT / 'clusters/dev/flux-system'),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if rendered.returncode != 0:
+            raise AssertionError(rendered.stderr or rendered.stdout)
+        cls.RENDERED_BASELINE = [
+            document
+            for document in yaml.safe_load_all(rendered.stdout)
+            if isinstance(document, dict)
+        ]
+
+    def setUp(self) -> None:
+        self.assertTrue(
+            hasattr(validator, 'validate_flux_phase_a'),
+            'validate_flux_phase_a must enforce the fail-closed Phase A contract',
+        )
+        self.assertTrue(
+            hasattr(validator, 'validate_flux_phase_a_probes'),
+            'validate_flux_phase_a_probes must enforce transient probe safety',
+        )
+
+    def make_deployment(
+        self,
+        name: str,
+        image: str,
+    ) -> dict[str, object]:
+        contract = self.CONTROLLERS[name]
+        return {
+            'apiVersion': 'apps/v1',
+            'kind': 'Deployment',
+            'metadata': {
+                'name': name,
+                'namespace': 'flux-system',
+                'labels': {'app.kubernetes.io/part-of': 'flux'},
+            },
+            'spec': {
+                'strategy': {
+                    'rollingUpdate': {'maxSurge': 1, 'maxUnavailable': 0},
+                    'type': 'RollingUpdate',
+                },
+                'template': {
+                    'spec': {
+                        'serviceAccountName': name,
+                        'containers': [
+                            {
+                                'name': 'manager',
+                                'image': image,
+                                'args': list(contract['args']),
+                                'resources': copy.deepcopy(contract['resources']),
+                                'securityContext': copy.deepcopy(
+                                    self.SECURITY_CONTEXT
+                                ),
+                            }
+                        ],
+                    }
+                },
+            },
+        }
+
+    def controller_subjects(self) -> list[dict[str, str]]:
+        return [
+            {
+                'kind': 'ServiceAccount',
+                'name': name,
+                'namespace': 'flux-system',
+            }
+            for name in self.CONTROLLER_SERVICE_ACCOUNTS
+        ]
+
+    def phase_a_rbac_documents(self) -> list[dict[str, object]]:
+        path = validator.ROOT / 'clusters/dev/flux-system/phase-a-rbac.yaml'
+        return [
+            document
+            for document in yaml.safe_load_all(path.read_text(encoding='utf-8'))
+            if isinstance(document, dict)
+        ]
+
+    def phase_a_network_policy_documents(self) -> list[dict[str, object]]:
+        return [
+            {
+                'apiVersion': 'networking.k8s.io/v1',
+                'kind': 'NetworkPolicy',
+                'metadata': {
+                    'name': 'default-deny',
+                    'namespace': 'flux-system',
+                },
+                'spec': {
+                    'podSelector': {},
+                    'policyTypes': ['Ingress', 'Egress'],
+                },
+            },
+            {
+                'apiVersion': 'networking.k8s.io/v1',
+                'kind': 'NetworkPolicy',
+                'metadata': {
+                    'name': 'allow-dns-egress',
+                    'namespace': 'flux-system',
+                },
+                'spec': {
+                    'podSelector': {
+                        'matchLabels': {'app.kubernetes.io/part-of': 'flux'}
+                    },
+                    'policyTypes': ['Egress'],
+                    'egress': [
+                        {
+                            'to': [
+                                {
+                                    'namespaceSelector': {
+                                        'matchLabels': {
+                                            'kubernetes.io/metadata.name': (
+                                                'kube-system'
+                                            )
+                                        }
+                                    },
+                                    'podSelector': {
+                                        'matchLabels': {'k8s-app': 'kube-dns'}
+                                    },
+                                }
+                            ],
+                            'ports': [
+                                {'port': 53, 'protocol': 'TCP'},
+                                {'port': 53, 'protocol': 'UDP'},
+                            ],
+                        }
+                    ],
+                },
+            },
+            {
+                'apiVersion': 'networking.k8s.io/v1',
+                'kind': 'NetworkPolicy',
+                'metadata': {
+                    'name': 'allow-controller-internal-ingress',
+                    'namespace': 'flux-system',
+                },
+                'spec': {
+                    'podSelector': {
+                        'matchExpressions': [
+                            {
+                                'key': 'app.kubernetes.io/component',
+                                'operator': 'In',
+                                'values': [
+                                    'source-controller',
+                                    'notification-controller',
+                                ],
+                            }
+                        ]
+                    },
+                    'policyTypes': ['Ingress'],
+                    'ingress': [
+                        {
+                            'from': [
+                                {
+                                    'podSelector': {
+                                        'matchLabels': {
+                                            'app.kubernetes.io/part-of': 'flux'
+                                        }
+                                    },
+                                }
+                            ],
+                            'ports': [{'port': 9090, 'protocol': 'TCP'}],
+                        }
+                    ],
+                },
+            },
+            {
+                'apiVersion': 'networking.k8s.io/v1',
+                'kind': 'NetworkPolicy',
+                'metadata': {
+                    'name': 'allow-controller-internal-egress',
+                    'namespace': 'flux-system',
+                },
+                'spec': {
+                    'podSelector': {
+                        'matchLabels': {'app.kubernetes.io/part-of': 'flux'}
+                    },
+                    'policyTypes': ['Egress'],
+                    'egress': [
+                        {
+                            'to': [
+                                {
+                                    'podSelector': {
+                                        'matchExpressions': [
+                                            {
+                                                'key': (
+                                                    'app.kubernetes.io/component'
+                                                ),
+                                                'operator': 'In',
+                                                'values': [
+                                                    'source-controller',
+                                                    'notification-controller',
+                                                ],
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                            'ports': [{'port': 9090, 'protocol': 'TCP'}],
+                        }
+                    ],
+                },
+            },
+            {
+                'apiVersion': 'cilium.io/v2',
+                'kind': 'CiliumNetworkPolicy',
+                'metadata': {
+                    'name': 'allow-kube-apiserver-egress',
+                    'namespace': 'flux-system',
+                },
+                'spec': {
+                    'endpointSelector': {
+                        'matchLabels': {
+                            'k8s:app.kubernetes.io/part-of': 'flux'
+                        }
+                    },
+                    'egress': [{'toEntities': ['kube-apiserver']}],
+                },
+            },
+        ]
+
+    def make_root(self) -> tuple[Path, list[dict[str, object]]]:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        cluster = root / 'clusters/dev'
+        flux = cluster / 'flux-system'
+        flux.mkdir(parents=True)
+
+        (cluster / 'kustomization.yaml').write_text(
+            yaml.safe_dump(
+                {
+                    'apiVersion': 'kustomize.config.k8s.io/v1beta1',
+                    'kind': 'Kustomization',
+                    'resources': ['flux-system'],
+                },
+                sort_keys=False,
+            ),
+            encoding='utf-8',
+        )
+        (flux / 'kustomization.yaml').write_text(
+            yaml.safe_dump(
+                {
+                    'apiVersion': 'kustomize.config.k8s.io/v1beta1',
+                    'kind': 'Kustomization',
+                    'resources': [
+                        'gotk-components.yaml',
+                        'phase-a-rbac.yaml',
+                        'phase-a-network-policy.yaml',
+                    ],
+                    'images': [
+                        {
+                            'name': f'ghcr.io/fluxcd/{name}',
+                            'digest': contract['digest'],
+                        }
+                        for name, contract in self.CONTROLLERS.items()
+                    ],
+                },
+                sort_keys=False,
+            ),
+            encoding='utf-8',
+        )
+        (flux / 'gotk-sync.yaml').write_text(
+            '# STATUS: BLOCKED\n'
+            '# ACTIVE: false\n'
+            '# REASON: Phase A does not create Git sync resources\n'
+            '# ACTIVATION_GATES: read-only deploy key approval and Phase B review\n',
+            encoding='utf-8',
+        )
+
+        namespace = {
+            'apiVersion': 'v1',
+            'kind': 'Namespace',
+            'metadata': {'name': 'flux-system', 'labels': self.PSS_LABELS},
+        }
+        component_documents = [
+            namespace,
+            {
+                'apiVersion': 'v1',
+                'kind': 'ResourceQuota',
+                'metadata': {
+                    'name': 'critical-pods-flux-system',
+                    'namespace': 'flux-system',
+                },
+            },
+            *(
+                {
+                    'apiVersion': 'apiextensions.k8s.io/v1',
+                    'kind': 'CustomResourceDefinition',
+                    'metadata': {'name': name},
+                }
+                for name in self.CRDS
+            ),
+            *(
+                {
+                    'apiVersion': 'v1',
+                    'kind': 'ServiceAccount',
+                    'metadata': {'name': name, 'namespace': 'flux-system'},
+                }
+                for name in self.CONTROLLER_SERVICE_ACCOUNTS
+            ),
+            *(
+                {
+                    'apiVersion': 'v1',
+                    'kind': 'Service',
+                    'metadata': {'name': name, 'namespace': 'flux-system'},
+                    'spec': copy.deepcopy(spec),
+                }
+                for name, spec in self.SERVICES.items()
+            ),
+            *(
+                self.make_deployment(
+                    name,
+                    f'ghcr.io/fluxcd/{name}:{contract["tag"]}',
+                )
+                for name, contract in self.CONTROLLERS.items()
+            ),
+        ]
+        (flux / 'gotk-components.yaml').write_bytes(
+            (
+                validator.ROOT
+                / 'clusters/dev/flux-system/gotk-components.yaml'
+            ).read_bytes()
+        )
+        rbac_documents = self.phase_a_rbac_documents()
+        (flux / 'phase-a-rbac.yaml').write_text(
+            yaml.safe_dump_all(rbac_documents, sort_keys=False),
+            encoding='utf-8',
+        )
+        network_policy_documents = self.phase_a_network_policy_documents()
+        (flux / 'phase-a-network-policy.yaml').write_text(
+            yaml.safe_dump_all(network_policy_documents, sort_keys=False),
+            encoding='utf-8',
+        )
+
+        rendered_documents = copy.deepcopy(self.RENDERED_BASELINE)
+        return root, rendered_documents
+
+    def deployment(
+        self,
+        documents: list[dict[str, object]],
+        name: str,
+    ) -> dict[str, object]:
+        return next(
+            document
+            for document in documents
+            if document.get('kind') == 'Deployment'
+            and document.get('metadata', {}).get('name') == name
+        )
+
+    def resource(
+        self,
+        documents: list[dict[str, object]],
+        kind: str,
+        name: str,
+    ) -> dict[str, object]:
+        return next(
+            document
+            for document in documents
+            if document.get('kind') == kind
+            and document.get('metadata', {}).get('name') == name
+        )
+
+    def validate(
+        self,
+        root: Path,
+        rendered_documents: list[dict[str, object]],
+    ) -> None:
+        render = subprocess.CompletedProcess(
+            args=['kubectl', 'kustomize', str(root / 'clusters/dev/flux-system')],
+            returncode=0,
+            stdout='rendered fixture',
+            stderr='',
+        )
+        original_parse = validator.parse_yaml_documents
+
+        def parse_documents(
+            source: str,
+            label: str,
+        ) -> list[dict[str, object]]:
+            if label == 'Flux Phase A rendered output':
+                return copy.deepcopy(rendered_documents)
+            return original_parse(source, label)
+
+        with (
+            mock.patch.object(validator.subprocess, 'run', return_value=render),
+            mock.patch.object(
+                validator,
+                'parse_yaml_documents',
+                side_effect=parse_documents,
+            ),
+        ):
+            validator.validate_flux_phase_a(root)
+
+    def assert_contract_fails(
+        self,
+        root: Path,
+        rendered_documents: list[dict[str, object]],
+        expected: str,
+    ) -> None:
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.validate(root, rendered_documents)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertRegex(stderr.getvalue(), expected)
+
+    def make_probe_root(self) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        for relative in (
+            'runbook/01-bootstrap.md',
+            'runbook/examples/flux-phase-a-network-probe.yaml',
+            'runbook/examples/flux-phase-a-external-network-probe.yaml',
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(validator.ROOT / relative, target)
+        return root
+
+    def assert_probe_contract_fails(self, root: Path, expected: str) -> None:
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            validator.validate_flux_phase_a_probes(root)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertRegex(stderr.getvalue(), expected)
+
+    def test_valid_four_controller_fixture_is_accepted(self) -> None:
+        root, rendered_documents = self.make_root()
+
+        self.validate(root, rendered_documents)
+
+    def test_valid_transient_probe_contract_is_accepted(self) -> None:
+        validator.validate_flux_phase_a_probes(self.make_probe_root())
+
+    def test_rejects_transient_probe_manifest_drift(self) -> None:
+        mutations = (
+            'fixed-name',
+            'missing-generate-name',
+            'tag-image',
+            'token',
+            'restart',
+            'root-filesystem',
+            'resources',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                root = self.make_probe_root()
+                path = (
+                    root
+                    / 'runbook/examples/flux-phase-a-network-probe.yaml'
+                )
+                document = yaml.safe_load(path.read_text(encoding='utf-8'))
+                if mutation == 'fixed-name':
+                    document['metadata']['name'] = 'flux-phase-a-probe'
+                elif mutation == 'missing-generate-name':
+                    del document['metadata']['generateName']
+                elif mutation == 'tag-image':
+                    document['spec']['containers'][0]['image'] = 'busybox:latest'
+                elif mutation == 'token':
+                    document['spec']['automountServiceAccountToken'] = True
+                elif mutation == 'restart':
+                    document['spec']['restartPolicy'] = 'Always'
+                elif mutation == 'root-filesystem':
+                    document['spec']['containers'][0]['securityContext'][
+                        'readOnlyRootFilesystem'
+                    ] = False
+                else:
+                    del document['spec']['containers'][0]['resources']
+                path.write_text(
+                    yaml.safe_dump(document, sort_keys=False),
+                    encoding='utf-8',
+                )
+                self.assert_probe_contract_fails(
+                    root,
+                    'probe|generateName|namespace|labels|BusyBox|Token|Never|'
+                    'non-root|RootFS|资源',
+                )
+
+    def test_rejects_transient_probe_runbook_drift(self) -> None:
+        mutations = (
+            'apply',
+            'missing-uid-capture',
+            'missing-uid-check',
+            'missing-ignore-not-found',
+            'swallowed-get-error',
+            'missing-public-control',
+            'old-probes-file',
+            'label-delete',
+            'missing-8080-negative',
+            'missing-9292-negative',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                root = self.make_probe_root()
+                path = root / 'runbook/01-bootstrap.md'
+                source = path.read_text(encoding='utf-8')
+                if mutation == 'apply':
+                    source = source.replace(
+                        'create -f runbook/examples/flux-phase-a-network-probe.yaml',
+                        'apply -f runbook/examples/flux-phase-a-network-probe.yaml',
+                        1,
+                    )
+                elif mutation == 'missing-uid-capture':
+                    source = source.replace(
+                        "{.metadata.name}:{.metadata.uid}",
+                        '{.metadata.name}',
+                    )
+                elif mutation == 'missing-uid-check':
+                    source = source.replace(
+                        'if [ "$current_uid" != "$expected_uid" ]',
+                        'if [ "$current_uid" = "$expected_uid" ]',
+                        1,
+                    )
+                elif mutation == 'missing-ignore-not-found':
+                    source = source.replace(
+                        'get pod "$pod_name" --ignore-not-found',
+                        'get pod "$pod_name"',
+                        1,
+                    )
+                elif mutation == 'swallowed-get-error':
+                    source = source.replace(
+                        "-o jsonpath='{.metadata.uid}'); then",
+                        "-o jsonpath='{.metadata.uid}' || true); then",
+                        1,
+                    )
+                elif mutation == 'missing-public-control':
+                    source = source.replace(
+                        'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- '
+                        'nc -z -w 5 1.1.1.1 443',
+                        'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- '
+                        'nc -z -w 5 1.1.1.2 443',
+                        1,
+                    )
+                elif mutation == 'old-probes-file':
+                    section_end = source.find(
+                        '\n判定：', source.find('网络证据使用')
+                    )
+                    source = (
+                        source[:section_end]
+                        + '\nlegacy: runbook/examples/probes.yaml\n'
+                        + source[section_end:]
+                    )
+                elif mutation == 'label-delete':
+                    section_end = source.find(
+                        '\n判定：', source.find('网络证据使用')
+                    )
+                    source = (
+                        source[:section_end]
+                        + '\nkubectl delete pods -l app=network-probe\n'
+                        + source[section_end:]
+                    )
+                elif mutation == 'missing-8080-negative':
+                    source = source.replace(
+                        '"$FLUX_PHASE_A_SOURCE_POD_IP" 8080',
+                        '"$FLUX_PHASE_A_SOURCE_POD_IP" 8081',
+                        1,
+                    )
+                else:
+                    source = source.replace(
+                        '"$FLUX_PHASE_A_NOTIFICATION_POD_IP" 9292',
+                        '"$FLUX_PHASE_A_NOTIFICATION_POD_IP" 9293',
+                        1,
+                    )
+                path.write_text(source, encoding='utf-8')
+                self.assert_probe_contract_fails(
+                    root,
+                    'probe runbook|kubectl create|name:uid|UID|8080|9292|'
+                    '1.1.1.1|正向|probes.yaml|apply|标签',
+                )
+
+    def test_rejects_components_bundle_sha_drift(self) -> None:
+        root, rendered_documents = self.make_root()
+        components = root / 'clusters/dev/flux-system/gotk-components.yaml'
+        components.write_bytes(components.read_bytes() + b'\n# drift\n')
+
+        self.assert_contract_fails(
+            root, rendered_documents, 'gotk-components|SHA-256|sha256|bundle'
+        )
+
+    def test_rejects_missing_or_extra_controller_deployment(self) -> None:
+        for name in self.CONTROLLERS:
+            with self.subTest(missing=name):
+                root, rendered_documents = self.make_root()
+                rendered_documents.remove(
+                    self.deployment(rendered_documents, name)
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'Deployment|controller'
+                )
+
+        for name in (
+            'image-reflector-controller',
+            'image-automation-controller',
+            'source-watcher',
+        ):
+            with self.subTest(extra=name):
+                root, rendered_documents = self.make_root()
+                extra = copy.deepcopy(
+                    self.deployment(rendered_documents, 'source-controller')
+                )
+                extra['metadata']['name'] = name
+                rendered_documents.append(extra)
+                self.assert_contract_fails(
+                    root, rendered_documents, 'Deployment|controller'
+                )
+
+    def test_requires_exact_controller_service_accounts(self) -> None:
+        for name in self.CONTROLLER_SERVICE_ACCOUNTS:
+            with self.subTest(missing=name):
+                root, rendered_documents = self.make_root()
+                rendered_documents.remove(
+                    self.resource(rendered_documents, 'ServiceAccount', name)
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'ServiceAccount|controller|四'
+                )
+
+        root, rendered_documents = self.make_root()
+        rendered_documents.append(
+            {
+                'apiVersion': 'v1',
+                'kind': 'ServiceAccount',
+                'metadata': {
+                    'name': 'image-reflector-controller',
+                    'namespace': 'flux-system',
+                },
+            }
+        )
+        self.assert_contract_fails(
+            root, rendered_documents, 'ServiceAccount|controller|四'
+        )
+
+        root, rendered_documents = self.make_root()
+        rendered_documents.append(
+            copy.deepcopy(
+                self.resource(
+                    rendered_documents,
+                    'ServiceAccount',
+                    'source-controller',
+                )
+            )
+        )
+        self.assert_contract_fails(
+            root, rendered_documents, 'ServiceAccount|controller|四'
+        )
+
+    def test_requires_exact_rendered_identity_inventory(self) -> None:
+        mutations = (
+            'extra-configmap',
+            'missing-service',
+            'renamed-quota',
+            'missing-crd',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                root, rendered_documents = self.make_root()
+                if mutation == 'extra-configmap':
+                    rendered_documents.append(
+                        {
+                            'apiVersion': 'v1',
+                            'kind': 'ConfigMap',
+                            'metadata': {
+                                'name': 'unexpected',
+                                'namespace': 'flux-system',
+                            },
+                        }
+                    )
+                elif mutation == 'missing-service':
+                    rendered_documents.remove(
+                        self.resource(
+                            rendered_documents, 'Service', 'source-controller'
+                        )
+                    )
+                elif mutation == 'renamed-quota':
+                    self.resource(
+                        rendered_documents,
+                        'ResourceQuota',
+                        'critical-pods-flux-system',
+                    )['metadata']['name'] = 'other-quota'
+                else:
+                    rendered_documents.remove(
+                        self.resource(
+                            rendered_documents,
+                            'CustomResourceDefinition',
+                            self.CRDS[0],
+                        )
+                    )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'identity|inventory|39|ConfigMap|Service|ResourceQuota|'
+                    'CustomResourceDefinition',
+                )
+
+    def test_rejects_service_contract_drift(self) -> None:
+        mutations = (
+            ('notification-controller', 'targetPort', 8080),
+            ('source-controller', 'selector', {'app': 'other'}),
+            ('webhook-receiver', 'port', 8080),
+        )
+        for name, field, value in mutations:
+            with self.subTest(service=name, field=field):
+                root, rendered_documents = self.make_root()
+                service = self.resource(rendered_documents, 'Service', name)
+                if field == 'selector':
+                    service['spec']['selector'] = value
+                else:
+                    service['spec']['ports'][0][field] = value
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'Service|selector|port|targetPort|ClusterIP',
+                )
+
+    def test_rejects_rollout_strategy_drift(self) -> None:
+        for name in self.CONTROLLERS:
+            with self.subTest(controller=name):
+                root, rendered_documents = self.make_root()
+                deployment = self.deployment(rendered_documents, name)
+                deployment['spec']['strategy']['rollingUpdate'][
+                    'maxUnavailable'
+                ] = 1
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'RollingUpdate|maxSurge|maxUnavailable|strategy',
+                )
+
+        root, rendered_documents = self.make_root()
+        self.deployment(rendered_documents, 'source-controller')['spec'][
+            'strategy'
+        ] = {'type': 'Recreate'}
+        self.assert_contract_fails(
+            root,
+            rendered_documents,
+            'RollingUpdate|maxSurge|maxUnavailable|strategy',
+        )
+
+    def test_rendered_bundle_digest_rejects_unlisted_field_drift(self) -> None:
+        mutations = (
+            'replicas',
+            'runtime-namespace',
+            'automount-token',
+            'image-pull-policy',
+            'source-data-mount',
+            'selector-template-mismatch',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                root, rendered_documents = self.make_root()
+                deployment = self.deployment(
+                    rendered_documents, 'source-controller'
+                )
+                pod_spec = deployment['spec']['template']['spec']
+                manager = pod_spec['containers'][0]
+                if mutation == 'replicas':
+                    deployment['spec']['replicas'] = 0
+                elif mutation == 'runtime-namespace':
+                    runtime_namespace = next(
+                        item
+                        for item in manager['env']
+                        if item.get('name') == 'RUNTIME_NAMESPACE'
+                    )
+                    runtime_namespace['valueFrom']['fieldRef'][
+                        'fieldPath'
+                    ] = 'metadata.name'
+                elif mutation == 'automount-token':
+                    pod_spec['automountServiceAccountToken'] = False
+                elif mutation == 'image-pull-policy':
+                    manager['imagePullPolicy'] = 'Never'
+                elif mutation == 'source-data-mount':
+                    manager['volumeMounts'] = [
+                        mount
+                        for mount in manager['volumeMounts']
+                        if mount.get('mountPath') != '/data'
+                    ]
+                else:
+                    deployment['spec']['selector']['matchLabels']['app'] = (
+                        'other-controller'
+                    )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'rendered bundle|canonical|SHA-256|digest',
+                )
+
+    def test_rejects_tag_only_or_wrong_rendered_image(self) -> None:
+        for name, contract in self.CONTROLLERS.items():
+            with self.subTest(controller=name, mutation='tag-only'):
+                root, rendered_documents = self.make_root()
+                container = self.deployment(
+                    rendered_documents, name
+                )['spec']['template']['spec']['containers'][0]
+                container['image'] = f'ghcr.io/fluxcd/{name}:{contract["tag"]}'
+                self.assert_contract_fails(
+                    root, rendered_documents, 'digest|image'
+                )
+
+            with self.subTest(controller=name, mutation='wrong-digest'):
+                root, rendered_documents = self.make_root()
+                container = self.deployment(
+                    rendered_documents, name
+                )['spec']['template']['spec']['containers'][0]
+                container['image'] = f'ghcr.io/fluxcd/{name}@sha256:{"0" * 64}'
+                self.assert_contract_fails(
+                    root, rendered_documents, 'digest|image'
+                )
+
+    def test_rejects_yaml_document_in_inactive_sync_file(self) -> None:
+        root, rendered_documents = self.make_root()
+        sync = {
+            'apiVersion': 'source.toolkit.fluxcd.io/v1',
+            'kind': 'GitRepository',
+            'metadata': {'name': 'flux-system', 'namespace': 'flux-system'},
+        }
+        (root / 'clusters/dev/flux-system/gotk-sync.yaml').write_text(
+            yaml.safe_dump(sync, sort_keys=False), encoding='utf-8'
+        )
+
+        self.assert_contract_fails(
+            root, rendered_documents, 'gotk-sync|YAML|document|sync'
+        )
+
+    def test_rejects_active_sync_reference(self) -> None:
+        root, rendered_documents = self.make_root()
+        flux = root / 'clusters/dev/flux-system'
+        kustomization = yaml.safe_load(
+            (flux / 'kustomization.yaml').read_text(encoding='utf-8')
+        )
+        kustomization['resources'].append('gotk-sync.yaml')
+        (flux / 'kustomization.yaml').write_text(
+            yaml.safe_dump(kustomization, sort_keys=False), encoding='utf-8'
+        )
+
+        self.assert_contract_fails(
+            root, rendered_documents, 'gotk-components|gotk-sync|resources|sync'
+        )
+
+    def test_requires_exact_phase_a_managed_resources(self) -> None:
+        required = (
+            'gotk-components.yaml',
+            'phase-a-rbac.yaml',
+            'phase-a-network-policy.yaml',
+        )
+        for missing in required:
+            with self.subTest(missing=missing):
+                root, rendered_documents = self.make_root()
+                path = root / 'clusters/dev/flux-system/kustomization.yaml'
+                kustomization = yaml.safe_load(path.read_text(encoding='utf-8'))
+                kustomization['resources'].remove(missing)
+                path.write_text(
+                    yaml.safe_dump(kustomization, sort_keys=False),
+                    encoding='utf-8',
+                )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'gotk-components|phase-a-rbac|phase-a-network-policy|resources',
+                )
+
+    def test_rejects_any_flux_custom_resource_instance(self) -> None:
+        resources = (
+            ('source.toolkit.fluxcd.io/v1', 'GitRepository'),
+            ('source.toolkit.fluxcd.io/v1', 'HelmRepository'),
+            ('source.toolkit.fluxcd.io/v1beta2', 'OCIRepository'),
+            ('source.toolkit.fluxcd.io/v1', 'Bucket'),
+            ('kustomize.toolkit.fluxcd.io/v1', 'Kustomization'),
+            ('helm.toolkit.fluxcd.io/v2', 'HelmRelease'),
+            ('notification.toolkit.fluxcd.io/v1beta3', 'Alert'),
+            ('notification.toolkit.fluxcd.io/v1beta3', 'Provider'),
+            ('notification.toolkit.fluxcd.io/v1', 'Receiver'),
+            ('image.toolkit.fluxcd.io/v1beta2', 'ImageRepository'),
+            ('source.extensions.fluxcd.io/v1beta1', 'ArtifactGenerator'),
+        )
+        for api_version, kind in resources:
+            with self.subTest(kind=kind):
+                root, rendered_documents = self.make_root()
+                sync = {
+                    'apiVersion': api_version,
+                    'kind': kind,
+                    'metadata': {'name': 'flux-system', 'namespace': 'flux-system'},
+                }
+                rendered_documents.append(sync)
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'Flux CR|custom resource|sync|Phase A',
+                )
+
+    def test_rejects_downstream_root_reference(self) -> None:
+        root, rendered_documents = self.make_root()
+        path = root / 'clusters/dev/kustomization.yaml'
+        kustomization = yaml.safe_load(path.read_text(encoding='utf-8'))
+        kustomization['resources'].append('infrastructure.yaml')
+        path.write_text(
+            yaml.safe_dump(kustomization, sort_keys=False), encoding='utf-8'
+        )
+
+        self.assert_contract_fails(root, rendered_documents, 'resources|活动根')
+
+    def test_rejects_downstream_namespace(self) -> None:
+        for name in (
+            'platform',
+            'minio',
+            'cert-manager',
+            'monitoring',
+            'cnpg-system',
+            'openbao',
+        ):
+            with self.subTest(namespace=name):
+                root, rendered_documents = self.make_root()
+                rendered_documents.append(
+                    {
+                        'apiVersion': 'v1',
+                        'kind': 'Namespace',
+                        'metadata': {'name': name},
+                    }
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'Namespace|namespace|下游'
+                )
+
+    def test_rejects_pss_label_drift(self) -> None:
+        for label in self.PSS_LABELS:
+            with self.subTest(label=label):
+                root, rendered_documents = self.make_root()
+                namespace = next(
+                    document
+                    for document in rendered_documents
+                    if document.get('kind') == 'Namespace'
+                )
+                namespace['metadata']['labels'][label] = (
+                    'latest' if label.endswith('-version') else 'baseline'
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'Pod Security|PSS|restricted|v1.36'
+                )
+
+    def test_rejects_container_security_context_drift(self) -> None:
+        mutations = {
+            'allow-privilege-escalation': ('allowPrivilegeEscalation', True),
+            'capabilities': ('capabilities', {'drop': []}),
+            'privileged': ('privileged', True),
+            'read-only-root': ('readOnlyRootFilesystem', False),
+            'run-as-non-root': ('runAsNonRoot', False),
+            'seccomp': ('seccompProfile', {'type': 'Unconfined'}),
+        }
+        for name, (key, value) in mutations.items():
+            with self.subTest(mutation=name):
+                root, rendered_documents = self.make_root()
+                container = self.deployment(
+                    rendered_documents, 'source-controller'
+                )['spec']['template']['spec']['containers'][0]
+                container['securityContext'][key] = value
+                self.assert_contract_fails(
+                    root, rendered_documents, 'securityContext|安全上下文'
+                )
+
+    def test_rejects_workload_identity_or_container_inventory_drift(
+        self,
+    ) -> None:
+        for name in self.CONTROLLERS:
+            with self.subTest(controller=name, mutation='service-account'):
+                root, rendered_documents = self.make_root()
+                pod_spec = self.deployment(rendered_documents, name)['spec'][
+                    'template'
+                ]['spec']
+                pod_spec['serviceAccountName'] = 'default'
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'serviceAccountName|ServiceAccount|controller',
+                )
+
+            with self.subTest(controller=name, mutation='sidecar'):
+                root, rendered_documents = self.make_root()
+                containers = self.deployment(rendered_documents, name)['spec'][
+                    'template'
+                ]['spec']['containers']
+                containers.append({'name': 'sidecar', 'image': 'example.invalid/x'})
+                self.assert_contract_fails(
+                    root, rendered_documents, 'container|单容器|manager'
+                )
+
+            with self.subTest(controller=name, mutation='command'):
+                root, rendered_documents = self.make_root()
+                container = self.deployment(rendered_documents, name)['spec'][
+                    'template'
+                ]['spec']['containers'][0]
+                container['command'] = ['/bin/false']
+                self.assert_contract_fails(
+                    root, rendered_documents, 'command|manager|container'
+                )
+
+            for field in ('hostNetwork', 'hostPID', 'hostIPC'):
+                with self.subTest(controller=name, mutation=field):
+                    root, rendered_documents = self.make_root()
+                    pod_spec = self.deployment(rendered_documents, name)[
+                        'spec'
+                    ]['template']['spec']
+                    pod_spec[field] = True
+                    self.assert_contract_fails(
+                        root,
+                        rendered_documents,
+                        'hostNetwork|hostPID|hostIPC|Pod|pod',
+                    )
+
+    def test_rejects_missing_multitenancy_argument(self) -> None:
+        multitenancy_flags = {
+            '--default-service-account',
+            '--no-cross-namespace-refs',
+            '--no-remote-bases',
+            '--watch-all-namespaces',
+        }
+        for controller, contract in self.CONTROLLERS.items():
+            arguments = (
+                argument
+                for argument in contract['args']
+                if argument.split('=', 1)[0] in multitenancy_flags
+            )
+            for argument in arguments:
+                with self.subTest(controller=controller, argument=argument):
+                    root, rendered_documents = self.make_root()
+                    container = self.deployment(
+                        rendered_documents, controller
+                    )['spec']['template']['spec']['containers'][0]
+                    container['args'].remove(argument)
+                    self.assert_contract_fails(
+                        root, rendered_documents, 'arg|参数|多租户'
+                    )
+
+    def test_rejects_watch_all_namespaces_true(self) -> None:
+        for controller in self.CONTROLLERS:
+            with self.subTest(controller=controller):
+                root, rendered_documents = self.make_root()
+                container = self.deployment(
+                    rendered_documents, controller
+                )['spec']['template']['spec']['containers'][0]
+                container['args'].remove('--watch-all-namespaces=false')
+                container['args'].append('--watch-all-namespaces=true')
+                self.assert_contract_fails(
+                    root, rendered_documents, 'watch-all-namespaces|arg|参数'
+                )
+
+    def test_rejects_duplicate_conflicting_or_unapproved_feature_flags(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                'kustomize-controller',
+                '--no-cross-namespace-refs=false',
+            ),
+            ('source-controller', '--watch-all-namespaces=true'),
+            ('source-controller', '--default-service-account=evil'),
+            (
+                'source-controller',
+                '--feature-gates=ObjectLevelWorkloadIdentity=true',
+            ),
+            ('source-controller', '--unknown-controller-flag=true'),
+            ('source-controller', '--feature-gates=UnknownFeature=true'),
+        )
+        for controller, argument in mutations:
+            with self.subTest(controller=controller, argument=argument):
+                root, rendered_documents = self.make_root()
+                container = self.deployment(
+                    rendered_documents, controller
+                )['spec']['template']['spec']['containers'][0]
+                container['args'].append(argument)
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'arg|flag|ObjectLevelWorkloadIdentity|feature gate|'
+                    'default-service-account',
+                )
+
+    def test_rejects_workload_identity_defaults_without_feature_gate(self) -> None:
+        forbidden = {
+            'source-controller': ('--default-service-account=default',),
+            'kustomize-controller': (
+                '--default-decryption-service-account=default',
+                '--default-kubeconfig-service-account=default',
+            ),
+            'helm-controller': (
+                '--default-kubeconfig-service-account=default',
+            ),
+            'notification-controller': ('--default-service-account=default',),
+        }
+        for controller, arguments in forbidden.items():
+            for argument in arguments:
+                with self.subTest(controller=controller, argument=argument):
+                    root, rendered_documents = self.make_root()
+                    container = self.deployment(
+                        rendered_documents, controller
+                    )['spec']['template']['spec']['containers'][0]
+                    container['args'].append(argument)
+                    self.assert_contract_fails(
+                        root,
+                        rendered_documents,
+                        'ObjectLevelWorkloadIdentity|feature gate|default-.*'
+                        'service-account',
+                    )
+
+    def test_rejects_resource_contract_drift(self) -> None:
+        for controller in self.CONTROLLERS:
+            for boundary, resource in (
+                ('requests', 'cpu'),
+                ('requests', 'memory'),
+                ('limits', 'cpu'),
+                ('limits', 'memory'),
+            ):
+                with self.subTest(
+                    controller=controller, boundary=boundary, resource=resource
+                ):
+                    root, rendered_documents = self.make_root()
+                    container = self.deployment(
+                        rendered_documents, controller
+                    )['spec']['template']['spec']['containers'][0]
+                    container['resources'][boundary][resource] = '1m'
+                    self.assert_contract_fails(
+                        root, rendered_documents, 'resources|资源'
+                    )
+
+    def test_rejects_cluster_admin_role_binding(self) -> None:
+        root, rendered_documents = self.make_root()
+        binding = self.resource(
+            rendered_documents,
+            'ClusterRoleBinding',
+            'flux-controller-api-health',
+        )
+        binding['roleRef']['name'] = 'cluster-admin'
+
+        self.assert_contract_fails(
+            root, rendered_documents, 'cluster-admin|roleRef|RBAC'
+        )
+
+    def test_controller_bindings_require_exact_controller_subjects(
+        self,
+    ) -> None:
+        for name in self.CONTROLLER_SERVICE_ACCOUNTS:
+            with self.subTest(binding=name, mutation='wrong-subject'):
+                root, rendered_documents = self.make_root()
+                binding = self.resource(rendered_documents, 'RoleBinding', name)
+                binding['subjects'][0]['name'] = 'source-watcher'
+                self.assert_contract_fails(
+                    root, rendered_documents, 'subject|ServiceAccount|controller'
+                )
+
+            with self.subTest(binding=name, mutation='extra-subject'):
+                root, rendered_documents = self.make_root()
+                binding = self.resource(rendered_documents, 'RoleBinding', name)
+                binding['subjects'].append(
+                    {
+                        'kind': 'ServiceAccount',
+                        'name': 'image-automation-controller',
+                        'namespace': 'flux-system',
+                    }
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'subject|ServiceAccount|controller'
+                )
+
+            with self.subTest(binding='api-health', missing=name):
+                root, rendered_documents = self.make_root()
+                binding = self.resource(
+                    rendered_documents,
+                    'ClusterRoleBinding',
+                    'flux-controller-api-health',
+                )
+                binding['subjects'] = [
+                    subject
+                    for subject in binding['subjects']
+                    if subject['name'] != name
+                ]
+                self.assert_contract_fails(
+                    root, rendered_documents, 'subject|ServiceAccount|controller'
+                )
+
+    def test_rejects_generated_cluster_wide_rbac(self) -> None:
+        resources = (
+            (
+                'ClusterRole',
+                'crd-controller-flux-system',
+                {
+                    'rules': [
+                        {
+                            'apiGroups': ['*'],
+                            'resources': ['*'],
+                            'verbs': ['*'],
+                        }
+                    ]
+                },
+            ),
+            (
+                'ClusterRoleBinding',
+                'cluster-reconciler',
+                {
+                    'roleRef': {
+                        'apiGroup': 'rbac.authorization.k8s.io',
+                        'kind': 'ClusterRole',
+                        'name': 'crd-controller-flux-system',
+                    },
+                    'subjects': self.controller_subjects(),
+                },
+            ),
+        )
+        for kind, name, body in resources:
+            with self.subTest(kind=kind):
+                root, rendered_documents = self.make_root()
+                rendered_documents.append(
+                    {
+                        'apiVersion': 'rbac.authorization.k8s.io/v1',
+                        'kind': kind,
+                        'metadata': {'name': name},
+                        **body,
+                    }
+                )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'crd-controller|cluster-reconciler|cluster-wide|RBAC',
+                )
+
+    def test_rejects_flux_edit_or_view_aggregate_cluster_role(self) -> None:
+        for name in ('flux-edit-flux-system', 'flux-view-flux-system'):
+            with self.subTest(cluster_role=name):
+                root, rendered_documents = self.make_root()
+                rendered_documents.append(
+                    {
+                        'apiVersion': 'rbac.authorization.k8s.io/v1',
+                        'kind': 'ClusterRole',
+                        'metadata': {
+                            'name': name,
+                            'labels': {
+                                'rbac.authorization.k8s.io/aggregate-to-admin': (
+                                    'true'
+                                )
+                            },
+                        },
+                        'rules': [],
+                    }
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'flux-edit|flux-view|aggregate|聚合'
+                )
+
+    def test_rejects_image_automation_or_source_watcher_rbac_group(self) -> None:
+        for api_group in (
+            'image.toolkit.fluxcd.io',
+            'source.extensions.fluxcd.io',
+        ):
+            with self.subTest(api_group=api_group):
+                root, rendered_documents = self.make_root()
+                role = self.resource(
+                    rendered_documents,
+                    'Role',
+                    'source-controller',
+                )
+                role['rules'].append(
+                    {
+                        'apiGroups': [api_group],
+                        'resources': ['*'],
+                        'verbs': ['get'],
+                    }
+                )
+                self.assert_contract_fails(
+                    root, rendered_documents, 'apiGroup|image.toolkit|source.extensions'
+                )
+
+    def test_rejects_service_account_token_creation(self) -> None:
+        root, rendered_documents = self.make_root()
+        role = self.resource(
+            rendered_documents, 'Role', 'source-controller'
+        )
+        role['rules'].append(
+            {
+                'apiGroups': [''],
+                'resources': ['serviceaccounts/token'],
+                'verbs': ['create'],
+            }
+        )
+
+        self.assert_contract_fails(
+            root, rendered_documents, 'serviceaccounts/token|Workload Identity|token'
+        )
+
+    def test_rejects_controller_role_rule_expansion(self) -> None:
+        mutations = (
+            ('source-controller', 'cross-controller-api-group'),
+            ('kustomize-controller', 'configmap-write'),
+            ('helm-controller', 'cross-controller-write'),
+            ('notification-controller', 'lease-broadening'),
+        )
+        for controller, mutation in mutations:
+            with self.subTest(controller=controller, mutation=mutation):
+                root, rendered_documents = self.make_root()
+                role = self.resource(rendered_documents, 'Role', controller)
+                if mutation == 'cross-controller-api-group':
+                    role['rules'].append(
+                        {
+                            'apiGroups': ['kustomize.toolkit.fluxcd.io'],
+                            'resources': ['kustomizations'],
+                            'verbs': ['create'],
+                        }
+                    )
+                elif mutation == 'configmap-write':
+                    core = next(
+                        rule
+                        for rule in role['rules']
+                        if 'configmaps' in rule.get('resources', [])
+                    )
+                    core['verbs'].append('update')
+                elif mutation == 'cross-controller-write':
+                    source_read = next(
+                        rule
+                        for rule in role['rules']
+                        if rule.get('apiGroups')
+                        == ['source.toolkit.fluxcd.io']
+                        and 'helmcharts' in rule.get('resources', [])
+                        and 'list' in rule.get('verbs', [])
+                    )
+                    source_read['verbs'].append('patch')
+                else:
+                    lease = next(
+                        rule
+                        for rule in role['rules']
+                        if rule.get('resources') == ['leases']
+                    )
+                    lease['verbs'].extend(['list', 'watch', 'patch', 'delete'])
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'Role|RBAC|namespaced|Lease|跨 Controller|权限',
+                )
+
+    def test_rejects_api_health_cluster_role_expansion(self) -> None:
+        mutations = (
+            ('non-resource-url', 'nonResourceURLs', ['*']),
+            ('non-resource-verb', 'verbs', ['get']),
+        )
+        for name, key, value in mutations:
+            with self.subTest(mutation=name):
+                root, rendered_documents = self.make_root()
+                role = self.resource(
+                    rendered_documents,
+                    'ClusterRole',
+                    'flux-controller-api-health',
+                )
+                role['rules'][0][key] = value
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'livez|ping|head|ClusterRole|health',
+                )
+
+        root, rendered_documents = self.make_root()
+        role = self.resource(
+            rendered_documents,
+            'ClusterRole',
+            'flux-controller-api-health',
+        )
+        role['rules'].append(
+            {
+                'apiGroups': [''],
+                'resources': ['namespaces'],
+                'verbs': ['get', 'list', 'watch'],
+            }
+        )
+        self.assert_contract_fails(
+            root, rendered_documents, 'livez|ping|head|ClusterRole|health'
+        )
+
+    def test_requires_default_deny_dns_and_apiserver_egress(self) -> None:
+        for policy_type in ('Ingress', 'Egress'):
+            with self.subTest(default_deny=policy_type):
+                root, rendered_documents = self.make_root()
+                default_deny = self.resource(
+                    rendered_documents, 'NetworkPolicy', 'default-deny'
+                )
+                default_deny['spec']['policyTypes'].remove(policy_type)
+                self.assert_contract_fails(
+                    root, rendered_documents, 'default.deny|NetworkPolicy|网络策略'
+                )
+
+        for kind, name in (
+            ('NetworkPolicy', 'allow-dns-egress'),
+            ('NetworkPolicy', 'allow-controller-internal-ingress'),
+            ('NetworkPolicy', 'allow-controller-internal-egress'),
+            ('CiliumNetworkPolicy', 'allow-kube-apiserver-egress'),
+        ):
+            with self.subTest(missing=name):
+                root, rendered_documents = self.make_root()
+                rendered_documents.remove(
+                    self.resource(rendered_documents, kind, name)
+                )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'DNS|controller|kube-apiserver|Cilium|egress|NetworkPolicy',
+                )
+
+    def test_rejects_controller_internal_network_expansion(self) -> None:
+        for mutation in (
+            'ingress-selected-pods',
+            'ingress-namespace',
+            'ingress-peer',
+            'metrics-port',
+            'egress-selected-pods',
+            'egress-destination',
+            'webhook-port',
+        ):
+            with self.subTest(mutation=mutation):
+                root, rendered_documents = self.make_root()
+                ingress_policy = self.resource(
+                    rendered_documents,
+                    'NetworkPolicy',
+                    'allow-controller-internal-ingress',
+                )
+                egress_policy = self.resource(
+                    rendered_documents,
+                    'NetworkPolicy',
+                    'allow-controller-internal-egress',
+                )
+                if mutation == 'ingress-selected-pods':
+                    ingress_policy['spec']['podSelector'] = {
+                        'matchLabels': {'app.kubernetes.io/part-of': 'flux'}
+                    }
+                elif mutation == 'ingress-namespace':
+                    ingress_policy['spec']['ingress'][0]['from'][0][
+                        'namespaceSelector'
+                    ] = {}
+                elif mutation == 'ingress-peer':
+                    ingress_policy['spec']['ingress'][0]['from'][0][
+                        'podSelector'
+                    ] = {}
+                elif mutation == 'metrics-port':
+                    ingress_policy['spec']['ingress'][0]['ports'].append(
+                        {'port': 8080, 'protocol': 'TCP'}
+                    )
+                elif mutation == 'egress-selected-pods':
+                    egress_policy['spec']['podSelector'] = {}
+                elif mutation == 'egress-destination':
+                    egress_policy['spec']['egress'][0]['to'][0][
+                        'podSelector'
+                    ] = {
+                        'matchLabels': {'app.kubernetes.io/part-of': 'flux'}
+                    }
+                else:
+                    egress_policy['spec']['egress'][0]['ports'].append(
+                        {'port': 9292, 'protocol': 'TCP'}
+                    )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'allow-controller-internal|9090|selector|NetworkPolicy',
+                )
+
+    def test_rejects_phase_a_egress_selector_broadening(self) -> None:
+        mutations = (
+            ('NetworkPolicy', 'allow-dns-egress', 'podSelector'),
+            (
+                'CiliumNetworkPolicy',
+                'allow-kube-apiserver-egress',
+                'endpointSelector',
+            ),
+        )
+        for kind, name, selector in mutations:
+            with self.subTest(policy=name):
+                root, rendered_documents = self.make_root()
+                policy = self.resource(rendered_documents, kind, name)
+                policy['spec'][selector] = {}
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'podSelector|endpointSelector|NetworkPolicy|Cilium',
+                )
+
+    def test_rejects_network_policy_scope_or_clusterwide_expansion(self) -> None:
+        root, rendered_documents = self.make_root()
+        dns = self.resource(
+            rendered_documents, 'NetworkPolicy', 'allow-dns-egress'
+        )
+        duplicate = copy.deepcopy(dns)
+        duplicate['metadata']['namespace'] = 'default'
+        rendered_documents.append(duplicate)
+        self.assert_contract_fails(
+            root,
+            rendered_documents,
+            'namespace|flux-system|NetworkPolicy|inventory',
+        )
+
+        root, rendered_documents = self.make_root()
+        rendered_documents.append(
+            {
+                'apiVersion': 'cilium.io/v2',
+                'kind': 'CiliumClusterwideNetworkPolicy',
+                'metadata': {'name': 'allow-kube-apiserver-egress'},
+                'spec': {
+                    'endpointSelector': {},
+                    'egress': [{'toEntities': ['kube-apiserver']}],
+                },
+            }
+        )
+        self.assert_contract_fails(
+            root,
+            rendered_documents,
+            'CiliumClusterwideNetworkPolicy|clusterwide|NetworkPolicy|inventory',
+        )
+
+    def test_rejects_broad_egress_or_metrics_webhook_ingress(self) -> None:
+        unsafe_policies = (
+            (
+                'allow-egress',
+                {
+                    'podSelector': {},
+                    'policyTypes': ['Egress'],
+                    'egress': [{}],
+                },
+            ),
+            (
+                'empty-namespace-selector',
+                {
+                    'podSelector': {},
+                    'policyTypes': ['Egress'],
+                    'egress': [{'to': [{'namespaceSelector': {}}]}],
+                },
+            ),
+            (
+                'allow-scraping',
+                {
+                    'podSelector': {},
+                    'policyTypes': ['Ingress'],
+                    'ingress': [{'ports': [{'port': 8080, 'protocol': 'TCP'}]}],
+                },
+            ),
+            (
+                'allow-webhooks',
+                {
+                    'podSelector': {},
+                    'policyTypes': ['Ingress'],
+                    'ingress': [{'ports': [{'port': 9443, 'protocol': 'TCP'}]}],
+                },
+            ),
+        )
+        for name, spec in unsafe_policies:
+            with self.subTest(network_policy=name):
+                root, rendered_documents = self.make_root()
+                rendered_documents.append(
+                    {
+                        'apiVersion': 'networking.k8s.io/v1',
+                        'kind': 'NetworkPolicy',
+                        'metadata': {'name': name, 'namespace': 'flux-system'},
+                        'spec': spec,
+                    }
+                )
+                self.assert_contract_fails(
+                    root,
+                    rendered_documents,
+                    'allow-egress|namespaceSelector|metrics|scraping|webhook|'
+                    'NetworkPolicy',
+                )
 
 
 class BootstrapContractTest(unittest.TestCase):

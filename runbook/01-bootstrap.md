@@ -101,7 +101,21 @@ scripts/bootstrap/run-approved.sh --apply
 停在旧提交上，此时**不带 SHA 会静默部署旧版本**（入口只校验它在 `origin/main` 历史上，
 不校验它是不是最新）。
 
-截至事实采样，`origin/main` 为 `1c5034b9a9c29ab72fde63644c57fa88604c45b6`，`origin/validated` 为 `696e9849e4f22501394324a4001e3c0b7091fe66`。当前 main 尚无可推动 `validated` 的成功验证结果，因此不得执行服务器部署。显式 SHA 入口只解决引用落后或回滚时的精确选版，不能绕过“目标 SHA 已通过 validation-gate”的人工授权前置。
+截至事实采样，私有仓 `origin/main` 为
+`72f360f0aa64b77747b3689a2f5372a10dd651f3`，私有仓 `origin/validated` 仍为
+`696e9849e4f22501394324a4001e3c0b7091fe66`。对应的脱敏公有镜像
+`engineering-platform-gitops-temp` 的 `main` 与 `validated` 均为
+`668035b25232216b094670e7dda956c14743b0b2`，CI run `32691520126` 的全部分片、
+`validation-gate` 与 `publish-validated` 已成功。该公有提交只替换主机身份等敏感事实，
+其 Release/PCS/验证逻辑已逐文件映射到私有提交 `72f360f`；它只承载验证，不是服务器
+Desired State 来源。
+
+私有 `validated` 落后期间，部署新私有提交的门禁固定为：从该私有提交单向生成脱敏
+公有镜像、审计仅含允许的消毒差异、公有 `validation-gate` 全绿且公有 `validated`
+精确指向镜像提交、记录私有 SHA ↔ 公有 SHA ↔ CI run 映射，最后由运维明确批准
+`run-approved.sh <private-sha> --check|--apply` 的显式 SHA 路径。公有仓不得反向成为
+服务器 remote，也不得以提交信息相似代替逐文件映射。显式 SHA 只解决私有引用落后或
+回滚时的精确选版，不能绕过上述验证与人工授权。
 
 历史上手工粘贴的等价门禁脚本已由该入口取代：粘贴长脚本曾多次因终端丢字符导致
 `APPROVED_SHA` 截断或行断裂，也曾遗漏 `merge --ff-only`（`exit 97`）。
@@ -424,18 +438,325 @@ serverTLSBootstrap: true
 待运维回填。
 ```
 
-## Flux bootstrap
+## Flux Phase A bootstrap
 
-命令与输出：
+状态：`NOT_EXECUTED`。本节只安装四个 Controller 基础层，不创建 Git deploy key、
+Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不激活任何
+下游 Desired State。Git deploy key 与仓库 sync 属于后续 Phase B/C。
 
-```text
-待运维回填。
+### 进入条件
+
+1. 私有候选提交已生成脱敏公有镜像，允许差异已逐文件审计。
+2. 公有仓 `engineering-platform-gitops-temp` 的 `validation-gate` 全绿，且公有
+   `validated` 精确指向候选镜像提交。
+3. 已记录私有候选 SHA、公有镜像 SHA、CI run URL 三者映射并获得本次 mutation 的
+   明确批准。
+4. 服务器执行 `run-approved.sh <private-sha> --check` 全绿；私有 `validated` 落后时
+   禁止使用无 SHA 入口。
+5. 运行前再次证明 DEV 不存在 `flux-system`、Flux CRD、sync CR 或下游 Namespace。
+
+### 固定供应链与预检
+
+在服务器私有仓 checkout 的已批准提交执行。`<private-sha>` 必须替换为记录映射中的
+完整 40 位 SHA，不能使用短 SHA 或公有镜像 SHA。
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops
+APPROVED_FLUX_PHASE_A_SHA='REPLACE_WITH_40_HEX_PRIVATE_SHA'
+./scripts/bootstrap/run-approved.sh "$APPROVED_FLUX_PHASE_A_SHA" --check
+
+install -d -m 0700 /root/flux-phase-a-v2.9.3
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --output /root/flux-phase-a-v2.9.3/flux_2.9.3_linux_amd64.tar.gz \
+  https://github.com/fluxcd/flux2/releases/download/v2.9.3/flux_2.9.3_linux_amd64.tar.gz
+cd /root/flux-phase-a-v2.9.3
+printf '%s  %s\n' \
+  eae4e8608c0ade2bf4e8dec1669dbb6b0c28b5822b252d97feccfb4fb1181fd2 \
+  flux_2.9.3_linux_amd64.tar.gz | sha256sum --check --strict
+tar -xzf flux_2.9.3_linux_amd64.tar.gz flux
+./flux version --client
+./flux check --pre --kubeconfig=/etc/kubernetes/admin.conf
 ```
+
+期望：archive SHA-256 为 `OK`，CLI 为 `v2.9.3`，pre-install check 通过。任何下载、
+TLS、摘要或兼容性失败都必须停止，不允许改用浮动 URL、tag 或未登记镜像。
+
+### 渲染与 dry-run
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops
+kubectl --kubeconfig=/etc/kubernetes/admin.conf kustomize \
+  clusters/dev/flux-system > /root/flux-phase-a-v2.9.3/rendered.yaml
+kubectl --kubeconfig=/etc/kubernetes/admin.conf apply --dry-run=client \
+  -k clusters/dev/flux-system
+kubectl --kubeconfig=/etc/kubernetes/admin.conf apply --server-side \
+  --dry-run=server \
+  --field-manager=engineering-platform-flux-phase-a \
+  -k clusters/dev/flux-system
+kubectl --kubeconfig=/etc/kubernetes/admin.conf diff --server-side \
+  --field-manager=engineering-platform-flux-phase-a \
+  -k clusters/dev/flux-system
+```
+
+`kubectl diff` 在存在预期新增对象时返回 `1`，这本身不是错误；必须人工审阅差异只含
+`flux-system`、四个 Controller、对应 CRD/Service/RBAC 与 Phase A 网络策略。若出现
+Git sync CR、`cluster-admin` binding、第五个 Controller、Secret 或下游 Namespace，
+立即停止。
+
+### Apply 与 rollout
+
+仅在 dry-run 回执审核后执行一次：
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops
+kubectl --kubeconfig=/etc/kubernetes/admin.conf apply --server-side \
+  --field-manager=engineering-platform-flux-phase-a \
+  -k clusters/dev/flux-system
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  rollout status deployment/source-controller --timeout=5m
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  rollout status deployment/kustomize-controller --timeout=5m
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  rollout status deployment/helm-controller --timeout=5m
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  rollout status deployment/notification-controller --timeout=5m
+/root/flux-phase-a-v2.9.3/flux check \
+  --kubeconfig=/etc/kubernetes/admin.conf \
+  --components=source-controller,kustomize-controller,helm-controller,notification-controller
+```
+
+禁止使用 `--force-conflicts`、`--prune`，禁止在 Phase A 创建 deploy key 或 sync CR。
+
+### 验收与证据
+
+完整命令、输出和退出码保存到
+`/root/dev-infra-evidence/15-flux-phase-a-<UTC>.txt`，最后记录该文件 SHA-256。先把
+本轮实际 UTC 文件名写入 `FLUX_PHASE_A_EVIDENCE_PATH`，至少包含：
+
+```bash
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  get deployment,pod,service,serviceaccount,role,rolebinding,networkpolicy -o wide
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  get pod -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.imageID}{"\n"}{end}{end}'
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  get ciliumnetworkpolicy -n flux-system -o yaml
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  auth can-i create deployments -A \
+  --as=system:serviceaccount:flux-system:kustomize-controller
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  auth can-i create clusterroles \
+  --as=system:serviceaccount:flux-system:helm-controller
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  auth can-i list namespaces \
+  --as=system:serviceaccount:flux-system:source-controller
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  auth can-i create helmreleases.helm.toolkit.fluxcd.io \
+  --namespace=flux-system \
+  --as=system:serviceaccount:flux-system:source-controller
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  get gitrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io \
+  -A --ignore-not-found
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get namespace
+```
+
+四个 `auth can-i` 必须均为 `no`；sync inventory 必须为空；Namespace inventory 不得
+新增 `platform`、`openbao`、`cert-manager`、`monitoring`、`cnpg-system` 或 MinIO 业务
+Namespace。
+
+网络证据使用 `runbook/examples/flux-phase-a-network-probe.yaml` 和
+`runbook/examples/flux-phase-a-external-network-probe.yaml` 各创建一个瞬态 Pod。它们复用
+PCS 已固定的 Kubernetes BusyBox linux/amd64 manifest
+`sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb`，无 Token、
+non-root、只读 RootFS；不属于 Desired State。下面整个 block 必须在同一个 Bash
+中执行：`generateName` 避免固定名称冲突，trap 只在当前 Pod UID 与本轮创建回执
+一致时删除精确 Pod；UID 不一致必须停止并人工处理，不得按标签批量删除：
+
+```bash
+set -o errexit -o nounset -o pipefail
+cd /opt/uni-code/engineering-platform-gitops
+
+FLUX_PHASE_A_PROBE_POD=''
+FLUX_PHASE_A_PROBE_UID=''
+FLUX_PHASE_A_EXTERNAL_PROBE_POD=''
+FLUX_PHASE_A_EXTERNAL_PROBE_UID=''
+
+delete_flux_phase_a_probe_if_owned() {
+  local pod_namespace="$1"
+  local pod_name="$2"
+  local expected_uid="$3"
+  local current_uid
+
+  if [ -z "$pod_name" ]; then
+    return 0
+  fi
+  if ! current_uid=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+    -n "$pod_namespace" get pod "$pod_name" --ignore-not-found \
+    -o jsonpath='{.metadata.uid}'); then
+    echo "STOP: unable to verify ownership of $pod_namespace/$pod_name" >&2
+    return 1
+  fi
+  if [ -z "$current_uid" ]; then
+    return 0
+  fi
+  if [ "$current_uid" != "$expected_uid" ]; then
+    echo "STOP: refuse to delete $pod_namespace/$pod_name; UID changed" >&2
+    return 1
+  fi
+  kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+    -n "$pod_namespace" delete pod "$pod_name" --wait=true
+}
+
+cleanup_flux_phase_a_probes() {
+  local cleanup_status=0
+  delete_flux_phase_a_probe_if_owned \
+    flux-system "$FLUX_PHASE_A_PROBE_POD" "$FLUX_PHASE_A_PROBE_UID" || cleanup_status=$?
+  delete_flux_phase_a_probe_if_owned \
+    default "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" "$FLUX_PHASE_A_EXTERNAL_PROBE_UID" || cleanup_status=$?
+  return "$cleanup_status"
+}
+trap cleanup_flux_phase_a_probes EXIT
+
+FLUX_PHASE_A_PROBE_ID=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  create -f runbook/examples/flux-phase-a-network-probe.yaml \
+  -o jsonpath='{.metadata.name}:{.metadata.uid}')
+FLUX_PHASE_A_PROBE_POD=${FLUX_PHASE_A_PROBE_ID%%:*}
+FLUX_PHASE_A_PROBE_UID=${FLUX_PHASE_A_PROBE_ID#*:}
+
+FLUX_PHASE_A_EXTERNAL_PROBE_ID=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  create -f runbook/examples/flux-phase-a-external-network-probe.yaml \
+  -o jsonpath='{.metadata.name}:{.metadata.uid}')
+FLUX_PHASE_A_EXTERNAL_PROBE_POD=${FLUX_PHASE_A_EXTERNAL_PROBE_ID%%:*}
+FLUX_PHASE_A_EXTERNAL_PROBE_UID=${FLUX_PHASE_A_EXTERNAL_PROBE_ID#*:}
+
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  wait --for=condition=Ready "pod/$FLUX_PHASE_A_PROBE_POD" --timeout=2m
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  wait --for=condition=Ready "pod/$FLUX_PHASE_A_EXTERNAL_PROBE_POD" --timeout=2m
+
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nslookup kubernetes.default.svc.cluster.local
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 kubernetes.default.svc.cluster.local 443
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 \
+  source-controller.flux-system.svc.cluster.local 80
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 \
+  notification-controller.flux-system.svc.cluster.local 80
+
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 1.1.1.1 443; then
+  echo 'FAIL: Flux probe reached public 1.1.1.1:443'
+  exit 1
+else
+  echo 'PASS: Flux public egress denied'
+fi
+
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nslookup \
+  kubernetes.default.svc.cluster.local
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 \
+  kubernetes.default.svc.cluster.local 443
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 1.1.1.1 443
+
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 \
+  source-controller.flux-system.svc.cluster.local 80; then
+  echo 'FAIL: non-Flux probe reached source-controller:9090'
+  exit 1
+else
+  echo 'PASS: non-Flux ingress to source-controller:9090 denied'
+fi
+
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 \
+  notification-controller.flux-system.svc.cluster.local 80; then
+  echo 'FAIL: non-Flux probe reached notification-controller:9090'
+  exit 1
+else
+  echo 'PASS: non-Flux ingress to notification-controller:9090 denied'
+fi
+
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 \
+  webhook-receiver.flux-system.svc.cluster.local 80; then
+  echo 'FAIL: non-Flux probe reached webhook receiver:9292'
+  exit 1
+else
+  echo 'PASS: non-Flux ingress to webhook receiver:9292 denied'
+fi
+
+FLUX_PHASE_A_SOURCE_POD_IP=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  -n flux-system get pod -l app=source-controller \
+  -o jsonpath='{.items[0].status.podIP}')
+FLUX_PHASE_A_NOTIFICATION_POD_IP=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  -n flux-system get pod -l app=notification-controller \
+  -o jsonpath='{.items[0].status.podIP}')
+
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 \
+  "$FLUX_PHASE_A_SOURCE_POD_IP" 8080; then
+  echo 'FAIL: Flux probe reached source-controller metrics:8080'
+  exit 1
+else
+  echo 'PASS: Flux traffic to source-controller metrics:8080 denied'
+fi
+
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 \
+  "$FLUX_PHASE_A_NOTIFICATION_POD_IP" 9292; then
+  echo 'FAIL: Flux probe reached notification-controller receiver:9292'
+  exit 1
+else
+  echo 'PASS: Flux traffic to notification-controller receiver:9292 denied'
+fi
+
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  get pod "$FLUX_PHASE_A_PROBE_POD" -o wide
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  get pod "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -o wide
+cleanup_flux_phase_a_probes
+trap - EXIT
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
+  get pod "$FLUX_PHASE_A_PROBE_POD" --ignore-not-found
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
+  get pod "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" --ignore-not-found
+
+FLUX_PHASE_A_EVIDENCE_PATH='/root/dev-infra-evidence/15-flux-phase-a-REPLACE_WITH_UTC.txt'
+sha256sum "$FLUX_PHASE_A_EVIDENCE_PATH"
+```
+
+正向七条命令必须成功，其中 non-Flux 探针访问同一 `1.1.1.1:443` 是公网路由
+正对照；六条负向连接必须进入 `PASS` 分支；最后两个 Pod 查询必须
+为空。只检查 YAML 或 Cilium policy 对象存在不能代替这些运行证据。
 
 判定：
 
-- [ ] Flux CLI / Controller 为 `v2.9.3`。
-- [ ] Git deploy key 为只读。
-- [ ] 仅 source/kustomize/helm/notification 四个 Controller。
-- [ ] `kustomize-controller` 与 `helm-controller` 启用 `--no-cross-namespace-refs=true`。
-- [ ] `flux check` 通过。
+- [ ] Flux CLI `v2.9.3`；Controller 精确为 source `v1.9.3`、kustomize `v1.9.4`、
+  helm `v1.6.3`、notification `v1.9.2`，运行 Image ID 与 PCS linux/amd64 digest 一致。
+- [ ] 仅 source/kustomize/helm/notification 四个 Controller，全部 Ready。
+- [ ] 无 `cluster-admin` binding；Controller 直接创建 Deployment/ClusterRole 或写入
+  其他 Controller 的 Flux API group 均被拒绝。
+- [ ] 全部 Controller 只 watch `flux-system`；kustomize/helm 的 Reconcile impersonation
+  后备、跨 Namespace 引用限制与 remote-base 限制均出现在实际 Pod args；Phase A
+  未出现需要 `ObjectLevelWorkloadIdentity` 的 default identity 参数。
+- [ ] default deny、DNS、Kubernetes API、source artifact 与 notification event
+  `9090` 内部网络边界通过正反向运行验证。
+- [ ] `flux check` 通过，sync CR 与下游 Namespace inventory 为空。
+- [ ] Evidence 文件与 SHA-256 已回填到 PCS；在此之前 Flux 状态保持 `BLOCKED`。
+
+### Phase A 回滚边界
+
+只有在 Phase B 尚未创建任何 Git Secret/deploy key/sync CR，且 inventory 再次证明为空
+时，才允许经单独批准回滚这个精确 bundle：
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops
+kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+  delete --wait=true -k clusters/dev/flux-system
+```
+
+出现任何 sync CR、用户 Secret 或下游资源后，此回滚路径立即失效，必须另写并评审
+恢复方案；不得强删 CRD、Namespace 或 finalizer。
