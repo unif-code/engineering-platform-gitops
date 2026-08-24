@@ -1501,6 +1501,10 @@ class FluxPhaseAContractTest(unittest.TestCase):
             'validate_flux_phase_a must enforce the fail-closed Phase A contract',
         )
         self.assertTrue(
+            hasattr(validator, 'validate_flux_phase_a_runbook'),
+            'validate_flux_phase_a_runbook must enforce dependency-safe staging',
+        )
+        self.assertTrue(
             hasattr(validator, 'validate_flux_phase_a_probes'),
             'validate_flux_phase_a_probes must enforce transient probe safety',
         )
@@ -1915,10 +1919,64 @@ class FluxPhaseAContractTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         self.assertRegex(stderr.getvalue(), expected)
 
+    def assert_runbook_contract_fails(self, root: Path, expected: str) -> None:
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            validator.validate_flux_phase_a_runbook(root)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertRegex(stderr.getvalue(), expected)
+
     def test_valid_four_controller_fixture_is_accepted(self) -> None:
         root, rendered_documents = self.make_root()
 
         self.validate(root, rendered_documents)
+
+    def test_valid_phase_a_runbook_stages_namespace_before_server_validation(
+        self,
+    ) -> None:
+        validator.validate_flux_phase_a_runbook(self.make_probe_root())
+
+    def test_rejects_phase_a_runbook_staging_regressions(self) -> None:
+        mutations = (
+            (
+                'missing-namespace-persistence',
+                "render_flux_namespace |\n  kubectl --kubeconfig=\"$KC\" apply "
+                "--server-side \\\n    --field-manager=\"$FIELD_MANAGER\" \\\n    -f -\n",
+                '',
+                'Namespace 持久化',
+            ),
+            (
+                'full-dry-run-before-namespace',
+                "render_flux_namespace |\n  kubectl --kubeconfig=\"$KC\" apply "
+                "--server-side \\\n    --field-manager=\"$FIELD_MANAGER\" \\\n    -f -\n",
+                "kubectl --kubeconfig=\"$KC\" apply --server-side \\\n"
+                "  --dry-run=server \\\n"
+                "  --field-manager=\"$FIELD_MANAGER\" \\\n"
+                "  -k clusters/dev/flux-system\n\n"
+                "render_flux_namespace |\n"
+                "  kubectl --kubeconfig=\"$KC\" apply --server-side \\\n"
+                "    --field-manager=\"$FIELD_MANAGER\" \\\n"
+                "    -f -\n",
+                '执行顺序',
+            ),
+            (
+                'diff-exit-one-rejected',
+                '  0|1)\n',
+                '  0)\n',
+                'diff.*0/1',
+            ),
+        )
+        for mutation, old, new, expected in mutations:
+            with self.subTest(mutation=mutation):
+                root = self.make_probe_root()
+                path = root / 'runbook/01-bootstrap.md'
+                source = path.read_text(encoding='utf-8')
+                self.assertEqual(source.count(old), 1)
+                path.write_text(source.replace(old, new), encoding='utf-8')
+                self.assert_runbook_contract_fails(root, expected)
 
     def test_valid_transient_probe_contract_is_accepted(self) -> None:
         validator.validate_flux_phase_a_probes(self.make_probe_root())
