@@ -458,13 +458,13 @@ class RepositoryProfileContractTest(unittest.TestCase):
         pcs = root / 'pcs/candidate-2.md'
         pcs.write_text(
             pcs.read_text(encoding='utf-8')
-            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}` | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；Runtime Image ID `{frontend_image_id}` | verified facts |\n''',
+            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}`（均 `success`） | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；运行 Image ID `{frontend_image_id}` | 当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署 |\n''',
             encoding='utf-8',
         )
         handoff = root / 'runbook/10-image-owner-handoff.md'
         handoff.write_text(
             handoff.read_text(encoding='utf-8')
-            + f'''\n| 字段 | frontend | backend |\n| --- | --- | --- |\n| Source commit（完整 40 位 SHA） | `{frontend_source}` | `NOT_AVAILABLE` |\n| CI run URL | `{frontend_ci_run}` / publish-image job `{frontend_publish_job}` | `NOT_AVAILABLE` |\n| Image tag `sha-<short-sha>` | `{frontend_tag}` | `NOT_AVAILABLE` |\n| OCI index digest | `{frontend_artifact}` | `NOT_AVAILABLE` |\n| `linux/amd64` manifest digest | `{frontend_manifest}` | `NOT_AVAILABLE` |\n| Runtime Image ID | `{frontend_image_id}` | `NOT_AVAILABLE` |\n''',
+            + f'''\n| 字段 | frontend | backend |\n| --- | --- | --- |\n| Source commit（完整 40 位 SHA） | `{frontend_source}` | `NOT_AVAILABLE` |\n| CI run URL | `https://github.com/unif-code/engineering-platform/actions/runs/{frontend_ci_run}`（`success`；publish-image job `{frontend_publish_job}`） | `NOT_AVAILABLE` |\n| Image tag `sha-<short-sha>` | `{frontend_tag}` | `NOT_AVAILABLE` |\n| OCI index digest | `{frontend_artifact}` | `NOT_AVAILABLE` |\n| `linux/amd64` manifest digest | `{frontend_manifest}` | `NOT_AVAILABLE` |\n| Runtime Image ID | `{frontend_image_id}` | `NOT_AVAILABLE` |\n''',
             encoding='utf-8',
         )
 
@@ -770,6 +770,44 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
         self.assertIn('当前 docs 架构事实提交计划与已推送 main 不一致', stderr)
 
+    def test_current_docs_plan_rejects_appended_conflicting_sha(self) -> None:
+        # Would fail if a valid current SHA can hide an additional conflicting value.
+        current = 'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
+        conflicting = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        mutations = (
+            (
+                f'docs 架构事实提交为远端可追溯的 `{current}`。',
+                f'docs 架构事实提交为远端可追溯的 `{current}`；冲突 `{conflicting}`。',
+            ),
+            (
+                f'docs 架构事实提交为 `{current}`。',
+                f'docs 架构事实提交为 `{current}`；冲突 `{conflicting}`。',
+            ),
+            (
+                f'| docs 架构事实提交 | `{current}` |',
+                f'| docs 架构事实提交 | `{current}` |\n'
+                f'| docs 架构事实提交 | `{conflicting}` |',
+            ),
+        )
+        for expected, mutation in mutations:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    path = root / (
+                        'docs/superpowers/plans/'
+                        '2026-08-23-pcs-runtime-reconciliation.md'
+                    )
+                    path.write_text(
+                        path.read_text(encoding='utf-8').replace(expected, mutation, 1),
+                        encoding='utf-8',
+                    )
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(
+                    '当前 docs 架构事实提交计划与已推送 main 不一致', stderr
+                )
+
     def test_frontend_component_and_handoff_summary_rows_reject_drift(self) -> None:
         # Would fail if duplicated release facts drift outside the dedicated table.
         mutations = (
@@ -809,6 +847,131 @@ class RepositoryProfileContractTest(unittest.TestCase):
                     for index, line in enumerate(lines):
                         if line.startswith(row_prefix):
                             lines[index] = line.replace(expected, mutation, 1)
+                            break
+                    else:
+                        self.fail(f'missing summary row: {row_prefix}')
+                    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(error, stderr)
+
+    def test_frontend_summary_rejects_appended_conflicting_facts_and_rows(
+        self,
+    ) -> None:
+        # Would fail if a correct first summary value can hide a conflicting append.
+        source = 'da72238abc87a19c07a5cac96e41d88d5f6bf2d3'
+        artifact = (
+            'sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1'
+        )
+        component_mutations = (
+            (f'Source `{source}`', f'Source `{source}`；冲突 `bad-source`'),
+            ('CI run `32683635240`', 'CI run `32683635240`；冲突 `00000000000`'),
+            (
+                'publish-image job `97305929974`',
+                'publish-image job `97305929974`；冲突 `00000000000`',
+            ),
+            (
+                'engineering-platform:sha-da72238',
+                'engineering-platform:sha-da72238；冲突 `sha-bad`',
+            ),
+            (f'OCI index `{artifact}`', f'OCI index `{artifact}`；冲突 `sha256:bad`'),
+            (
+                'linux/amd64 manifest '
+                '`sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`',
+                'linux/amd64 manifest '
+                '`sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`'
+                '；冲突 `sha256:bad`',
+            ),
+        )
+        for expected, mutation in component_mutations:
+            with self.subTest(summary='component', expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    path = root / 'pcs/candidate-2.md'
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                    for index, line in enumerate(lines):
+                        if line.startswith(
+                            '| Application | engineering-platform frontend |'
+                        ):
+                            lines[index] = line.replace(expected, mutation, 1)
+                            break
+                    else:
+                        self.fail('missing frontend component summary row')
+                    path.write_text(
+                        '\n'.join(lines) + '\n',
+                        encoding='utf-8',
+                    )
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn('PCS frontend 组件表与当前审计快照不一致', stderr)
+
+        handoff_fields = (
+            ('Source commit（完整 40 位 SHA）', '；冲突 `bad-source`'),
+            ('CI run URL', '；冲突 `00000000000`'),
+            ('Image tag `sha-<short-sha>`', '；冲突 `sha-bad`'),
+            ('OCI index digest', '；冲突 `sha256:bad`'),
+            ('`linux/amd64` manifest digest', '；冲突 `sha256:bad`'),
+        )
+        for field, conflict in handoff_fields:
+            with self.subTest(summary='handoff', field=field):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    path = root / 'runbook/10-image-owner-handoff.md'
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                    summary_started = False
+                    for index, line in enumerate(lines):
+                        if line.strip() == '| 字段 | frontend | backend |':
+                            summary_started = True
+                            continue
+                        if summary_started and line.startswith(f'| {field} |'):
+                            cells = line.split('|')
+                            cells[2] = cells[2].rstrip() + conflict + ' '
+                            lines[index] = '|'.join(cells)
+                            break
+                    else:
+                        self.fail(f'missing handoff summary row: {field}')
+                    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(
+                    f'Image Owner Handoff 汇总表 {field} 与当前审计快照不一致',
+                    stderr,
+                )
+
+        for summary in ('component', 'handoff'):
+            with self.subTest(summary=summary, mutation='duplicate-row'):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    if summary == 'component':
+                        path = root / 'pcs/candidate-2.md'
+                        row_prefix = '| Application | engineering-platform frontend |'
+                        conflicting_row = lambda line: line.replace(
+                            source, 'bad-source', 1
+                        )
+                        error = 'PCS frontend 组件表与当前审计快照不一致'
+                    else:
+                        path = root / 'runbook/10-image-owner-handoff.md'
+                        row_prefix = '| OCI index digest |'
+                        conflicting_row = lambda line: line.replace(
+                            artifact, 'sha256:bad', 1
+                        )
+                        error = (
+                            'Image Owner Handoff 汇总表 OCI index digest '
+                            '与当前审计快照不一致'
+                        )
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                    summary_started = False
+                    for index, line in enumerate(lines):
+                        if summary == 'handoff' and line.strip() == '| 字段 | frontend | backend |':
+                            summary_started = True
+                            continue
+                        if line.startswith(row_prefix) and (
+                            summary != 'handoff' or summary_started
+                        ):
+                            lines.insert(index + 1, conflicting_row(line))
                             break
                     else:
                         self.fail(f'missing summary row: {row_prefix}')

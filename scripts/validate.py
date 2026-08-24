@@ -34,6 +34,41 @@ CURRENT_FRONTEND_LINUX_AMD64_MANIFEST = (
     'sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
 )
 NOT_VERIFIED = 'NOT_VERIFIED'
+CURRENT_FRONTEND_COMPONENT_CELLS = (
+    'Application',
+    'engineering-platform frontend',
+    (
+        f'Source `{CURRENT_FRONTEND_SOURCE}` / CI run `{CURRENT_FRONTEND_CI_RUN}`、'
+        f'publish-image job `{CURRENT_FRONTEND_PUBLISH_IMAGE_JOB}`（均 `success`）'
+    ),
+    (
+        f'`ghcr.io/unif-code/engineering-platform:{CURRENT_FRONTEND_TAG}`；'
+        f'OCI index `{CURRENT_FRONTEND_OCI_INDEX_DIGEST}`'
+    ),
+    (
+        f'linux/amd64 manifest `{CURRENT_FRONTEND_LINUX_AMD64_MANIFEST}`；'
+        f'运行 Image ID `{NOT_VERIFIED}`'
+    ),
+    '当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署',
+)
+CURRENT_FRONTEND_HANDOFF_FACTS = (
+    ('Source commit（完整 40 位 SHA）', f'`{CURRENT_FRONTEND_SOURCE}`'),
+    (
+        'CI run URL',
+        (
+            '`https://github.com/unif-code/engineering-platform/actions/runs/'
+            f'{CURRENT_FRONTEND_CI_RUN}`（`success`；publish-image job '
+            f'`{CURRENT_FRONTEND_PUBLISH_IMAGE_JOB}`）'
+        ),
+    ),
+    ('Image tag `sha-<short-sha>`', f'`{CURRENT_FRONTEND_TAG}`'),
+    ('OCI index digest', f'`{CURRENT_FRONTEND_OCI_INDEX_DIGEST}`'),
+    (
+        '`linux/amd64` manifest digest',
+        f'`{CURRENT_FRONTEND_LINUX_AMD64_MANIFEST}`',
+    ),
+    ('Runtime Image ID', f'`{NOT_VERIFIED}`'),
+)
 CURRENT_MINIO_SERVER_STATUS = (
     'BLOCKED：精确摘要供应链证据或获批风险决定未满足；清单引用不代表获准或已部署'
 )
@@ -1414,11 +1449,47 @@ def markdown_table_row(section: str, field: str) -> str:
     return match.group(0)
 
 
-def markdown_table_status_cell(row: str) -> str:
-    cells = [cell.strip() for cell in row.strip().split('|')[1:-1]]
+def markdown_table_cells(row: str) -> tuple[str, ...]:
+    stripped = row.strip()
+    if not stripped.startswith('|') or not stripped.endswith('|'):
+        fail('Markdown 表格行格式无效')
+    cells = tuple(cell.strip() for cell in stripped.split('|')[1:-1])
     if not cells:
-        fail('Markdown 表格行缺少状态单元格')
-    return cells[-1].strip('`* ')
+        fail('Markdown 表格行缺少单元格')
+    return cells
+
+
+def markdown_table_status_cell(row: str) -> str:
+    return markdown_table_cells(row)[-1].strip('`* ')
+
+
+def markdown_table_rows_after_unique_header(
+    document: str,
+    header: str,
+    error: str,
+) -> tuple[tuple[str, ...], ...]:
+    lines = document.splitlines()
+    header_indexes = [
+        index for index, line in enumerate(lines) if line.strip() == header
+    ]
+    if len(header_indexes) != 1:
+        fail(error)
+    separator_index = header_indexes[0] + 1
+    if separator_index >= len(lines) or not lines[separator_index].strip().startswith('|'):
+        fail(error)
+
+    rows: list[tuple[str, ...]] = []
+    for line in lines[separator_index + 1 :]:
+        if not line.strip().startswith('|'):
+            break
+        rows.append(markdown_table_cells(line))
+    return tuple(rows)
+
+
+def current_commit_values(value: str) -> tuple[str, ...]:
+    return tuple(
+        re.findall(r'(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])', value)
+    )
 
 
 def is_blocked_status(status: str) -> bool:
@@ -1471,50 +1542,34 @@ def validate_current_frontend_evidence() -> None:
 
 def validate_current_frontend_summary_evidence() -> None:
     pcs = CURRENT_PCS.read_text(encoding='utf-8')
-    component = re.search(
-        r'^\| Application \| engineering-platform frontend \|.*$',
-        pcs,
-        re.MULTILINE,
+    component_rows = tuple(
+        markdown_table_cells(line)
+        for line in pcs.splitlines()
+        if line.strip().startswith('|')
+        and markdown_table_cells(line)[:2]
+        == ('Application', 'engineering-platform frontend')
     )
-    if component is None:
-        fail('PCS 缺少 frontend 组件表行')
-    component_facts = (
-        CURRENT_FRONTEND_SOURCE,
-        CURRENT_FRONTEND_CI_RUN,
-        CURRENT_FRONTEND_PUBLISH_IMAGE_JOB,
-        CURRENT_FRONTEND_TAG,
-        CURRENT_FRONTEND_OCI_INDEX_DIGEST,
-        CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,
-        NOT_VERIFIED,
-    )
-    if not all(expected in component.group(0) for expected in component_facts):
+    if (
+        len(component_rows) != 1
+        or component_rows[0] != CURRENT_FRONTEND_COMPONENT_CELLS
+    ):
         fail('PCS frontend 组件表与当前审计快照不一致')
 
     handoff = (ROOT / 'runbook/10-image-owner-handoff.md').read_text(
         encoding='utf-8'
     )
-    table_header = '| 字段 | frontend | backend |'
-    table_start = handoff.find(table_header)
-    if table_start == -1:
-        fail('Image Owner Handoff 缺少汇总表')
-    summary = handoff[table_start:]
-    summary_facts = (
-        ('Source commit（完整 40 位 SHA）', (CURRENT_FRONTEND_SOURCE,)),
-        (
-            'CI run URL',
-            (CURRENT_FRONTEND_CI_RUN, CURRENT_FRONTEND_PUBLISH_IMAGE_JOB),
-        ),
-        ('Image tag `sha-<short-sha>`', (CURRENT_FRONTEND_TAG,)),
-        ('OCI index digest', (CURRENT_FRONTEND_OCI_INDEX_DIGEST,)),
-        (
-            '`linux/amd64` manifest digest',
-            (CURRENT_FRONTEND_LINUX_AMD64_MANIFEST,),
-        ),
-        ('Runtime Image ID', (NOT_VERIFIED,)),
+    summary_rows = markdown_table_rows_after_unique_header(
+        handoff,
+        '| 字段 | frontend | backend |',
+        'Image Owner Handoff 汇总表与当前审计快照不一致',
     )
-    for field, expected_values in summary_facts:
-        row = markdown_table_row(summary, field)
-        if not all(expected in row for expected in expected_values):
+    for field, expected_frontend_value in CURRENT_FRONTEND_HANDOFF_FACTS:
+        rows = tuple(row for row in summary_rows if row[0] == field)
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 3
+            or rows[0][1] != expected_frontend_value
+        ):
             fail(f'Image Owner Handoff 汇总表 {field} 与当前审计快照不一致')
 
 
@@ -1528,16 +1583,19 @@ def validate_current_docs_architecture_commit() -> None:
         fail('当前 docs 架构事实提交与已推送 main 不一致')
 
     plan = (ROOT / CURRENT_DOCS_ARCHITECTURE_PLAN).read_text(encoding='utf-8')
-    plan_facts = (
-        f'事实提交为远端可追溯的 `{CURRENT_DOCS_ARCHITECTURE_COMMIT}`',
-        f'事实提交为 `{CURRENT_DOCS_ARCHITECTURE_COMMIT}`',
-        f'| docs 架构事实提交 | `{CURRENT_DOCS_ARCHITECTURE_COMMIT}` |',
+    plan_fact_patterns = (
+        r'^-\s*docs 架构事实提交为远端可追溯的\s*(?P<value>.+)$',
+        r'^-\s*.*事实提交为\s+(?P<value>.+)$',
+        r'^\|\s*docs 架构事实提交\s*\|\s*(?P<value>.*?)\s*\|\s*$',
     )
-    if (
-        '6267120f345e7ad967daf08fb244c6018054281d' in plan
-        or not all(expected in plan for expected in plan_facts)
-    ):
-        fail('当前 docs 架构事实提交计划与已推送 main 不一致')
+    for pattern in plan_fact_patterns:
+        matches = list(re.finditer(pattern, plan, re.MULTILINE))
+        if (
+            len(matches) != 1
+            or current_commit_values(matches[0].group('value'))
+            != (CURRENT_DOCS_ARCHITECTURE_COMMIT,)
+        ):
+            fail('当前 docs 架构事实提交计划与已推送 main 不一致')
 
 
 def validate_blocked_storage_acceptance() -> None:
