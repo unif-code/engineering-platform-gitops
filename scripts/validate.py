@@ -2962,7 +2962,7 @@ def validate_flux_phase_a_probes(root: Path = ROOT) -> None:
         'if [ "$current_uid" != "$expected_uid" ]',
         'delete pod "$pod_name" --wait=true',
         'trap cleanup_flux_phase_a_probes EXIT',
-        'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 1.1.1.1 443',
+        'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 github.com 443',
         '"$FLUX_PHASE_A_SOURCE_POD_IP" 8080',
         '"$FLUX_PHASE_A_NOTIFICATION_POD_IP" 9292',
         'PASS: Flux traffic to source-controller metrics:8080 denied',
@@ -2972,12 +2972,15 @@ def validate_flux_phase_a_probes(root: Path = ROOT) -> None:
     missing_tokens = [
         token for token in required_tokens if token not in normalized
     ]
-    if missing_tokens or normalized.count(
-        "-o jsonpath='{.metadata.name}:{.metadata.uid}'"
-    ) != 2:
+    if (
+        missing_tokens
+        or normalized.count("-o jsonpath='{.metadata.name}:{.metadata.uid}'")
+        != 2
+        or normalized.count('nc -z -w 5 github.com 443') != 2
+    ):
         fail(
             'Flux Phase A probe runbook 必须用 kubectl create 捕获两组 '
-            'name:uid、按 UID 归属清理，以 non-Flux 1.1.1.1:443 '
+            'name:uid、按 UID 归属清理，以 non-Flux github.com:443 '
             f'作为正对照，并覆盖 8080/9292 负测：{missing_tokens}'
         )
     forbidden_patterns = (
