@@ -2075,9 +2075,9 @@ class FluxPhaseAContractTest(unittest.TestCase):
                 elif mutation == 'missing-public-control':
                     source = source.replace(
                         'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- '
-                        'nc -z -w 5 1.1.1.1 443',
+                        'nc -z -w 5 github.com 443',
                         'exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- '
-                        'nc -z -w 5 1.1.1.2 443',
+                        'nc -z -w 5 example.invalid 443',
                         1,
                     )
                 elif mutation == 'old-probes-file':
@@ -2114,8 +2114,21 @@ class FluxPhaseAContractTest(unittest.TestCase):
                 self.assert_probe_contract_fails(
                     root,
                     'probe runbook|kubectl create|name:uid|UID|8080|9292|'
-                    '1.1.1.1|正向|probes.yaml|apply|标签',
+                    'github.com|正向|probes.yaml|apply|标签',
                 )
+
+    def test_rejects_blocked_public_probe_control(self) -> None:
+        root = self.make_probe_root()
+        path = root / 'runbook/01-bootstrap.md'
+        source = path.read_text(encoding='utf-8').replace(
+            'github.com 443',
+            '1.1.1.1 443',
+        )
+        path.write_text(source, encoding='utf-8')
+        self.assert_probe_contract_fails(
+            root,
+            'github.com|公网正对照|1.1.1.1',
+        )
 
     def test_rejects_components_bundle_sha_drift(self) -> None:
         root, rendered_documents = self.make_root()

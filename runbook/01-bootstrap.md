@@ -741,8 +741,8 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
   notification-controller.flux-system.svc.cluster.local 80
 
 if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
-  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 1.1.1.1 443; then
-  echo 'FAIL: Flux probe reached public 1.1.1.1:443'
+  exec "$FLUX_PHASE_A_PROBE_POD" -- nc -z -w 5 github.com 443; then
+  echo 'FAIL: Flux probe reached public github.com:443'
   exit 1
 else
   echo 'PASS: Flux public egress denied'
@@ -755,7 +755,7 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
   exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 \
   kubernetes.default.svc.cluster.local 443
 kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
-  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 1.1.1.1 443
+  exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 github.com 443
 
 if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default \
   exec "$FLUX_PHASE_A_EXTERNAL_PROBE_POD" -- nc -z -w 5 \
@@ -824,8 +824,9 @@ FLUX_PHASE_A_EVIDENCE_PATH='/root/dev-infra-evidence/15-flux-phase-a-REPLACE_WIT
 sha256sum "$FLUX_PHASE_A_EVIDENCE_PATH"
 ```
 
-正向七条命令必须成功，其中 non-Flux 探针访问同一 `1.1.1.1:443` 是公网路由
-正对照；六条负向连接必须进入 `PASS` 分支；最后两个 Pod 查询必须
+正向七条命令必须成功，其中 non-Flux 探针访问同一 `github.com:443` 是企业出口实际
+可达的公网路由正对照；固定公网 IP `1.1.1.1:443` 在该环境被上游阻断，禁止用作正对照。
+六条负向连接必须进入 `PASS` 分支；最后两个 Pod 查询必须
 为空。只检查 YAML 或 Cilium policy 对象存在不能代替这些运行证据。
 
 判定：

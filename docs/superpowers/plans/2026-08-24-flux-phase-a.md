@@ -101,7 +101,7 @@ Remove only `gotk-components.yaml` from the inactive entrypoints list; keep `got
 - Create: `runbook/examples/flux-phase-a-external-network-probe.yaml`
 - Modify: `runbook/examples/README.md`
 
-Record the fixed Flux CLI/controller supply-chain facts while keeping Flux activation and V0.1 status `BLOCKED` until runtime evidence exists. Add exact Phase A preflight, dry-run, apply, evidence and rollback commands. Add two digest-pinned, tokenless transient BusyBox Pods and an always-cleanup trap for DNS/API/9090 positive probes plus public egress, webhook, metrics and non-Flux ingress negative probes. Do not claim execution and do not alter the current Runtime snapshot.
+Record the fixed Flux CLI/controller supply-chain facts while keeping Flux activation and V0.1 status `BLOCKED` until runtime evidence exists. Add exact Phase A preflight, dry-run, apply, evidence and rollback commands. Add two digest-pinned, tokenless transient BusyBox Pods and an always-cleanup trap for DNS/API/9090 positive probes plus public egress, webhook, metrics and non-Flux ingress negative probes. Use the enterprise-reachable repository endpoint `github.com:443` for the public-route positive control; do not use upstream-blocked fixed IPs such as `1.1.1.1`. Do not claim execution and do not alter the current Runtime snapshot.
 
 ## Task 5: Verify and commit Desired State
 
