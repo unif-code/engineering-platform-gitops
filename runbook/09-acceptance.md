@@ -10,7 +10,7 @@ PCS Candidate：`pcs/candidate-2.md`
 
 ## 当前 DEV Runtime 观测
 
-`2026-08-24 03:42Z` 的只读 `run-approved --check` 已验证 bootstrap；Runtime inventory 没有 `flux-system`、`platform` 或 `openbao`，GitRepository 查询为空，因此以下验收项继续 fail-closed 为 `BLOCKED`。
+`2026-08-24 03:42Z` 的上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；它已验证 bootstrap。Runtime inventory 没有 `flux-system`、`platform` 或 `openbao`，GitRepository 查询为空，因此以下验收项继续 fail-closed 为 `BLOCKED`。
 
 | 字段 | 值 |
 | --- | --- |

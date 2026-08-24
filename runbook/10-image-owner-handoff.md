@@ -15,7 +15,7 @@
 
 ## 当前 DEV Runtime 观测
 
-本节记录服务器 GitOps `main` 的只读 `run-approved --check` 回执；frontend 的可部署 manifest 事实不等同于 Runtime Image ID。
+本节记录服务器 GitOps `main` 的上层 `run-approved.sh --check` 回执。上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；frontend 的可部署 manifest 事实不等同于 Runtime Image ID。
 
 | 字段 | 值 |
 | --- | --- |

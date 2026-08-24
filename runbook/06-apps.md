@@ -13,7 +13,7 @@
 
 ## 当前 DEV Runtime 观测
 
-`2026-08-24 03:42Z` 的只读 `run-approved --check` 表明 bootstrap 检查已通过；Runtime inventory 仍只有基础组件和 GitLab Runner，应用验收合同尚未执行。`2026-08-22 16:58 +08:00` 仅为历史观察。
+`2026-08-24 03:42Z` 的上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；它表明 bootstrap 检查已通过。Runtime inventory 仍只有基础组件和 GitLab Runner，应用验收合同尚未执行。`2026-08-22 16:58 +08:00` 仅为历史观察。
 
 | 字段 | 值 |
 | --- | --- |

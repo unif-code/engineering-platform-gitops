@@ -28,11 +28,11 @@
 | backend Source Commit | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |
 | DEV Runtime 当前观测时间 | `2026-08-24 03:42Z` |
 | DEV Runtime 历史观测时间 | `2026-08-22 16:58 +08:00`（历史） |
-| DEV Runtime 当前结论 | `run-approved --check` 的 8 个 stage 均通过或 `ALREADY_COMPLIANT`；仅 bootstrap 基础组件和 GitLab Runner 存在，Flux、平台基础设施与应用仍未激活 |
+| DEV Runtime 当前结论 | `run-approved.sh --check` 的 8 个 stage 均通过或 `ALREADY_COMPLIANT`；仅 bootstrap 基础组件和 GitLab Runner 存在，Flux、平台基础设施与应用仍未激活 |
 
 ## 当前 DEV Runtime 观测
 
-本节是外部 Chrome 堡垒机 root 会话在服务器 GitOps `main` 上只读执行 `run-approved --check` 的最新采样；不构成部署或应用验收。
+本节是外部 Chrome 堡垒机 root 会话在服务器 GitOps `main` 上执行上层 `run-approved.sh --check` 的最新采样。上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；不构成部署或应用验收。
 
 | 字段 | 值 |
 | --- | --- |

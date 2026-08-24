@@ -34,6 +34,9 @@ CURRENT_FRONTEND_LINUX_AMD64_MANIFEST = (
     'sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
 )
 NOT_VERIFIED = 'NOT_VERIFIED'
+CURRENT_MINIO_SERVER_STATUS = (
+    'BLOCKED：精确摘要供应链证据或获批风险决定未满足；清单引用不代表获准或已部署'
+)
 CURRENT_FRONTEND_DOCUMENTS = (
     'pcs/candidate-2.md',
     'runbook/06-apps.md',
@@ -1324,6 +1327,19 @@ def validate_rejected_chainguard_minio_candidate() -> None:
     ):
         fail('MinIO 被拒候选缺少精确 digest 供应链证据或 BLOCKED 激活结论')
 
+    minio_component = re.search(
+        r'^\| Object Storage \| MinIO Server \|.*$',
+        pcs,
+        re.MULTILINE,
+    )
+    if minio_component is None:
+        fail('PCS 缺少当前 MinIO Server 组件行')
+    if (
+        markdown_table_status_cell(minio_component.group(0))
+        != CURRENT_MINIO_SERVER_STATUS
+    ):
+        fail('PCS 当前 MinIO Server 状态必须为 BLOCKED 且不得含正向激活语义')
+
     deployment = document_by_identity(
         ROOT / 'infrastructure/minio/deployment.yaml',
         'Deployment',
@@ -1370,11 +1386,16 @@ def validate_rejected_chainguard_minio_candidate() -> None:
 
 
 def markdown_section(document: str, heading: str) -> str:
-    start = document.find(heading)
-    if start == -1:
+    matches = list(re.finditer(rf'^{re.escape(heading)}\s*$', document, re.MULTILINE))
+    if not matches:
         fail(f'文档缺少事实区段：{heading}')
-    next_heading = document.find('\n## ', start + len(heading))
-    return document[start:] if next_heading == -1 else document[start:next_heading]
+    if len(matches) != 1:
+        fail(f'文档事实区段重复：{heading}')
+    start = matches[0].start()
+    next_heading = re.search(r'^##\s+', document[matches[0].end() :], re.MULTILINE)
+    if next_heading is None:
+        return document[start:]
+    return document[start : matches[0].end() + next_heading.start()]
 
 
 def markdown_table_value(section: str, field: str) -> str:
@@ -1391,6 +1412,17 @@ def markdown_table_row(section: str, field: str) -> str:
     if match is None:
         fail(f'事实区段缺少行：{field}')
     return match.group(0)
+
+
+def markdown_table_status_cell(row: str) -> str:
+    cells = [cell.strip() for cell in row.strip().split('|')[1:-1]]
+    if not cells:
+        fail('Markdown 表格行缺少状态单元格')
+    return cells[-1].strip('`* ')
+
+
+def is_blocked_status(status: str) -> bool:
+    return re.match(r'^BLOCKED(?:$|[（(:：])', status) is not None
 
 
 def validate_current_runtime_evidence() -> None:
@@ -1497,6 +1529,7 @@ def validate_current_docs_architecture_commit() -> None:
 
     plan = (ROOT / CURRENT_DOCS_ARCHITECTURE_PLAN).read_text(encoding='utf-8')
     plan_facts = (
+        f'事实提交为远端可追溯的 `{CURRENT_DOCS_ARCHITECTURE_COMMIT}`',
         f'事实提交为 `{CURRENT_DOCS_ARCHITECTURE_COMMIT}`',
         f'| docs 架构事实提交 | `{CURRENT_DOCS_ARCHITECTURE_COMMIT}` |',
     )
@@ -1517,16 +1550,22 @@ def validate_blocked_storage_acceptance() -> None:
 
     acceptance = (ROOT / 'runbook/09-acceptance.md').read_text(encoding='utf-8')
     required_rows = (
-        ('3', 'PG PITR 与 etcd 隔离 restore'),
-        ('6', '容量与整机重启'),
+        ('3', 'PG PITR 与 etcd 隔离 restore', ('Flux', 'MinIO')),
+        ('4', '三 bucket Versioning/Object Lock', ('MinIO',)),
+        ('6', '容量与整机重启', ('Flux', 'MinIO')),
     )
-    for number, criterion in required_rows:
+    for number, criterion, dependencies in required_rows:
         row = re.search(rf'^\|\s*{number}\s*\|.*$', acceptance, re.MULTILINE)
-        if row is None or not all(
-            expected in row.group(0) for expected in ('BLOCKED', 'Flux', 'MinIO')
+        if row is None:
+            fail(f'Flux/MinIO 仍 BLOCKED 时，{criterion} 验收状态必须为 BLOCKED')
+        status = markdown_table_status_cell(row.group(0))
+        if (
+            not is_blocked_status(status)
+            or re.search(r'\b(?:PASS|APPROVED)\b', status) is not None
+            or not all(expected in row.group(0) for expected in dependencies)
         ):
             fail(
-                f'Flux/MinIO 仍 BLOCKED 时，{criterion} 验收必须为 BLOCKED 并声明依赖'
+                f'Flux/MinIO 仍 BLOCKED 时，{criterion} 验收状态必须为 BLOCKED'
             )
 
 

@@ -208,6 +208,110 @@ class RepositoryProfileContractTest(unittest.TestCase):
     def test_metrics_server_contract(self) -> None:
         validate_metrics_server()
 
+    def test_runtime_check_docs_disclose_checkout_sync_side_effect(self) -> None:
+        # Would fail if wrapper wording hides checkout synchronization or weakens its inner check.
+        wrapper_contract = (
+            '上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` '
+            '并以 `ff-only` 更新服务器 Git checkout'
+        )
+        for relative_path in (
+            'pcs/candidate-2.md',
+            'runbook/01-bootstrap.md',
+            'runbook/06-apps.md',
+            'runbook/09-acceptance.md',
+            'runbook/10-image-owner-handoff.md',
+        ):
+            with self.subTest(document=relative_path):
+                document = (validator.ROOT / relative_path).read_text(encoding='utf-8')
+                self.assertIn(wrapper_contract, document)
+                self.assertNotRegex(
+                    document,
+                    r'(?:只读执行|只读) `run-approved(?:\.sh)? --check`',
+                )
+
+        bootstrap = (validator.ROOT / 'runbook/01-bootstrap.md').read_text(
+            encoding='utf-8'
+        )
+        self.assertIn('底层 `bootstrap-all.sh --check` 全程只读', bootstrap)
+
+    def test_minio_component_row_cannot_gain_activation_approval(self) -> None:
+        # Would fail if the component table can approve MinIO while its summary is blocked.
+        statuses = (
+            '**APPROVED：允许激活；历史结论曾为 BLOCKED**',
+            '**BLOCKED：但已获准激活**',
+            '**BLOCKED：获准**',
+        )
+        for status in statuses:
+            with self.subTest(status=status):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    minio = root / 'infrastructure/minio'
+                    minio.mkdir(parents=True)
+                    current_pcs = root / 'candidate-2.md'
+                    lines = validator.CURRENT_PCS.read_text(encoding='utf-8').splitlines()
+                    for index, line in enumerate(lines):
+                        if line.startswith('| Object Storage | MinIO Server |'):
+                            lines[index] = line.replace(
+                                '**BLOCKED：精确摘要供应链证据或获批风险决定未满足；'
+                                '清单引用不代表获准或已部署**',
+                                status,
+                            )
+                            break
+                    else:
+                        self.fail('missing MinIO Server component row')
+                    current_pcs.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                    for filename in ('deployment.yaml', 'bootstrap-job.yaml'):
+                        shutil.copy(
+                            validator.ROOT / 'infrastructure/minio' / filename,
+                            minio / filename,
+                        )
+                    stderr = io.StringIO()
+                    with (
+                        mock.patch.object(validator, 'ROOT', root),
+                        mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as raised,
+                    ):
+                        validator.validate_rejected_chainguard_minio_candidate()
+
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn(
+                    'PCS 当前 MinIO Server 状态必须为 BLOCKED',
+                    stderr.getvalue(),
+                )
+
+    def test_blocked_storage_acceptance_rejects_pass_status_with_blocked_prose(
+        self,
+    ) -> None:
+        # Would fail if the acceptance status column can mask PASS with dependency prose.
+        criteria = (
+            ('3', 'PG PITR 与 etcd 隔离 restore'),
+            ('4', '三 bucket Versioning/Object Lock'),
+            ('6', '容量与整机重启'),
+        )
+        for number, criterion in criteria:
+            with self.subTest(criterion=number):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.write_release_fact_documents(root)
+                    path = root / 'runbook/09-acceptance.md'
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                    for index, line in enumerate(lines):
+                        if line.startswith(f'| {number} |'):
+                            cells = line.split('|')
+                            cells[-2] = ' PASS（忽略仍 BLOCKED 的 Flux 与 MinIO） '
+                            lines[index] = '|'.join(cells)
+                            break
+                    else:
+                        self.fail(f'missing acceptance row: {number}')
+                    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                    stderr = self.assert_main_rejects_release_fact_documents(root)
+
+                self.assertIn(
+                    f'Flux/MinIO 仍 BLOCKED 时，{criterion} 验收状态必须为 BLOCKED',
+                    stderr,
+                )
+
     def test_rejected_chainguard_minio_candidate_contract(self) -> None:
         validator.validate_rejected_chainguard_minio_candidate()
 
@@ -406,6 +510,12 @@ class RepositoryProfileContractTest(unittest.TestCase):
         plan.write_text(
             f'''# Current docs facts
 
+## Final reconciliation result
+
+- docs 架构事实提交为远端可追溯的 `{docs_architecture_commit}`。
+
+## Global Constraints
+
 - docs 架构事实提交为 `{docs_architecture_commit}`。
 
 | 事实 | 值 |
@@ -464,6 +574,27 @@ class RepositoryProfileContractTest(unittest.TestCase):
             stderr = self.assert_main_rejects_release_fact_documents(root)
 
         self.assertIn('当前 frontend Source Commit 不能复用历史', stderr)
+
+    def test_current_frontend_duplicate_heading_is_rejected(self) -> None:
+        # Would fail if a bad later candidate section is silently ignored.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(root)
+            path = root / 'pcs/candidate-2.md'
+            path.write_text(
+                path.read_text(encoding='utf-8')
+                + '''\n## 当前 frontend 候选
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `bad-source` |
+| CI provenance | `NOT_VERIFIED` |
+''',
+                encoding='utf-8',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('文档事实区段重复：## 当前 frontend 候选', stderr)
 
     def test_current_frontend_unproven_provenance_is_rejected(self) -> None:
         # Would fail if a current candidate could erase already-bound provenance.
@@ -615,6 +746,29 @@ class RepositoryProfileContractTest(unittest.TestCase):
                     stderr = self.assert_main_rejects_release_fact_documents(root)
 
                 self.assertIn('当前 docs 架构事实提交计划与已推送 main 不一致', stderr)
+
+    def test_final_reconciliation_docs_sha_rejects_any_drift(self) -> None:
+        # Would fail if a duplicate current docs fact can diverge from the constraints.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(root)
+            path = root / (
+                'docs/superpowers/plans/'
+                '2026-08-23-pcs-runtime-reconciliation.md'
+            )
+            path.write_text(
+                path.read_text(encoding='utf-8').replace(
+                    'docs 架构事实提交为远端可追溯的 '
+                    '`d6d846a612c974991f4d0ffc0685d06adf2ddfe7`',
+                    'docs 架构事实提交为远端可追溯的 '
+                    '`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`',
+                    1,
+                ),
+                encoding='utf-8',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('当前 docs 架构事实提交计划与已推送 main 不一致', stderr)
 
     def test_frontend_component_and_handoff_summary_rows_reject_drift(self) -> None:
         # Would fail if duplicated release facts drift outside the dedicated table.
