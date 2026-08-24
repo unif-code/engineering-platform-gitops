@@ -18,6 +18,17 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_PCS = ROOT / 'pcs/candidate-2.md'
+CURRENT_FRONTEND_SOURCE = 'da72238abc87a19c07a5cac96e41d88d5f6bf2d3'
+HISTORICAL_FRONTEND_SOURCE = 'c392c6fc7a82a26f1eb4be22c35c6cda00e5d75c'
+CURRENT_FRONTEND_OCI_INDEX_DIGEST = (
+    'sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1'
+)
+NOT_VERIFIED = 'NOT_VERIFIED'
+CURRENT_FRONTEND_DOCUMENTS = (
+    'pcs/candidate-2.md',
+    'runbook/06-apps.md',
+    'runbook/10-image-owner-handoff.md',
+)
 MANIFEST_ROOTS = (ROOT / 'clusters', ROOT / 'infrastructure', ROOT / 'apps')
 EXACT_VERSION = re.compile(r'^v?\d+\.\d+\.\d+$')
 FLOATING_IMAGE = re.compile(r':(?:latest|main|master)$')
@@ -1250,18 +1261,17 @@ def validate_rejected_chainguard_minio_candidate() -> None:
         '候选结论：`REJECTED`',
         'sha256:cc18cac5456a3718bde96c368beaed53b9b876233f28c5f68b8fb667b9a528a7',
         'sha256:c9680a1ad80b56c67b2b9e44cc480a8fd0fb4362dab01f68b8bfbccae9d77596',
-        'minio 0.20260717.120751-r9',
         'sha256:b456af84dd3aa6883e67a74e2cc9aca9b1e060197dcd040d73bdec9e8c6b99fb',
         'sha256:043d0ad5c2b297c0f0382dcac9b9436483d9f4a1d16cecdcc9471affb5e643e4',
-        'mc 0.20250813.083541-r21',
-        'libcrypto3 3.6.3-r5',
-        'CVE-2026-5450',
-        'CVE-2026-54876',
-        '未做风险批准',
     )
     for expected in required_facts:
         if expected not in pcs:
             fail(f'PCS 缺少 MinIO 被拒候选事实：{expected}')
+    if (
+        '供应链证据：`NOT_VERIFIED`' not in pcs
+        or '激活结论：`BLOCKED`' not in pcs
+    ):
+        fail('MinIO 被拒候选缺少精确 digest 供应链证据或 BLOCKED 激活结论')
 
     deployment = document_by_identity(
         ROOT / 'infrastructure/minio/deployment.yaml',
@@ -1304,6 +1314,88 @@ def validate_rejected_chainguard_minio_candidate() -> None:
     for image in active_images:
         if any(digest in image for digest in rejected_digests):
             fail(f'MinIO 清单引用了未获风险批准的 Chainguard 候选：{image}')
+
+
+def markdown_section(document: str, heading: str) -> str:
+    start = document.find(heading)
+    if start == -1:
+        fail(f'文档缺少事实区段：{heading}')
+    next_heading = document.find('\n## ', start + len(heading))
+    return document[start:] if next_heading == -1 else document[start:next_heading]
+
+
+def markdown_table_value(section: str, field: str) -> str:
+    pattern = re.compile(rf'^\|\s*{re.escape(field)}\s*\|\s*(.*?)\s*\|\s*$', re.MULTILINE)
+    match = pattern.search(section)
+    if match is None:
+        fail(f'事实区段缺少字段：{field}')
+    return match.group(1).strip().strip('`')
+
+
+def validate_current_frontend_evidence() -> None:
+    for relative_path in CURRENT_FRONTEND_DOCUMENTS:
+        document = (ROOT / relative_path).read_text(encoding='utf-8')
+        current = markdown_section(document, '## 当前 frontend 候选')
+        historical = markdown_section(document, '## 2026-08-22 frontend 历史证据')
+        current_source = markdown_table_value(current, 'Source Commit')
+        historical_source = markdown_table_value(historical, 'Source Commit')
+
+        if current_source == historical_source or current_source == HISTORICAL_FRONTEND_SOURCE:
+            fail('当前 frontend Source Commit 不能复用历史 Source Commit')
+        if historical_source != HISTORICAL_FRONTEND_SOURCE:
+            fail('frontend 历史证据必须保留已审计的 2026-08-22 Source Commit')
+        if current_source != CURRENT_FRONTEND_SOURCE:
+            fail('当前 frontend Source Commit 与当前审计快照不一致')
+
+        provenance = markdown_table_value(current, 'CI provenance')
+        if provenance == NOT_VERIFIED:
+            for field in (
+                'Artifact / OCI index digest',
+                'linux/amd64 manifest digest',
+                'Runtime Image ID',
+            ):
+                if markdown_table_value(current, field) != NOT_VERIFIED:
+                    fail(
+                        f'当前 frontend {field} 在 provenance 未核验时必须为 '
+                        'NOT_VERIFIED'
+                    )
+        elif provenance == 'VERIFIED':
+            if (
+                markdown_table_value(current, 'Artifact / OCI index digest')
+                != CURRENT_FRONTEND_OCI_INDEX_DIGEST
+            ):
+                fail('当前 frontend OCI index digest 必须匹配已发布 provenance')
+            if not markdown_table_value(
+                current, 'linux/amd64 manifest digest'
+            ).startswith(NOT_VERIFIED):
+                fail('未独立确认的 frontend linux/amd64 manifest 必须为 NOT_VERIFIED')
+            if markdown_table_value(current, 'Runtime Image ID') != NOT_VERIFIED:
+                fail('当前 frontend Runtime Image ID 在未部署前必须为 NOT_VERIFIED')
+        else:
+            fail('当前 frontend CI provenance 状态必须为 VERIFIED 或 NOT_VERIFIED')
+
+
+def validate_blocked_storage_acceptance() -> None:
+    pcs = CURRENT_PCS.read_text(encoding='utf-8')
+    dependencies = markdown_section(pcs, '## 当前阻塞依赖')
+    flux = markdown_table_value(dependencies, 'Flux')
+    minio = markdown_table_value(dependencies, 'MinIO')
+    if flux != 'BLOCKED' or minio != 'BLOCKED':
+        return
+
+    acceptance = (ROOT / 'runbook/09-acceptance.md').read_text(encoding='utf-8')
+    required_rows = (
+        ('3', 'PG PITR 与 etcd 隔离 restore'),
+        ('6', '容量与整机重启'),
+    )
+    for number, criterion in required_rows:
+        row = re.search(rf'^\|\s*{number}\s*\|.*$', acceptance, re.MULTILINE)
+        if row is None or not all(
+            expected in row.group(0) for expected in ('BLOCKED', 'Flux', 'MinIO')
+        ):
+            fail(
+                f'Flux/MinIO 仍 BLOCKED 时，{criterion} 验收必须为 BLOCKED 并声明依赖'
+            )
 
 
 def resource_id(document: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -1448,6 +1540,8 @@ def main() -> None:
     validate_single_user_resources()
     validate_metrics_server()
     validate_rejected_chainguard_minio_candidate()
+    validate_current_frontend_evidence()
+    validate_blocked_storage_acceptance()
     print('GitOps manifests validated successfully.')
 
 

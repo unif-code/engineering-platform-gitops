@@ -24,14 +24,14 @@ GitOps commit / PR：bootstrap 完成于 `a3eb3945c733b77f2594c9ff10e99dcd8587cd
 集群构成：kubeadm 单节点控制面（`clusterName=engineering-platform-dev`）、containerd 2.3.1 + runc、
 Kubernetes 1.36.3 四包 hold、Cilium 1.20.0（kube-proxy replacement、Gateway API v1.6.1 standard、Envoy DaemonSet）。
 
-### 2026-08-21 最新复核
+### 2026-08-21 历史 bootstrap 观测
 
 | 证据 | 结果 |
 | --- | --- |
 | `/root/dev-infra-evidence/07-preflight-20260821T071118Z.txt` | `PASS_PREFLIGHT`；SHA-256 `9d8a287936c14362899d26846cd92a3a0927fa392af1c74efda599c2f774fe20` |
 | `/root/dev-infra-evidence/14-verify-20260821T073936Z.txt` | `PASS_BOOTSTRAP_VERIFIED`；SHA-256 `0c0b06a4b19c8cfe5169357be572dad77acdf227aeccdd6aa7ae82003a9d1daa` |
 
-最后一次运行时只存在 Kubernetes/Cilium 基础组件和 GitLab Runner；Flux CRD、`flux-system`、`platform`、MinIO、CNPG、cert-manager、monitoring 及 frontend/backend 工作负载均不存在。因此本页只证明 bootstrap，不证明 GitOps 或应用已部署。
+该日期的运行时观测只存在 Kubernetes/Cilium 基础组件和 GitLab Runner；Flux CRD、`flux-system`、`platform`、MinIO、CNPG、cert-manager、monitoring 及 frontend/backend 工作负载均不存在。因此这是历史 bootstrap 证据，只证明当时 bootstrap，不证明最新运行时、GitOps 或应用已部署。
 
 ## 可恢复的一次性执行合同
 

@@ -281,6 +281,188 @@ class RepositoryProfileContractTest(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    @staticmethod
+    def write_release_fact_documents(
+        root: Path,
+        *,
+        frontend_source: str = 'da72238abc87a19c07a5cac96e41d88d5f6bf2d3',
+        frontend_provenance: str = 'NOT_VERIFIED',
+        frontend_artifact: str = 'NOT_VERIFIED',
+        frontend_manifest: str = 'NOT_VERIFIED',
+        frontend_image_id: str = 'NOT_VERIFIED',
+        backup_status: str = 'BLOCKED',
+        capacity_status: str = 'BLOCKED',
+    ) -> Path:
+        historical_source = 'c392c6fc7a82a26f1eb4be22c35c6cda00e5d75c'
+        historical_digest = (
+            'sha256:ee548974e159916ba7ca0fafe8bb30d72722a34625ffbce31d6e495324d06c0c'
+        )
+        current = f'''## 当前 frontend 候选
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `{frontend_source}` |
+| CI provenance | `{frontend_provenance}` |
+| Artifact / OCI index digest | `{frontend_artifact}` |
+| linux/amd64 manifest digest | `{frontend_manifest}` |
+| Runtime Image ID | `{frontend_image_id}` |
+
+## 2026-08-22 frontend 历史证据
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `{historical_source}` |
+| OCI index digest | `{historical_digest}` |
+
+## 当前阻塞依赖
+
+| 依赖 | 状态 |
+| --- | --- |
+| Flux | `BLOCKED` |
+| MinIO | `BLOCKED` |
+'''
+        for relative_path in (
+            'pcs/candidate-2.md',
+            'runbook/06-apps.md',
+            'runbook/10-image-owner-handoff.md',
+        ):
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(current, encoding='utf-8')
+
+        acceptance = root / 'runbook/09-acceptance.md'
+        acceptance.write_text(
+            f'''| # | 验收标准 | 证据 | 状态 |
+| --- | --- | --- | --- |
+| 1 | Flux 单向 Reconcile | Flux 输出 | BLOCKED（Flux 未激活） |
+| 3 | PG PITR 与 etcd 隔离 restore 各完成一次 | restore drill | {backup_status}（依赖 Flux 与 MinIO） |
+| 4 | 三 bucket Versioning/Object Lock | MinIO verify | BLOCKED（MinIO 供应链阻塞） |
+| 6 | 容量与重启证据 | capacity drill | {capacity_status}（依赖 Flux 与 MinIO） |
+''',
+            encoding='utf-8',
+        )
+        return root / 'pcs/candidate-2.md'
+
+    def assert_main_rejects_release_fact_documents(self, root: Path) -> str:
+        stderr = io.StringIO()
+        current_pcs = root / 'pcs/candidate-2.md'
+        with (
+            mock.patch.object(validator, 'ROOT', root),
+            mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+            mock.patch.object(validator, 'validate_active_root'),
+            mock.patch.object(validator, 'validate_bootstrap_contracts'),
+            mock.patch.object(validator, 'validate_kustomize_builds'),
+            mock.patch.object(validator, 'validate_documents'),
+            mock.patch.object(validator, 'validate_single_user_storage'),
+            mock.patch.object(validator, 'validate_single_user_resources'),
+            mock.patch.object(validator, 'validate_metrics_server'),
+            mock.patch.object(
+                validator, 'validate_rejected_chainguard_minio_candidate'
+            ),
+            contextlib.redirect_stderr(stderr),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            validator.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        return stderr.getvalue()
+
+    def test_current_frontend_cannot_reuse_historical_source(self) -> None:
+        # Would fail if the current-candidate check stops separating dated history.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(
+                root,
+                frontend_source='c392c6fc7a82a26f1eb4be22c35c6cda00e5d75c',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('当前 frontend Source Commit 不能复用历史', stderr)
+
+    def test_unproven_frontend_artifact_and_image_id_remain_fail_closed(
+        self,
+    ) -> None:
+        # Would fail if an unverified provenance record can authorize a digest.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(
+                root,
+                frontend_artifact='sha256:unverified-artifact',
+                frontend_image_id='sha256:unverified-image-id',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn(
+            '当前 frontend Artifact / OCI index digest 在 provenance 未核验时必须为 NOT_VERIFIED',
+            stderr,
+        )
+
+    def test_verified_frontend_provenance_binds_published_index_only(self) -> None:
+        # Would fail if a successful CI run did not bind its published index digest.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(
+                root,
+                frontend_provenance='VERIFIED',
+                frontend_artifact='NOT_VERIFIED',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('当前 frontend OCI index digest 必须匹配已发布 provenance', stderr)
+
+    def test_blocked_flux_and_minio_block_backup_restore_and_capacity_acceptance(
+        self,
+    ) -> None:
+        # Would fail if storage-dependent acceptance is relabeled PENDING.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_release_fact_documents(
+                root,
+                frontend_source='da72238abc87a19c07a5cac96e41d88d5f6bf2d3',
+                backup_status='PENDING',
+                capacity_status='PENDING',
+            )
+            stderr = self.assert_main_rejects_release_fact_documents(root)
+
+        self.assertIn('Flux/MinIO 仍 BLOCKED 时，PG PITR', stderr)
+
+    def test_rejected_minio_candidate_requires_exact_digest_evidence_to_activate(
+        self,
+    ) -> None:
+        # Would fail if a mutable vendor-page claim could replace digest evidence.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            minio = root / 'infrastructure/minio'
+            minio.mkdir(parents=True)
+            current_pcs = root / 'candidate-2.md'
+            current_pcs.write_text(
+                validator.CURRENT_PCS.read_text(encoding='utf-8').replace(
+                    '供应链证据：`NOT_VERIFIED`',
+                    '供应链证据：`VERIFIED`',
+                ),
+                encoding='utf-8',
+            )
+            shutil.copy(
+                validator.ROOT / 'infrastructure/minio/deployment.yaml',
+                minio / 'deployment.yaml',
+            )
+            shutil.copy(
+                validator.ROOT / 'infrastructure/minio/bootstrap-job.yaml',
+                minio / 'bootstrap-job.yaml',
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(validator, 'ROOT', root),
+                mock.patch.object(validator, 'CURRENT_PCS', current_pcs),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                validator.validate_rejected_chainguard_minio_candidate()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn('MinIO 被拒候选缺少精确 digest 供应链证据', stderr.getvalue())
+
     def test_single_user_resource_contract(self) -> None:
         self.assertEqual(validate_single_user_resources(), (1115, 2720))
 
