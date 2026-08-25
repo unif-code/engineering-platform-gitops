@@ -1,0 +1,112 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    platform.unif.internal/backend-image: sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857
+    platform.unif.internal/backend-source: 4aaf721fa91abd729b33765e4e329b02aa2ece02
+    platform.unif.internal/migration-generation: '1'
+  labels:
+    app.kubernetes.io/name: platform-migration
+    app.kubernetes.io/part-of: engineering-platform
+  name: platform-migrate-4aaf721
+  namespace: platform
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform-migration
+        app.kubernetes.io/part-of: engineering-platform
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ghcr-pull
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platform-migration
+      containers:
+        - args:
+            - |-
+              python - <<'PY'
+              from sqlalchemy import create_engine, text
+
+              from control_plane.app.shared.db.settings import DbSettings
+
+              expected = {
+                  "audit_rw",
+                  "authorization_rw",
+                  "configuration_rw",
+                  "identity_rw",
+                  "organization_rw",
+                  "workspace_rw",
+              }
+              engine = create_engine(DbSettings().migration_database_url)
+              try:
+                  with engine.connect() as connection:
+                      current_user = connection.execute(
+                          text("SELECT current_user")
+                      ).scalar_one()
+                      rows = connection.execute(
+                          text(
+                              "SELECT rolname, rolcanlogin, rolsuper "
+                              "FROM pg_roles WHERE rolname = ANY(:roles)"
+                          ),
+                          {"roles": sorted(expected)},
+                      )
+                      observed = {
+                          row.rolname: (row.rolcanlogin, row.rolsuper)
+                          for row in rows
+                      }
+              finally:
+                  engine.dispose()
+              if current_user != "platform_owner":
+                  raise SystemExit("migration owner identity mismatch")
+              if set(observed) != expected:
+                  raise SystemExit("runtime role inventory mismatch")
+              if any(not login or superuser for login, superuser in observed.values()):
+                  raise SystemExit("runtime role privilege mismatch")
+              PY
+              exec alembic upgrade heads
+          command:
+            - /bin/sh
+            - -ec
+          image: ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857
+          imagePullPolicy: IfNotPresent
+          name: migrate
+          resources:
+            limits:
+              cpu: '1'
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 999
+            runAsNonRoot: true
+            runAsUser: 999
+          volumeMounts:
+            - mountPath: /app/.env
+              name: migration-config
+              readOnly: true
+              subPath: .env
+            - mountPath: /tmp
+              name: tmp
+      volumes:
+        - name: migration-config
+          secret:
+            defaultMode: 288
+            secretName: platform-migration-config
+        - emptyDir: {}
+          name: tmp

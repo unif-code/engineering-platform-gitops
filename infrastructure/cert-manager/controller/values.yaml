@@ -1,0 +1,47 @@
+crds:
+  enabled: true
+image:
+  digest: sha256:4c2b5201fd66085b777dc6b256d96d7d346b6445404cec34db5f8aea86182cc5
+webhook:
+  image:
+    digest: sha256:741084291faf115a2909bfe3515458b54926c67f039ac20effd821bac69817a4
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 20m
+      memory: 64Mi
+cainjector:
+  image:
+    digest: sha256:1910ad7e134880e27d229e07affb43da1b07841a77f70c364f17467cb4e49bd9
+  resources:
+    limits:
+      cpu: 300m
+      memory: 256Mi
+    requests:
+      cpu: 30m
+      memory: 64Mi
+startupapicheck:
+  image:
+    digest: sha256:15cafecd3d23a4fa2226185f78c4792914010b2713f59060a1b9b484029041e4
+  resources:
+    limits:
+      cpu: 100m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi
+acmesolver:
+  image:
+    digest: sha256:e5a8da10354cdd0225eb039c84ad3696d47282de18c21905a25bb3a392542b34
+prometheus:
+  servicemonitor:
+    enabled: false
+resources:
+  limits:
+    cpu: 300m
+    memory: 256Mi
+  requests:
+    cpu: 30m
+    memory: 64Mi

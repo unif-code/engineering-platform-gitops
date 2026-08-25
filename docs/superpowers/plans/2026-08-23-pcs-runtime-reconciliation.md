@@ -12,14 +12,14 @@
 
 ## Final reconciliation result（2026-08-24）
 
-- docs 架构事实提交为远端可追溯的 `d6d846a612c974991f4d0ffc0685d06adf2ddfe7`。
+- docs 架构事实提交为远端可追溯的 `541b186878d1e28e1aa9308111a2962cdfefb91b`。
 - frontend 当前 Source Commit 为 `da72238abc87a19c07a5cac96e41d88d5f6bf2d3`；CI run `32683635240`、publish-image job `97305929974`、tag `sha-da72238`、OCI index `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` 与可部署 `linux/amd64` manifest `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` 均已绑定；Runtime Image ID 仍为 `NOT_VERIFIED`。
 - 当前 DEV Runtime 采样为 `2026-08-24 03:42Z`：`run-approved --check` 的 `RESULT=PASS_BOOTSTRAP_ALL_CHECK`，GitOps commit `1c5034b9a9c29ab72fde63644c57fa88604c45b6`，但 `flux-system`、`platform`、`openbao` 仍不存在，GitRepository 查询为空；应用、恢复和容量 Gate 因此仍为 `BLOCKED`。
 - 2026-08-22 frontend 和 Runtime 值仅保留于明确的历史证据区段，不构成当前候选或验收结论。
 
 ## Global Constraints
 
-- docs 架构基线固定为 `2026-08-23.1`，事实提交为 `d6d846a612c974991f4d0ffc0685d06adf2ddfe7`。
+- docs 架构基线固定为 `2026-08-24.1`，事实提交为 `541b186878d1e28e1aa9308111a2962cdfefb91b`。
 - 当前采样时 GitOps main 为 `1c5034b9a9c29ab72fde63644c57fa88604c45b6`，frontend 为 `da72238abc87a19c07a5cac96e41d88d5f6bf2d3`，backend 为 `647d509bca1bbf9ff0f6ab719d5905d8f836e92f`。
 - DEV Runtime 只能陈述最后一次成功观测：`2026-08-24 03:42Z` 的 `PASS_BOOTSTRAP_ALL_CHECK`；它只证明 bootstrap check，不证明 GitOps 或应用已部署。
 - frontend CI 事实为 run `32683635240`、publish-image job `97305929974`、tag `sha-da72238`、OCI index `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` 与已核验的 `linux/amd64` manifest `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`；运行 Image ID 仍未核验。
@@ -39,7 +39,7 @@
 - Modify: `scripts/test_validate.py:1-12,180-205`
 
 **Interfaces:**
-- Consumes: Candidate 1 的完整组件锁定表、docs 基线 `2026-08-23.1` 和四仓 Source Commit。
+- Consumes: Candidate 1 的完整组件锁定表、docs 基线 `2026-08-24.1` 和四仓 Source Commit。
 - Produces: `validator.CURRENT_PCS: Path`，供 `validate_metrics_server()` 读取当前 PCS。
 
 - [x] **Step 1: 写入会失败的当前 PCS 路径测试**
@@ -87,7 +87,7 @@ Expected: FAIL，唯一原因是 `validate` 尚无 `CURRENT_PCS`，`mock.patch.o
 
 状态：`BLOCKED CANDIDATE`
 环境：`DEV` / `NON_HA`
-基线：`2026-08-23.1`
+基线：`2026-08-24.1`
 ```
 
 在组件表前增加：
@@ -97,7 +97,7 @@ Expected: FAIL，唯一原因是 `validate` 尚无 `CURRENT_PCS`，`mock.patch.o
 
 | 事实 | 值 |
 | --- | --- |
-| docs 架构事实提交 | `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` |
+| docs 架构事实提交 | `541b186878d1e28e1aa9308111a2962cdfefb91b` |
 | GitOps main 采样提交 | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
 | frontend Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
 | backend Source Commit | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |

@@ -9,6 +9,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 bootstrap_dir=$(cd "${script_dir}/../.." && pwd -P)
 repo_root=$(cd "${bootstrap_dir}/../.." && pwd -P)
 # shellcheck source=scripts/bootstrap/lib/common.sh
+# shellcheck disable=SC1091
 source "${bootstrap_dir}/lib/common.sh"
 # shellcheck disable=SC1091
 source "${bootstrap_dir}/lib/host-config.sh"

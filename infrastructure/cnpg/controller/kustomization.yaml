@@ -1,6 +1,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - repository.yaml
-  - cnpg-release.yaml
-  - barman-release.yaml
+  - rendered.yaml
+images:
+  - name: ghcr.io/cloudnative-pg/cloudnative-pg
+    newName: ghcr.io/cloudnative-pg/cloudnative-pg
+    digest: sha256:091d306935cfdf646debfe78010d59ebfb572150eb6eb922b0203873c0c68841

@@ -137,9 +137,11 @@ Desired State 来源。
 
 `--apply` 会先检查每个 stage，跳过返回 `ALREADY_COMPLIANT` 的 stage，仅对需要变更的
 stage 执行 apply，并要求 apply 后的 post-check 回到 compliant；否则立即停止。当前编排顺序
-为 stage `00`、`10`、`20`、`30`、`40`、`50`、`60`、`90`、`100`。Stage `100` 是 Flux Phase A 的正式一键入口，
-仍严格限制为 source、kustomize、helm、notification 四个 Controller；它不会创建 Secret、
-sync CR、第五个 Controller、下游 Namespace，也不会执行 OpenBao、备份或业务应用。
+为 stage `00`、`10`、`20`、`30`、`40`、`50`、`60`、`90`、`100`、`110`、`120`、
+`130`、`140`、`150`、`160`。Stage `100` 仍只管理 Flux Phase A 的 source、kustomize、helm、
+notification 四个 Controller；Stage `110` 才激活公共 `validated` sync，后续阶段按依赖等待
+基础设施、创建带外 Secret、等待数据库/migration/应用并写入非敏感证据。整个编排不执行
+OpenBao、MinIO、备份、恢复、observability 或账号初始化。
 运行失败后，
 重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，不读取或维护 progress file。
 
@@ -148,6 +150,50 @@ orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 sta
 Flux Phase A 四 Controller 另有历史验收；包含 stage `100` 的新候选继续运行时，由 stage
 `100` 对 Flux Phase A 做 fail-closed 的只读判定；完整
 compliant 时直接返回 `ALREADY_COMPLIANT`，不会重复部署或创建探针。
+
+### Business-ready 候选阶段 110–160
+
+本节描述待合并并通过 `validation-gate` 的候选 Desired State，不改变上文历史运行事实：在取得
+新的 Stage 160 证据前，Git sync、平台基础设施、migration、frontend/backend 与账号初始化均为
+`NOT_EXECUTED`。业务可用也不等于 V0.1 完整验收；OpenBao、MinIO、备份/恢复、observability
+和整机重启验收继续 `BLOCKED`。
+
+活动 DAG 固定为 `foundation -> cert-manager + cnpg -> database -> migration -> apps`。所有
+Flux CR 位于 `flux-system` 并使用独立最小权限 ServiceAccount；活动 root 只允许五个 Namespace：
+`flux-system`、`local-path-storage`、`cert-manager`、`cnpg-system`、`platform`。每个 Namespace
+都有双向 default deny 与 DNS egress；按职责精确放行 kube-apiserver/webhook，并只允许 Cilium
+Gateway 的 `ingress` identity 访问 frontend/backend。
+
+私有 GHCR 拉取必须在服务器预先存在以下两个 root-owned、mode `0600` 文件；不得通过终端回显、
+聊天或 evidence 展示内容：
+
+- `/root/.config/engineering-platform/ghcr-username`
+- `/root/.config/engineering-platform/ghcr-read-token`
+
+| Stage | `--check` | `--apply` | 责任 |
+| --- | --- | --- | --- |
+| 110 | `PASS_FLUX_SYNC_CHECK` | `PASS_FLUX_SYNC_ENABLED` | 持久化 sync Namespace、公共 GitRepository、根 Kustomization 与 Git FQDN egress |
+| 120 | `PASS_PLATFORM_CORE_CHECK` | `PASS_PLATFORM_CORE_READY` | 等待 foundation、cert-manager 与 CNPG Operator Ready |
+| 130 | `PASS_PLATFORM_DATABASE_CHECK` | `PASS_PLATFORM_DATABASE_READY` | 创建 13 个不覆盖的 Secret，等待单实例 PostgreSQL，生成 file-only runtime config |
+| 140 | `PASS_PLATFORM_MIGRATION_CHECK` | `PASS_PLATFORM_MIGRATION_COMPLETE` | 等待不可变 Job `platform-migrate-4aaf721` 完成并验证 migration heads |
+| 150 | `PASS_PLATFORM_APPS_CHECK` | `PASS_PLATFORM_APPS_READY` | 等待 workload/TLS/Gateway 并执行 HTTPS `/`、`/healthz`、`/readyz`、未认证 `/api/v1/me` smoke |
+| 160 | `PASS_BUSINESS_READY_EVIDENCE_CHECK` | `PASS_BUSINESS_READY` | 重放 smoke，写入 mode `0600` evidence 与 SHA-256 sidecar |
+
+重复运行时，已精确合规的 stage 返回 `ALREADY_COMPLIANT`；任何 partial、extra、Secret 语义漂移、
+供应链漂移、readiness 或 smoke 未知状态都 fail closed。Stage 160 证据路径固定为
+`/root/dev-infra-evidence/16-business-ready-<UTC>.txt` 及同名 `.sha256`，且明确记录
+`OPENBAO=NOT_EXECUTED`、`MINIO=NOT_EXECUTED`、`BACKUPS=NOT_EXECUTED`、
+`RESTORE=NOT_EXECUTED`、`OBSERVABILITY=NOT_EXECUTED` 与 `SECRET_VALUES=NOT_RECORDED`。
+
+正常部署只使用合并后完整 SHA：先单独审批并执行
+`./scripts/bootstrap/run-approved.sh <merged-sha> --check`；完整回执合规后，再展示并单独审批
+`./scripts/bootstrap/run-approved.sh <merged-sha> --apply`。`--check` 对主机/集群配置只读，
+但 `run-approved.sh` 会 fetch/ff-only 更新服务器 checkout，Stage 150/160 会发出非变更性 HTTPS
+probe，因此仍属于必须先展示完整命令的运维动作。
+
+账号初始化不属于 Stage 160。它必须在应用 Ready 后单独证明尚无 Super Admin，再展示完整的
+受控交互命令并取得数据库写入批准；临时密码只允许当前 TTY 一次显示，不进入 Job log、证据、
+聊天或文件。
 
 ### 单阶段诊断和人工应急入口
 
@@ -165,6 +211,12 @@ compliant 时直接返回 `ALREADY_COMPLIANT`，不会重复部署或创建探�
 | 13 | `stages/60-install-cilium/run.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/13-cilium-*.txt` |
 | 14 | `stages/90-verify/run.sh` | 仅 `--check` | `PASS_BOOTSTRAP_VERIFIED` | `/root/dev-infra-evidence/14-verify-*.txt` |
 | 15 | `stages/100-flux-phase-a/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_PHASE_A_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
+| 16 | `stages/110-flux-sync/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_SYNC_ENABLED` 或 `ALREADY_COMPLIANT` | 终端回执 |
+| 17 | `stages/120-platform-core/run.sh` | `--check` 后批准 `--apply` | `PASS_PLATFORM_CORE_READY` 或 `ALREADY_COMPLIANT` | 终端回执 |
+| 18 | `stages/130-platform-database/run.sh` | `--check` 后批准 `--apply` | `PASS_PLATFORM_DATABASE_READY` 或 `ALREADY_COMPLIANT` | 仅 Secret metadata 的终端回执 |
+| 19 | `stages/140-platform-migration/run.sh` | `--check` 后批准 `--apply` | `PASS_PLATFORM_MIGRATION_COMPLETE` 或 `ALREADY_COMPLIANT` | 终端回执 |
+| 20 | `stages/150-platform-apps/run.sh` | `--check` 后批准 `--apply` | `PASS_PLATFORM_APPS_READY` 或 `ALREADY_COMPLIANT` | 非敏感 HTTPS smoke 回执 |
+| 21 | `stages/160-business-ready-evidence/run.sh` | `--check` 后批准 `--apply` | `PASS_BUSINESS_READY` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/16-business-ready-*.txt` 及同名 `.sha256` |
 
 固定退出码：`0` 表示当前阶段按输出判定完成或需要获批 APPLY；`10` 为前置条件失败，
 `20` 为供应链不匹配，`30` 为未知/漂移状态，`40` 为 APPLY 失败，`50` 为部署后
@@ -194,9 +246,9 @@ EXIT_CODE=30
 进度行与心跳走 **stderr**，形如：
 
 ```
-[5/9] stage 40 check ...
-[5/9] stage 40 check ... 5s elapsed
-[5/9] stage 40 check -> ALREADY_COMPLIANT (37s)
+[5/15] stage 40 check ...
+[5/15] stage 40 check ... 5s elapsed
+[5/15] stage 40 check -> ALREADY_COMPLIANT (37s)
 ```
 
 它们是给人看的存活信号，**不属于 stdout 的证据契约，不需要回填**。慢 stage 首拍
@@ -476,9 +528,9 @@ Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不
 | 证据 SHA-256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7`；侧车校验 `OK` |
 | 未执行 | Git sync、OpenBao、全部备份、infrastructure、apps、MinIO 与应用部署 |
 
-以上为带时间戳的历史运行证据，不冒充后续实时 readback。`2026-08-25` 恢复时外部 Chrome
-没有“Web终端 - 统一企业堡垒机”标签页，因此本批次未重新查询服务器或集群，也未执行任何
-`kubectl apply/diff` 或其他服务端写操作。
+以上为带时间戳的历史运行证据，不冒充后续实时 readback。`2026-08-25` 较早一次恢复时外部
+Chrome 没有“Web终端 - 统一企业堡垒机”标签页，因此当次未重新查询服务器或集群，也未执行
+任何 `kubectl apply/diff` 或其他服务端写操作；后续候选部署仍必须使用最新匹配标签页重新核验。
 
 ### 首次部署进入条件（历史执行合同）
 
@@ -527,9 +579,9 @@ RENDERED='/root/flux-phase-a-v2.9.3/rendered.yaml'
 FIELD_MANAGER='engineering-platform-flux-phase-a'
 
 kubectl --kubeconfig="$KC" kustomize \
-  clusters/dev/flux-system > "$RENDERED"
+  clusters/dev/flux-system/phase-a > "$RENDERED"
 kubectl --kubeconfig="$KC" create --dry-run=client \
-  -k clusters/dev/flux-system
+  -k clusters/dev/flux-system/phase-a
 ```
 
 这里必须使用 `create --dry-run=client`：该步骤只在客户端构建并校验完整 Desired State，
@@ -560,7 +612,7 @@ FIELD_MANAGER='engineering-platform-flux-phase-a'
 
 test -s "$RENDERED"
 cmp -s "$RENDERED" \
-  <(kubectl --kubeconfig="$KC" kustomize clusters/dev/flux-system)
+  <(kubectl --kubeconfig="$KC" kustomize clusters/dev/flux-system/phase-a)
 test -z "$(
   kubectl --kubeconfig="$KC" get namespace flux-system \
     --ignore-not-found -o name
@@ -615,12 +667,12 @@ kubectl --kubeconfig="$KC" wait \
 kubectl --kubeconfig="$KC" apply --server-side \
   --dry-run=server \
   --field-manager="$FIELD_MANAGER" \
-  -k clusters/dev/flux-system
+  -k clusters/dev/flux-system/phase-a
 
 DIFF_RC=0
 kubectl --kubeconfig="$KC" diff --server-side \
   --field-manager="$FIELD_MANAGER" \
-  -k clusters/dev/flux-system || DIFF_RC=$?
+  -k clusters/dev/flux-system/phase-a || DIFF_RC=$?
 
 case "$DIFF_RC" in
   0|1)
@@ -650,7 +702,7 @@ Git sync CR、`cluster-admin` binding、第五个 Controller、Secret 或下游 
 cd /opt/uni-code/engineering-platform-gitops
 kubectl --kubeconfig=/etc/kubernetes/admin.conf apply --server-side \
   --field-manager=engineering-platform-flux-phase-a \
-  -k clusters/dev/flux-system
+  -k clusters/dev/flux-system/phase-a
 kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
   rollout status deployment/source-controller --timeout=5m
 kubectl --kubeconfig=/etc/kubernetes/admin.conf -n flux-system \
@@ -895,7 +947,7 @@ sha256sum "$FLUX_PHASE_A_EVIDENCE_PATH"
 ```bash
 cd /opt/uni-code/engineering-platform-gitops
 kubectl --kubeconfig=/etc/kubernetes/admin.conf \
-  delete --wait=true -k clusters/dev/flux-system
+  delete --wait=true -k clusters/dev/flux-system/phase-a
 ```
 
 出现任何 sync CR、用户 Secret 或下游资源后，此回滚路径立即失效，必须另写并评审

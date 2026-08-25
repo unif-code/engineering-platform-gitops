@@ -1,22 +1,38 @@
-# STATUS: STAGED
-# ACTIVE: false
-# REASON: frontend 与 backend Desired State 尚未具备完整发布 Gate
-# ACTIVATION_GATES: bootstrap、Flux、数据库迁移、镜像 digest 与应用 owner 验收全部通过
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
-  name: apps
+  name: platform-migration
   namespace: flux-system
 spec:
   dependsOn:
     - name: platform-database
   interval: 10m
-  path: ./apps
-  prune: true
+  path: ./apps/migration
+  prune: false
   retryInterval: 1m
-  serviceAccountName: flux-platform-reconciler
+  serviceAccountName: flux-platform-migration-reconciler
   sourceRef:
     kind: GitRepository
     name: flux-system
   timeout: 10m
+  wait: true
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: platform-apps
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: platform-migration
+    - name: cert-manager-config
+  interval: 10m
+  path: ./apps
+  prune: true
+  retryInterval: 1m
+  serviceAccountName: flux-platform-app-reconciler
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  timeout: 15m
   wait: true

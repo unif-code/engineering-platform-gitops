@@ -10,8 +10,13 @@
 - backend `engineering-platform-backend` main 位于 `4aaf721fa91abd729b33765e4e329b02aa2ece02`；CI run `32802909349` 的 verify 与 publish-image 均成功，tag 为 `sha-4aaf721`，不可变 OCI index digest 为 `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`。
 - backend 历史 commit `1d627b9` 的 digest `sha256:c77fb2d88a61659fa8c2b5074a4ea3103002698085e578652d999d2e2b45e8d7` 只作历史记录，不进入当前 handoff。
 - `2026-08-24 12:16:47Z` 的历史 DEV Runtime inventory 没有 platform Namespace、migration Job 或 frontend/backend 工作负载，所有应用 Smoke 均未执行；该记录不冒充 2026-08-25 实时 readback。
+- GitOps business-ready 候选已经锁定上述两个 digest，并包含 migration、Deployment、Service、
+  HTTPRoute 与 Stage 110–160；它尚未合并/部署，运行 Image ID 和 Smoke 仍为 `NOT_VERIFIED`/
+  `NOT_EXECUTED`。
 
-backend 交付已成为可用输入，但当前批准计划尚未进入 backend 部署阶段；不得据此提前提交或执行应用 Desired State。进入应用阶段前的回执为：
+backend/frontend 交付已成为 business-ready 候选的锁定输入。只有候选合并 SHA 的
+`validation-gate` 与 `validated` 一致，并通过独立服务器写入审批后，Stage 110–160 才可执行；
+不得把仓库候选冒充 runtime。进入运行阶段前的回执为：
 
 ## 当前 DEV Runtime 观测
 
@@ -70,8 +75,11 @@ run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认�
 | Migration | `NOT_EXECUTED` |
 | Account initialization | `NOT_EXECUTED` |
 
-只有后续批准计划进入 backend 部署阶段，才可将上述 digest 写入清单并执行 migration、
-健康检查和运行 readback。账号初始化仍未执行；临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
+上述 digest 已写入候选清单；migration、健康检查和运行 readback 尚未执行。私有 GHCR
+credential 只允许通过服务器 root-owned、mode `0600` 的受保护文件供给，值不得出现在 Git、
+命令回显或证据。账号初始化仍未执行；临时密码只允许在受控初始化 TTY 中一次性显示，
+不得写入 Git、聊天、日志或长期证据。
+临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
 
 ## 2026-08-22 frontend 历史证据
 
@@ -97,7 +105,9 @@ run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认�
 | Account initialization | 不适用 | `NOT_EXECUTED` |
 | Smoke 结果 | `/` 登录页：`NOT_EXECUTED` | `/api/v1/me`、`/healthz`、`/readyz`：`NOT_EXECUTED` |
 
-应用 Desired State 只接受 Registry 查询结果或 CI provenance 中的 digest。backend 不可变输入已到齐，但当前批准计划仍未进入应用部署阶段；backend/frontend Deployment、Service、HTTPRoute、Alembic migration Job 和账号初始化均不得提前执行。
+应用 Desired State 只接受 Registry 查询结果或 CI provenance 中的 digest。当前候选已锁定
+backend/frontend Deployment、Service、HTTPRoute 与 Alembic migration Job；在合并、CI 与
+服务器运行门完成前它们仍为 `NOT_EXECUTED`。账号初始化始终是编排器外的独立数据库写入门。
 
 DEV-002 初始资源合同也必须由应用 owner 验证并随首个清单提交：
 

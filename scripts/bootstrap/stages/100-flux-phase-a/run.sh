@@ -64,7 +64,7 @@ if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
   TAR_BINARY=$(host_path /usr/bin/tar)
 fi
 readonly TAR_BINARY
-readonly DESIRED_ROOT="${repo_root}/clusters/dev/flux-system"
+readonly DESIRED_ROOT="${repo_root}/clusters/dev/flux-system/phase-a"
 readonly RAW_RENDERED_SHA256=1a82990f5b4a84bc52692a84871a04ebbda4cc02fb1e72e4283d6f320f4f4994
 readonly FIELD_MANAGER=engineering-platform-flux-phase-a
 readonly FLUX_VERSION=2.9.3
@@ -76,6 +76,8 @@ readonly EXPECTED_CRDS=$'customresourcedefinition.apiextensions.k8s.io/alerts.no
 readonly EXPECTED_DEPLOYMENTS=$'deployment.apps/helm-controller\ndeployment.apps/kustomize-controller\ndeployment.apps/notification-controller\ndeployment.apps/source-controller'
 readonly EXPECTED_CLUSTER_RBAC=$'clusterrole.rbac.authorization.k8s.io/flux-controller-api-health\nclusterrolebinding.rbac.authorization.k8s.io/flux-controller-api-health'
 readonly FLUX_CUSTOM_RESOURCE_TYPES=alerts.notification.toolkit.fluxcd.io,buckets.source.toolkit.fluxcd.io,externalartifacts.source.toolkit.fluxcd.io,gitrepositories.source.toolkit.fluxcd.io,helmcharts.source.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io,helmrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,ocirepositories.source.toolkit.fluxcd.io,providers.notification.toolkit.fluxcd.io,receivers.notification.toolkit.fluxcd.io
+readonly EXPECTED_BUSINESS_NAMESPACES=$'namespace/cert-manager\nnamespace/cnpg-system\nnamespace/local-path-storage\nnamespace/platform'
+readonly EXPECTED_BUSINESS_SYNC=$'gitrepository.source.toolkit.fluxcd.io/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/cert-manager-config\nkustomization.kustomize.toolkit.fluxcd.io/cert-manager-controller\nkustomization.kustomize.toolkit.fluxcd.io/cnpg-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/infrastructure-foundation\nkustomization.kustomize.toolkit.fluxcd.io/platform-apps\nkustomization.kustomize.toolkit.fluxcd.io/platform-database\nkustomization.kustomize.toolkit.fluxcd.io/platform-migration'
 
 namespace_json_is_exact() {
   python_isolated -c '
@@ -206,10 +208,13 @@ api_health_rbac=$(kubectl_run get clusterrole,clusterrolebinding \
   flux-controller-api-health --ignore-not-found --output=name 2>/dev/null) ||
   complete STOP_UNKNOWN_STATE flux-cluster-resource-query-failed "$EXIT_UNKNOWN_STATE" NONE
 downstream_namespaces=$(kubectl_run get namespace platform openbao cert-manager \
-  monitoring cnpg-system minio --ignore-not-found --output=name 2>/dev/null) ||
+  monitoring cnpg-system minio local-path-storage --ignore-not-found \
+  --output=name 2>/dev/null) ||
   complete STOP_UNKNOWN_STATE downstream-namespace-query-failed "$EXIT_UNKNOWN_STATE" NONE
 
-[[ -z "$downstream_namespaces" ]] ||
+sorted_downstream_namespaces=$(printf '%s\n' "$downstream_namespaces" | sort)
+[[ -z "$downstream_namespaces" ||
+   "$sorted_downstream_namespaces" == "$EXPECTED_BUSINESS_NAMESPACES" ]] ||
   complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
 if [[ -z "$namespace_name" && -z "$flux_crds" ]]; then
   [[ -z "$flux_cluster_resources" && -z "$api_health_rbac" ]] ||
@@ -263,7 +268,9 @@ if [[ -n "$flux_crds" ]]; then
   sync_inventory=$(kubectl_run get "$FLUX_CUSTOM_RESOURCE_TYPES" \
     --all-namespaces --ignore-not-found --output=name 2>/dev/null) ||
     complete STOP_UNKNOWN_STATE flux-sync-query-failed "$EXIT_UNKNOWN_STATE" NONE
-  [[ -z "$sync_inventory" ]] ||
+  sorted_sync_inventory=$(printf '%s\n' "$sync_inventory" | sort)
+  [[ -z "$sync_inventory" ||
+     "$sorted_sync_inventory" == "$EXPECTED_BUSINESS_SYNC" ]] ||
     complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
 
   diff_rc=0

@@ -1,6 +1,6 @@
 # V0.1 DEV 验收对照
 
-GitOps commit / PR：尚未形成可部署的完整 Desired State
+GitOps commit / PR：business-ready 候选 Desired State 已形成，合并 SHA、CI 与运行证据待回填
 
 PCS Candidate：`pcs/candidate-2.md`
 
@@ -14,6 +14,11 @@ PCS Candidate：`pcs/candidate-2.md`
 `platform`、`openbao`、备份和应用仍未激活，因此以下端到端验收项继续 fail-closed 为
 `BLOCKED`。该记录不代表 2026-08-25 实时状态。
 上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout。
+
+仓库候选现已覆盖公共 `validated` sync、无备份 foundation/cert-manager/CNPG、单实例 PostgreSQL、
+不可变 migration/frontend/backend 与 HTTPS Gateway，并以 Stage 110–160 做 fail-closed 编排。
+这只是静态候选，不改变下表运行状态；OpenBao、MinIO、备份/恢复、observability、容量/重启
+验收与账号初始化明确不在本次 business-ready 运行闭环中。
 
 | 字段 | 值 |
 | --- | --- |
@@ -37,8 +42,8 @@ PCS Candidate：`pcs/candidate-2.md`
 
 | # | 验收标准 | 证据 | 状态 |
 | --- | --- | --- | --- |
-| 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（Phase A Controller 已部署，但 Git sync 与单向 Reconcile 未激活） |
-| 2 | frontend/backend 按 digest，经 Gateway 单入口通过页面/API Smoke | `runbook/06-apps.md` | BLOCKED（backend 不可变输入已就绪，但应用 Desired State、migration、账号初始化与 Smoke 均未执行） |
+| 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（候选已形成；Git sync、运行 Reconcile 与漂移演示尚未验收） |
+| 2 | frontend/backend 按 digest，经 Gateway 单入口通过页面/API Smoke | `runbook/06-apps.md` | BLOCKED（候选清单已锁定；Deployment、migration、账号初始化与 Smoke 均未执行） |
 | 3 | PG PITR 与 etcd 隔离 restore 各完成一次 | `runbook/07-restore-drill.md` | BLOCKED（依赖 Flux sync、MinIO 可用存储与单独备份批准；均未满足） |
 | 4 | 三 bucket Versioning/Object Lock 通过，DEV-001 醒目标注 | `runbook/03-minio-verify.md`、`runbook/README.md` | BLOCKED（MinIO 供应链决策） |
 | 5 | PCS 与部署版本/Image ID 一致 | `pcs/candidate-2.md` 与抽查输出 | BLOCKED（平台尚未部署，无法与运行 Image ID 对齐） |
@@ -65,7 +70,8 @@ PCS Candidate：`pcs/candidate-2.md`
 待运维回填。
 ```
 
-最终结论：`BLOCKED`（bootstrap 已验证；Flux、平台基础设施、应用与 V0.1 Release Gate 证据未闭环）
+最终结论：`BLOCKED`（bootstrap/Flux Phase A 已验证；business-ready 候选不等于运行通过，
+完整 V0.1 的备份、恢复、observability、容量与重启 Gate 也未闭环）
 
 DEV-001 状态：`ACTIVE`
 

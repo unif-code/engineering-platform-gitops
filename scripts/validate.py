@@ -19,7 +19,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_PCS = ROOT / 'pcs/candidate-2.md'
-CURRENT_DOCS_ARCHITECTURE_COMMIT = 'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
+CURRENT_DOCS_ARCHITECTURE_COMMIT = '541b186878d1e28e1aa9308111a2962cdfefb91b'
 CURRENT_DOCS_ARCHITECTURE_PLAN = (
     'docs/superpowers/plans/2026-08-23-pcs-runtime-reconciliation.md'
 )
@@ -65,7 +65,7 @@ CURRENT_FRONTEND_COMPONENT_CELLS = (
         f'linux/amd64 manifest `{CURRENT_FRONTEND_LINUX_AMD64_MANIFEST}`；'
         f'运行 Image ID `{NOT_VERIFIED}`'
     ),
-    '当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署',
+    'business-ready 候选已锁定 workload；运行未部署',
 )
 CURRENT_FRONTEND_HANDOFF_FACTS = (
     ('Source commit（完整 40 位 SHA）', f'`{CURRENT_FRONTEND_SOURCE}`'),
@@ -99,7 +99,7 @@ CURRENT_BACKEND_COMPONENT_CELLS = (
     (
         f'不可变输入 `{CURRENT_BACKEND_IMAGE}`；运行 Image ID `{NOT_VERIFIED}`'
     ),
-    '候选可用；Desired State、迁移与账号初始化均未执行',
+    'business-ready 候选已锁定 migration/backend；运行与账号初始化均未执行',
 )
 CURRENT_BACKEND_HANDOFF_FACTS = (
     ('Source commit（完整 40 位 SHA）', f'`{CURRENT_BACKEND_SOURCE}`'),
@@ -179,14 +179,17 @@ FLUX_PHASE_A_EVIDENCE_SHA256 = (
 MANIFEST_ROOTS = (ROOT / 'clusters', ROOT / 'infrastructure', ROOT / 'apps')
 EXACT_VERSION = re.compile(r'^v?\d+\.\d+\.\d+$')
 FLOATING_IMAGE = re.compile(r':(?:latest|main|master)$')
-PLACEHOLDER = re.compile(r'(?:REPLACE_ME|TODO_DIGEST|<[^>]+>)')
+ANGLE_TOKEN = re.compile(r'<[/A-Za-z][^<>\r\n]{0,127}>')
+PLACEHOLDER = re.compile(
+    rf'(?:REPLACE_ME|TODO_DIGEST|{ANGLE_TOKEN.pattern})'
+)
 INSECURE_TLS = re.compile(
     r'(?:--insecure\b|insecureSkip(?:TLS)?Verify:\s*true)'
 )
 
 REQUIRED_TASK4_RESOURCES = {
     ('storage.k8s.io/v1', 'StorageClass', '', 'stateful-rwo-lowlatency'),
-    ('helm.toolkit.fluxcd.io/v2', 'HelmRelease', 'cert-manager', 'cert-manager'),
+    ('apps/v1', 'Deployment', 'cert-manager', 'cert-manager'),
     ('cert-manager.io/v1', 'ClusterIssuer', '', 'dev-selfsigned'),
     ('apps/v1', 'Deployment', 'minio', 'minio'),
     ('batch/v1', 'Job', 'minio', 'minio-bootstrap-v1'),
@@ -201,8 +204,8 @@ REQUIRED_TASK4_RESOURCES = {
 
 REQUIRED_TASK5_RESOURCES = {
     (
-        'helm.toolkit.fluxcd.io/v2',
-        'HelmRelease',
+        'apps/v1',
+        'Deployment',
         'cnpg-system',
         'cloudnative-pg',
     ),
@@ -246,12 +249,11 @@ REQUIRED_METRICS_SERVER_RESOURCES = {
     ),
 }
 
-ACTIVE_ROOT_RESOURCES = ('flux-system',)
-INACTIVE_ENTRYPOINTS = (
-    'clusters/dev/reconcile-rbac.yaml',
-    'clusters/dev/infrastructure.yaml',
-    'clusters/dev/apps.yaml',
-    'clusters/dev/flux-system/gotk-sync.yaml',
+ACTIVE_ROOT_RESOURCES = (
+    'flux-system',
+    'reconcile-rbac.yaml',
+    'infrastructure.yaml',
+    'apps.yaml',
 )
 
 FLUX_PHASE_A_RESOURCES = (
@@ -778,24 +780,10 @@ def validate_active_root(root: Path = ROOT) -> None:
     resources = document.get('resources')
     if resources != list(ACTIVE_ROOT_RESOURCES):
         fail(
-            'clusters/dev 活动根只允许引用 flux-system；'
+            'clusters/dev 活动根必须精确引用获批的业务就绪入口，'
+            '且不得引用 OpenBao、备份、MinIO 或 observability；'
             f'实测 resources={resources!r}'
         )
-
-    required_headers = (
-        '# STATUS: ',
-        '# ACTIVE: false',
-        '# REASON: ',
-        '# ACTIVATION_GATES: ',
-    )
-    for relative_path in INACTIVE_ENTRYPOINTS:
-        path = root / relative_path
-        if not path.exists():
-            continue
-        header = '\n'.join(path.read_text(encoding='utf-8').splitlines()[:8])
-        for required in required_headers:
-            if required not in header:
-                fail(f'{relative_path} 缺少 inactive 审计字段：{required.strip()}')
 
 
 PathToken = Union[str, Tuple[str, str]]
@@ -1280,8 +1268,6 @@ def validate_single_user_storage() -> None:
         if document.get('kind') == 'ResourceQuota'
     }
     expected_quotas = {
-        'minio': ('1', '50Gi'),
-        'monitoring': ('3', '13Gi'),
         'platform': ('2', '45Gi'),
     }
     for namespace, (claim_count, storage) in expected_quotas.items():
@@ -1376,7 +1362,7 @@ def validate_single_user_resources() -> Tuple[int, int]:
             total_memory_mib += memory_mib(request_memory)
 
     flux_kustomization = next(
-        load_documents(ROOT / 'clusters/dev/flux-system/kustomization.yaml')
+        load_documents(ROOT / 'clusters/dev/flux-system/phase-a/kustomization.yaml')
     )
     flux_contracts = (
         ('source-controller', '100m', '256Mi', '400m', '512Mi'),
@@ -1429,34 +1415,34 @@ def validate_single_user_resources() -> Tuple[int, int]:
         ),
         (
             'cert-manager controller',
-            'infrastructure/cert-manager/controller/release.yaml',
-            'HelmRelease',
+            'infrastructure/cert-manager/controller/rendered.yaml',
+            'Deployment',
             'cert-manager',
-            ('spec', 'values', 'resources'),
+            ('spec', 'template', 'spec', 'containers', ('name', 'cert-manager-controller'), 'resources'),
             '30m', '64Mi', '300m', '256Mi', True,
         ),
         (
             'cert-manager cainjector',
-            'infrastructure/cert-manager/controller/release.yaml',
-            'HelmRelease',
-            'cert-manager',
-            ('spec', 'values', 'cainjector', 'resources'),
+            'infrastructure/cert-manager/controller/rendered.yaml',
+            'Deployment',
+            'cert-manager-cainjector',
+            ('spec', 'template', 'spec', 'containers', ('name', 'cert-manager-cainjector'), 'resources'),
             '30m', '64Mi', '300m', '256Mi', True,
         ),
         (
             'cert-manager webhook',
-            'infrastructure/cert-manager/controller/release.yaml',
-            'HelmRelease',
-            'cert-manager',
-            ('spec', 'values', 'webhook', 'resources'),
+            'infrastructure/cert-manager/controller/rendered.yaml',
+            'Deployment',
+            'cert-manager-webhook',
+            ('spec', 'template', 'spec', 'containers', ('name', 'cert-manager-webhook'), 'resources'),
             '20m', '64Mi', '200m', '128Mi', True,
         ),
         (
             'cert-manager startupapicheck',
-            'infrastructure/cert-manager/controller/release.yaml',
-            'HelmRelease',
-            'cert-manager',
-            ('spec', 'values', 'startupapicheck', 'resources'),
+            'infrastructure/cert-manager/controller/rendered.yaml',
+            'Job',
+            'cert-manager-startupapicheck',
+            ('spec', 'template', 'spec', 'containers', ('name', 'cert-manager-startupapicheck'), 'resources'),
             '10m', '32Mi', '100m', '64Mi', False,
         ),
         (
@@ -1477,10 +1463,10 @@ def validate_single_user_resources() -> Tuple[int, int]:
         ),
         (
             'CloudNativePG operator',
-            'infrastructure/cnpg/controller/cnpg-release.yaml',
-            'HelmRelease',
+            'infrastructure/cnpg/controller/rendered.yaml',
+            'Deployment',
             'cloudnative-pg',
-            ('spec', 'values', 'resources'),
+            ('spec', 'template', 'spec', 'containers', ('name', 'manager'), 'resources'),
             '50m', '128Mi', '300m', '256Mi', True,
         ),
         (
@@ -1811,19 +1797,14 @@ def validate_metrics_server() -> None:
     if not required_resources.issubset(resources):
         fail('observability controller Kustomization 未接入 metrics-server')
 
-    infrastructure = document_by_identity(
-        ROOT / 'clusters/dev/infrastructure.yaml',
-        'Kustomization',
-        'observability-controller',
-    )
-    dependencies = {
-        dependency.get('name')
-        for dependency in value_at(infrastructure, ('spec', 'dependsOn'))
-        if isinstance(dependency, dict)
-    }
-    required_dependencies = {'cert-manager-config', 'infrastructure-foundation'}
-    if not required_dependencies.issubset(dependencies):
-        fail('observability-controller 必须等待 cert-manager-config 与 foundation')
+    active_observability = [
+        document
+        for document in load_documents(ROOT / 'clusters/dev/infrastructure.yaml')
+        if document.get('kind') == 'Kustomization'
+        and document.get('metadata', {}).get('name') == 'observability-controller'
+    ]
+    if active_observability:
+        fail('业务就绪无备份切片禁止激活 observability-controller')
 
     pcs = CURRENT_PCS.read_text(encoding='utf-8')
     pcs_contracts = (
@@ -2306,11 +2287,10 @@ def rbac_rule_set(rules: Any, label: str) -> set[tuple[tuple[str, ...], ...]]:
 
 
 def validate_flux_phase_a(root: Path = ROOT) -> None:
-    validate_active_root(root)
-    flux_directory = root / 'clusters/dev/flux-system'
+    flux_directory = root / 'clusters/dev/flux-system/phase-a'
     kustomization = load_yaml_mapping(
         flux_directory / 'kustomization.yaml',
-        'clusters/dev/flux-system/kustomization.yaml',
+        'clusters/dev/flux-system/phase-a/kustomization.yaml',
     )
     resources = kustomization.get('resources')
     if resources != list(FLUX_PHASE_A_RESOURCES):
@@ -2330,16 +2310,6 @@ def validate_flux_phase_a(root: Path = ROOT) -> None:
             'Flux Phase A gotk-components bundle SHA-256 漂移：'
             f'期望 {FLUX_PHASE_A_COMPONENTS_SHA256}，实测 {components_sha256}'
         )
-
-    sync_path = flux_directory / 'gotk-sync.yaml'
-    if not sync_path.is_file():
-        fail('Flux Phase A gotk-sync.yaml 不存在')
-    sync_documents = parse_yaml_documents(
-        sync_path.read_text(encoding='utf-8'),
-        'clusters/dev/flux-system/gotk-sync.yaml',
-    )
-    if sync_documents:
-        fail('Flux Phase A gotk-sync.yaml 必须不含 YAML document，sync 保持关闭')
 
     expected_digests = {
         f'ghcr.io/fluxcd/{name}': contract['digest']
@@ -2925,7 +2895,7 @@ def validate_flux_phase_a_runbook(root: Path = ROOT) -> None:
     normalized = re.sub(r'\s+', ' ', without_continuations)
     if (
         'kubectl --kubeconfig="$KC" apply --dry-run=client '
-        '-k clusters/dev/flux-system'
+        '-k clusters/dev/flux-system/phase-a'
     ) in normalized:
         fail(
             'Flux Phase A runbook client dry-run 禁止使用 kubectl apply '
@@ -2935,7 +2905,7 @@ def validate_flux_phase_a_runbook(root: Path = ROOT) -> None:
         (
             '完整 client dry-run',
             'kubectl --kubeconfig="$KC" create --dry-run=client '
-            '-k clusters/dev/flux-system',
+            '-k clusters/dev/flux-system/phase-a',
         ),
         (
             'Namespace server dry-run',
@@ -2958,13 +2928,13 @@ def validate_flux_phase_a_runbook(root: Path = ROOT) -> None:
             '完整 server dry-run',
             'kubectl --kubeconfig="$KC" apply --server-side '
             '--dry-run=server --field-manager="$FIELD_MANAGER" '
-            '-k clusters/dev/flux-system',
+            '-k clusters/dev/flux-system/phase-a',
         ),
         (
             '完整 server diff',
             'kubectl --kubeconfig="$KC" diff --server-side '
             '--field-manager="$FIELD_MANAGER" '
-            '-k clusters/dev/flux-system || DIFF_RC=$?',
+            '-k clusters/dev/flux-system/phase-a || DIFF_RC=$?',
         ),
     )
     positions: list[int] = []
@@ -3031,7 +3001,7 @@ def validate_flux_phase_a_runtime_record(root: Path = ROOT) -> None:
             (
                 '批准 SHA',
                 '| GitOps private main / validated | '
-                f'`{FLUX_PHASE_A_APPROVED_SHA}` |',
+                f'`{FLUX_PHASE_A_APPROVED_SHA}`（Phase A 运行采样时） |',
             ),
             ('CI run', FLUX_PHASE_A_CI_RUN),
             ('证据路径', FLUX_PHASE_A_EVIDENCE),
@@ -3241,7 +3211,7 @@ def validate_kustomize_builds() -> None:
                 f'{diagnostic.strip()}'
             )
         relative_directory = path.parent.relative_to(ROOT).as_posix()
-        if relative_directory == 'clusters/dev/flux-system':
+        if relative_directory == 'clusters/dev/flux-system/phase-a':
             raw_rendered_sha256 = hashlib.sha256(result.stdout).hexdigest()
             if raw_rendered_sha256 != FLUX_PHASE_A_RAW_RENDERED_SHA256:
                 fail(
@@ -3270,22 +3240,26 @@ def validate_manifest_placeholders(
     source: str,
     documents: list[dict[str, Any]],
 ) -> None:
-    generated_components = ROOT / 'clusters/dev/flux-system/gotk-components.yaml'
-    if path != generated_components:
+    generated_schema_manifests = {
+        ROOT / 'clusters/dev/flux-system/phase-a/gotk-components.yaml',
+        ROOT / 'infrastructure/cert-manager/controller/rendered.yaml',
+        ROOT / 'infrastructure/cnpg/controller/rendered.yaml',
+    }
+    if path not in generated_schema_manifests:
         if PLACEHOLDER.search(source):
             fail(f'{path.relative_to(ROOT)} 含未关闭的占位符')
         return
 
     if re.search(r'(?:REPLACE_ME|TODO_DIGEST)', source):
         fail(f'{path.relative_to(ROOT)} 含未关闭的占位符')
-    source_angle_tokens = sorted(re.findall(r'<[^>]+>', source))
+    source_angle_tokens = sorted(ANGLE_TOKEN.findall(source))
     allowed_angle_tokens: list[str] = []
     for document in documents:
         if document.get('kind') != 'CustomResourceDefinition':
             continue
         for value_path, value in scalar_strings(document):
             if value_path and value_path[-1] == 'description':
-                allowed_angle_tokens.extend(re.findall(r'<[^>]+>', value))
+                allowed_angle_tokens.extend(ANGLE_TOKEN.findall(value))
     if source_angle_tokens != sorted(allowed_angle_tokens):
         fail(
             f'{path.relative_to(ROOT)} 的尖括号占位符只允许出现在 '
@@ -3337,13 +3311,41 @@ def validate_documents() -> None:
                     fail(f'{path.relative_to(ROOT)} 使用浮动镜像 {image}')
                 if '@sha256:' not in image:
                     generated_components = (
-                        ROOT / 'clusters/dev/flux-system/gotk-components.yaml'
+                        ROOT
+                        / 'clusters/dev/flux-system/phase-a/gotk-components.yaml'
                     )
                     allowed_generated_images = {
                         f'ghcr.io/fluxcd/{name}:{contract["tag"]}'
                         for name, contract in FLUX_PHASE_A_CONTROLLERS.items()
                     }
                     if path == generated_components and image in allowed_generated_images:
+                        continue
+                    cnpg_rendered = (
+                        ROOT / 'infrastructure/cnpg/controller/rendered.yaml'
+                    )
+                    cnpg_tagged_image = (
+                        'ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0'
+                    )
+                    if path == cnpg_rendered and image == cnpg_tagged_image:
+                        cnpg_kustomization = load_yaml_mapping(
+                            cnpg_rendered.parent / 'kustomization.yaml',
+                            'infrastructure/cnpg/controller/kustomization.yaml',
+                        )
+                        expected_rewrite = [
+                            {
+                                'name': 'ghcr.io/cloudnative-pg/cloudnative-pg',
+                                'newName': 'ghcr.io/cloudnative-pg/cloudnative-pg',
+                                'digest': (
+                                    'sha256:'
+                                    '091d306935cfdf646debfe78010d59ebfb572150eb6eb922b0203873c0c68841'
+                                ),
+                            }
+                        ]
+                        if cnpg_kustomization.get('images') != expected_rewrite:
+                            fail(
+                                'CNPG generated chart image 必须由 Kustomize '
+                                '精确改写为批准的 linux/amd64 digest'
+                            )
                         continue
                     fail(
                         f'{path.relative_to(ROOT)} 直接工作负载镜像未按 '

@@ -43,8 +43,8 @@ restore drill、observability 和整机重启验收继续保持 `BLOCKED`/`NOT_E
 
 ### 方案 A：GitOps 原生分阶段激活（采用）
 
-一个受保护候选提交包含全部最终 Desired State，一键 orchestrator 按依赖顺序创建带外
-Secret、激活 sync、等待 Controller/数据库/migration/应用。Flux 负责持续 Reconcile，
+一个受保护候选提交包含全部最终 Desired State，一键 orchestrator 先激活 sync，再按阶段等待
+Controller/基础设施、创建带外 Secret、等待数据库/migration/应用。Flux 负责持续 Reconcile，
 stage 只处理 Git 无法保存的 Secret、顺序门禁和证据。
 
 优点是最终状态只有一个 Git 事实源，重复运行可判定 `ALREADY_COMPLIANT`，且不会把临时
@@ -77,27 +77,31 @@ stage 只处理 Git 无法保存的 Secret、顺序门禁和证据。
   root、foundation、cert-manager Helm、CNPG Helm、platform database、migration 和 app
   ServiceAccount/Role/ClusterRole/Binding。
 - root reconciler 只能管理固定 Namespace、上述 RBAC 和 `flux-system` 中受支持的 Flux CR。
-- Helm reconciler 只拥有固定 Chart 所需的 API group/resource verbs；不得取得 Secret 内容读取、
-  Node 写、CSR 批准、Token 创建、impersonate 或任意非资源 URL 权限。
+- controller manifest reconciler 只拥有固定渲染对象所需的 API group/resource verbs；不得取得
+  Secret 内容读取、Node 写、CSR 批准、Token 创建或任意非资源 URL 权限。
 - platform database、migration、app reconciler 使用不同身份；migration 身份不能成为 backend
   runtime 身份。
 
 ### 固定 Chart
 
 - cert-manager `v1.21.1` 与 CloudNativePG chart `0.29.0` 必须从官方来源下载并先验证 SHA-256。
-- Chart 解包内容 vendored 到 `vendor/charts/`，HelmRelease 从同一 gated GitRepository 读取，
-  不再依赖运行时可变 HelmRepository index。
-- HelmRelease 位于 `flux-system`，使用 `targetNamespace` 和专用 impersonation ServiceAccount；
-  Controller 继续只 watch `flux-system`，不扩大为全 Namespace 监听。
+- Chart 解包内容 vendored 到 `vendor/charts/`，用固定 Helm 二进制离线渲染后提交 YAML；
+  active Kustomization 对不支持 digest value 的 operator 镜像做精确 digest transform。
+- 不创建 HelmRelease、HelmRepository 或 Helm release-storage Secret。根因是 HelmRelease 的
+  impersonation ServiceAccount 必须读写 Helm storage Secret，与本设计的 Secret 零读取权限冲突。
+  四个 Flux Controller 仍全部保留并只 watch `flux-system`。
 
 ### Core infrastructure
 
 - 活动基础设施只包含 Namespace、ResourceQuota、local-path StorageClass/provisioner、
   cert-manager、DEV self-signed issuer、CloudNativePG Operator 和单实例 PostgreSQL。
-- 新建 core/no-backup Kustomize entrypoint；原 MinIO、Barman、ScheduledBackup、etcd-backup、
-  observability 清单继续保留为 inactive，不进入 root render。
+- 复用 `infrastructure/foundation` 与 `infrastructure/cnpg/database` 的精确活动入口；原 MinIO、
+  Barman、ScheduledBackup、etcd-backup、observability 清单继续保留为 inactive，不进入 root render。
 - PostgreSQL Cluster 删除 `plugins`、`ObjectStore`、`ScheduledBackup` 和 WAL archiver 参数，
   继续固定 PG `18.4` linux/amd64 digest、20Gi PVC 和 DEV-002 resources。
+- `flux-system`、`local-path-storage`、`cert-manager`、`cnpg-system`、`platform` 五个活动 Namespace
+  均保留双向 default deny 与 DNS egress；按职责精确增加 kube-apiserver/webhook 流量，并仅以
+  Cilium `ingress` entity 放行 Gateway 到 frontend/backend 的入口。
 
 ## Secret 与数据库顺序
 
@@ -105,6 +109,7 @@ stage 只处理 Git 无法保存的 Secret、顺序门禁和证据。
 
 stage 在 `umask 077` 的 `/root` 私有临时目录中用 CSPRNG 生成：
 
+- 一个数据库 owner `platform_owner` 的独立密码；
 - 六个 runtime 数据库角色的独立密码：`audit_rw`、`identity_rw`、`organization_rw`、
   `workspace_rw`、`authorization_rw`、`configuration_rw`；
 - 三份互不相同的 32-byte 二进制材料：`pepper`、`totp_key`、`idempotency_key`。
@@ -115,11 +120,13 @@ key contract 或 owner 不符的 Secret fail closed，绝不覆盖或轮换。
 
 ### PostgreSQL 与运行配置
 
-1. 先持久化精确 Namespace 和 Secret prerequisite。
-2. 激活 GitRepository 和根 Kustomization。
-3. 等待 CNPG Operator 与 `platform/platform` Ready，并确认 CNPG 生成的
-   `platform-superuser` Secret 只用于 migration。
-4. 在不输出值的情况下组合 `/app/.env` 内容，写入 `platform/backend-runtime-config`
+1. stage 110 持久化精确 Namespace、公共 GitRepository、根 Kustomization 与 Git egress。
+2. stage 120 等待 foundation、cert-manager 与 CNPG Operator 达到 Ready；数据库 Kustomization
+   在 Secret prerequisite 到齐前允许由 Flux 重试，但后续 stage 不会越过。
+3. stage 130 创建 `platform-owner`、六个 runtime role 与三份材料 Secret；owner 与 runtime role
+   均必须 LOGIN、非 superuser，任何 Secret 语义漂移都停止。
+4. 等待 `platform/platform` Ready，并在不输出值的情况下组合 `/app/.env` 内容，写入
+   `platform/backend-runtime-config`
    Secret；该 Secret 只以文件挂载，Pod spec 不出现 `env`/`envFrom` Secret 引用。
 5. migration Job 先连接数据库验证七个期望角色均存在；六个 runtime role 必须 LOGIN、
    非 superuser 且密码不等于历史默认值。验证通过才执行 `alembic upgrade heads`。
@@ -159,16 +166,17 @@ base64 或 DSN。
 
 | Stage | 责任 | 成功状态 |
 | --- | --- | --- |
-| 110 | Phase B 公共 gated GitRepository、sync CR 与 Git egress | `PASS_FLUX_SYNC_ACTIVATED` / `ALREADY_COMPLIANT` |
-| 120 | Namespace、最小 RBAC、core infrastructure prerequisites | `PASS_PLATFORM_CORE_ACTIVATED` / `ALREADY_COMPLIANT` |
-| 130 | 角色/材料 Secret、CNPG Ready、runtime `.env` Secret | `PASS_PLATFORM_DATABASE_READY` / `ALREADY_COMPLIANT` |
-| 140 | Alembic migration，验证所有 heads | `PASS_PLATFORM_MIGRATED` / `ALREADY_COMPLIANT` |
-| 150 | frontend/backend/Gateway rollout 与只读 Smoke | `PASS_PLATFORM_APPS_READY` / `ALREADY_COMPLIANT` |
-| 160 | 汇总非敏感运行证据与 SHA-256 sidecar | `PASS_BUSINESS_READY_ACCEPTED` / `ALREADY_COMPLIANT` |
+| 110 | Phase B 公共 gated GitRepository、sync CR 与 Git egress | check `PASS_FLUX_SYNC_CHECK`；apply `PASS_FLUX_SYNC_ENABLED`；已合规 `ALREADY_COMPLIANT` |
+| 120 | Namespace、最小 RBAC、core infrastructure prerequisites | check `PASS_PLATFORM_CORE_CHECK`；apply `PASS_PLATFORM_CORE_READY`；已合规 `ALREADY_COMPLIANT` |
+| 130 | 角色/材料 Secret、CNPG Ready、runtime `.env` Secret | check `PASS_PLATFORM_DATABASE_CHECK`；apply `PASS_PLATFORM_DATABASE_READY`；已合规 `ALREADY_COMPLIANT` |
+| 140 | Alembic migration，验证所有 heads | check `PASS_PLATFORM_MIGRATION_CHECK`；apply `PASS_PLATFORM_MIGRATION_COMPLETE`；已合规 `ALREADY_COMPLIANT` |
+| 150 | frontend/backend/Gateway rollout 与只读 Smoke | check `PASS_PLATFORM_APPS_CHECK`；apply `PASS_PLATFORM_APPS_READY`；已合规 `ALREADY_COMPLIANT` |
+| 160 | 汇总非敏感运行证据与 SHA-256 sidecar | check `PASS_BUSINESS_READY_EVIDENCE_CHECK`；apply `PASS_BUSINESS_READY`；已合规 `ALREADY_COMPLIANT` |
 
-`--check` 始终只读，在第一个需要 mutation 的 stage 停止；`--apply` 对每个 stage 先 check，
-只执行缺失部分。Phase A stage 100 改为验证“四 Controller 基础子集仍合规”，sync 的精确合法性
-交给 stage 110；未知或非预期 sync 仍 fail closed。
+各 stage 的 `--check` 对主机与集群只读，在第一个需要 mutation 的 stage 停止；顶层
+`run-approved.sh` 仍会 fetch 并以 ff-only 更新服务器 checkout。stage 150/160 check 会执行非变更性
+HTTPS probe。`--apply` 对每个 stage 先 check，只执行缺失部分。Phase A stage 100 改为验证
+“四 Controller 基础子集仍合规”，sync 的精确合法性交给 stage 110；未知或非预期 sync 仍 fail closed。
 
 ## 账号初始化
 

@@ -6,7 +6,7 @@
 
 **Architecture:** Keep the four Flux controllers scoped to `flux-system`. Store every Flux CR in `flux-system`, reconcile downstream objects through dedicated least-privilege service accounts, and use a public `validated` branch without a Git credential Secret. Git owns all non-secret desired state. Bootstrap stages 110–160 own only ordered activation, out-of-band Secret generation, readiness gates and non-sensitive evidence. PostgreSQL is a single CNPG instance with managed roles and no Barman/ObjectStore/ScheduledBackup. Backend secrets are mounted as files, never injected through `env`/`envFrom`.
 
-**Tech Stack:** Flux v2.9.3, Kustomize, HelmRelease v2, cert-manager v1.21.1, CloudNativePG 1.30.0/chart 0.29.0, PostgreSQL 18.4, Kubernetes v1.36.3, Cilium Gateway API, Bash, Python 3, unittest, PyYAML.
+**Tech Stack:** Flux v2.9.3, Kustomize, Helm v3.21.0 offline rendering, cert-manager v1.21.1, CloudNativePG 1.30.0/chart 0.29.0, PostgreSQL 18.4, Kubernetes v1.36.3, Cilium Gateway API, Bash, Python 3, unittest, PyYAML.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-business-ready-gitops-activation-design.md`
 
@@ -24,7 +24,7 @@
 1. Add `BusinessReadyGitOpsContractTest` with helpers that render `clusters/dev` and locate objects by `apiVersion/kind/namespace/name`.
 2. Assert the active root contains exactly the approved Namespaces, least-privilege RBAC and Flux CR entrypoints; assert it does not render OpenBao, MinIO, monitoring, Barman, ObjectStore, ScheduledBackup or etcd backup resources.
 3. Assert `GitRepository/flux-system` uses the public HTTPS repository, `ref.branch=validated`, has no `secretRef`, and is accompanied only by source-controller FQDN egress to `github.com:443`.
-4. Assert cert-manager and CNPG HelmReleases live in `flux-system`, target their fixed namespaces, use dedicated service accounts and vendored Git chart paths, and contain no `HelmRepository` dependency.
+4. Assert cert-manager and CNPG use vendored charts, committed offline render output and dedicated Kustomization service accounts; assert no active `HelmRelease`, `HelmRepository` or Helm storage Secret.
 5. Assert CNPG has one instance, fixed PostgreSQL digest, six managed non-superuser login roles, 20Gi storage and no plugins/ObjectStore/ScheduledBackup/archive configuration.
 6. Assert migration, frontend and backend images are immutable; workloads have exact resources/security contexts, the backend uses Secret file volumes without Secret `env`/`envFrom`, and the app Kustomization depends on migration.
 7. Assert Gateway routing is HTTPS-only with `/api`, `/healthz` and `/readyz` to backend and `/` to frontend; prohibit Ingress, NodePort and LoadBalancer.
@@ -76,10 +76,10 @@ git commit -m "feat(gitops): activate gated public Flux sync"
 - Create: `vendor/charts/cert-manager/`
 - Create: `vendor/charts/cloudnative-pg/`
 - Create: `vendor/charts/README.md`
-- Replace: `infrastructure/cert-manager/controller/release.yaml`
+- Delete: `infrastructure/cert-manager/controller/release.yaml`
 - Modify: `infrastructure/cert-manager/controller/kustomization.yaml`
 - Delete: `infrastructure/cert-manager/controller/repository.yaml`
-- Replace: `infrastructure/cnpg/controller/cnpg-release.yaml`
+- Delete: `infrastructure/cnpg/controller/cnpg-release.yaml`
 - Modify: `infrastructure/cnpg/controller/kustomization.yaml`
 - Keep inactive: `infrastructure/cnpg/controller/barman-release.yaml`
 - Delete: `infrastructure/cnpg/controller/repository.yaml`
@@ -88,7 +88,7 @@ git commit -m "feat(gitops): activate gated public Flux sync"
 1. Download cert-manager chart `v1.21.1` and CloudNativePG chart `0.29.0` only from their official repositories into a private temporary directory.
 2. Compute SHA-256 before extraction. Verify CloudNativePG equals the existing PCS digest `668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f`; record the observed cert-manager chart digest as a new candidate fact.
 3. Extract with path traversal/link checks and copy chart contents into `vendor/charts/`; retain upstream license files and provenance in `vendor/charts/README.md`.
-4. Change both HelmReleases to `metadata.namespace=flux-system`, fixed `targetNamespace`, GitRepository chart paths and `reconcileStrategy=Revision`; remove HelmRepository objects and Barman from the active kustomization.
+4. Commit deterministic `helm template` output, change both active controller Kustomizations to that output, pin every operand image by digest, and remove HelmRepository/HelmRelease/Barman from active rendering.
 5. Pin operand images/digests through chart values where supported and render both charts locally with the exact values to prove no floating workload image remains.
 
 Run:
@@ -106,35 +106,36 @@ git add vendor infrastructure/cert-manager infrastructure/cnpg/controller pcs/ca
 git commit -m "feat(gitops): vendor approved platform charts"
 ```
 
-## Task 4: Add no-backup core infrastructure and database desired state
+## Task 4: Narrow the existing core and database entrypoints to no-backup desired state
 
 **Files:**
 
-- Create: `infrastructure/core/kustomization.yaml`
-- Create: `infrastructure/core/namespaces.yaml`
-- Create: `infrastructure/core/resource-quotas.yaml`
-- Create: `infrastructure/cnpg/database-no-backup/kustomization.yaml`
-- Create: `infrastructure/cnpg/database-no-backup/cluster.yaml`
+- Modify: `infrastructure/foundation/kustomization.yaml`
+- Modify: `infrastructure/foundation/resource-quotas.yaml`
+- Create: `infrastructure/foundation/network-policies.yaml`
+- Modify: `infrastructure/cnpg/database/kustomization.yaml`
+- Modify: `infrastructure/cnpg/database/cluster.yaml`
+- Create: `infrastructure/cnpg/database/network-policy.yaml`
 - Modify: `infrastructure/foundation/environment.yaml`
 
 1. Create only `local-path-storage`, `cert-manager`, `cnpg-system` and `platform` Namespaces with restricted Pod Security labels where compatible.
 2. Reuse the fixed local-path provisioner/storage class and platform quota while excluding MinIO/monitoring quotas.
-3. Create a no-backup CNPG Cluster with six managed roles/password Secret references, one instance, fixed PG 18.4 linux/amd64 digest, 20Gi PVC and DEV-002 resources.
+3. Create a no-backup CNPG Cluster with one non-superuser owner and six managed runtime roles/password Secret references, one instance, fixed PG 18.4 linux/amd64 digest, 20Gi PVC and DEV-002 resources.
 4. Do not include the existing backup database kustomization, Barman plugin, ObjectStore, ScheduledBackup or archive parameters.
 5. Update environment metadata so inactive DEV-001 storage does not appear as an active binding.
 
 Run:
 
 ```bash
-kubectl kustomize infrastructure/core
-kubectl kustomize infrastructure/cnpg/database-no-backup
+kubectl kustomize infrastructure/foundation
+kubectl kustomize infrastructure/cnpg/database
 python3 -B -m unittest scripts.test_validate.BusinessReadyGitOpsContractTest -v
 ```
 
 Commit:
 
 ```bash
-git add infrastructure/core infrastructure/cnpg/database-no-backup infrastructure/foundation/environment.yaml
+git add infrastructure/foundation infrastructure/cnpg/database
 git commit -m "feat(gitops): add no-backup DEV database core"
 ```
 
@@ -156,7 +157,7 @@ git commit -m "feat(gitops): add no-backup DEV database core"
 - Modify: `apps/gateway/kustomization.yaml`
 
 1. Add immutable migration Job generation for backend source `4aaf721...` and image `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f...`; make role preflight and `alembic upgrade heads` one fail-closed command.
-2. Mount CNPG superuser and runtime configuration only as Secret files; do not print or transform their values in Pod arguments.
+2. Mount the non-superuser `platform_owner` migration configuration and runtime configuration only as Secret files; do not print or transform their values in Pod arguments.
 3. Add frontend using linux/amd64 digest `sha256:21248f...` and backend using the approved immutable digest, exact resources/probes, non-root read-only security and writable `emptyDir` mounts.
 4. Mount backend runtime config at `/app/.env` and the three DEV-003 materials at dedicated read-only file paths; use no Secret env reference.
 5. Add ClusterIP services, PDBs/network policies and one HTTPRoute attached to `platform-gateway`; preserve the existing Certificate/Gateway.
@@ -287,8 +288,8 @@ python3 -B scripts/run_validation.py --profile fast
 python3 -B scripts/run_validation.py --profile static
 python3 -B scripts/run_validation.py --profile full
 kubectl kustomize clusters/dev
-kubectl kustomize infrastructure/core
-kubectl kustomize infrastructure/cnpg/database-no-backup
+kubectl kustomize infrastructure/foundation
+kubectl kustomize infrastructure/cnpg/database
 kubectl kustomize apps/migration
 kubectl kustomize apps/platform
 git diff --check

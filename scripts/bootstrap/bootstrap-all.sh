@@ -4,8 +4,8 @@ export LC_ALL=C
 umask 077
 IFS=$' \t\n'
 
-readonly -a STAGES=(00 10 20 30 40 50 60 90 100)
-readonly -a MUTATING_STAGES=(10 20 30 40 50 60 100)
+readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160)
+readonly -a MUTATING_STAGES=(10 20 30 40 50 60 100 110 120 130 140 150 160)
 
 declare -a SUMMARY_STAGE=()
 declare -a SUMMARY_RESULT=()
@@ -277,6 +277,12 @@ stage_path() {
     60) printf '%s/stages/60-install-cilium/run.sh\n' "$stage_dir" ;;
     90) printf '%s/stages/90-verify/run.sh\n' "$stage_dir" ;;
     100) printf '%s/stages/100-flux-phase-a/run.sh\n' "$stage_dir" ;;
+    110) printf '%s/stages/110-flux-sync/run.sh\n' "$stage_dir" ;;
+    120) printf '%s/stages/120-platform-core/run.sh\n' "$stage_dir" ;;
+    130) printf '%s/stages/130-platform-database/run.sh\n' "$stage_dir" ;;
+    140) printf '%s/stages/140-platform-migration/run.sh\n' "$stage_dir" ;;
+    150) printf '%s/stages/150-platform-apps/run.sh\n' "$stage_dir" ;;
+    160) printf '%s/stages/160-business-ready-evidence/run.sh\n' "$stage_dir" ;;
     *) return 30 ;;
   esac
 }
@@ -286,7 +292,9 @@ check_result_is_complete() {
     00:PASS_PREFLIGHT|10:ALREADY_COMPLIANT|20:ALREADY_COMPLIANT|\
     30:ALREADY_COMPLIANT|40:ALREADY_COMPLIANT|50:ALREADY_COMPLIANT|\
     60:ALREADY_COMPLIANT|90:PASS_BOOTSTRAP_VERIFIED|\
-    100:ALREADY_COMPLIANT) return 0 ;;
+    100:ALREADY_COMPLIANT|110:ALREADY_COMPLIANT|120:ALREADY_COMPLIANT|\
+    130:ALREADY_COMPLIANT|140:ALREADY_COMPLIANT|150:ALREADY_COMPLIANT|\
+    160:ALREADY_COMPLIANT) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -296,7 +304,10 @@ check_result_requires_apply() {
     10:PASS_ARTIFACTS_CHECK|20:PASS_KERNEL_CHECK|\
     30:PASS_CONTAINERD_CHECK|40:PASS_KUBERNETES_CHECK|\
     50:PASS_KUBEADM_CHECK|60:PASS_CILIUM_CHECK|\
-    100:PASS_FLUX_PHASE_A_CHECK) return 0 ;;
+    100:PASS_FLUX_PHASE_A_CHECK|110:PASS_FLUX_SYNC_CHECK|\
+    120:PASS_PLATFORM_CORE_CHECK|130:PASS_PLATFORM_DATABASE_CHECK|\
+    140:PASS_PLATFORM_MIGRATION_CHECK|150:PASS_PLATFORM_APPS_CHECK|\
+    160:PASS_BUSINESS_READY_EVIDENCE_CHECK) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -306,10 +317,15 @@ apply_result_is_success() {
     10:PASS_ARTIFACTS_STAGED|20:PASS_KERNEL_PREPARED|\
     30:PASS_CONTAINERD_INSTALLED|40:PASS_KUBERNETES_INSTALLED|\
     50:PASS_KUBEADM_INITIALIZED|60:PASS_CILIUM_INSTALLED|\
-    100:PASS_FLUX_PHASE_A_INSTALLED|\
+    100:PASS_FLUX_PHASE_A_INSTALLED|110:PASS_FLUX_SYNC_ENABLED|\
+    120:PASS_PLATFORM_CORE_READY|130:PASS_PLATFORM_DATABASE_READY|\
+    140:PASS_PLATFORM_MIGRATION_COMPLETE|150:PASS_PLATFORM_APPS_READY|\
+    160:PASS_BUSINESS_READY|\
     10:ALREADY_COMPLIANT|20:ALREADY_COMPLIANT|30:ALREADY_COMPLIANT|\
     40:ALREADY_COMPLIANT|50:ALREADY_COMPLIANT|60:ALREADY_COMPLIANT|\
-    100:ALREADY_COMPLIANT) return 0 ;;
+    100:ALREADY_COMPLIANT|110:ALREADY_COMPLIANT|120:ALREADY_COMPLIANT|\
+    130:ALREADY_COMPLIANT|140:ALREADY_COMPLIANT|150:ALREADY_COMPLIANT|\
+    160:ALREADY_COMPLIANT) return 0 ;;
     *) return 1 ;;
   esac
 }
