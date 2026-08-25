@@ -528,9 +528,16 @@ FIELD_MANAGER='engineering-platform-flux-phase-a'
 
 kubectl --kubeconfig="$KC" kustomize \
   clusters/dev/flux-system > "$RENDERED"
-kubectl --kubeconfig="$KC" apply --dry-run=client \
+kubectl --kubeconfig="$KC" create --dry-run=client \
   -k clusters/dev/flux-system
 ```
+
+这里必须使用 `create --dry-run=client`：该步骤只在客户端构建并校验完整 Desired State，
+不针对集群中已有对象计算本地三方合并补丁，也不发出资源创建写请求。Phase A 资源由
+server-side apply 管理，已有 CRD 还包含 API server 默认字段；使用
+`apply --dry-run=client` 会混入 client-side apply 的补丁语义，并可能在 CRD 默认字段上以
+`applying patch locally: expected a struct, but received a nil` 失败。权威的现状差异校验仍由
+后续 server-side dry-run 与 `kubectl diff --server-side` 完成。
 
 首次部署时 `flux-system` 尚不存在。API server 的 dry-run 不持久化前一个请求模拟创建的
 Namespace，因此不能把完整 bundle 的 server-side dry-run 当成单个事务：后续 namespaced

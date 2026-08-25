@@ -2108,6 +2108,23 @@ class FluxPhaseAContractTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         self.assertRegex(stderr.getvalue(), expected)
 
+    def write_client_create_runbook(self, root: Path) -> None:
+        path = root / 'runbook/01-bootstrap.md'
+        source = path.read_text(encoding='utf-8')
+        client_apply = (
+            'kubectl --kubeconfig="$KC" apply --dry-run=client \\\n'
+            '  -k clusters/dev/flux-system'
+        )
+        client_create = (
+            'kubectl --kubeconfig="$KC" create --dry-run=client \\\n'
+            '  -k clusters/dev/flux-system'
+        )
+        if client_create not in source:
+            self.assertEqual(source.count(client_apply), 1)
+            source = source.replace(client_apply, client_create)
+        self.assertEqual(source.count(client_create), 1)
+        path.write_text(source, encoding='utf-8')
+
     def test_valid_four_controller_fixture_is_accepted(self) -> None:
         root, rendered_documents = self.make_root()
 
@@ -2117,6 +2134,35 @@ class FluxPhaseAContractTest(unittest.TestCase):
         self,
     ) -> None:
         validator.validate_flux_phase_a_runbook(self.make_probe_root())
+
+    def test_accepts_phase_a_client_create_dry_run(self) -> None:
+        root = self.make_probe_root()
+        self.write_client_create_runbook(root)
+
+        validator.validate_flux_phase_a_runbook(root)
+
+    def test_rejects_phase_a_client_apply_patch_simulation(self) -> None:
+        root = self.make_probe_root()
+        self.write_client_create_runbook(root)
+        path = root / 'runbook/01-bootstrap.md'
+        source = path.read_text(encoding='utf-8')
+        client_create = (
+            'kubectl --kubeconfig="$KC" create --dry-run=client \\\n'
+            '  -k clusters/dev/flux-system'
+        )
+        client_apply = (
+            'kubectl --kubeconfig="$KC" apply --dry-run=client \\\n'
+            '  -k clusters/dev/flux-system'
+        )
+        self.assertEqual(source.count(client_create), 1)
+        path.write_text(
+            source.replace(client_create, client_apply),
+            encoding='utf-8',
+        )
+
+        self.assert_runbook_contract_fails(
+            root, 'client dry-run.*kubectl apply'
+        )
 
     def test_rejects_phase_a_runbook_staging_regressions(self) -> None:
         mutations = (

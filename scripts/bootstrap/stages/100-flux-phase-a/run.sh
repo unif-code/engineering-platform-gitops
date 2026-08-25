@@ -191,7 +191,7 @@ rendered_sha=$(
 ) || complete STOP_SUPPLY_CHAIN_MISMATCH render-failed "$EXIT_SUPPLY_CHAIN" NONE
 [[ "$rendered_sha" == "$expected_raw_rendered_sha" ]] ||
   complete STOP_SUPPLY_CHAIN_MISMATCH rendered-bundle-digest-drift "$EXIT_SUPPLY_CHAIN" NONE
-kubectl_run apply --dry-run=client --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 ||
+kubectl_run create --dry-run=client --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 ||
   complete STOP_VERIFY_FAILED client-dry-run-failed "$EXIT_VERIFY_FAILED" NONE
 
 namespace_name=$(kubectl_run get namespace flux-system --ignore-not-found --output=name 2>/dev/null) ||
