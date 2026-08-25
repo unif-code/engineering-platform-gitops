@@ -4325,6 +4325,16 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                 'apply', '--dry-run=client', '--kustomize',
                 os.environ['FAKE_DESIRED_ROOT'],
             ]:
+                if os.environ.get('FAKE_FAIL_CLIENT_APPLY_PATCH') == '1':
+                    sys.stderr.write(
+                        'applying patch locally: expected a struct, '
+                        'but received a nil\n'
+                    )
+                    raise SystemExit(1)
+            elif command == [
+                'create', '--dry-run=client', '--kustomize',
+                os.environ['FAKE_DESIRED_ROOT'],
+            ]:
                 pass
             elif command == [
                 'get', 'namespace', 'flux-system', '--ignore-not-found', '--output=name',
@@ -4635,8 +4645,11 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         self.assertIn('REASON=apply-required', result.stdout)
         self.assertIn('EVIDENCE=NONE', result.stdout)
         commands = command_log.read_text(encoding='utf-8')
-        self.assertIn('apply --dry-run=client --kustomize', commands)
-        for mutation in (' apply --server-side', ' create ', ' delete ', 'curl '):
+        self.assertIn('create --dry-run=client --kustomize', commands)
+        for command in commands.splitlines():
+            if ' create ' in command:
+                self.assertIn(' create --dry-run=client ', command)
+        for mutation in (' apply --server-side', ' delete ', 'curl '):
             self.assertNotIn(mutation, commands)
         self.assertEqual(list((host / 'root/dev-infra-evidence').iterdir()), [])
 
@@ -4663,6 +4676,19 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         commands = command_log.read_text(encoding='utf-8')
         self.assertIn('diff --server-side', commands)
         self.assertNotIn(' apply --server-side', commands)
+
+    def test_check_avoids_client_apply_patch_for_existing_ssa_crds(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_FAIL_CLIENT_APPLY_PATCH'] = '1'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn('create --dry-run=client --kustomize', commands)
+        self.assertNotIn('apply --dry-run=client --kustomize', commands)
 
     def test_check_rejects_partial_or_downstream_state(self) -> None:
         for state in (

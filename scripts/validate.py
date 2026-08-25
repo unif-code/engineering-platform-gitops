@@ -2923,10 +2923,18 @@ def validate_flux_phase_a_runbook(root: Path = ROOT) -> None:
     section = source[section_start:section_end]
     without_continuations = re.sub(r'\\\s*\n\s*', ' ', section)
     normalized = re.sub(r'\s+', ' ', without_continuations)
+    if (
+        'kubectl --kubeconfig="$KC" apply --dry-run=client '
+        '-k clusters/dev/flux-system'
+    ) in normalized:
+        fail(
+            'Flux Phase A runbook client dry-run 禁止使用 kubectl apply '
+            '本地补丁模拟'
+        )
     ordered_tokens = (
         (
             '完整 client dry-run',
-            'kubectl --kubeconfig="$KC" apply --dry-run=client '
+            'kubectl --kubeconfig="$KC" create --dry-run=client '
             '-k clusters/dev/flux-system',
         ),
         (
