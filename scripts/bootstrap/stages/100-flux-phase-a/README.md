@@ -1,0 +1,91 @@
+# 100-flux-phase-a
+
+Flux Phase A 的一键部署与验收，只允许安装 source、kustomize、helm、notification
+四个 Controller。禁止 Secret、sync CR、第五个 Controller、下游 Namespace、OpenBao、
+备份与业务应用。
+
+| 项 | 值 |
+| --- | --- |
+| PHASE | `flux-phase-a` |
+| check 结果 | `PASS_FLUX_PHASE_A_CHECK` 或 `ALREADY_COMPLIANT` |
+| apply 结果 | `PASS_FLUX_PHASE_A_INSTALLED` |
+| 证据 | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
+| 网络探针 | 两个瞬态 Pod；只按本轮创建回执的名称和 UID 精确删除 |
+
+`--check` 只读识别 `ABSENT`、精确 `NAMESPACE_ONLY` 或完整 `COMPLIANT` 状态；任何
+部分安装、未知资源、sync 资源或下游 Namespace 都 fail-closed。`--apply` 固定 Flux CLI
+版本与摘要，先单独处理 Namespace 依赖，再执行完整 bundle 的 server-side dry-run、diff
+和 apply，最后完成 rollout、`flux check`、网络边界验证、只读 postcheck 与证据落盘。
+
+## 停止原因
+
+一律 fail-closed，退出码固定：10 前置条件 / 20 供应链 / 30 未知或漂移 /
+40 apply 失败 / 50 verify 失败，不降级为告警。
+
+下列 64 个字面量 REASON 由 `StageReadmeTest` 与 `run.sh` 逐项比对，
+文档漂移会判红。模板化的 REASON（如 `missing-command-${cmd}`）不在此列。
+
+- `admin-conf-content-or-structure-drift`
+- `admin-conf-raced-after-flux-precheck`
+- `admin-conf-raced-before-flux-precheck`
+- `bundle-diff-state-unexpected`
+- `bundle-server-apply-failed`
+- `bundle-server-dry-run-failed`
+- `client-dry-run-failed`
+- `curl-provenance-drift`
+- `downstream-namespace-query-failed`
+- `evidence-open-failed`
+- `flux-check-failed`
+- `flux-cluster-resource-query-failed`
+- `flux-cli-archive-digest-drift`
+- `flux-cli-binary-unsafe`
+- `flux-cli-download-failed`
+- `flux-cli-extraction-failed`
+- `flux-cli-version-drift`
+- `flux-controller-not-ready`
+- `flux-controller-rollout-failed`
+- `flux-crd-query-failed`
+- `flux-deployment-query-failed`
+- `flux-desired-state-drift`
+- `flux-external-probe-create-failed`
+- `flux-external-probe-identity-unsafe`
+- `flux-external-probe-not-ready`
+- `flux-internal-probe-create-failed`
+- `flux-internal-probe-identity-unsafe`
+- `flux-internal-probe-not-ready`
+- `flux-kubeconfig-create-failed`
+- `flux-kubeconfig-mode-failed`
+- `flux-kubeconfig-unsafe`
+- `flux-namespace-drift`
+- `flux-namespace-query-failed`
+- `flux-network-boundary-failed`
+- `flux-network-pod-ip-query-failed`
+- `flux-network-pod-ip-unsafe`
+- `flux-network-positive-probe-failed`
+- `flux-network-probe-cleanup-failed`
+- `flux-phase-a-state-unknown`
+- `flux-postcheck-failed`
+- `flux-postcheck-output-drift`
+- `flux-precheck-failed`
+- `flux-resource-query-failed`
+- `flux-secret-query-failed`
+- `flux-sync-query-failed`
+- `flux-work-directory-cleanup-failed`
+- `flux-work-directory-create-failed`
+- `flux-work-directory-unsafe`
+- `flux-work-root-unsafe`
+- `kubectl-provenance-drift`
+- `missing-command-python3`
+- `missing-command-sha256`
+- `namespace-active-wait-failed`
+- `namespace-apply-failed`
+- `namespace-extraction-failed`
+- `namespace-server-dry-run-failed`
+- `not-root`
+- `render-failed`
+- `render-raced`
+- `rendered-bundle-digest-drift`
+- `rendered-bundle-raced`
+- `tar-provenance-drift`
+- `test-flux-archive-sha256-unsafe`
+- `test-rendered-sha256-unsafe`

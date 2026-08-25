@@ -36,6 +36,7 @@ STAGE_SCRIPTS = {
     '50': 'scripts/bootstrap/stages/50-kubeadm-init/run.sh',
     '60': 'scripts/bootstrap/stages/60-install-cilium/run.sh',
     '90': 'scripts/bootstrap/stages/90-verify/run.sh',
+    '100': 'scripts/bootstrap/stages/100-flux-phase-a/run.sh',
 }
 PREFLIGHT = ROOT / STAGE_SCRIPTS['00']
 STAGE_ARTIFACTS = ROOT / STAGE_SCRIPTS['10']
@@ -45,6 +46,7 @@ INSTALL_KUBERNETES = ROOT / STAGE_SCRIPTS['40']
 KUBEADM_INIT = ROOT / STAGE_SCRIPTS['50']
 INSTALL_CILIUM = ROOT / STAGE_SCRIPTS['60']
 FINAL_VERIFY = ROOT / STAGE_SCRIPTS['90']
+FLUX_PHASE_A = ROOT / STAGE_SCRIPTS['100']
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
 
@@ -619,8 +621,8 @@ class CommonLibraryTest(BootstrapTestCase):
         而漏改的症状往往是「枚举型断言静默通过 0 个文件」——恒绿而非判红。
         """
         self.assertEqual(
-            sorted(STAGE_SCRIPTS),
-            ['00', '10', '20', '30', '40', '50', '60', '90'],
+            sorted(STAGE_SCRIPTS, key=int),
+            ['00', '10', '20', '30', '40', '50', '60', '90', '100'],
         )
         for number in STAGE_SCRIPTS:
             with self.subTest(stage=number):
@@ -634,7 +636,7 @@ class CommonLibraryTest(BootstrapTestCase):
         orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
         mapping = dict(
             re.findall(
-                r"^    ([0-9]{2})\) printf '%s/(\S+)\\n' \"\$stage_dir\" ;;$",
+                r"^    ([0-9]{2,3})\) printf '%s/(\S+)\\n' \"\$stage_dir\" ;;$",
                 orchestrator,
                 re.M,
             )
@@ -652,7 +654,7 @@ class CommonLibraryTest(BootstrapTestCase):
         lines = source.splitlines()
         start = lines.index('STAGE_SCRIPTS = {')
         end = next(i for i in range(start, len(lines)) if lines[i] == '}')
-        pattern = re.compile(r'bootstrap/[0-9]{2}-')
+        pattern = re.compile(r'bootstrap/[0-9]{2,3}-')
         offenders = [
             number
             for number, line in enumerate(lines, 1)
@@ -661,7 +663,7 @@ class CommonLibraryTest(BootstrapTestCase):
         self.assertEqual(offenders, [], '这些行绕过了 STAGE_SCRIPTS 表')
 
     def test_every_stage_delegates_host_path_and_complete(self) -> None:
-        """八个 stage 曾各留一份 host_path 与 complete，必须只保留共享库那一份。
+        """各 stage 的 host_path 与 complete 必须只保留共享库那一份。
 
         complete 有四种形态，其中 **stage 10 是唯一不委托 finish_phase 的**：它内联
         打印并硬编码 EVIDENCE=NONE / SHA256=NONE。统一为委托的前提已核实——stage 10
@@ -672,13 +674,13 @@ class CommonLibraryTest(BootstrapTestCase):
         shared = COMMON.read_text(encoding='utf-8')
         for declaration in ('host_path()', 'complete()'):
             self.assertEqual(shared.count(declaration), 1, declaration)
-        # next 取更宽松的默认值，其余七个 stage 总是传参，不受影响。
+        # next 取更宽松的默认值，其余 stage 总是传参，不受影响。
         self.assertIn('local result=$1 reason=$2 code=$3 next=${4:-NONE}', shared)
         self.assertIn('finish_phase "$result" "$reason" "$code" "$next"', shared)
 
         # 走表而非通配：迁移后 `[0-9]*.sh` 只剩尚未迁移的那几个，枚举会静默变少。
         stages = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stages), 8, [str(s) for s in stages])
+        self.assertEqual(len(stages), 9, [str(s) for s in stages])
         for stage in stages:
             with self.subTest(stage=stage.name):
                 body = stage.read_text(encoding='utf-8')
@@ -830,6 +832,7 @@ class PathFactsTest(BootstrapTestCase):
         KUBEADM_INIT,
         INSTALL_CILIUM,
         FINAL_VERIFY,
+        FLUX_PHASE_A,
     )
 
     def run_facts(
@@ -974,7 +977,7 @@ class PathFactsTest(BootstrapTestCase):
     def test_every_stage_delegates_path_facts_to_the_shared_library(
         self,
     ) -> None:
-        """六个 stage 必须只 source 共享库，不得保留本地副本。"""
+        """七个 stage 必须只 source 共享库，不得保留本地副本。"""
         self.assertNotEqual(os.geteuid(), 0, '该用例必须由实际非 root 用户运行')
         self.assertTrue(PATH_FACTS.is_file(), 'lib/path-facts.sh is missing')
         self.assertFalse(PATH_FACTS.is_symlink())
@@ -1027,7 +1030,7 @@ class PathFactsTest(BootstrapTestCase):
 class ExecSafetyTest(BootstrapTestCase):
     """lib/exec-safety.sh 的受控执行与路径安全谓词。"""
 
-    STAGES = (INSTALL_CILIUM, FINAL_VERIFY)
+    STAGES = (INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A)
 
     def run_exec_safety(
         self, body: str, *arguments: str, env: dict[str, str] | None = None
@@ -1237,7 +1240,7 @@ class ExecSafetyTest(BootstrapTestCase):
     def test_both_consuming_stages_delegate_to_the_shared_library(
         self,
     ) -> None:
-        """60/90 必须只 source 共享库，不得保留本地副本。"""
+        """60/90/100 必须只 source 共享库，不得保留本地副本。"""
         self.assertTrue(EXEC_SAFETY.is_file(), 'lib/exec-safety.sh is missing')
         self.assertFalse(EXEC_SAFETY.is_symlink())
         # 与 bootstrap-all.sh 的 safe_owned_file 同义：它只拒绝组/他人可写
@@ -1270,7 +1273,11 @@ class ExecSafetyTest(BootstrapTestCase):
                 self.assertRegex(body, source_line)
                 self.assertRegex(body, facts_source_line)
                 self.assertIn('readonly PYTHON_BINARY=/usr/bin/python3', body)
-                self.assertIn('readonly TAR_BINARY=/usr/bin/tar', body)
+                if stage == FLUX_PHASE_A:
+                    self.assertIn('TAR_BINARY=/usr/bin/tar', body)
+                    self.assertIn('\nreadonly TAR_BINARY\n', body)
+                else:
+                    self.assertIn('readonly TAR_BINARY=/usr/bin/tar', body)
                 for declaration in declarations:
                     self.assertNotIn(declaration, body, declaration)
 
@@ -1641,13 +1648,13 @@ class ArchiveLibraryTest(BootstrapTestCase):
 
 
 class KubectlLibraryTest(BootstrapTestCase):
-    """lib/kubectl.sh：stage 60/90 曾各留一份的 admin.conf 生命周期与 kubectl 门禁。
+    """lib/kubectl.sh：60/90 的共享 admin.conf 生命周期，100 复用同一门禁。
 
     两份实现归一命名后字节一致，唯一差异是 60 把 safe_file 的四项检查内联展开
     （账本 Task 5 裁决）。统一取 90 的命名与抽取形态。
     """
 
-    STAGES = (INSTALL_CILIUM, FINAL_VERIFY)
+    STAGES = (INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A)
     DECLARATIONS = (
         'admin_conf_metadata_is_safe()',
         'capture_admin_conf()',
@@ -1657,7 +1664,7 @@ class KubectlLibraryTest(BootstrapTestCase):
     )
 
     def test_both_consuming_stages_delegate_to_the_shared_library(self) -> None:
-        """60/90 必须只 source 共享库，且不得残留旧的 _gate 命名。"""
+        """60/90/100 必须只 source 共享库，且不得残留旧的 _gate 命名。"""
         self.assertTrue(KUBECTL_LIB.is_file(), 'lib/kubectl.sh is missing')
         self.assertFalse(KUBECTL_LIB.is_symlink())
         self.assertEqual(KUBECTL_LIB.stat().st_mode & 0o022, 0)
@@ -1841,7 +1848,7 @@ class StageReadmeTest(BootstrapTestCase):
 
     def test_every_stage_has_a_readme(self) -> None:
         directories = self.stage_dirs()
-        self.assertEqual(len(directories), 8, [str(d) for d in directories])
+        self.assertEqual(len(directories), 9, [str(d) for d in directories])
         for directory in directories:
             with self.subTest(stage=directory.name):
                 readme = directory / 'README.md'
@@ -2927,7 +2934,7 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 
     def test_environment_rejection_names_offending_variables(self) -> None:
         """拒绝不可信环境时必须列出违规变量名（只列名不列值），便于运维定位 unset。"""
-        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+        for script in (INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
                 environment['KUBECACHEDIR'] = '/dev/null'
@@ -2965,7 +2972,7 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 
     def test_environment_rejection_deduplicates_fixed_and_prefix_names(self) -> None:
         """KUBECTL_EXTERNAL_DIFF 同时命中固定清单与 KUBECTL_ 前缀，只能列出一次。"""
-        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+        for script in (INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A):
             with self.subTest(script=script.name):
                 environment, _ = self.production_environment()
                 environment['KUBECTL_EXTERNAL_DIFF'] = 'diff'
@@ -3003,7 +3010,7 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         # 安全性完全依赖入口守卫拦在 source 之前。
         for script in (
             PREPARE_KERNEL, INSTALL_CONTAINERD, INSTALL_KUBERNETES, KUBEADM_INIT,
-            INSTALL_CILIUM, FINAL_VERIFY,
+            INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A,
         ):
             with self.subTest(script=script.name):
                 environment, command_log = self.production_environment()
@@ -3142,7 +3149,7 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
         untrusted-environment-override——本地恒红两条而 CI 全绿。用例环境必须与
         调用者的 shell 无关，否则任何人导出 KUBECONFIG 或 HELM_* 都会重演。
         """
-        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+        for script in (INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A):
             with self.subTest(script=script.name):
                 self.ambient_environment(**self.untrusted_environment_probe())
                 environment, command_log = self.production_environment()
@@ -3459,7 +3466,8 @@ class RunApprovedTest(BootstrapTestCase):
         self.assertNotIn('FAKE_MODE', result.stdout)
 
 
-class BootstrapOrchestratorTest(BootstrapTestCase):
+class BootstrapOrchestratorMixin:
+    """编排器 fixture、助手和前半组契约；由最终 TestCase 与后半组共同装配。"""
     commit = '0123456789abcdef0123456789abcdef01234567'
     canary = 'SECRET_CANARY_ORCHESTRATOR_DO_NOT_LOG'
     library_names = (
@@ -3574,6 +3582,10 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
               60)
                 check_result=PASS_CILIUM_CHECK
                 apply_result=PASS_CILIUM_INSTALLED
+                ;;
+              100)
+                check_result=PASS_FLUX_PHASE_A_CHECK
+                apply_result=PASS_FLUX_PHASE_A_INSTALLED
                 ;;
               *) exit 30 ;;
             esac
@@ -3769,6 +3781,11 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
             (('10', '20', '30', '40', '50'), 'PASS_BOOTSTRAP_CHECK', '60'),
             (
                 ('10', '20', '30', '40', '50', '60'),
+                'PASS_BOOTSTRAP_CHECK',
+                '100',
+            ),
+            (
+                ('10', '20', '30', '40', '50', '60', '100'),
                 'PASS_BOOTSTRAP_ALL_CHECK',
                 'NONE',
             ),
@@ -3784,15 +3801,18 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'RESULT={expected_result}', result.stdout)
                 self.assertIn(f'NEXT_STAGE={expected_next}', result.stdout)
-                expected_checks = ['00', *completed]
-                expected_checks.append('90' if expected_next == 'NONE' else expected_next)
+                expected_checks = ['00', '10', '20', '30', '40', '50', '60', '90', '100']
+                if expected_next != 'NONE':
+                    expected_checks = expected_checks[
+                        :expected_checks.index(expected_next) + 1
+                    ]
                 self.assertEqual(
                     self.command_log.read_text(encoding='utf-8').splitlines(),
                     [f'{stage} --check' for stage in expected_checks],
                 )
 
     def test_apply_on_fully_complete_state_performs_no_stage_apply(self) -> None:
-        for stage in ('10', '20', '30', '40', '50', '60'):
+        for stage in ('10', '20', '30', '40', '50', '60', '100'):
             (self.state_dir / stage).touch()
 
         result = self.run_orchestrator('--apply')
@@ -3803,9 +3823,28 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         lines = self.command_log.read_text(encoding='utf-8').splitlines()
         self.assertEqual(
             lines,
-            [f'{stage} --check' for stage in ('00', '10', '20', '30', '40', '50', '60', '90')],
+            [
+                f'{stage} --check'
+                for stage in ('00', '10', '20', '30', '40', '50', '60', '90', '100')
+            ],
         )
         self.assertTrue(all('--apply' not in line for line in lines))
+
+    def test_apply_reaches_flux_phase_a_after_final_verify(self) -> None:
+        for stage in ('10', '20', '30', '40', '50', '60'):
+            (self.state_dir / stage).touch()
+
+        result = self.run_orchestrator('--apply')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_BOOTSTRAP_ALL', result.stdout)
+        self.assertIn('STAGE_100_RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
+        self.assertIn('STAGE_100_RESULT=PASS_FLUX_PHASE_A_INSTALLED', result.stdout)
+        self.assertIn('STAGE_100_RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertEqual(
+            self.command_log.read_text(encoding='utf-8').splitlines()[-4:],
+            ['90 --check', '100 --check', '100 --apply', '100 --check'],
+        )
 
     def test_apply_resumes_at_40_and_reaches_final_verify(self) -> None:
         for stage in ('10', '20', '30'):
@@ -3868,18 +3907,19 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in (
-            '[1/8] stage 00 check ...',
-            '[1/8] stage 00 check -> PASS_PREFLIGHT',
-            '[5/8] stage 40 check -> PASS_KUBERNETES_CHECK',
-            '[5/8] stage 40 apply ...',
-            '[5/8] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
-            '[5/8] stage 40 postcheck -> ALREADY_COMPLIANT',
-            '[8/8] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
+            '[1/9] stage 00 check ...',
+            '[1/9] stage 00 check -> PASS_PREFLIGHT',
+            '[5/9] stage 40 check -> PASS_KUBERNETES_CHECK',
+            '[5/9] stage 40 apply ...',
+            '[5/9] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
+            '[5/9] stage 40 postcheck -> ALREADY_COMPLIANT',
+            '[8/9] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
+            '[9/9] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
         ):
             self.assertIn(line, result.stderr)
         # 进度行一旦漏进 stdout，下游解析与既有逐字段断言都会被打乱。
-        for index in range(1, 9):
-            self.assertNotIn(f'[{index}/8]', result.stdout)
+        for index in range(1, 10):
+            self.assertNotIn(f'[{index}/9]', result.stdout)
         # 进度行只回显编排器自己掌握的事实，不含 stage 自由文本与终端控制序列。
         self.assertNotIn(self.canary, result.stdout + result.stderr)
         self.assertNotIn('\x1b', result.stdout + result.stderr)
@@ -3897,18 +3937,18 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(
-            result.stderr, r'\[5/8\] stage 40 check \.\.\. \d+s elapsed'
+            result.stderr, r'\[5/9\] stage 40 check \.\.\. \d+s elapsed'
         )
         # 结束行带累计耗时，事后也能看出哪个 stage 慢。
         self.assertRegex(
             result.stderr,
-            r'\[5/8\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
+            r'\[5/9\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
         )
         # 心跳必须随 stage 结束而停。没被 kill 掉的话它会变成孤儿，一路刷进
         # 后续 stage——行数会远超该 stage 的实际时长。这条才是真正的区分点：
         # 「有心跳」很容易，「心跳能停」才是并发代码的难处。
         beats = re.findall(
-            r'\[5/8\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/9\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertTrue(beats)
         self.assertLessEqual(len(beats), 6, result.stderr)
@@ -3931,7 +3971,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         beats = re.findall(
-            r'\[5/8\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/9\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertEqual(beats, ['5'], result.stderr)
 
@@ -4055,16 +4095,15 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         self.assertTrue(self.lock_file.is_symlink())
 
     def test_check_all_complete_reaches_final_verify(self) -> None:
-        for stage in ('10', '20', '30', '40', '50', '60'):
+        for stage in ('10', '20', '30', '40', '50', '60', '100'):
             (self.state_dir / stage).touch()
 
         result = self.run_orchestrator('--check')
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('RESULT=PASS_BOOTSTRAP_ALL_CHECK', result.stdout)
-        self.assertIn(
-            '90 --check', self.command_log.read_text(encoding='utf-8')
-        )
+        commands = self.command_log.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(commands[-2:], ['90 --check', '100 --check'])
 
     def test_summary_is_structured_and_does_not_leak_untrusted_next(self) -> None:
         self.environment['FAKE_STAGE_NEXT'] = self.canary
@@ -4169,6 +4208,639 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
                     'REASON=untrusted-git-environment', result.stderr
                 )
 
+
+class FluxPhaseAStageTest(BootstrapTestCase):
+    canary = 'SECRET_CANARY_FLUX_PHASE_A_DO_NOT_LOG'
+
+    def write_executable(self, path: Path, source: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
+        path.chmod(0o755)
+
+    def make_environment(self) -> tuple[dict[str, str], Path, Path]:
+        directory = self.temporary_directory().resolve()
+        host = directory / 'host'
+        fake_bin = directory / 'bin'
+        command_log = directory / 'commands.log'
+        rendered = directory / 'rendered.yaml'
+        state_file = directory / 'flux-state'
+        for path in (
+            host / 'root/dev-infra-evidence',
+            host / 'etc/kubernetes',
+            host / 'usr/bin',
+            fake_bin,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        (host / 'root').chmod(0o700)
+        command_log.write_text('', encoding='utf-8')
+        rendered.write_text(
+            '---\napiVersion: v1\nkind: Namespace\nmetadata:\n'
+            '  name: flux-system\n',
+            encoding='utf-8',
+        )
+        admin_conf = host / 'etc/kubernetes/admin.conf'
+        admin_conf.write_text(self.canary + '\n', encoding='utf-8')
+        admin_conf.chmod(0o600)
+        hosts_root = directory / 'hosts'
+        hosts_root.mkdir()
+        self.write_fixture_host(hosts_root)
+
+        self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
+        self.write_executable(
+            fake_bin / 'hostname',
+            '#!/bin/sh\nprintf "retail-test-workflow\\n"\n',
+        )
+        self.write_executable(
+            host / 'usr/bin/curl',
+            r'''
+            #!/bin/sh
+            printf 'curl %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            output=
+            previous=
+            for argument do
+              if [ "$previous" = --output ]; then
+                output=$argument
+                break
+              fi
+              previous=$argument
+            done
+            [ -n "$output" ] || exit 64
+            printf 'flux archive fixture\n' >"$output"
+        ''',
+        )
+        self.write_executable(
+            host / 'usr/bin/tar',
+            r'''
+            #!/bin/sh
+            printf 'tar %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            [ "$1" = -xzf ] && [ "$3" = -C ] && [ "$5" = flux ] || exit 64
+            cat >"$4/flux" <<'EOF'
+            #!/bin/sh
+            printf 'flux %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+            case "$*" in
+              'version --client') printf 'flux version 2.9.3\n' ;;
+              check\ --pre\ --kubeconfig=*) printf 'pre-install checks passed\n' ;;
+              check\ --kubeconfig=*\ --components=source-controller,kustomize-controller,helm-controller,notification-controller)
+                printf 'all checks passed\n'
+                ;;
+              *) exit 64 ;;
+            esac
+            EOF
+            chmod 0755 "$4/flux"
+        ''',
+        )
+        self.write_executable(
+            host / 'usr/bin/kubectl',
+            r'''
+            #!/usr/bin/python3 -B
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            def current_state():
+                path = Path(os.environ['FAKE_STATE_FILE'])
+                if path.exists():
+                    return path.read_text(encoding='utf-8').strip()
+                return os.environ.get('FAKE_FLUX_STATE', 'ABSENT')
+
+            args = sys.argv[1:]
+            with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
+                log.write('kubectl ' + ' '.join(args) + '\n')
+            if len(args) < 3 or args[0] != '--kubeconfig':
+                raise SystemExit(64)
+            if Path(args[1]).read_text(encoding='utf-8') != os.environ['FAKE_ADMIN_CONF_CONTENT']:
+                raise SystemExit(64)
+            if args[2] == '--cache-dir=/dev/null':
+                command = args[3:]
+            else:
+                command = args[2:]
+            if command == [
+                'config', 'view', '--raw', '--merge=false', '--output=json',
+            ]:
+                sys.stdout.write(os.environ['FAKE_ADMIN_VIEW_JSON'])
+            elif command == ['kustomize', os.environ['FAKE_DESIRED_ROOT']]:
+                sys.stdout.write(Path(os.environ['FAKE_RENDERED']).read_text(encoding='utf-8'))
+            elif command == [
+                'apply', '--dry-run=client', '--kustomize',
+                os.environ['FAKE_DESIRED_ROOT'],
+            ]:
+                pass
+            elif command == [
+                'get', 'namespace', 'flux-system', '--ignore-not-found', '--output=name',
+            ]:
+                if current_state() not in ('ABSENT', 'CLUSTER_RBAC'):
+                    sys.stdout.write('namespace/flux-system\n')
+            elif command == [
+                'get', 'customresourcedefinitions.apiextensions.k8s.io',
+                '--selector=app.kubernetes.io/part-of=flux', '--output=name',
+            ]:
+                if current_state() == 'COMPLIANT':
+                    names = (
+                        'alerts.notification.toolkit.fluxcd.io',
+                        'buckets.source.toolkit.fluxcd.io',
+                        'externalartifacts.source.toolkit.fluxcd.io',
+                        'gitrepositories.source.toolkit.fluxcd.io',
+                        'helmcharts.source.toolkit.fluxcd.io',
+                        'helmreleases.helm.toolkit.fluxcd.io',
+                        'helmrepositories.source.toolkit.fluxcd.io',
+                        'kustomizations.kustomize.toolkit.fluxcd.io',
+                        'ocirepositories.source.toolkit.fluxcd.io',
+                        'providers.notification.toolkit.fluxcd.io',
+                        'receivers.notification.toolkit.fluxcd.io',
+                    )
+                    sys.stdout.write(''.join(
+                        'customresourcedefinition.apiextensions.k8s.io/' + name + '\n'
+                        for name in names
+                    ))
+            elif command == [
+                'get', 'clusterrole,clusterrolebinding',
+                '--selector=app.kubernetes.io/part-of=flux', '--output=name',
+            ]:
+                if current_state() == 'CLUSTER_RBAC':
+                    sys.stdout.write(
+                        'clusterrole.rbac.authorization.k8s.io/'
+                        'unexpected-flux-role\n'
+                    )
+            elif command == [
+                'get', 'clusterrole,clusterrolebinding',
+                'flux-controller-api-health', '--ignore-not-found', '--output=name',
+            ]:
+                if current_state() == 'COMPLIANT':
+                    sys.stdout.write(
+                        'clusterrole.rbac.authorization.k8s.io/'
+                        'flux-controller-api-health\n'
+                        'clusterrolebinding.rbac.authorization.k8s.io/'
+                        'flux-controller-api-health\n'
+                    )
+            elif command == [
+                'get', 'namespace', 'platform', 'openbao', 'cert-manager',
+                'monitoring', 'cnpg-system', 'minio', '--ignore-not-found',
+                '--output=name',
+            ]:
+                if current_state() == 'DOWNSTREAM':
+                    sys.stdout.write('namespace/platform\n')
+            elif command == [
+                '--namespace=flux-system', 'get', 'deployment.apps', '--output=name',
+            ]:
+                state = current_state()
+                if state == 'COMPLIANT':
+                    sys.stdout.write(
+                        'deployment.apps/helm-controller\n'
+                        'deployment.apps/kustomize-controller\n'
+                        'deployment.apps/notification-controller\n'
+                        'deployment.apps/source-controller\n'
+                    )
+                elif state == 'PARTIAL':
+                    sys.stdout.write('deployment.apps/source-controller\n')
+            elif command == [
+                '--namespace=flux-system', 'get', 'secret', '--output=name',
+            ]:
+                pass
+            elif command == [
+                '--namespace=flux-system', 'get',
+                'serviceaccount,service,role,rolebinding,resourcequota,networkpolicy,ciliumnetworkpolicy',
+                '--output=name',
+            ]:
+                if current_state() == 'PARTIAL':
+                    sys.stdout.write('service/source-controller\n')
+                elif current_state() == 'NAMESPACE_RESOURCE':
+                    sys.stdout.write('serviceaccount/source-controller\n')
+            elif command == [
+                'get',
+                'alerts.notification.toolkit.fluxcd.io,buckets.source.toolkit.fluxcd.io,externalartifacts.source.toolkit.fluxcd.io,gitrepositories.source.toolkit.fluxcd.io,helmcharts.source.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io,helmrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,ocirepositories.source.toolkit.fluxcd.io,providers.notification.toolkit.fluxcd.io,receivers.notification.toolkit.fluxcd.io',
+                '--all-namespaces', '--ignore-not-found', '--output=name',
+            ]:
+                if os.environ.get('FAKE_SYNC_INVENTORY') == '1':
+                    sys.stdout.write(
+                        'gitrepository.source.toolkit.fluxcd.io/unexpected\n'
+                    )
+            elif command == [
+                'diff', '--server-side',
+                '--field-manager=engineering-platform-flux-phase-a',
+                '--kustomize', os.environ['FAKE_DESIRED_ROOT'],
+            ]:
+                if current_state() != 'COMPLIANT':
+                    raise SystemExit(1)
+            elif command == [
+                '--namespace=flux-system', 'get', 'deployment.apps', '--output=json',
+            ]:
+                names = (
+                    'source-controller', 'kustomize-controller',
+                    'helm-controller', 'notification-controller',
+                )
+                sys.stdout.write(json.dumps({'items': [
+                    {
+                        'metadata': {'name': name, 'generation': 1},
+                        'spec': {'replicas': 1},
+                        'status': {
+                            'observedGeneration': 1, 'readyReplicas': 1,
+                            'availableReplicas': 1, 'updatedReplicas': 1,
+                        },
+                    }
+                    for name in names
+                ]}))
+            elif command == [
+                'get', 'namespace', 'flux-system', '--output=json',
+            ]:
+                sys.stdout.write(json.dumps({
+                    'metadata': {
+                        'name': 'flux-system',
+                        'labels': {
+                            'app.kubernetes.io/instance': 'flux-system',
+                            'app.kubernetes.io/part-of': 'flux',
+                            'app.kubernetes.io/version': 'v2.9.3',
+                            'pod-security.kubernetes.io/audit': 'restricted',
+                            'pod-security.kubernetes.io/audit-version': 'v1.36',
+                            'pod-security.kubernetes.io/enforce': 'restricted',
+                            'pod-security.kubernetes.io/enforce-version': 'v1.36',
+                            'pod-security.kubernetes.io/warn': 'restricted',
+                            'pod-security.kubernetes.io/warn-version': 'v1.36',
+                            'kubernetes.io/metadata.name': 'flux-system',
+                        },
+                    },
+                    'status': {'phase': 'Active'},
+                }))
+            elif command == [
+                'apply', '--server-side', '--dry-run=server',
+                '--field-manager=engineering-platform-flux-phase-a', '--filename=-',
+            ]:
+                sys.stdin.read()
+            elif command == [
+                'apply', '--server-side',
+                '--field-manager=engineering-platform-flux-phase-a', '--filename=-',
+            ]:
+                sys.stdin.read()
+                Path(os.environ['FAKE_STATE_FILE']).write_text(
+                    'NAMESPACE_ONLY\n', encoding='utf-8'
+                )
+            elif command == [
+                'wait', '--for=jsonpath={.status.phase}=Active',
+                'namespace/flux-system', '--timeout=60s',
+            ]:
+                if current_state() != 'NAMESPACE_ONLY':
+                    raise SystemExit(1)
+            elif command == [
+                'apply', '--server-side', '--dry-run=server',
+                '--field-manager=engineering-platform-flux-phase-a',
+                '--kustomize', os.environ['FAKE_DESIRED_ROOT'],
+            ]:
+                if current_state() != 'NAMESPACE_ONLY':
+                    raise SystemExit(1)
+                if os.environ.get('FAKE_FAIL_BUNDLE_SERVER_DRY_RUN') == '1':
+                    raise SystemExit(1)
+            elif command == [
+                'apply', '--server-side',
+                '--field-manager=engineering-platform-flux-phase-a',
+                '--kustomize', os.environ['FAKE_DESIRED_ROOT'],
+            ]:
+                if current_state() != 'NAMESPACE_ONLY':
+                    raise SystemExit(1)
+                Path(os.environ['FAKE_STATE_FILE']).write_text(
+                    'COMPLIANT\n', encoding='utf-8'
+                )
+            elif len(command) == 5 and command[:3] == [
+                '--namespace=flux-system', 'rollout', 'status',
+            ] and command[4] == '--timeout=5m':
+                if current_state() != 'COMPLIANT':
+                    raise SystemExit(1)
+            elif command == [
+                'create', '--filename=' + os.environ['FAKE_INTERNAL_PROBE'],
+                '--output=jsonpath={.metadata.name}:{.metadata.uid}',
+            ]:
+                Path(os.environ['FAKE_INTERNAL_PROBE_STATE']).write_text(
+                    '11111111-1111-4111-8111-111111111111\n', encoding='utf-8'
+                )
+                sys.stdout.write(
+                    'flux-phase-a-probe-fixture:'
+                    '11111111-1111-4111-8111-111111111111'
+                )
+            elif command == [
+                'create', '--filename=' + os.environ['FAKE_EXTERNAL_PROBE'],
+                '--output=jsonpath={.metadata.name}:{.metadata.uid}',
+            ]:
+                Path(os.environ['FAKE_EXTERNAL_PROBE_STATE']).write_text(
+                    '22222222-2222-4222-8222-222222222222\n', encoding='utf-8'
+                )
+                sys.stdout.write(
+                    'flux-phase-a-external-probe-fixture:'
+                    '22222222-2222-4222-8222-222222222222'
+                )
+            elif len(command) == 5 and command[1:3] == ['wait', '--for=condition=Ready']:
+                pass
+            elif command == [
+                '--namespace=flux-system', 'get', 'pod',
+                '--selector=app=source-controller',
+                '--output=jsonpath={.items[0].status.podIP}',
+            ]:
+                sys.stdout.write('10.0.0.10')
+            elif command == [
+                '--namespace=flux-system', 'get', 'pod',
+                '--selector=app=notification-controller',
+                '--output=jsonpath={.items[0].status.podIP}',
+            ]:
+                sys.stdout.write('10.0.0.11')
+            elif len(command) >= 5 and command[1] == 'exec':
+                namespace = command[0]
+                target = ' '.join(command[4:])
+                if (
+                    os.environ.get('FAKE_FAIL_POSITIVE_PROBE') == '1'
+                    and namespace == '--namespace=flux-system'
+                    and target == 'nslookup kubernetes.default.svc.cluster.local'
+                ):
+                    raise SystemExit(1)
+                denied = (
+                    namespace == '--namespace=flux-system' and target == 'nc -z -w 5 github.com 443'
+                ) or (
+                    namespace == '--namespace=default'
+                    and target in {
+                        'nc -z -w 5 source-controller.flux-system.svc.cluster.local 80',
+                        'nc -z -w 5 notification-controller.flux-system.svc.cluster.local 80',
+                        'nc -z -w 5 webhook-receiver.flux-system.svc.cluster.local 80',
+                    }
+                ) or (
+                    namespace == '--namespace=flux-system'
+                    and target in {
+                        'nc -z -w 5 10.0.0.10 8080',
+                        'nc -z -w 5 10.0.0.11 9292',
+                    }
+                )
+                if denied:
+                    raise SystemExit(1)
+            elif len(command) == 6 and command[1:3] == ['get', 'pod'] and command[4] == '--ignore-not-found':
+                name = command[3]
+                state_path = (
+                    Path(os.environ['FAKE_INTERNAL_PROBE_STATE'])
+                    if name == 'flux-phase-a-probe-fixture'
+                    else Path(os.environ['FAKE_EXTERNAL_PROBE_STATE'])
+                )
+                if state_path.exists():
+                    sys.stdout.write(state_path.read_text(encoding='utf-8').strip())
+            elif len(command) == 5 and command[1:3] == ['delete', 'pod'] and command[4] == '--wait=true':
+                name = command[3]
+                state_path = (
+                    Path(os.environ['FAKE_INTERNAL_PROBE_STATE'])
+                    if name == 'flux-phase-a-probe-fixture'
+                    else Path(os.environ['FAKE_EXTERNAL_PROBE_STATE'])
+                )
+                state_path.unlink()
+            else:
+                raise SystemExit(64)
+        ''',
+        )
+        environment = self.sanitized_environment(
+            PATH=f'{fake_bin}:/usr/bin:/bin',
+            BOOTSTRAP_TEST_MODE='1',
+            BOOTSTRAP_TEST_ROOT=str(host),
+            BOOTSTRAP_TEST_HOSTS_DIR=str(hosts_root),
+            BOOTSTRAP_TEST_RENDERED_FILE=str(rendered),
+            BOOTSTRAP_TEST_RENDERED_SHA256=hashlib.sha256(
+                rendered.read_bytes()
+            ).hexdigest(),
+            BOOTSTRAP_TEST_FLUX_ARCHIVE_SHA256=hashlib.sha256(
+                b'flux archive fixture\n'
+            ).hexdigest(),
+            FAKE_COMMAND_LOG=str(command_log),
+            FAKE_ADMIN_CONF_CONTENT=self.canary + '\n',
+            FAKE_ADMIN_VIEW_JSON=json.dumps(self.admin_config_object()),
+            FAKE_DESIRED_ROOT=str(ROOT / 'clusters/dev/flux-system'),
+            FAKE_RENDERED=str(rendered),
+            FAKE_STATE_FILE=str(state_file),
+            FAKE_INTERNAL_PROBE=str(
+                ROOT / 'runbook/examples/flux-phase-a-network-probe.yaml'
+            ),
+            FAKE_EXTERNAL_PROBE=str(
+                ROOT / 'runbook/examples/flux-phase-a-external-network-probe.yaml'
+            ),
+            FAKE_INTERNAL_PROBE_STATE=str(directory / 'internal-probe-state'),
+            FAKE_EXTERNAL_PROBE_STATE=str(directory / 'external-probe-state'),
+        )
+        return environment, command_log, host
+
+    def run_stage(
+        self, environment: dict[str, str], mode: str
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertTrue(FLUX_PHASE_A.exists(), 'Stage 100 entry is missing')
+        return self.run_command(
+            ['/bin/bash', '-p', str(FLUX_PHASE_A), mode], env=environment
+        )
+
+    def test_check_on_absent_cluster_is_read_only_and_requests_apply(self) -> None:
+        environment, command_log, host = self.make_environment()
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
+        self.assertIn('REASON=apply-required', result.stdout)
+        self.assertIn('EVIDENCE=NONE', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn('apply --dry-run=client --kustomize', commands)
+        for mutation in (' apply --server-side', ' create ', ' delete ', 'curl '):
+            self.assertNotIn(mutation, commands)
+        self.assertEqual(list((host / 'root/dev-infra-evidence').iterdir()), [])
+
+    def test_check_accepts_namespace_only_as_a_resumable_checkpoint(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'NAMESPACE_ONLY'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
+        self.assertIn('REASON=namespace-only-apply-required', result.stdout)
+        self.assertNotIn(' apply --server-side', command_log.read_text(encoding='utf-8'))
+
+    def test_check_returns_already_compliant_without_mutation(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertIn('REASON=flux-phase-a-ready', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn('diff --server-side', commands)
+        self.assertNotIn(' apply --server-side', commands)
+
+    def test_check_rejects_partial_or_downstream_state(self) -> None:
+        for state in (
+            'PARTIAL', 'DOWNSTREAM', 'NAMESPACE_RESOURCE', 'CLUSTER_RBAC',
+        ):
+            with self.subTest(state=state):
+                environment, _, _ = self.make_environment()
+                environment['FAKE_FLUX_STATE'] = state
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(result.returncode, 30)
+                self.assertIn('REASON=flux-phase-a-state-unknown', result.stdout)
+
+    def test_check_rejects_any_flux_custom_resource_inventory(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_SYNC_INVENTORY'] = '1'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-phase-a-state-unknown', result.stdout)
+
+    def test_apply_installs_from_absent_state_in_dependency_order(self) -> None:
+        environment, command_log, host = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_INSTALLED', result.stdout)
+        self.assertIn('REASON=flux-phase-a-ready', result.stdout)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        namespace_dry_run = next(
+            i for i, line in enumerate(commands)
+            if 'apply --server-side --dry-run=server' in line and '--filename=-' in line
+        )
+        namespace_apply = next(
+            i for i, line in enumerate(commands)
+            if 'apply --server-side --field-manager=' in line and '--filename=-' in line
+        )
+        bundle_dry_run = next(
+            i for i, line in enumerate(commands)
+            if 'apply --server-side --dry-run=server' in line and '--kustomize' in line
+        )
+        bundle_diff = next(i for i, line in enumerate(commands) if 'diff --server-side' in line)
+        bundle_apply = next(
+            i for i, line in enumerate(commands)
+            if 'apply --server-side --field-manager=' in line and '--kustomize' in line
+        )
+        self.assertLess(
+            namespace_dry_run, namespace_apply,
+        )
+        self.assertLess(namespace_apply, bundle_dry_run)
+        self.assertLess(bundle_dry_run, bundle_diff)
+        self.assertLess(bundle_diff, bundle_apply)
+        for controller in (
+            'source-controller', 'kustomize-controller',
+            'helm-controller', 'notification-controller',
+        ):
+            self.assertTrue(any(
+                f'rollout status deployment/{controller} --timeout=5m' in line
+                for line in commands
+            ), controller)
+        evidence_files = list((host / 'root/dev-infra-evidence').glob(
+            '15-flux-phase-a-*.txt'
+        ))
+        self.assertEqual(len(evidence_files), 1, evidence_files)
+        self.assertEqual(evidence_files[0].stat().st_mode & 0o777, 0o600)
+        evidence_text = evidence_files[0].read_text(encoding='utf-8')
+        for expected_line in (
+            'FLUX_CHECK=all-checks-passed',
+            'NETWORK_PROBE_POSITIVE_COUNT=7',
+            'NETWORK_PROBE_NEGATIVE_COUNT=6',
+            'NETWORK_PROBE_CLEANUP=owned-uid-exact',
+            'OPENBAO=NOT_EXECUTED',
+            'BACKUPS=NOT_EXECUTED',
+            'APPLICATIONS=NOT_EXECUTED',
+        ):
+            self.assertIn(expected_line + '\n', evidence_text)
+        sidecar = Path(f'{evidence_files[0]}.sha256')
+        self.assertTrue(sidecar.is_file(), sidecar)
+        self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+        evidence_digest = hashlib.sha256(evidence_files[0].read_bytes()).hexdigest()
+        self.assertEqual(
+            sidecar.read_text(encoding='utf-8'),
+            f'{evidence_digest}  {evidence_files[0].name}\n',
+        )
+        self.assertRegex(result.stdout, r'SHA256=[0-9a-f]{64}')
+        self.assertIn(f'SHA256_FILE={sidecar}', result.stdout)
+
+    def test_apply_runs_and_uid_cleans_both_network_probes(self) -> None:
+        environment, command_log, _ = self.make_environment()
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        creates = [line for line in commands if ' create --filename=' in line]
+        deletes = [line for line in commands if ' delete pod ' in line]
+        self.assertEqual(len(creates), 2, creates)
+        self.assertEqual(len(deletes), 2, deletes)
+        self.assertTrue(any('flux-phase-a-probe-fixture' in line for line in deletes))
+        self.assertTrue(any(
+            'flux-phase-a-external-probe-fixture' in line for line in deletes
+        ))
+        self.assertFalse(any('delete --filename' in line for line in commands))
+        self.assertFalse(any('--selector' in line for line in deletes))
+        execs = {
+            'kubectl ' + line.split('--cache-dir=/dev/null ', 1)[1]
+            for line in commands if ' exec ' in line
+        }
+        self.assertEqual(
+            execs,
+            {
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nslookup kubernetes.default.svc.cluster.local',
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nc -z -w 5 kubernetes.default.svc.cluster.local 443',
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nc -z -w 5 source-controller.flux-system.svc.cluster.local 80',
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nc -z -w 5 notification-controller.flux-system.svc.cluster.local 80',
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nc -z -w 5 github.com 443',
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nc -z -w 5 10.0.0.10 8080',
+                'kubectl --namespace=flux-system exec flux-phase-a-probe-fixture -- nc -z -w 5 10.0.0.11 9292',
+                'kubectl --namespace=default exec flux-phase-a-external-probe-fixture -- nslookup kubernetes.default.svc.cluster.local',
+                'kubectl --namespace=default exec flux-phase-a-external-probe-fixture -- nc -z -w 5 kubernetes.default.svc.cluster.local 443',
+                'kubectl --namespace=default exec flux-phase-a-external-probe-fixture -- nc -z -w 5 github.com 443',
+                'kubectl --namespace=default exec flux-phase-a-external-probe-fixture -- nc -z -w 5 source-controller.flux-system.svc.cluster.local 80',
+                'kubectl --namespace=default exec flux-phase-a-external-probe-fixture -- nc -z -w 5 notification-controller.flux-system.svc.cluster.local 80',
+                'kubectl --namespace=default exec flux-phase-a-external-probe-fixture -- nc -z -w 5 webhook-receiver.flux-system.svc.cluster.local 80',
+            },
+        )
+        self.assertIn('NETWORK_PROBE_RESULT=PASS', result.stdout)
+
+    def test_apply_rejects_archive_digest_drift_before_server_mutation(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['BOOTSTRAP_TEST_FLUX_ARCHIVE_SHA256'] = '0' * 64
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-cli-archive-digest-drift', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertNotIn(' apply --server-side', commands)
+        self.assertNotIn(' create --filename=', commands)
+
+    def test_apply_stops_before_bundle_apply_when_server_dry_run_fails(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FAIL_BUNDLE_SERVER_DRY_RUN'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 50, result.stdout + result.stderr)
+        self.assertIn('REASON=bundle-server-dry-run-failed', result.stdout)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        bundle_applies = [
+            line for line in commands
+            if 'apply --server-side --field-manager=' in line and '--kustomize' in line
+        ]
+        self.assertEqual(bundle_applies, [])
+        self.assertFalse(any(' create --filename=' in line for line in commands))
+
+    def test_apply_cleans_both_owned_probes_when_positive_probe_fails(self) -> None:
+        environment, command_log, host = self.make_environment()
+        environment['FAKE_FAIL_POSITIVE_PROBE'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 50, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-network-positive-probe-failed', result.stdout)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        deletes = [line for line in commands if ' delete pod ' in line]
+        self.assertEqual(len(deletes), 2, deletes)
+        self.assertFalse(any('--selector' in line for line in deletes))
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').iterdir()), []
+        )
+
+
+class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
     def test_test_path_checks_ignore_caller_stat_binary(self) -> None:
         self.state_dir.chmod(0o777)
         self.write_executable(
@@ -4528,7 +5200,7 @@ class BootstrapOrchestratorTest(BootstrapTestCase):
         # 表本身与编排器 stage_path() 的一致性由
         # CommonLibraryTest.test_stage_paths_come_from_one_table 交叉校验。
         stage_scripts = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stage_scripts), 8, [str(s) for s in stage_scripts])
+        self.assertEqual(len(stage_scripts), 9, [str(s) for s in stage_scripts])
         for script in stage_scripts:
             self.assertTrue(script.is_file(), script)
         sourced: set[str] = set()
@@ -13288,8 +13960,8 @@ operator:
         self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
 
     def test_admin_conf_predicate_is_not_duplicated(self) -> None:
-        """Stage 60/90 必须共用同一份 admin.conf 谓词，避免再次漂移。"""
-        for script in (INSTALL_CILIUM, FINAL_VERIFY):
+        """Stage 60/90/100 必须共用同一份 admin.conf 谓词，避免再次漂移。"""
+        for script in (INSTALL_CILIUM, FINAL_VERIFY, FLUX_PHASE_A):
             with self.subTest(script=script.name):
                 text = script.read_text(encoding='utf-8')
                 self.assertIn('lib/admin-conf.sh', text)

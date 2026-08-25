@@ -1556,6 +1556,26 @@ class FluxPhaseAContractTest(unittest.TestCase):
     }
     CONTROLLER_SERVICE_ACCOUNTS = tuple(CONTROLLERS)
 
+    def test_stage_100_pins_the_canonical_rendered_bundle(self) -> None:
+        stage = (
+            validator.ROOT
+            / 'scripts/bootstrap/stages/100-flux-phase-a/run.sh'
+        )
+        self.assertTrue(stage.is_file(), 'Stage 100 Flux Phase A entry is missing')
+        source = stage.read_text(encoding='utf-8')
+        match = re.search(
+            r'^readonly RENDERED_SHA256=([0-9a-f]{64})$', source, re.MULTILINE
+        )
+        self.assertIsNotNone(match, 'Stage 100 does not pin rendered SHA-256')
+        assert match is not None
+        self.assertEqual(match.group(1), validator.FLUX_PHASE_A_RENDERED_SHA256)
+
+        orchestrator = (
+            validator.ROOT / 'scripts/bootstrap/bootstrap-all.sh'
+        ).read_text(encoding='utf-8')
+        self.assertIn('readonly -a STAGES=(00 10 20 30 40 50 60 90 100)', orchestrator)
+        self.assertIn('100:PASS_FLUX_PHASE_A_INSTALLED', orchestrator)
+
     @classmethod
     def setUpClass(cls) -> None:
         rendered = subprocess.run(

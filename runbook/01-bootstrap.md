@@ -136,11 +136,18 @@ Desired State 来源。
 ```
 
 `--apply` 会先检查每个 stage，跳过返回 `ALREADY_COMPLIANT` 的 stage，仅对需要变更的
-stage 执行 apply，并要求 apply 后的 post-check 回到 compliant；否则立即停止。运行失败后，
+stage 执行 apply，并要求 apply 后的 post-check 回到 compliant；否则立即停止。当前编排顺序
+为 stage `00`、`10`、`20`、`30`、`40`、`50`、`60`、`90`、`100`。Stage `100` 是 Flux Phase A 的正式一键入口，
+仍严格限制为 source、kustomize、helm、notification 四个 Controller；它不会创建 Secret、
+sync CR、第五个 Controller、下游 Namespace，也不会执行 OpenBao、备份或业务应用。
+运行失败后，
 重跑同一条命令即可恢复：orchestrator 根据真实主机状态重建进度，不读取或维护 progress file。
 
 当前服务器已完成全部 stage `00`～`90`。GitHub `validation-gate` 成功后重跑
 orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，并直接抵达 stage `90`。
+Flux Phase A 四 Controller 另有历史验收；包含 stage `100` 的新候选继续运行时，由 stage
+`100` 对 Flux Phase A 做 fail-closed 的只读判定；完整
+compliant 时直接返回 `ALREADY_COMPLIANT`，不会重复部署或创建探针。
 
 ### 单阶段诊断和人工应急入口
 
@@ -157,6 +164,7 @@ orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 sta
 | 12 | `stages/50-kubeadm-init/run.sh` | `--check` 后批准 `--apply` | `PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/12-kubeadm-*.txt` |
 | 13 | `stages/60-install-cilium/run.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/13-cilium-*.txt` |
 | 14 | `stages/90-verify/run.sh` | 仅 `--check` | `PASS_BOOTSTRAP_VERIFIED` | `/root/dev-infra-evidence/14-verify-*.txt` |
+| 15 | `stages/100-flux-phase-a/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_PHASE_A_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
 
 固定退出码：`0` 表示当前阶段按输出判定完成或需要获批 APPLY；`10` 为前置条件失败，
 `20` 为供应链不匹配，`30` 为未知/漂移状态，`40` 为 APPLY 失败，`50` 为部署后
@@ -186,9 +194,9 @@ EXIT_CODE=30
 进度行与心跳走 **stderr**，形如：
 
 ```
-[5/8] stage 40 check ...
-[5/8] stage 40 check ... 5s elapsed
-[5/8] stage 40 check -> ALREADY_COMPLIANT (37s)
+[5/9] stage 40 check ...
+[5/9] stage 40 check ... 5s elapsed
+[5/9] stage 40 check -> ALREADY_COMPLIANT (37s)
 ```
 
 它们是给人看的存活信号，**不属于 stdout 的证据契约，不需要回填**。慢 stage 首拍
@@ -446,6 +454,11 @@ serverTLSBootstrap: true
 状态：`PHASE_A_CONTROLLERS_DEPLOYED_SYNC_INACTIVE`。本节只安装四个 Controller 基础层，不创建 Git deploy key、
 Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不激活任何
 下游 Desired State。Git deploy key 与仓库 sync 属于后续 Phase B/C。
+
+从 stage `100` 合入起，正常部署只使用上文的一键入口
+`scripts/bootstrap/run-approved.sh --check|--apply`。本节保留的长命令块是历史执行合同、
+审计细节和单阶段故障诊断依据，不再是正常部署时需要人工逐条粘贴的流程；不得用这些命令
+绕过 stage `100` 的状态机、固定摘要、依赖顺序、UID 清理或证据门禁。
 
 ### 2026-08-24 执行与验收记录
 
