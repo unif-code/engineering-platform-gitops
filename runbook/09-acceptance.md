@@ -10,33 +10,36 @@ PCS Candidate：`pcs/candidate-2.md`
 
 ## 当前 DEV Runtime 观测
 
-`2026-08-24 03:42Z` 的上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；它已验证 bootstrap。Runtime inventory 没有 `flux-system`、`platform` 或 `openbao`，GitRepository 查询为空，因此以下验收项继续 fail-closed 为 `BLOCKED`。
+`2026-08-24 12:16:47Z` 的历史证据已验收 Flux Phase A 四 Controller 基础层；Git sync、
+`platform`、`openbao`、备份和应用仍未激活，因此以下端到端验收项继续 fail-closed 为
+`BLOCKED`。该记录不代表 2026-08-25 实时状态。
+上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout。
 
 | 字段 | 值 |
 | --- | --- |
-| 采样时间 | `2026-08-24 03:42Z` |
-| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
-| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
-| REASON | `bootstrap-check-complete` |
-| STAGE_00 | `PASS_PREFLIGHT` |
-| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
-| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
-| STAGE_10-60 | `ALREADY_COMPLIANT` |
-| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
-| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
-| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
-| NEXT_STAGE | `NONE` |
+| 采样时间 | `2026-08-24 12:16:47Z` |
+| GIT_COMMIT | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| RESULT | `PASS_FLUX_PHASE_A` |
+| REASON | `four-controller-runtime-accepted` |
+| FLUX_CHECK | `all checks passed` |
+| CONTROLLERS | `source v1.9.3/kustomize v1.9.4/helm v1.6.3/notification v1.9.2` |
+| FLUX_CRD_COUNT | `11` |
+| SECRET_COUNT | `0` |
+| SYNC_INVENTORY | `empty` |
+| DOWNSTREAM_NAMESPACE_INVENTORY | `empty` |
+| NETWORK_PROBE_V2 | `PASS` |
+| EVIDENCE | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| EVIDENCE SHA256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7` |
+| OPENBAO | `NOT_EXECUTED` |
+| BACKUPS | `NOT_EXECUTED` |
+| NEXT_STAGE | `PHASE_B_REQUIRES_SEPARATE_APPROVAL` |
 | EXIT_CODE | `0` |
-| COMMAND_EXIT_CODE | `0` |
-| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
-| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
-| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
 
 | # | 验收标准 | 证据 | 状态 |
 | --- | --- | --- | --- |
-| 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（DEV 尚无 Flux CRD 或 `flux-system`） |
+| 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（Phase A Controller 已部署，但 Git sync 与单向 Reconcile 未激活） |
 | 2 | frontend/backend 按 digest，经 Gateway 单入口通过页面/API Smoke | `runbook/06-apps.md` | BLOCKED（backend digest、应用 Desired State、migration 与 Smoke 均未闭环） |
-| 3 | PG PITR 与 etcd 隔离 restore 各完成一次 | `runbook/07-restore-drill.md` | BLOCKED（依赖 Flux 激活与 MinIO 可用存储；两者当前均 BLOCKED） |
+| 3 | PG PITR 与 etcd 隔离 restore 各完成一次 | `runbook/07-restore-drill.md` | BLOCKED（依赖 Flux sync、MinIO 可用存储与单独备份批准；均未满足） |
 | 4 | 三 bucket Versioning/Object Lock 通过，DEV-001 醒目标注 | `runbook/03-minio-verify.md`、`runbook/README.md` | BLOCKED（MinIO 供应链决策） |
 | 5 | PCS 与部署版本/Image ID 一致 | `pcs/candidate-2.md` 与抽查输出 | BLOCKED（平台尚未部署，无法与运行 Image ID 对齐） |
 | 6 | DEV-002 容量包络、Metrics API 与 80%/90% Gate 有证据，整机重启后全栈自愈 | `runbook/08-capacity.md`、`runbook/07-restore-drill.md` | BLOCKED（容量与重启验收依赖 Flux 激活和 MinIO 可用存储；两者当前均 BLOCKED） |

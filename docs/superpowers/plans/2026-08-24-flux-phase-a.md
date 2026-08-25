@@ -1,6 +1,6 @@
 # Flux Phase A Four-Controller Activation Implementation Plan
 
-> **执行状态：`IN_PROGRESS`。** 本计划只激活 Flux Controller 基础层，不创建 Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不激活 infrastructure、apps、MinIO、OpenBao 或任何应用工作负载。
+> **执行状态：`COMPLETED`。** 本计划只激活 Flux Controller 基础层，不创建 Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不激活 infrastructure、apps、MinIO、OpenBao 或任何应用工作负载。
 
 **Goal:** 在 DEV 安装并验证 Flux v2.9.3 的 `source-controller`、`kustomize-controller`、`helm-controller`、`notification-controller`，同时保持 Git sync 与所有下游 Desired State fail-closed。
 
@@ -9,6 +9,19 @@
 **Tech Stack:** Flux CLI v2.9.3、Kustomize、Kubernetes v1.36.3、Python 3、unittest、PyYAML、GitHub Actions。
 
 **Architecture Sources:** `engineering-platform-docs` main `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` 的 `architecture/09-infrastructure-operations.md` 与 `architecture/appendix-parameters.md`。
+
+## Runtime completion record
+
+- 批准并部署的 Desired State SHA：`685198db15299fdb6b8cdffd72162a4864c8666b`。
+- 私有仓 GitHub Actions run `32724003530` 的 `validation-gate` 与
+  `publish-validated` 均成功；`main` 与 `validated` 均指向上述 SHA。
+- `2026-08-24 12:16:47Z` 验收四个 Controller Ready、11 个 Flux CRD、
+  `flux check` 为 `all checks passed`；Secret、sync CR、第五个 Controller 与下游
+  Namespace 均为空，网络正反向探针及 UID 精确清理通过。
+- 证据：`/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt`；SHA-256
+  `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7`。
+- Git sync、OpenBao、备份、infrastructure、apps、MinIO 与应用部署均未执行；这些状态
+  不因 Controller 基础层完成而自动解锁。
 
 ## Fixed supply-chain inputs
 
@@ -120,7 +133,7 @@ Request independent code review. Merge and push the private Desired State only a
 
 ## Task 6: Deploy Phase A and capture evidence
 
-This task remains `BLOCKED` until the Phase A private commit has a reviewed public mirror, that mirror's CI is green, public `validated` has advanced to it, and the user has approved the mapped private SHA for mutation. The private repository's `validated` ref may remain behind while private Actions cannot allocate a Runner; in that state the server must use the explicit private SHA path and must never use the no-argument entrypoint. Once unblocked:
+Completed on `2026-08-24` with the exact SHA, CI and evidence mapping recorded above. The following sequence remains the audited execution contract for this completed run and any separately approved recovery review:
 
 1. Run `run-approved.sh <mapped-private-sha> --check` to synchronize and re-verify the server checkout.
 2. Verify the fixed linux/amd64 Flux CLI archive and run `flux check --pre`.

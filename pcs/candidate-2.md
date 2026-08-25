@@ -23,38 +23,41 @@
 | 事实 | 值 |
 | --- | --- |
 | docs 架构事实提交 | `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` |
-| GitOps private main 采样提交 | `72f360f0aa64b77747b3689a2f5372a10dd651f3` |
-| GitOps public validation mirror | `668035b25232216b094670e7dda956c14743b0b2`；CI run `32691520126`、`validation-gate`、`publish-validated` 均 `success` |
-| DEV server checkout | `1c5034b9a9c29ab72fde63644c57fa88604c45b6`（本次 runtime `--check` 采样） |
+| GitOps private main / validated | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| GitOps private validation | CI run `32724003530`；`validation-gate`、`publish-validated` 均 `success` |
+| DEV server checkout | `685198db15299fdb6b8cdffd72162a4864c8666b`（Phase A 验收记录） |
 | frontend Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
 | backend Source Commit | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |
-| DEV Runtime 当前观测时间 | `2026-08-24 03:42Z` |
+| DEV Runtime 当前观测时间 | `2026-08-24 12:16:47Z`（带时间戳历史验收；2026-08-25 尚未实时刷新） |
 | DEV Runtime 历史观测时间 | `2026-08-22 16:58 +08:00`（历史） |
-| DEV Runtime 当前结论 | `run-approved.sh --check` 的 8 个 stage 均通过或 `ALREADY_COMPLIANT`；仅 bootstrap 基础组件和 GitLab Runner 存在，Flux、平台基础设施与应用仍未激活 |
+| DEV Runtime 当前结论 | Flux Phase A 四 Controller 基础层已验收；Git sync、平台基础设施、OpenBao、备份与应用仍未激活 |
 
 ## 当前 DEV Runtime 观测
 
-本节是外部 Chrome 堡垒机 root 会话在服务器 GitOps `main` 上执行上层 `run-approved.sh --check` 的最新采样。上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；不构成部署或应用验收。
+本节是外部 Chrome 堡垒机 root 会话在服务器完成 Flux Phase A 后的最新带时间戳验收。
+它只证明 `2026-08-24 12:16:47Z` 的四 Controller 基础层，不证明 2026-08-25 实时状态，
+也不构成 Git sync、基础设施、OpenBao、备份或应用验收。
+上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout。
 
 | 字段 | 值 |
 | --- | --- |
-| 采样时间 | `2026-08-24 03:42Z` |
-| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
-| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
-| REASON | `bootstrap-check-complete` |
-| STAGE_00 | `PASS_PREFLIGHT` |
-| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
-| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
-| STAGE_10-60 | `ALREADY_COMPLIANT` |
-| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
-| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
-| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
-| NEXT_STAGE | `NONE` |
+| 采样时间 | `2026-08-24 12:16:47Z` |
+| GIT_COMMIT | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| RESULT | `PASS_FLUX_PHASE_A` |
+| REASON | `four-controller-runtime-accepted` |
+| FLUX_CHECK | `all checks passed` |
+| CONTROLLERS | `source v1.9.3/kustomize v1.9.4/helm v1.6.3/notification v1.9.2` |
+| FLUX_CRD_COUNT | `11` |
+| SECRET_COUNT | `0` |
+| SYNC_INVENTORY | `empty` |
+| DOWNSTREAM_NAMESPACE_INVENTORY | `empty` |
+| NETWORK_PROBE_V2 | `PASS` |
+| EVIDENCE | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| EVIDENCE SHA256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7` |
+| OPENBAO | `NOT_EXECUTED` |
+| BACKUPS | `NOT_EXECUTED` |
+| NEXT_STAGE | `PHASE_B_REQUIRES_SEPARATE_APPROVAL` |
 | EXIT_CODE | `0` |
-| COMMAND_EXIT_CODE | `0` |
-| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
-| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
-| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
 
 ## 组件锁定与运行状态
 
@@ -66,7 +69,7 @@
 | Runtime | CoreDNS | `v1.14.2` | `registry.k8s.io/coredns/coredns:v1.14.2` | 运行版本 `v1.14.2`；实际 Image ID 待回填 | 两副本 Ready |
 | Network | Cilium | `1.20.0` | Helm `cilium/cilium` | Helm revision `1`、chart/app `1.20.0`；实际 Image ID 待回填 | kube-proxy replacement、Gateway API enabled；agent/operator/Envoy Ready |
 | Network | Gateway API CRD | `v1.6.1` Standard | upstream release manifest | CRD 已安装；Manifest digest 待回填 | GatewayClass `cilium` Accepted；平台 Gateway/HTTPRoute 不存在 |
-| GitOps | Flux | CLI `v2.9.3`；Controller `source v1.9.3` / `kustomize v1.9.4` / `helm v1.6.3` / `notification v1.9.2` | 四 Controller 官方生成 bundle + 项目 Phase A 收敛 overlay | linux/amd64 manifest：source `sha256:c6c82b3182f48b833252c71aefa0741957ca18296612bc6d2b9b5fb276f926e4`；kustomize `sha256:3e57aecb74419be93d09ba062cfc882bea405193c474009e0da1826de71a4ebd`；helm `sha256:22c0a585d0d9b1f792b9d5638144b7810e273d28e310da37740f01226bd044a2`；notification `sha256:cb17eefffbc442412ba6f63336defd04c0fc387d5082d951998d1ff163a9180d` | **BLOCKED：Phase A Desired State 已形成候选，但尚未取得该候选的公有镜像 CI、DEV rollout、RBAC/网络与 Image ID 证据；当前 Runtime 仍无 Flux CRD、Namespace 或 Controller** |
+| GitOps | Flux | CLI `v2.9.3`；Controller `source v1.9.3` / `kustomize v1.9.4` / `helm v1.6.3` / `notification v1.9.2` | 四 Controller 官方生成 bundle + 项目 Phase A 收敛 overlay | linux/amd64 manifest：source `sha256:c6c82b3182f48b833252c71aefa0741957ca18296612bc6d2b9b5fb276f926e4`；kustomize `sha256:3e57aecb74419be93d09ba062cfc882bea405193c474009e0da1826de71a4ebd`；helm `sha256:22c0a585d0d9b1f792b9d5638144b7810e273d28e310da37740f01226bd044a2`；notification `sha256:cb17eefffbc442412ba6f63336defd04c0fc387d5082d951998d1ff163a9180d` | **PHASE_A_DEPLOYED / SYNC_BLOCKED：四 Controller、RBAC 与网络边界已验收；Git Credential、sync CR 与下游 Desired State 未激活** |
 | Storage | local-path-provisioner | `v0.0.31` | `docker.io/rancher/local-path-provisioner` | amd64 `sha256:5fb0394abf87407a27cc56db94334eb0c92d0b5de2636683a7ec51f38143dfc9` | **DEV-002 GAP**；平台 Desired State 未激活，运行补偿控制未验证 |
 | Storage | local-path helper / Phase A 瞬态网络探针 | `1.36.1-1` | `registry.k8s.io/e2e-test-images/busybox` | index `sha256:a9155b13325b2abef48e71de77bb8ac015412a566829f621d06bfae5c699b1b9`；amd64 `sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb` | platform provisioner helper Pod 未部署；Phase A 探针只在验收窗口瞬态创建并删除，不进入 Desired State |
 | PKI | cert-manager | `v1.21.1` | Helm chart `v1.21.1` | Chart/运行 digest 待部署回填 | `dev-selfsigned` 仅限 DEV；CRD/Controller 未部署 |
@@ -95,7 +98,7 @@
 
 CI run `32683635240` 与 publish-image job `97305929974` 均已 `success`，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow 的 `build --platform linux/amd64`、导出 manifest 日志与独立 attestation manifest 均确认该 digest 为可部署的 `linux/amd64` manifest。当前候选不得复用带日期的历史制品观察；运行 Image ID 在工作负载部署前仍 fail-closed。
 
-## 当前 Flux Phase A 候选
+## 当前 Flux Phase A Runtime 记录
 
 Phase A 只候选四个 Controller 基础层，不包含 Git Credential、`GitRepository`、Flux
 `Kustomization`、`HelmRelease`、image automation、infrastructure、apps 或业务
@@ -111,14 +114,16 @@ Namespace。完整生成来源与安全收敛见 `clusters/dev/flux-system/READM
 | 运行架构 | `linux/amd64`，四个镜像均固定到上表 manifest digest |
 | 瞬态网络探针 | 复用已锁定 `registry.k8s.io/e2e-test-images/busybox@sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb`；不进入 Desired State，验收结束必须删除 |
 | Git sync | `ACTIVE: false`；Phase A 渲染不得包含任何 sync CR |
-| 公有镜像 CI | `NOT_RUN`；私有候选提交产生后须脱敏镜像到 `engineering-platform-gitops-temp` |
-| Runtime | `NOT_DEPLOYED`；当前 DEV 无 `flux-system`、Flux CRD 或 Controller |
+| 批准 Desired State SHA | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| 私有仓 CI | run `32724003530`；`validation-gate` 与 `publish-validated` 均 `success` |
+| Runtime | `PHASE_A_DEPLOYED / SYNC_BLOCKED`；四 Controller Ready、11 CRD、Secret/sync/downstream inventory 为空 |
+| 证据 | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| 证据 SHA-256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7`；侧车校验 `OK` |
 
-供应链固定不等于激活批准。只有公有镜像仓 `validation-gate` 全绿且其
-`validated` 指向与私有候选一一对应的脱敏镜像提交，才可人工批准服务器以显式私有
-SHA 进入 Phase A；私有仓 `origin/validated` 落后时不得使用无参数入口。部署后还必须
-以 Pod Image ID、Rollout、RBAC negative check、NetworkPolicy 与空 sync inventory
-回填运行证据，届时本候选才可从 Flux `BLOCKED` 收敛。
+Phase A Controller 基础层已完成，不代表 GitOps 单向 Reconcile 已激活。当前阻塞依赖中的
+Flux 仍指 Phase B/C 的 Git Credential、`GitRepository` 与 Flux `Kustomization`；这些资源
+仍需独立设计、CI 与 mutation 批准。OpenBao、备份、infrastructure、apps、MinIO 与应用
+部署不因本记录自动解锁。
 
 ## 2026-08-22 frontend 历史证据
 
@@ -168,7 +173,7 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A -o jsonpath='{range 
 
 - [x] Node Ready，Kubernetes/containerd/Cilium/Gateway API 运行版本已观察。
 - [x] bootstrap preflight 与 final verify 证据及 SHA-256 已回填。
-- [ ] Flux 安装并形成 Inventory/Condition 证据。
+- [x] Flux Phase A 四 Controller、RBAC、NetworkPolicy、空 sync inventory 与运行边界证据已形成。
 - [ ] MinIO 供应链阻塞关闭并记录可信构件或明确风险决定。
 - [x] frontend linux/amd64 manifest digest 已由 workflow、CI log 与 attestation 独立确认。
 - [ ] backend 当前 digest 与 frontend/backend 实际 Image ID 回填。

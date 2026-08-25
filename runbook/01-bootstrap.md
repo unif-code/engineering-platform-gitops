@@ -9,31 +9,34 @@
 服务器标识：`retail-test-workflow`
 GitOps commit / PR：bootstrap 完成于 `a3eb3945c733b77f2594c9ff10e99dcd8587cd4d`
 
-## 当前状态：2026-08-24 bootstrap check 已验证
+## 当前状态：2026-08-24 Flux Phase A 已验收
 
-在服务器 GitOps `main` 的 `1c5034b9a9c29ab72fde63644c57fa88604c45b6` 上，外部 Chrome 堡垒机 root 会话于 `2026-08-24 03:42Z` 执行上层 `run-approved.sh --check`。上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；8 个 stage 均为通过或 `ALREADY_COMPLIANT`。这证明最新 bootstrap 检查通过，不证明 Flux、平台基础设施或应用已部署。
+在服务器 GitOps `main` 的 `685198db15299fdb6b8cdffd72162a4864c8666b` 上，外部
+Chrome 堡垒机 root 会话于 `2026-08-24 12:16:47Z` 完成 Flux Phase A 四 Controller
+验收。该记录不证明 2026-08-25 实时状态，也不证明 Git sync、平台基础设施、OpenBao、
+备份或应用已部署。
 
 ## 当前 DEV Runtime 观测
 
 | 字段 | 值 |
 | --- | --- |
-| 采样时间 | `2026-08-24 03:42Z` |
-| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
-| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
-| REASON | `bootstrap-check-complete` |
-| STAGE_00 | `PASS_PREFLIGHT` |
-| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
-| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
-| STAGE_10-60 | `ALREADY_COMPLIANT` |
-| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
-| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
-| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
-| NEXT_STAGE | `NONE` |
+| 采样时间 | `2026-08-24 12:16:47Z` |
+| GIT_COMMIT | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| RESULT | `PASS_FLUX_PHASE_A` |
+| REASON | `four-controller-runtime-accepted` |
+| FLUX_CHECK | `all checks passed` |
+| CONTROLLERS | `source v1.9.3/kustomize v1.9.4/helm v1.6.3/notification v1.9.2` |
+| FLUX_CRD_COUNT | `11` |
+| SECRET_COUNT | `0` |
+| SYNC_INVENTORY | `empty` |
+| DOWNSTREAM_NAMESPACE_INVENTORY | `empty` |
+| NETWORK_PROBE_V2 | `PASS` |
+| EVIDENCE | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| EVIDENCE SHA256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7` |
+| OPENBAO | `NOT_EXECUTED` |
+| BACKUPS | `NOT_EXECUTED` |
+| NEXT_STAGE | `PHASE_B_REQUIRES_SEPARATE_APPROVAL` |
 | EXIT_CODE | `0` |
-| COMMAND_EXIT_CODE | `0` |
-| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
-| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
-| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
 
 ### 2026-08-19 历史 bootstrap apply
 
@@ -440,11 +443,31 @@ serverTLSBootstrap: true
 
 ## Flux Phase A bootstrap
 
-状态：`NOT_EXECUTED`。本节只安装四个 Controller 基础层，不创建 Git deploy key、
+状态：`PHASE_A_CONTROLLERS_DEPLOYED_SYNC_INACTIVE`。本节只安装四个 Controller 基础层，不创建 Git deploy key、
 Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不激活任何
 下游 Desired State。Git deploy key 与仓库 sync 属于后续 Phase B/C。
 
-### 进入条件
+### 2026-08-24 执行与验收记录
+
+| 字段 | 值 |
+| --- | --- |
+| 批准 SHA | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| GitHub Actions | run `32724003530`；`validation-gate`、`publish-validated` 均 `success` |
+| 验收完成时间 | `2026-08-24 12:16:47Z` |
+| Controller | source `v1.9.3`、kustomize `v1.9.4`、helm `v1.6.3`、notification `v1.9.2`；全部 Ready |
+| Flux CRD | `11` |
+| `flux check` | `all checks passed`；`FINAL_ACCEPTANCE_V2_RESULT=PASS` |
+| 禁止资源 | Secret `0`；sync CR、第五个 Controller、下游 Namespace 均为空 |
+| 网络边界 | `NETWORK_PROBE_V2_RESULT=PASS`；两个瞬态 Pod 按本轮 UID 精确删除 |
+| 证据 | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| 证据 SHA-256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7`；侧车校验 `OK` |
+| 未执行 | Git sync、OpenBao、全部备份、infrastructure、apps、MinIO 与应用部署 |
+
+以上为带时间戳的历史运行证据，不冒充后续实时 readback。`2026-08-25` 恢复时外部 Chrome
+没有“Web终端 - 统一企业堡垒机”标签页，因此本批次未重新查询服务器或集群，也未执行任何
+`kubectl apply/diff` 或其他服务端写操作。
+
+### 首次部署进入条件（历史执行合同）
 
 1. 私有候选提交已生成脱敏公有镜像，允许差异已逐文件审计。
 2. 公有仓 `engineering-platform-gitops-temp` 的 `validation-gate` 全绿，且公有

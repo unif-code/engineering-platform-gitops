@@ -86,38 +86,40 @@ CURRENT_RUNTIME_DOCUMENTS = (
     'runbook/10-image-owner-handoff.md',
 )
 CURRENT_RUNTIME_FACTS = (
-    ('采样时间', '2026-08-24 03:42Z'),
-    ('GIT_COMMIT', '1c5034b9a9c29ab72fde63644c57fa88604c45b6'),
-    ('RESULT', 'PASS_BOOTSTRAP_ALL_CHECK'),
-    ('REASON', 'bootstrap-check-complete'),
-    ('STAGE_00', 'PASS_PREFLIGHT'),
+    ('采样时间', '2026-08-24 12:16:47Z'),
+    ('GIT_COMMIT', '685198db15299fdb6b8cdffd72162a4864c8666b'),
+    ('RESULT', 'PASS_FLUX_PHASE_A'),
+    ('REASON', 'four-controller-runtime-accepted'),
+    ('FLUX_CHECK', 'all checks passed'),
     (
-        'STAGE_00 evidence',
-        '/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt',
+        'CONTROLLERS',
+        'source v1.9.3/kustomize v1.9.4/helm v1.6.3/notification v1.9.2',
+    ),
+    ('FLUX_CRD_COUNT', '11'),
+    ('SECRET_COUNT', '0'),
+    ('SYNC_INVENTORY', 'empty'),
+    ('DOWNSTREAM_NAMESPACE_INVENTORY', 'empty'),
+    ('NETWORK_PROBE_V2', 'PASS'),
+    (
+        'EVIDENCE',
+        '/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt',
     ),
     (
-        'STAGE_00 SHA256',
-        '14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a',
+        'EVIDENCE SHA256',
+        '2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7',
     ),
-    ('STAGE_10-60', 'ALREADY_COMPLIANT'),
-    ('STAGE_90', 'PASS_BOOTSTRAP_VERIFIED'),
-    (
-        'STAGE_90 evidence',
-        '/root/dev-infra-evidence/14-verify-20260824T034246Z.txt',
-    ),
-    (
-        'STAGE_90 SHA256',
-        '0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5',
-    ),
-    ('NEXT_STAGE', 'NONE'),
+    ('OPENBAO', 'NOT_EXECUTED'),
+    ('BACKUPS', 'NOT_EXECUTED'),
+    ('NEXT_STAGE', 'PHASE_B_REQUIRES_SEPARATE_APPROVAL'),
     ('EXIT_CODE', '0'),
-    ('COMMAND_EXIT_CODE', '0'),
-    (
-        'Namespace inventory',
-        'cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system',
-    ),
-    ('Pod inventory', 'gitlab-runner and kube-system control plane/Cilium/CoreDNS only'),
-    ('Inactive inventory', 'flux-system/platform/openbao absent; GitRepository query empty'),
+)
+FLUX_PHASE_A_APPROVED_SHA = '685198db15299fdb6b8cdffd72162a4864c8666b'
+FLUX_PHASE_A_CI_RUN = '32724003530'
+FLUX_PHASE_A_EVIDENCE = (
+    '/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt'
+)
+FLUX_PHASE_A_EVIDENCE_SHA256 = (
+    '2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7'
 )
 MANIFEST_ROOTS = (ROOT / 'clusters', ROOT / 'infrastructure', ROOT / 'apps')
 EXACT_VERSION = re.compile(r'^v?\d+\.\d+\.\d+$')
@@ -2862,6 +2864,87 @@ def validate_flux_phase_a_runbook(root: Path = ROOT) -> None:
         fail('Flux Phase A runbook 禁止绕过渲染清单直接创建 Namespace')
 
 
+def validate_flux_phase_a_runtime_record(root: Path = ROOT) -> None:
+    paths = {
+        'runbook': root / 'runbook/01-bootstrap.md',
+        'pcs': root / 'pcs/candidate-2.md',
+        'plan': root / 'docs/superpowers/plans/2026-08-24-flux-phase-a.md',
+        'progress': root / 'docs/superpowers/progress/current.md',
+    }
+    for label, path in paths.items():
+        if not path.is_file():
+            fail(f'Flux Phase A runtime record 缺少 {label}: {path}')
+
+    documents = {
+        label: path.read_text(encoding='utf-8')
+        for label, path in paths.items()
+    }
+    expected = {
+        'runbook': (
+            ('Runbook 状态', 'PHASE_A_CONTROLLERS_DEPLOYED_SYNC_INACTIVE'),
+            ('批准 SHA', FLUX_PHASE_A_APPROVED_SHA),
+            ('CI run', FLUX_PHASE_A_CI_RUN),
+            ('证据路径', FLUX_PHASE_A_EVIDENCE),
+            (
+                '证据 SHA-256',
+                f'| EVIDENCE SHA256 | `{FLUX_PHASE_A_EVIDENCE_SHA256}` |',
+            ),
+            ('最终验收', 'FINAL_ACCEPTANCE_V2_RESULT=PASS'),
+        ),
+        'pcs': (
+            ('PCS 状态', 'PHASE_A_DEPLOYED / SYNC_BLOCKED'),
+            (
+                '批准 SHA',
+                '| GitOps private main / validated | '
+                f'`{FLUX_PHASE_A_APPROVED_SHA}` |',
+            ),
+            ('CI run', FLUX_PHASE_A_CI_RUN),
+            ('证据路径', FLUX_PHASE_A_EVIDENCE),
+            ('证据 SHA-256', FLUX_PHASE_A_EVIDENCE_SHA256),
+        ),
+        'plan': (
+            ('计划状态', '执行状态：`COMPLETED`'),
+            ('批准 SHA', FLUX_PHASE_A_APPROVED_SHA),
+            ('CI run', FLUX_PHASE_A_CI_RUN),
+            ('证据路径', FLUX_PHASE_A_EVIDENCE),
+            ('证据 SHA-256', FLUX_PHASE_A_EVIDENCE_SHA256),
+        ),
+        'progress': (
+            (
+                'current.md Based On Commit',
+                f'Based On Commit: {FLUX_PHASE_A_APPROVED_SHA}',
+            ),
+            (
+                'current.md Active Plan',
+                'Active Plan: docs/superpowers/plans/2026-08-24-flux-phase-a.md',
+            ),
+            ('批准 SHA', FLUX_PHASE_A_APPROVED_SHA),
+            ('CI run', FLUX_PHASE_A_CI_RUN),
+            ('证据路径', FLUX_PHASE_A_EVIDENCE),
+            ('证据 SHA-256', FLUX_PHASE_A_EVIDENCE_SHA256),
+        ),
+    }
+    for document, facts in expected.items():
+        source = documents[document]
+        for label, token in facts:
+            if token not in source:
+                fail(f'Flux Phase A runtime record {document} 缺少或漂移：{label}')
+
+    forbidden = {
+        'runbook': ('状态：`NOT_EXECUTED`',),
+        'pcs': ('| Runtime | `NOT_DEPLOYED`', '当前 Runtime 仍无 Flux CRD'),
+        'plan': ('执行状态：`IN_PROGRESS`',),
+        'progress': (
+            'Active Plan: docs/superpowers/plans/2026-08-19-bootstrap-stage-decoupling.md',
+        ),
+    }
+    for document, tokens in forbidden.items():
+        source = documents[document]
+        for token in tokens:
+            if token in source:
+                fail(f'Flux Phase A runtime record {document} 仍含部署前陈述：{token}')
+
+
 def validate_flux_phase_a_probes(root: Path = ROOT) -> None:
     image = (
         'registry.k8s.io/e2e-test-images/busybox@sha256:'
@@ -3167,6 +3250,7 @@ def main() -> None:
     validate_bootstrap_contracts()
     validate_flux_phase_a()
     validate_flux_phase_a_runbook()
+    validate_flux_phase_a_runtime_record()
     validate_flux_phase_a_probes()
     validate_kustomize_builds()
     validate_documents()
