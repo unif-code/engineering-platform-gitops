@@ -1556,7 +1556,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
     }
     CONTROLLER_SERVICE_ACCOUNTS = tuple(CONTROLLERS)
 
-    def test_stage_100_pins_the_canonical_rendered_bundle(self) -> None:
+    def test_stage_100_pins_the_raw_rendered_bundle(self) -> None:
         stage = (
             validator.ROOT
             / 'scripts/bootstrap/stages/100-flux-phase-a/run.sh'
@@ -1564,11 +1564,16 @@ class FluxPhaseAContractTest(unittest.TestCase):
         self.assertTrue(stage.is_file(), 'Stage 100 Flux Phase A entry is missing')
         source = stage.read_text(encoding='utf-8')
         match = re.search(
-            r'^readonly RENDERED_SHA256=([0-9a-f]{64})$', source, re.MULTILINE
+            r'^readonly RAW_RENDERED_SHA256=([0-9a-f]{64})$',
+            source,
+            re.MULTILINE,
         )
-        self.assertIsNotNone(match, 'Stage 100 does not pin rendered SHA-256')
+        self.assertIsNotNone(match, 'Stage 100 does not pin raw rendered SHA-256')
         assert match is not None
-        self.assertEqual(match.group(1), validator.FLUX_PHASE_A_RENDERED_SHA256)
+        self.assertEqual(
+            match.group(1),
+            validator.FLUX_PHASE_A_RAW_RENDERED_SHA256,
+        )
 
         orchestrator = (
             validator.ROOT / 'scripts/bootstrap/bootstrap-all.sh'
@@ -1590,11 +1595,55 @@ class FluxPhaseAContractTest(unittest.TestCase):
         )
         if rendered.returncode != 0:
             raise AssertionError(rendered.stderr or rendered.stdout)
+        cls.RENDERED_TEXT = rendered.stdout
         cls.RENDERED_BASELINE = [
             document
             for document in yaml.safe_load_all(rendered.stdout)
             if isinstance(document, dict)
         ]
+
+    def test_kustomize_builds_rejects_flux_raw_rendered_byte_drift(self) -> None:
+        baseline_render = subprocess.CompletedProcess(
+            args=[
+                'kubectl',
+                'kustomize',
+                str(validator.ROOT / 'clusters/dev/flux-system'),
+            ],
+            returncode=0,
+            stdout=self.RENDERED_TEXT.encode('utf-8'),
+            stderr=b'',
+        )
+        altered_render = copy.copy(baseline_render)
+        altered_render.stdout = b'# byte-level drift\n' + baseline_render.stdout
+        manifest_roots = (validator.ROOT / 'clusters/dev/flux-system',)
+        with (
+            mock.patch.object(validator, 'MANIFEST_ROOTS', manifest_roots),
+            mock.patch.object(
+                validator.subprocess,
+                'run',
+                return_value=baseline_render,
+            ),
+        ):
+            validator.validate_kustomize_builds()
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(validator, 'MANIFEST_ROOTS', manifest_roots),
+            mock.patch.object(
+                validator.subprocess,
+                'run',
+                return_value=altered_render,
+            ),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            validator.validate_kustomize_builds()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertRegex(
+            stderr.getvalue(),
+            'Flux Phase A rendered bundle raw SHA-256 漂移',
+        )
 
     def setUp(self) -> None:
         self.assertTrue(
