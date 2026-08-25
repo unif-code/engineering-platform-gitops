@@ -1,10 +1,10 @@
 # 当前开发进度
 
 - Repository: engineering-platform-gitops
-- Updated At: 2026-08-25T03:10:46Z
+- Updated At: 2026-08-25T03:29:15Z
 - Based On Commit: 685198db15299fdb6b8cdffd72162a4864c8666b
-- Branch: codex/fix-flux-phase-a-dry-run-order-v2
-- State: active
+- Branch: main
+- State: blocked
 - Active Plan: docs/superpowers/plans/2026-08-24-flux-phase-a.md
 - Remote Recoverable: yes
 
@@ -29,12 +29,15 @@
   `32802909349` 已核验成功；tag `sha-4aaf721` 的不可变 OCI index digest 为
   `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`。
   该事实仅作为后续应用阶段可用输入；业务应用尚未部署，migration 与账号初始化均未执行。
+- Runtime 事实与 backend 可用输入已通过 PR #3 合入 `main`；实现/事实同步提交
+  `2f5aa38bd94211e4e31b9400061070dc7b57a54c` 的 GitHub Actions run
+  `32804691522` 全绿，`validation-gate` 与 `publish-validated` 均成功。
+- 修复过程使用的两个旧 worktree，以及本地/远端三个旧修复分支均已在验证树对象等价且
+  工作树干净后删除；当前只保留仓库 `main` 工作树。
 
 ## 进行中
 
-- 将 Phase A 部署后的精确 Runtime 事实及 backend 可用输入同步到 PCS、Runbook、活动
-  计划与验证器，保持“Controller 基础层已部署”“backend 输入可用”与“Git sync/下游
-  Desired State 仍 BLOCKED”三个状态分离。
+- 没有进行中的仓库实现或集群写入；当前停在服务器现场只读刷新前的安全检查点。
 
 ## 剩余工作
 
@@ -53,10 +56,12 @@
 
 ## 最近验证
 
-- 本地 `main`、`origin/main` 与 `origin/validated` 已只读刷新并一致指向
-  `685198db15299fdb6b8cdffd72162a4864c8666b`。
-- GitHub Actions run `32724003530`：workflow `validate`、head SHA
-  `685198db15299fdb6b8cdffd72162a4864c8666b`、conclusion `success`。
+- Phase A 运行批准基线 `685198db15299fdb6b8cdffd72162a4864c8666b` 仍是本进度文件的
+  Based On Commit；事实同步提交 `2f5aa38bd94211e4e31b9400061070dc7b57a54c` 已确认同时位于
+  本地 `main`、`origin/main` 与 `origin/validated`。
+- GitHub Actions run `32804691522`：workflow `validate`、head SHA
+  `2f5aa38bd94211e4e31b9400061070dc7b57a54c`、conclusion `success`；static、plan、
+  8 个测试分片、`validation-gate` 与 `publish-validated` 均成功。
 - backend GitHub Actions run `32802909349`：head SHA
   `4aaf721fa91abd729b33765e4e329b02aa2ece02`，verify 与 publish-image 均 `success`；
   publish 日志确认 `--platform linux/amd64`、tag `sha-4aaf721` 与上述 OCI index digest。
@@ -70,8 +75,9 @@
 
 ## 工作树
 
-- 改动位于隔离 worktree
-  `D:/tongyi/code/.worktrees/engineering-platform-gitops-flux-phase-a-dry-run-order-v2`，
-  分支 `codex/fix-flux-phase-a-dry-run-order-v2`。
-- 本节的 `Remote Recoverable: yes` 以本进度同步提交已推送远端为成立条件；若 push/CI
-  尚未完成，交接时必须明确报告实际远端状态。
+- 当前只保留 `D:/tongyi/code/engineering-platform-gitops` 的 `main` 工作树。
+- 已清理本地与远端分支 `codex/fix-flux-phase-a-dry-run-order-v2`、
+  `codex/fix-flux-phase-a-egress-control`、`codex/fix-flux-phase-a-dry-run-order`，以及它们的
+  两个旧隔离 worktree。
+- `Remote Recoverable: yes` 表示 Phase A 代码、Runtime 事实、backend 可用输入与当前阻塞
+  均已进入受保护远端流程；不存在本机独有业务改动。
