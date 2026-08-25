@@ -38,7 +38,7 @@ PCS Candidate：`pcs/candidate-2.md`
 | # | 验收标准 | 证据 | 状态 |
 | --- | --- | --- | --- |
 | 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（Phase A Controller 已部署，但 Git sync 与单向 Reconcile 未激活） |
-| 2 | frontend/backend 按 digest，经 Gateway 单入口通过页面/API Smoke | `runbook/06-apps.md` | BLOCKED（backend digest、应用 Desired State、migration 与 Smoke 均未闭环） |
+| 2 | frontend/backend 按 digest，经 Gateway 单入口通过页面/API Smoke | `runbook/06-apps.md` | BLOCKED（backend 不可变输入已就绪，但应用 Desired State、migration、账号初始化与 Smoke 均未执行） |
 | 3 | PG PITR 与 etcd 隔离 restore 各完成一次 | `runbook/07-restore-drill.md` | BLOCKED（依赖 Flux sync、MinIO 可用存储与单独备份批准；均未满足） |
 | 4 | 三 bucket Versioning/Object Lock 通过，DEV-001 醒目标注 | `runbook/03-minio-verify.md`、`runbook/README.md` | BLOCKED（MinIO 供应链决策） |
 | 5 | PCS 与部署版本/Image ID 一致 | `pcs/candidate-2.md` 与抽查输出 | BLOCKED（平台尚未部署，无法与运行 Image ID 对齐） |
@@ -53,7 +53,7 @@ PCS Candidate：`pcs/candidate-2.md`
 - [ ] `dev-cp.unif.internal` 稳定解析已落地。
 - [x] frontend 当前 Source Commit 的 CI provenance、OCI index digest 与 nginx / 80 启动契约已核验。
 - [x] frontend 当前 `linux/amd64` manifest digest 已由 workflow、CI log 与 attestation 核验。
-- [ ] backend 当前 Source Commit image digest 已核验。
+- [x] backend Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` 的 CI 与不可变 OCI index digest 已核验。
 - [ ] frontend/backend Deployment 实际 Image ID 与 GitOps digest 已对齐。
 - [ ] kubelet serving certificate、metrics-server APIService 与 `kubectl top` 均通过安全 TLS 验证。
 

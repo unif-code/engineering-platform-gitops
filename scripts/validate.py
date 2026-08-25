@@ -34,6 +34,21 @@ CURRENT_FRONTEND_OCI_INDEX_DIGEST = (
 CURRENT_FRONTEND_LINUX_AMD64_MANIFEST = (
     'sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
 )
+CURRENT_BACKEND_SOURCE = '4aaf721fa91abd729b33765e4e329b02aa2ece02'
+CURRENT_BACKEND_CI_RUN = '32802909349'
+CURRENT_BACKEND_PUBLISH_IMAGE_JOB = '97667504061'
+CURRENT_BACKEND_TAG = 'sha-4aaf721'
+CURRENT_BACKEND_OCI_INDEX_DIGEST = (
+    'sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857'
+)
+CURRENT_BACKEND_IMAGE = (
+    'ghcr.io/unif-code/engineering-platform-backend@'
+    f'{CURRENT_BACKEND_OCI_INDEX_DIGEST}'
+)
+CURRENT_BACKEND_VERIFY = (
+    'success（Ruff、mypy、lint-imports、Alembic、全量 pytest、OpenAPI）'
+)
+NOT_EXECUTED = 'NOT_EXECUTED'
 NOT_VERIFIED = 'NOT_VERIFIED'
 CURRENT_FRONTEND_COMPONENT_CELLS = (
     'Application',
@@ -70,10 +85,50 @@ CURRENT_FRONTEND_HANDOFF_FACTS = (
     ),
     ('Runtime Image ID', f'`{NOT_VERIFIED}`'),
 )
+CURRENT_BACKEND_COMPONENT_CELLS = (
+    'Application',
+    'engineering-platform-backend',
+    (
+        f'Source `{CURRENT_BACKEND_SOURCE}` / CI run `{CURRENT_BACKEND_CI_RUN}`；'
+        'verify、publish-image 均 `success`'
+    ),
+    (
+        f'`ghcr.io/unif-code/engineering-platform-backend:{CURRENT_BACKEND_TAG}`；'
+        f'OCI index `{CURRENT_BACKEND_OCI_INDEX_DIGEST}`'
+    ),
+    (
+        f'不可变输入 `{CURRENT_BACKEND_IMAGE}`；运行 Image ID `{NOT_VERIFIED}`'
+    ),
+    '候选可用；Desired State、迁移与账号初始化均未执行',
+)
+CURRENT_BACKEND_HANDOFF_FACTS = (
+    ('Source commit（完整 40 位 SHA）', f'`{CURRENT_BACKEND_SOURCE}`'),
+    (
+        'CI run URL',
+        (
+            '`https://github.com/unif-code/engineering-platform-backend/actions/'
+            f'runs/{CURRENT_BACKEND_CI_RUN}`（`success`；verify、publish-image 均成功）'
+        ),
+    ),
+    ('Image tag `sha-<short-sha>`', f'`{CURRENT_BACKEND_TAG}`'),
+    ('OCI index digest', f'`{CURRENT_BACKEND_OCI_INDEX_DIGEST}`'),
+    (
+        '`linux/amd64` manifest digest',
+        '`NOT_SEPARATELY_VERIFIED`（build 固定 `linux/amd64`；部署锁定 OCI index digest）',
+    ),
+    ('Runtime Image ID', f'`{NOT_VERIFIED}`'),
+    ('Migration', f'`{NOT_EXECUTED}`'),
+    ('Account initialization', f'`{NOT_EXECUTED}`'),
+)
 CURRENT_MINIO_SERVER_STATUS = (
     'BLOCKED：精确摘要供应链证据或获批风险决定未满足；清单引用不代表获准或已部署'
 )
 CURRENT_FRONTEND_DOCUMENTS = (
+    'pcs/candidate-2.md',
+    'runbook/06-apps.md',
+    'runbook/10-image-owner-handoff.md',
+)
+CURRENT_BACKEND_DOCUMENTS = (
     'pcs/candidate-2.md',
     'runbook/06-apps.md',
     'runbook/10-image-owner-handoff.md',
@@ -2011,6 +2066,74 @@ def validate_current_frontend_summary_evidence() -> None:
             fail(f'Image Owner Handoff 汇总表 {field} 与当前审计快照不一致')
 
 
+def validate_current_backend_delivery(root: Path = ROOT) -> None:
+    expected_facts = (
+        ('Source Commit', CURRENT_BACKEND_SOURCE),
+        ('CI run', CURRENT_BACKEND_CI_RUN),
+        ('verify', CURRENT_BACKEND_VERIFY),
+        ('publish-image job', CURRENT_BACKEND_PUBLISH_IMAGE_JOB),
+        ('Image tag', CURRENT_BACKEND_TAG),
+        ('Immutable image', CURRENT_BACKEND_IMAGE),
+        ('Runtime Image ID', NOT_VERIFIED),
+        ('Deployment', NOT_EXECUTED),
+        ('Migration', NOT_EXECUTED),
+        ('Account initialization', NOT_EXECUTED),
+    )
+    for relative_path in CURRENT_BACKEND_DOCUMENTS:
+        document = (root / relative_path).read_text(encoding='utf-8')
+        candidate = markdown_section(document, '## 当前 backend 可用输入')
+        for field, expected in expected_facts:
+            if markdown_table_value(candidate, field) != expected:
+                fail(f'当前 backend {field} 与已核验交付输入不一致')
+
+    pcs = (root / 'pcs/candidate-2.md').read_text(encoding='utf-8')
+    pcs_facts = markdown_section(pcs, '## 事实采样')
+    if (
+        markdown_table_value(pcs_facts, 'backend Source Commit')
+        != CURRENT_BACKEND_SOURCE
+    ):
+        fail('当前 backend Source Commit 在 PCS 事实采样中不一致')
+    component_rows = tuple(
+        markdown_table_cells(line)
+        for line in pcs.splitlines()
+        if line.strip().startswith('|')
+        and markdown_table_cells(line)[:2]
+        == ('Application', 'engineering-platform-backend')
+    )
+    if (
+        len(component_rows) != 1
+        or component_rows[0] != CURRENT_BACKEND_COMPONENT_CELLS
+    ):
+        fail('PCS backend 组件表与已核验交付输入不一致')
+
+    handoff = (root / 'runbook/10-image-owner-handoff.md').read_text(
+        encoding='utf-8'
+    )
+    summary_rows = markdown_table_rows_after_unique_header(
+        handoff,
+        '| 字段 | frontend | backend |',
+        'Image Owner Handoff 汇总表与当前审计快照不一致',
+    )
+    for field, expected_backend_value in CURRENT_BACKEND_HANDOFF_FACTS:
+        rows = tuple(row for row in summary_rows if row[0] == field)
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 3
+            or rows[0][2] != expected_backend_value
+        ):
+            fail(f'Image Owner Handoff backend {field} 与已核验交付输入不一致')
+
+    password_contract = (
+        '临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据'
+    )
+    for relative_path in (
+        'runbook/06-apps.md',
+        'runbook/10-image-owner-handoff.md',
+    ):
+        if password_contract not in (root / relative_path).read_text(encoding='utf-8'):
+            fail(f'{relative_path} 缺少账号初始化临时密码处理合同')
+
+
 def validate_current_docs_architecture_commit() -> None:
     pcs = CURRENT_PCS.read_text(encoding='utf-8')
     facts = markdown_section(pcs, '## 事实采样')
@@ -3261,6 +3384,7 @@ def main() -> None:
     validate_current_runtime_evidence()
     validate_current_frontend_evidence()
     validate_current_frontend_summary_evidence()
+    validate_current_backend_delivery(ROOT)
     validate_current_docs_architecture_commit()
     validate_blocked_storage_acceptance()
     print('GitOps manifests validated successfully.')

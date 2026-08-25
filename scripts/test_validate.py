@@ -419,6 +419,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
 | 事实 | 值 |
 | --- | --- |
 | docs 架构事实提交 | `{docs_architecture_commit}` |
+| backend Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
 
 ## 当前 frontend 候选
 
@@ -432,6 +433,23 @@ class RepositoryProfileContractTest(unittest.TestCase):
 | Artifact / OCI index digest | `{frontend_artifact}` |
 | linux/amd64 manifest digest | `{frontend_manifest}` |
 | Runtime Image ID | `{frontend_image_id}` |
+
+## 当前 backend 可用输入
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
+| CI run | `32802909349` |
+| verify | `success（Ruff、mypy、lint-imports、Alembic、全量 pytest、OpenAPI）` |
+| publish-image job | `97667504061` |
+| Image tag | `sha-4aaf721` |
+| Immutable image | `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` |
+| Runtime Image ID | `NOT_VERIFIED` |
+| Deployment | `NOT_EXECUTED` |
+| Migration | `NOT_EXECUTED` |
+| Account initialization | `NOT_EXECUTED` |
+
+临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
 
 ## 2026-08-22 frontend 历史证据
 
@@ -459,13 +477,14 @@ class RepositoryProfileContractTest(unittest.TestCase):
         pcs = root / 'pcs/candidate-2.md'
         pcs.write_text(
             pcs.read_text(encoding='utf-8')
-            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}`（均 `success`） | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；运行 Image ID `{frontend_image_id}` | 当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署 |\n''',
+            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}`（均 `success`） | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；运行 Image ID `{frontend_image_id}` | 当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署 |
+| Application | engineering-platform-backend | Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` / CI run `32802909349`；verify、publish-image 均 `success` | `ghcr.io/unif-code/engineering-platform-backend:sha-4aaf721`；OCI index `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` | 不可变输入 `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`；运行 Image ID `NOT_VERIFIED` | 候选可用；Desired State、迁移与账号初始化均未执行 |\n''',
             encoding='utf-8',
         )
         handoff = root / 'runbook/10-image-owner-handoff.md'
         handoff.write_text(
             handoff.read_text(encoding='utf-8')
-            + f'''\n| 字段 | frontend | backend |\n| --- | --- | --- |\n| Source commit（完整 40 位 SHA） | `{frontend_source}` | `NOT_AVAILABLE` |\n| CI run URL | `https://github.com/unif-code/engineering-platform/actions/runs/{frontend_ci_run}`（`success`；publish-image job `{frontend_publish_job}`） | `NOT_AVAILABLE` |\n| Image tag `sha-<short-sha>` | `{frontend_tag}` | `NOT_AVAILABLE` |\n| OCI index digest | `{frontend_artifact}` | `NOT_AVAILABLE` |\n| `linux/amd64` manifest digest | `{frontend_manifest}` | `NOT_AVAILABLE` |\n| Runtime Image ID | `{frontend_image_id}` | `NOT_AVAILABLE` |\n''',
+            + f'''\n| 字段 | frontend | backend |\n| --- | --- | --- |\n| Source commit（完整 40 位 SHA） | `{frontend_source}` | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |\n| CI run URL | `https://github.com/unif-code/engineering-platform/actions/runs/{frontend_ci_run}`（`success`；publish-image job `{frontend_publish_job}`） | `https://github.com/unif-code/engineering-platform-backend/actions/runs/32802909349`（`success`；verify、publish-image 均成功） |\n| Image tag `sha-<short-sha>` | `{frontend_tag}` | `sha-4aaf721` |\n| OCI index digest | `{frontend_artifact}` | `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` |\n| `linux/amd64` manifest digest | `{frontend_manifest}` | `NOT_SEPARATELY_VERIFIED`（build 固定 `linux/amd64`；部署锁定 OCI index digest） |\n| Runtime Image ID | `{frontend_image_id}` | `NOT_VERIFIED` |\n| Migration | 不适用 | `NOT_EXECUTED` |\n| Account initialization | 不适用 | `NOT_EXECUTED` |\n''',
             encoding='utf-8',
         )
 
@@ -662,6 +681,68 @@ class RepositoryProfileContractTest(unittest.TestCase):
             stderr = self.assert_main_rejects_release_fact_documents(root)
 
         self.assertIn('当前 frontend linux/amd64 manifest digest 与当前审计快照不一致', stderr)
+
+    def test_current_backend_delivery_is_pinned_but_not_deployed(self) -> None:
+        self.assertTrue(
+            hasattr(validator, 'validate_current_backend_delivery'),
+            'backend delivery input must have a fail-closed validator',
+        )
+        validator.validate_current_backend_delivery()
+
+    def test_current_backend_delivery_rejects_fact_or_runtime_drift(self) -> None:
+        mutations = (
+            (
+                'pcs/candidate-2.md',
+                '4aaf721fa91abd729b33765e4e329b02aa2ece02',
+                'bad-source',
+                '当前 backend Source Commit',
+            ),
+            (
+                'runbook/06-apps.md',
+                'ghcr.io/unif-code/engineering-platform-backend@sha256:'
+                'f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857',
+                'ghcr.io/unif-code/engineering-platform-backend@sha256:bad-digest',
+                '当前 backend Immutable image',
+            ),
+            (
+                'runbook/10-image-owner-handoff.md',
+                '| Deployment | `NOT_EXECUTED` |',
+                '| Deployment | `DEPLOYED` |',
+                '当前 backend Deployment',
+            ),
+            (
+                'pcs/candidate-2.md',
+                '| Account initialization | `NOT_EXECUTED` |',
+                '| Account initialization | `EXECUTED` |',
+                '当前 backend Account initialization',
+            ),
+        )
+        documents = (
+            'pcs/candidate-2.md',
+            'runbook/06-apps.md',
+            'runbook/10-image-owner-handoff.md',
+        )
+        for relative_path, old, new, expected in mutations:
+            with self.subTest(document=relative_path, mutation=new):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for document in documents:
+                        source = validator.ROOT / document
+                        target = root / document
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(source, target)
+                    path = root / relative_path
+                    source = path.read_text(encoding='utf-8')
+                    self.assertIn(old, source)
+                    path.write_text(source.replace(old, new, 1), encoding='utf-8')
+                    stderr = io.StringIO()
+                    with (
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as raised,
+                    ):
+                        validator.validate_current_backend_delivery(root)
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn(expected, stderr.getvalue())
 
     def test_current_frontend_release_facts_reject_single_document_mutations(
         self,
