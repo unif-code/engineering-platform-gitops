@@ -5,9 +5,10 @@
 | 字段 | 值 |
 | --- | --- |
 | GitOps commit / PR | 未执行应用 Desired State |
-| backend Source Commit | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |
-| backend digest | `BLOCKED` |
+| backend Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
+| backend digest | `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`（可用输入，未部署） |
 | 执行状态 | `NOT_EXECUTED` |
+| 账号初始化 | `NOT_EXECUTED` |
 | Gateway address | `NOT_AVAILABLE` |
 | Hostname | `platform.dev.local` |
 
@@ -52,6 +53,24 @@
 | Runtime Image ID | `NOT_VERIFIED` |
 
 CI run `32683635240` 与 publish-image job `97305929974` 均 `success`，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow 的 `build --platform linux/amd64`、导出 manifest 日志和独立 attestation manifest 共同确认该 digest 为可部署 linux/amd64 manifest；运行 Image ID 仍待部署后核验。
+
+## 当前 backend 可用输入
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
+| CI run | `32802909349` |
+| verify | `success（Ruff、mypy、lint-imports、Alembic、全量 pytest、OpenAPI）` |
+| publish-image job | `97667504061` |
+| Image tag | `sha-4aaf721` |
+| Immutable image | `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` |
+| Runtime Image ID | `NOT_VERIFIED` |
+| Deployment | `NOT_EXECUTED` |
+| Migration | `NOT_EXECUTED` |
+| Account initialization | `NOT_EXECUTED` |
+
+当前批准计划尚未进入 backend 部署阶段；本节只登记可用输入，不授权创建 Deployment、
+执行 migration、健康检查、运行 readback 或账号初始化。临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
 
 ## 2026-08-22 frontend 历史证据
 

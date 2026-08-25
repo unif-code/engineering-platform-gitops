@@ -1,17 +1,17 @@
 # 应用 Image Owner Handoff
 
-检查时间：`2026-08-24 03:42Z`（当前 Runtime 审计采样）
+检查时间：`2026-08-25 02:52Z`（backend 交付输入核验；Runtime 仍沿用历史采样）
 状态：`BLOCKED`
 
 只读检查确认：
 
 - frontend 当前 Source Commit 为 `da72238abc87a19c07a5cac96e41d88d5f6bf2d3`，已有 Dockerfile、nginx 80 启动合同和 main image workflow；CI run `32683635240` 与 publish-image job `97305929974` 已 `success`。
 - 当前 OCI index digest 已确认为 `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1`；workflow 的 `build --platform linux/amd64`、导出 manifest 日志与独立 attestation manifest 已确认 `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` 为可部署 linux/amd64 manifest，运行 Image ID 仍为 `NOT_VERIFIED`。
-- backend `engineering-platform-backend` 位于 `647d509bca1bbf9ff0f6ab719d5905d8f836e92f`，已有 Dockerfile、Alembic migrations 和 uvicorn 8000 启动合同；当前 Source Commit 尚无成功 image digest。
+- backend `engineering-platform-backend` main 位于 `4aaf721fa91abd729b33765e4e329b02aa2ece02`；CI run `32802909349` 的 verify 与 publish-image 均成功，tag 为 `sha-4aaf721`，不可变 OCI index digest 为 `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`。
 - backend 历史 commit `1d627b9` 的 digest `sha256:c77fb2d88a61659fa8c2b5074a4ea3103002698085e578652d999d2e2b45e8d7` 只作历史记录，不进入当前 handoff。
-- `2026-08-24 03:42Z` 的当前 DEV Runtime inventory 没有 platform Namespace、migration Job 或 frontend/backend 工作负载，所有运行 Smoke 均未执行；`2026-08-22 16:58 +08:00` 仅保留为历史观察。
+- `2026-08-24 12:16:47Z` 的历史 DEV Runtime inventory 没有 platform Namespace、migration Job 或 frontend/backend 工作负载，所有应用 Smoke 均未执行；该记录不冒充 2026-08-25 实时 readback。
 
-因此当前不得生成带猜测 digest 的 Deployment。进入应用 Desired State 前的回执为：
+backend 交付已成为可用输入，但当前批准计划尚未进入 backend 部署阶段；不得据此提前提交或执行应用 Desired State。进入应用阶段前的回执为：
 
 ## 当前 DEV Runtime 观测
 
@@ -53,7 +53,25 @@
 | linux/amd64 manifest digest | `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` |
 | Runtime Image ID | `NOT_VERIFIED` |
 
-run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow、CI log 与独立 attestation 已确认 child manifest 的 linux/amd64 身份；可创建使用该 digest 的应用 Deployment，但运行 Image ID 必须在部署后回填。
+run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow、CI log 与独立 attestation 已确认 child manifest 的 linux/amd64 身份；该 digest 只作为后续应用阶段输入，当前不得创建应用 Deployment，运行 Image ID 仍为 `NOT_VERIFIED`。
+
+## 当前 backend 可用输入
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
+| CI run | `32802909349` |
+| verify | `success（Ruff、mypy、lint-imports、Alembic、全量 pytest、OpenAPI）` |
+| publish-image job | `97667504061` |
+| Image tag | `sha-4aaf721` |
+| Immutable image | `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` |
+| Runtime Image ID | `NOT_VERIFIED` |
+| Deployment | `NOT_EXECUTED` |
+| Migration | `NOT_EXECUTED` |
+| Account initialization | `NOT_EXECUTED` |
+
+只有后续批准计划进入 backend 部署阶段，才可将上述 digest 写入清单并执行 migration、
+健康检查和运行 readback。账号初始化仍未执行；临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
 
 ## 2026-08-22 frontend 历史证据
 
@@ -67,17 +85,19 @@ run `32683635240` 与 publish-image job `97305929974` 的 provenance 已确认�
 | 字段 | frontend | backend |
 | --- | --- | --- |
 | Repository | `unif-code/engineering-platform` | `unif-code/engineering-platform-backend` |
-| Source commit（完整 40 位 SHA） | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |
-| CI run URL | `https://github.com/unif-code/engineering-platform/actions/runs/32683635240`（`success`；publish-image job `97305929974`） | 当前 Source Commit 无成功 run |
-| Image tag `sha-<short-sha>` | `sha-da72238` | `NOT_AVAILABLE` |
-| OCI index digest | `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` | `NOT_AVAILABLE` |
-| `linux/amd64` manifest digest | `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` | `NOT_AVAILABLE` |
-| Runtime Image ID | `NOT_VERIFIED` | `NOT_AVAILABLE` |
+| Source commit（完整 40 位 SHA） | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
+| CI run URL | `https://github.com/unif-code/engineering-platform/actions/runs/32683635240`（`success`；publish-image job `97305929974`） | `https://github.com/unif-code/engineering-platform-backend/actions/runs/32802909349`（`success`；verify、publish-image 均成功） |
+| Image tag `sha-<short-sha>` | `sha-da72238` | `sha-4aaf721` |
+| OCI index digest | `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` | `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` |
+| `linux/amd64` manifest digest | `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c` | `NOT_SEPARATELY_VERIFIED`（build 固定 `linux/amd64`；部署锁定 OCI index digest） |
+| Runtime Image ID | `NOT_VERIFIED` | `NOT_VERIFIED` |
 | 启动命令 / 监听端口 | nginx / 80 | `uvicorn control_plane.app.bootstrap.app:create_app --factory --host 0.0.0.0 --port 8000` |
-| Migration | 不适用 | `alembic upgrade heads`，`NOT_EXECUTED` |
+| Migration | 不适用 | `NOT_EXECUTED` |
+| Migration command | 不适用 | `alembic upgrade heads` |
+| Account initialization | 不适用 | `NOT_EXECUTED` |
 | Smoke 结果 | `/` 登录页：`NOT_EXECUTED` | `/api/v1/me`、`/healthz`、`/readyz`：`NOT_EXECUTED` |
 
-应用 Desired State 只接受 Registry 查询结果或 CI provenance 中的 digest，并将经核验的 `linux/amd64` manifest digest 直接写入 Deployment。frontend platform manifest 与 backend 当前 digest 到齐后，才可提交 backend/frontend Deployment、Service、HTTPRoute 与 Alembic migration Job。
+应用 Desired State 只接受 Registry 查询结果或 CI provenance 中的 digest。backend 不可变输入已到齐，但当前批准计划仍未进入应用部署阶段；backend/frontend Deployment、Service、HTTPRoute、Alembic migration Job 和账号初始化均不得提前执行。
 
 DEV-002 初始资源合同也必须由应用 owner 验证并随首个清单提交：
 

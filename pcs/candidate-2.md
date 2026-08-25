@@ -27,7 +27,7 @@
 | GitOps private validation | CI run `32724003530`；`validation-gate`、`publish-validated` 均 `success` |
 | DEV server checkout | `685198db15299fdb6b8cdffd72162a4864c8666b`（Phase A 验收记录） |
 | frontend Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
-| backend Source Commit | `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` |
+| backend Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
 | DEV Runtime 当前观测时间 | `2026-08-24 12:16:47Z`（带时间戳历史验收；2026-08-25 尚未实时刷新） |
 | DEV Runtime 历史观测时间 | `2026-08-22 16:58 +08:00`（历史） |
 | DEV Runtime 当前结论 | Flux Phase A 四 Controller 基础层已验收；Git sync、平台基础设施、OpenBao、备份与应用仍未激活 |
@@ -80,7 +80,7 @@
 | Database | Barman Cloud Plugin | `0.13.0` | Helm chart `plugin-barman-cloud` `0.7.0` | chart `sha256:683494c04cc94f7d33c4ac5f3d8d64c209634b48bd0e84da31d7d1fad22cdcdb`；运行镜像待部署回填 | Plugin/备份对象未部署 |
 | Observability | kube-prometheus-stack | `88.1.5` | Helm chart `kube-prometheus-stack` | Chart/运行 digest 待部署回填 | 未部署；Grafana Managed Alerting off |
 | Observability | Metrics Server | app `0.8.1` / chart `3.13.1` | Helm chart `metrics-server` | chart `sha256:084e6edb680cf4e2acc30bd496568c53fdf663cbacf6e17876b25785c35b7a13`；index `sha256:b2d2efaf5ac3b366ed0f839d2412a2c4279d4fc2a2a733f12c52133faed36c41`；amd64 `sha256:6231fb0a1ffab76c92ab880f51a0d11b290f688373647bcedff85af025dfd8a9` | 未部署；禁止任何 insecure TLS 参数 |
-| Application | engineering-platform-backend | Source `647d509bca1bbf9ff0f6ab719d5905d8f836e92f` | 当前 Source Commit 无候选 image | `BLOCKED` | 历史 commit `1d627b9` 的 digest `sha256:c77fb2d88a61659fa8c2b5074a4ea3103002698085e578652d999d2e2b45e8d7` 不得作为当前候选；无工作负载 |
+| Application | engineering-platform-backend | Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` / CI run `32802909349`；verify、publish-image 均 `success` | `ghcr.io/unif-code/engineering-platform-backend:sha-4aaf721`；OCI index `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` | 不可变输入 `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`；运行 Image ID `NOT_VERIFIED` | 候选可用；Desired State、迁移与账号初始化均未执行 |
 | Application | engineering-platform frontend | Source `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` / CI run `32683635240`、publish-image job `97305929974`（均 `success`） | `ghcr.io/unif-code/engineering-platform:sha-da72238`；OCI index `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` | linux/amd64 manifest `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`；运行 Image ID `NOT_VERIFIED` | 当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署 |
 
 ## 当前 frontend 候选
@@ -97,6 +97,25 @@
 | Runtime Image ID | `NOT_VERIFIED` |
 
 CI run `32683635240` 与 publish-image job `97305929974` 均已 `success`，发布 tag 为 `ghcr.io/unif-code/engineering-platform:sha-da72238`。workflow 的 `build --platform linux/amd64`、导出 manifest 日志与独立 attestation manifest 均确认该 digest 为可部署的 `linux/amd64` manifest。当前候选不得复用带日期的历史制品观察；运行 Image ID 在工作负载部署前仍 fail-closed。
+
+## 当前 backend 可用输入
+
+| 字段 | 值 |
+| --- | --- |
+| Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
+| CI run | `32802909349` |
+| verify | `success（Ruff、mypy、lint-imports、Alembic、全量 pytest、OpenAPI）` |
+| publish-image job | `97667504061` |
+| Image tag | `sha-4aaf721` |
+| Immutable image | `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` |
+| Runtime Image ID | `NOT_VERIFIED` |
+| Deployment | `NOT_EXECUTED` |
+| Migration | `NOT_EXECUTED` |
+| Account initialization | `NOT_EXECUTED` |
+
+该交付已成为后续应用阶段的可用输入，但当前批准计划仍是 Flux Phase A 收口，尚未进入
+backend 部署阶段；因此未修改应用 Desired State，未执行 migration、健康检查、运行
+readback 或账号初始化。
 
 ## 当前 Flux Phase A Runtime 记录
 
@@ -176,7 +195,7 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A -o jsonpath='{range 
 - [x] Flux Phase A 四 Controller、RBAC、NetworkPolicy、空 sync inventory 与运行边界证据已形成。
 - [ ] MinIO 供应链阻塞关闭并记录可信构件或明确风险决定。
 - [x] frontend linux/amd64 manifest digest 已由 workflow、CI log 与 attestation 独立确认。
-- [ ] backend 当前 digest 与 frontend/backend 实际 Image ID 回填。
+- [x] backend 当前 Source Commit、CI 与不可变 OCI index digest 已核验；工作负载实际 Image ID 仍待部署后回填。
 - [ ] 所有计划组件逐项与实际版本、Chart Revision、Image digest 对齐。
 - [ ] 无 `latest`、无浮动 tag、无未解释的 digest 漂移。
 - [ ] DEV-002 运行补偿控制完成验收。
