@@ -473,23 +473,23 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
 | 字段 | 值 |
 | --- | --- |
-| 采样时间 | `2026-08-24 03:42Z` |
-| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
-| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
-| REASON | `bootstrap-check-complete` |
-| STAGE_00 | `PASS_PREFLIGHT` |
-| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
-| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
-| STAGE_10-60 | `ALREADY_COMPLIANT` |
-| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
-| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
-| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
-| NEXT_STAGE | `NONE` |
+| 采样时间 | `2026-08-24 12:16:47Z` |
+| GIT_COMMIT | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| RESULT | `PASS_FLUX_PHASE_A` |
+| REASON | `four-controller-runtime-accepted` |
+| FLUX_CHECK | `all checks passed` |
+| CONTROLLERS | `source v1.9.3/kustomize v1.9.4/helm v1.6.3/notification v1.9.2` |
+| FLUX_CRD_COUNT | `11` |
+| SECRET_COUNT | `0` |
+| SYNC_INVENTORY | `empty` |
+| DOWNSTREAM_NAMESPACE_INVENTORY | `empty` |
+| NETWORK_PROBE_V2 | `PASS` |
+| EVIDENCE | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| EVIDENCE SHA256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7` |
+| OPENBAO | `NOT_EXECUTED` |
+| BACKUPS | `NOT_EXECUTED` |
+| NEXT_STAGE | `PHASE_B_REQUIRES_SEPARATE_APPROVAL` |
 | EXIT_CODE | `0` |
-| COMMAND_EXIT_CODE | `0` |
-| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
-| Pod inventory | gitlab-runner and kube-system control plane/Cilium/CoreDNS only |
-| Inactive inventory | flux-system/platform/openbao absent; GitRepository query empty |
 '''
         for relative_path in (
             'pcs/candidate-2.md',
@@ -989,7 +989,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
             path = root / 'runbook/06-apps.md'
             path.write_text(
                 path.read_text(encoding='utf-8').replace(
-                    '| 采样时间 | `2026-08-24 03:42Z` |',
+                    '| 采样时间 | `2026-08-24 12:16:47Z` |',
                     '| 采样时间 | `2026-08-22 16:58 +08:00` |',
                     1,
                 ),
@@ -1007,7 +1007,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
             path = root / 'runbook/09-acceptance.md'
             path.write_text(
                 path.read_text(encoding='utf-8').replace(
-                    '| 采样时间 | `2026-08-24 03:42Z` |',
+                    '| 采样时间 | `2026-08-24 12:16:47Z` |',
                     '| 采样时间 | `2026-08-22 16:58 +08:00` |',
                     1,
                 ),
@@ -1505,6 +1505,10 @@ class FluxPhaseAContractTest(unittest.TestCase):
             'validate_flux_phase_a_runbook must enforce dependency-safe staging',
         )
         self.assertTrue(
+            hasattr(validator, 'validate_flux_phase_a_runtime_record'),
+            'validate_flux_phase_a_runtime_record must reject stale runtime facts',
+        )
+        self.assertTrue(
             hasattr(validator, 'validate_flux_phase_a_probes'),
             'validate_flux_phase_a_probes must enforce transient probe safety',
         )
@@ -1909,6 +1913,21 @@ class FluxPhaseAContractTest(unittest.TestCase):
             shutil.copyfile(validator.ROOT / relative, target)
         return root
 
+    def make_runtime_record_root(self) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        for relative in (
+            'docs/superpowers/plans/2026-08-24-flux-phase-a.md',
+            'docs/superpowers/progress/current.md',
+            'pcs/candidate-2.md',
+            'runbook/01-bootstrap.md',
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(validator.ROOT / relative, target)
+        return root
+
     def assert_probe_contract_fails(self, root: Path, expected: str) -> None:
         stderr = io.StringIO()
         with (
@@ -1926,6 +1945,16 @@ class FluxPhaseAContractTest(unittest.TestCase):
             self.assertRaises(SystemExit) as raised,
         ):
             validator.validate_flux_phase_a_runbook(root)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertRegex(stderr.getvalue(), expected)
+
+    def assert_runtime_record_fails(self, root: Path, expected: str) -> None:
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            validator.validate_flux_phase_a_runtime_record(root)
         self.assertEqual(raised.exception.code, 1)
         self.assertRegex(stderr.getvalue(), expected)
 
@@ -1977,6 +2006,60 @@ class FluxPhaseAContractTest(unittest.TestCase):
                 self.assertEqual(source.count(old), 1)
                 path.write_text(source.replace(old, new), encoding='utf-8')
                 self.assert_runbook_contract_fails(root, expected)
+
+    def test_phase_a_runtime_record_is_complete_and_cross_file_consistent(
+        self,
+    ) -> None:
+        validator.validate_flux_phase_a_runtime_record(
+            self.make_runtime_record_root()
+        )
+
+    def test_rejects_stale_or_inconsistent_phase_a_runtime_record(self) -> None:
+        mutations = (
+            (
+                'runbook-status',
+                'runbook/01-bootstrap.md',
+                'PHASE_A_CONTROLLERS_DEPLOYED_SYNC_INACTIVE',
+                'NOT_EXECUTED',
+                'Runbook.*状态',
+            ),
+            (
+                'approved-sha',
+                'pcs/candidate-2.md',
+                '685198db15299fdb6b8cdffd72162a4864c8666b',
+                '785198db15299fdb6b8cdffd72162a4864c8666b',
+                '批准 SHA',
+            ),
+            (
+                'evidence-sha',
+                'runbook/01-bootstrap.md',
+                '2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7',
+                '3e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7',
+                '证据 SHA-256',
+            ),
+            (
+                'plan-status',
+                'docs/superpowers/plans/2026-08-24-flux-phase-a.md',
+                '执行状态：`COMPLETED`',
+                '执行状态：`IN_PROGRESS`',
+                '计划状态',
+            ),
+            (
+                'progress-plan',
+                'docs/superpowers/progress/current.md',
+                'Active Plan: docs/superpowers/plans/2026-08-24-flux-phase-a.md',
+                'Active Plan: docs/superpowers/plans/2026-08-19-bootstrap-stage-decoupling.md',
+                'current.md',
+            ),
+        )
+        for mutation, relative, old, new, expected in mutations:
+            with self.subTest(mutation=mutation):
+                root = self.make_runtime_record_root()
+                path = root / relative
+                source = path.read_text(encoding='utf-8')
+                self.assertGreaterEqual(source.count(old), 1)
+                path.write_text(source.replace(old, new, 1), encoding='utf-8')
+                self.assert_runtime_record_fails(root, expected)
 
     def test_valid_transient_probe_contract_is_accepted(self) -> None:
         validator.validate_flux_phase_a_probes(self.make_probe_root())

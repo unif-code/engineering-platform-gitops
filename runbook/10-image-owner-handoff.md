@@ -15,27 +15,30 @@
 
 ## 当前 DEV Runtime 观测
 
-本节记录服务器 GitOps `main` 的上层 `run-approved.sh --check` 回执。上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout；frontend 的可部署 manifest 事实不等同于 Runtime Image ID。
+本节记录 `2026-08-24 12:16:47Z` 的 Flux Phase A 历史验收；它不代表 2026-08-25
+实时状态。Controller 基础层完成不等于应用 Desired State 或 frontend Runtime Image ID
+已验证。
+上层 `run-approved.sh --check` 对集群和主机配置只读，但会 `fetch` 并以 `ff-only` 更新服务器 Git checkout。
 
 | 字段 | 值 |
 | --- | --- |
-| 采样时间 | `2026-08-24 03:42Z` |
-| GIT_COMMIT | `1c5034b9a9c29ab72fde63644c57fa88604c45b6` |
-| RESULT | `PASS_BOOTSTRAP_ALL_CHECK` |
-| REASON | `bootstrap-check-complete` |
-| STAGE_00 | `PASS_PREFLIGHT` |
-| STAGE_00 evidence | `/root/dev-infra-evidence/07-preflight-20260824T034100Z.txt` |
-| STAGE_00 SHA256 | `14e4ca38101d8aead55c5a28a19ddd495a7bb94f5b736cc432bbd8fe5d55361a` |
-| STAGE_10-60 | `ALREADY_COMPLIANT` |
-| STAGE_90 | `PASS_BOOTSTRAP_VERIFIED` |
-| STAGE_90 evidence | `/root/dev-infra-evidence/14-verify-20260824T034246Z.txt` |
-| STAGE_90 SHA256 | `0064b11860ec708491f290b7fb0594e02fcbc0737aed7674690ae1ded82ce4d5` |
-| NEXT_STAGE | `NONE` |
+| 采样时间 | `2026-08-24 12:16:47Z` |
+| GIT_COMMIT | `685198db15299fdb6b8cdffd72162a4864c8666b` |
+| RESULT | `PASS_FLUX_PHASE_A` |
+| REASON | `four-controller-runtime-accepted` |
+| FLUX_CHECK | `all checks passed` |
+| CONTROLLERS | `source v1.9.3/kustomize v1.9.4/helm v1.6.3/notification v1.9.2` |
+| FLUX_CRD_COUNT | `11` |
+| SECRET_COUNT | `0` |
+| SYNC_INVENTORY | `empty` |
+| DOWNSTREAM_NAMESPACE_INVENTORY | `empty` |
+| NETWORK_PROBE_V2 | `PASS` |
+| EVIDENCE | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
+| EVIDENCE SHA256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7` |
+| OPENBAO | `NOT_EXECUTED` |
+| BACKUPS | `NOT_EXECUTED` |
+| NEXT_STAGE | `PHASE_B_REQUIRES_SEPARATE_APPROVAL` |
 | EXIT_CODE | `0` |
-| COMMAND_EXIT_CODE | `0` |
-| Namespace inventory | `cilium-secrets/default/gitlab-runner/kube-node-lease/kube-public/kube-system` |
-| Pod inventory | `gitlab-runner and kube-system control plane/Cilium/CoreDNS only` |
-| Inactive inventory | `flux-system/platform/openbao absent; GitRepository query empty` |
 
 ## 当前 frontend 候选
 
