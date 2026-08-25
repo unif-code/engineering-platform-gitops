@@ -15,8 +15,10 @@ spec:
       encoding: UTF8
       localeCType: C.UTF-8
       localeCollate: C.UTF-8
-      owner: platform_app
-  enableSuperuserAccess: true
+      owner: platform_owner
+      secret:
+        name: platform-owner
+  enableSuperuserAccess: false
   imageName: ghcr.io/cloudnative-pg/postgresql@sha256:ae0ec6943c3c24b0de87f93b73ac531a8e546a4cc895655f793547eed2fdbef1
   imagePullPolicy: IfNotPresent
   instances: 1
@@ -28,16 +30,41 @@ spec:
         passwordSecret:
           name: platform-audit-rw
         superuser: false
+      - ensure: present
+        login: true
+        name: authorization_rw
+        passwordSecret:
+          name: platform-authorization-rw
+        superuser: false
+      - ensure: present
+        login: true
+        name: configuration_rw
+        passwordSecret:
+          name: platform-configuration-rw
+        superuser: false
+      - ensure: present
+        login: true
+        name: identity_rw
+        passwordSecret:
+          name: platform-identity-rw
+        superuser: false
+      - ensure: present
+        login: true
+        name: organization_rw
+        passwordSecret:
+          name: platform-organization-rw
+        superuser: false
+      - ensure: present
+        login: true
+        name: workspace_rw
+        passwordSecret:
+          name: platform-workspace-rw
+        superuser: false
   monitoring:
     enablePodMonitor: false
-  plugins:
-    - isWALArchiver: true
-      name: barman-cloud.cloudnative-pg.io
-      parameters:
-        barmanObjectName: platform-backup
   postgresql:
     parameters:
-      archive_timeout: 5min
+      password_encryption: scram-sha-256
   primaryUpdateStrategy: unsupervised
   resources:
     limits:

@@ -4,13 +4,13 @@
 
 环境：`DEV` / `NON_HA`
 
-基线：`2026-08-23.1`
+基线：`2026-08-24.1`
 
 基础设施与运维架构：`engineering-platform-docs/architecture/09-infrastructure-operations.md`
 
 架构参数：`engineering-platform-docs/architecture/appendix-parameters.md`
 
-治理例外（DEV-001 / DEV-002 / DEV-004）：`engineering-platform-docs/architecture/deviations.md`
+治理例外（DEV-001 / DEV-002 / DEV-003 / DEV-004）：`engineering-platform-docs/architecture/deviations.md`
 
 容量 Profile：`DEV-002` / `SINGLE_USER_MINIMAL`
 
@@ -22,9 +22,10 @@
 
 | 事实 | 值 |
 | --- | --- |
-| docs 架构事实提交 | `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` |
-| GitOps private main / validated | `685198db15299fdb6b8cdffd72162a4864c8666b` |
-| GitOps private validation | CI run `32724003530`；`validation-gate`、`publish-validated` 均 `success` |
+| docs 架构事实提交 | `541b186878d1e28e1aa9308111a2962cdfefb91b` |
+| GitOps private main / validated | `685198db15299fdb6b8cdffd72162a4864c8666b`（Phase A 运行采样时） |
+| GitOps pre-candidate main / validated | `c12036bfdf8bb8c0c0c6add12cd91ddf4d34e530` |
+| GitOps business-ready candidate | Desired State 已形成；合并 SHA、`validation-gate`、`publish-validated` 与运行证据待回填 |
 | DEV server checkout | `685198db15299fdb6b8cdffd72162a4864c8666b`（Phase A 验收记录） |
 | frontend Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
 | backend Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
@@ -72,16 +73,16 @@
 | GitOps | Flux | CLI `v2.9.3`；Controller `source v1.9.3` / `kustomize v1.9.4` / `helm v1.6.3` / `notification v1.9.2` | 四 Controller 官方生成 bundle + 项目 Phase A 收敛 overlay | linux/amd64 manifest：source `sha256:c6c82b3182f48b833252c71aefa0741957ca18296612bc6d2b9b5fb276f926e4`；kustomize `sha256:3e57aecb74419be93d09ba062cfc882bea405193c474009e0da1826de71a4ebd`；helm `sha256:22c0a585d0d9b1f792b9d5638144b7810e273d28e310da37740f01226bd044a2`；notification `sha256:cb17eefffbc442412ba6f63336defd04c0fc387d5082d951998d1ff163a9180d` | **PHASE_A_DEPLOYED / SYNC_BLOCKED：四 Controller、RBAC 与网络边界已验收；Git Credential、sync CR 与下游 Desired State 未激活** |
 | Storage | local-path-provisioner | `v0.0.31` | `docker.io/rancher/local-path-provisioner` | amd64 `sha256:5fb0394abf87407a27cc56db94334eb0c92d0b5de2636683a7ec51f38143dfc9` | **DEV-002 GAP**；平台 Desired State 未激活，运行补偿控制未验证 |
 | Storage | local-path helper / Phase A 瞬态网络探针 | `1.36.1-1` | `registry.k8s.io/e2e-test-images/busybox` | index `sha256:a9155b13325b2abef48e71de77bb8ac015412a566829f621d06bfae5c699b1b9`；amd64 `sha256:caec39cad3b12c26600baf6e67ba811ac15d28a9288d0ccdfffb4b318992c3bb` | platform provisioner helper Pod 未部署；Phase A 探针只在验收窗口瞬态创建并删除，不进入 Desired State |
-| PKI | cert-manager | `v1.21.1` | Helm chart `v1.21.1` | Chart/运行 digest 待部署回填 | `dev-selfsigned` 仅限 DEV；CRD/Controller 未部署 |
+| PKI | cert-manager | `v1.21.1` | vendored Helm chart `v1.21.1`，离线提交 render | package `sha256:c27101f3f3e2349fb4a9e704316105bf7b52ad73b8c8257d3498ef7f2f6a4adc`；OCI registry `sha256:15c0b46d9006ce8eb9ff14d1bf54d1bbfcc587bb9e24cd9fe186fb8fec56af1f`；运行 Image ID 待回填 | business-ready 候选已固定四个 operand digest；Runtime 未部署 |
 | Object Storage | MinIO Server | `RELEASE.2025-09-07T16-13-09Z` | `quay.io/minio/minio` | index `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`；amd64 `sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2` | **BLOCKED：精确摘要供应链证据或获批风险决定未满足；清单引用不代表获准或已部署** |
 | Object Storage | MinIO Client (`mc`) | `RELEASE.2025-08-13T08-35-41Z` | `quay.io/minio/mc` | index `sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727`；amd64 `sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780` | 初始化、验证与 etcd 上传工具；未部署 |
-| Database | CloudNativePG Operator | `1.30.0` | Helm chart `cloudnative-pg` `0.29.0` | chart `sha256:668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f`；运行镜像待部署回填 | CRD/Operator 未部署 |
+| Database | CloudNativePG Operator | `1.30.0` | vendored Helm chart `cloudnative-pg` `0.29.0`，离线提交 render | chart `sha256:668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f`；linux/amd64 `sha256:091d306935cfdf646debfe78010d59ebfb572150eb6eb922b0203873c0c68841`；运行 Image ID 待回填 | business-ready 候选已固定；CRD/Operator 未部署 |
 | Database | PostgreSQL | `18.4` | `ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie` | index `sha256:f0cc49632b5cc1e51f65ba03658c89bd31d64ea2672b14843a808a8d281417e1`；amd64 `sha256:ae0ec6943c3c24b0de87f93b73ac531a8e546a4cc895655f793547eed2fdbef1` | Cluster 未部署 |
 | Database | Barman Cloud Plugin | `0.13.0` | Helm chart `plugin-barman-cloud` `0.7.0` | chart `sha256:683494c04cc94f7d33c4ac5f3d8d64c209634b48bd0e84da31d7d1fad22cdcdb`；运行镜像待部署回填 | Plugin/备份对象未部署 |
 | Observability | kube-prometheus-stack | `88.1.5` | Helm chart `kube-prometheus-stack` | Chart/运行 digest 待部署回填 | 未部署；Grafana Managed Alerting off |
 | Observability | Metrics Server | app `0.8.1` / chart `3.13.1` | Helm chart `metrics-server` | chart `sha256:084e6edb680cf4e2acc30bd496568c53fdf663cbacf6e17876b25785c35b7a13`；index `sha256:b2d2efaf5ac3b366ed0f839d2412a2c4279d4fc2a2a733f12c52133faed36c41`；amd64 `sha256:6231fb0a1ffab76c92ab880f51a0d11b290f688373647bcedff85af025dfd8a9` | 未部署；禁止任何 insecure TLS 参数 |
-| Application | engineering-platform-backend | Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` / CI run `32802909349`；verify、publish-image 均 `success` | `ghcr.io/unif-code/engineering-platform-backend:sha-4aaf721`；OCI index `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` | 不可变输入 `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`；运行 Image ID `NOT_VERIFIED` | 候选可用；Desired State、迁移与账号初始化均未执行 |
-| Application | engineering-platform frontend | Source `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` / CI run `32683635240`、publish-image job `97305929974`（均 `success`） | `ghcr.io/unif-code/engineering-platform:sha-da72238`；OCI index `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` | linux/amd64 manifest `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`；运行 Image ID `NOT_VERIFIED` | 当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署 |
+| Application | engineering-platform-backend | Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` / CI run `32802909349`；verify、publish-image 均 `success` | `ghcr.io/unif-code/engineering-platform-backend:sha-4aaf721`；OCI index `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` | 不可变输入 `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`；运行 Image ID `NOT_VERIFIED` | business-ready 候选已锁定 migration/backend；运行与账号初始化均未执行 |
+| Application | engineering-platform frontend | Source `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` / CI run `32683635240`、publish-image job `97305929974`（均 `success`） | `ghcr.io/unif-code/engineering-platform:sha-da72238`；OCI index `sha256:77c2b01247e2e3e0a09ff159290feaf758b0ebec6a2d08843d927c5153642bd1` | linux/amd64 manifest `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`；运行 Image ID `NOT_VERIFIED` | business-ready 候选已锁定 workload；运行未部署 |
 
 ## 当前 frontend 候选
 
@@ -113,9 +114,9 @@ CI run `32683635240` 与 publish-image job `97305929974` 均已 `success`，发�
 | Migration | `NOT_EXECUTED` |
 | Account initialization | `NOT_EXECUTED` |
 
-该交付已成为后续应用阶段的可用输入，但当前批准计划仍是 Flux Phase A 收口，尚未进入
-backend 部署阶段；因此未修改应用 Desired State，未执行 migration、健康检查、运行
-readback 或账号初始化。
+该交付已成为 business-ready 候选的锁定输入，migration/backend Desired State 已形成；但
+合并 SHA、CI、服务器 Stage 110–160、健康检查、运行 readback 与账号初始化均尚未完成。
+仓库候选不能作为已部署证明。
 
 ## 当前 Flux Phase A Runtime 记录
 
@@ -139,10 +140,10 @@ Namespace。完整生成来源与安全收敛见 `clusters/dev/flux-system/READM
 | 证据 | `/root/dev-infra-evidence/15-flux-phase-a-20260824T105630Z.txt` |
 | 证据 SHA-256 | `2e773304741d1eb0c8cc4b6558df21b8422d88c91c66cb09418f50a6373f66e7`；侧车校验 `OK` |
 
-Phase A Controller 基础层已完成，不代表 GitOps 单向 Reconcile 已激活。当前阻塞依赖中的
-Flux 仍指 Phase B/C 的 Git Credential、`GitRepository` 与 Flux `Kustomization`；这些资源
-仍需独立设计、CI 与 mutation 批准。OpenBao、备份、infrastructure、apps、MinIO 与应用
-部署不因本记录自动解锁。
+Phase A Controller 基础层已完成，不代表 GitOps 单向 Reconcile 已激活。business-ready 候选
+使用 public `validated` GitRepository（无 Git credential Secret）与 Flux `Kustomization`，
+仍须合并、CI、独立服务器写入门和运行 readback。OpenBao、备份、MinIO、observability 与
+账号初始化不因候选形成而解锁。
 
 ## 2026-08-22 frontend 历史证据
 
@@ -159,6 +160,8 @@ Flux 仍指 Phase B/C 的 Git Credential、`GitRepository` 与 Flux `Kustomizati
 | --- | --- |
 | Flux | `BLOCKED` |
 | MinIO | `BLOCKED` |
+
+Flux 的 business-ready 候选已形成，但未合并/部署；因此 runtime 依赖仍保持 `BLOCKED`。
 
 ## 已拒绝的 MinIO 替代候选
 

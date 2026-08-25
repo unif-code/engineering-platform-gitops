@@ -403,7 +403,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
         ),
         frontend_image_id: str = 'NOT_VERIFIED',
         docs_architecture_commit: str = (
-            'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
+            '541b186878d1e28e1aa9308111a2962cdfefb91b'
         ),
         flux_status: str = 'BLOCKED',
         minio_status: str = 'BLOCKED',
@@ -477,8 +477,8 @@ class RepositoryProfileContractTest(unittest.TestCase):
         pcs = root / 'pcs/candidate-2.md'
         pcs.write_text(
             pcs.read_text(encoding='utf-8')
-            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}`（均 `success`） | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；运行 Image ID `{frontend_image_id}` | 当前 provenance 与 linux/amd64 manifest 已确认；工作负载未部署 |
-| Application | engineering-platform-backend | Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` / CI run `32802909349`；verify、publish-image 均 `success` | `ghcr.io/unif-code/engineering-platform-backend:sha-4aaf721`；OCI index `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` | 不可变输入 `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`；运行 Image ID `NOT_VERIFIED` | 候选可用；Desired State、迁移与账号初始化均未执行 |\n''',
+            + f'''\n| Application | engineering-platform frontend | Source `{frontend_source}` / CI run `{frontend_ci_run}`、publish-image job `{frontend_publish_job}`（均 `success`） | `ghcr.io/unif-code/engineering-platform:{frontend_tag}`；OCI index `{frontend_artifact}` | linux/amd64 manifest `{frontend_manifest}`；运行 Image ID `{frontend_image_id}` | business-ready 候选已锁定 workload；运行未部署 |
+| Application | engineering-platform-backend | Source `4aaf721fa91abd729b33765e4e329b02aa2ece02` / CI run `32802909349`；verify、publish-image 均 `success` | `ghcr.io/unif-code/engineering-platform-backend:sha-4aaf721`；OCI index `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857` | 不可变输入 `ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`；运行 Image ID `NOT_VERIFIED` | business-ready 候选已锁定 migration/backend；运行与账号初始化均未执行 |\n''',
             encoding='utf-8',
         )
         handoff = root / 'runbook/10-image-owner-handoff.md'
@@ -775,7 +775,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
             (
                 'pcs/candidate-2.md',
                 'docs 架构事实提交',
-                'd6d846a612c974991f4d0ffc0685d06adf2ddfe7',
+                '541b186878d1e28e1aa9308111a2962cdfefb91b',
                 '6267120f345e7ad967daf08fb244c6018054281d',
                 '当前 docs 架构事实提交',
             ),
@@ -802,8 +802,8 @@ class RepositoryProfileContractTest(unittest.TestCase):
     def test_current_docs_architecture_plan_rejects_orphan_sha(self) -> None:
         # Would fail if the current plan can retain the inaccessible sibling SHA.
         mutations = (
-            'docs 架构事实提交为 `d6d846a612c974991f4d0ffc0685d06adf2ddfe7`',
-            '| docs 架构事实提交 | `d6d846a612c974991f4d0ffc0685d06adf2ddfe7` |',
+            'docs 架构事实提交为 `541b186878d1e28e1aa9308111a2962cdfefb91b`',
+            '| docs 架构事实提交 | `541b186878d1e28e1aa9308111a2962cdfefb91b` |',
         )
         for expected in mutations:
             with self.subTest(expected=expected):
@@ -818,7 +818,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
                         path.read_text(encoding='utf-8').replace(
                             expected,
                             expected.replace(
-                                'd6d846a612c974991f4d0ffc0685d06adf2ddfe7',
+                                '541b186878d1e28e1aa9308111a2962cdfefb91b',
                                 '6267120f345e7ad967daf08fb244c6018054281d',
                             ),
                             1,
@@ -841,7 +841,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
             path.write_text(
                 path.read_text(encoding='utf-8').replace(
                     'docs 架构事实提交为远端可追溯的 '
-                    '`d6d846a612c974991f4d0ffc0685d06adf2ddfe7`',
+                    '`541b186878d1e28e1aa9308111a2962cdfefb91b`',
                     'docs 架构事实提交为远端可追溯的 '
                     '`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`',
                     1,
@@ -854,7 +854,7 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
     def test_current_docs_plan_rejects_appended_conflicting_sha(self) -> None:
         # Would fail if a valid current SHA can hide an additional conflicting value.
-        current = 'd6d846a612c974991f4d0ffc0685d06adf2ddfe7'
+        current = '541b186878d1e28e1aa9308111a2962cdfefb91b'
         conflicting = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
         mutations = (
             (
@@ -1358,6 +1358,13 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
 
 class ActiveRootIsolationTest(unittest.TestCase):
+    APPROVED_RESOURCES = [
+        'flux-system',
+        'reconcile-rbac.yaml',
+        'infrastructure.yaml',
+        'apps.yaml',
+    ]
+
     def make_root(self, resources: list[str]) -> Path:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1377,36 +1384,31 @@ class ActiveRootIsolationTest(unittest.TestCase):
         )
         return root
 
-    def test_active_root_rejects_staged_entrypoint(self) -> None:
+    def test_active_root_rejects_unapproved_entrypoint(self) -> None:
         self.assertTrue(
             hasattr(validator, 'validate_active_root'),
             'validate_active_root must enforce the active-root allowlist',
         )
-        root = self.make_root(['flux-system', 'apps.yaml'])
+        root = self.make_root([*self.APPROVED_RESOURCES, 'backups.yaml'])
 
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 validator.validate_active_root(root)
 
-    def test_active_root_accepts_flux_only(self) -> None:
+    def test_active_root_accepts_exact_business_ready_entrypoints(self) -> None:
         self.assertTrue(
             hasattr(validator, 'validate_active_root'),
             'validate_active_root must enforce the active-root allowlist',
         )
-        root = self.make_root(['flux-system'])
+        root = self.make_root(self.APPROVED_RESOURCES)
 
         validator.validate_active_root(root)
 
-    def test_repository_inactive_entrypoints_are_annotated(self) -> None:
-        self.assertTrue(
-            hasattr(validator, 'validate_active_root'),
-            'validate_active_root must validate inactive audit headers',
-        )
-
+    def test_repository_uses_exact_business_ready_entrypoints(self) -> None:
         validator.validate_active_root(validator.ROOT)
 
 
-class FluxPhaseAContractTest(unittest.TestCase):
+class _FluxPhaseAContractBase:
     CONTROLLERS = {
         'source-controller': {
             'tag': 'v1.9.3',
@@ -1578,7 +1580,10 @@ class FluxPhaseAContractTest(unittest.TestCase):
         orchestrator = (
             validator.ROOT / 'scripts/bootstrap/bootstrap-all.sh'
         ).read_text(encoding='utf-8')
-        self.assertIn('readonly -a STAGES=(00 10 20 30 40 50 60 90 100)', orchestrator)
+        self.assertIn(
+            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160)',
+            orchestrator,
+        )
         self.assertIn('100:PASS_FLUX_PHASE_A_INSTALLED', orchestrator)
 
     @classmethod
@@ -1587,7 +1592,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
             [
                 'kubectl',
                 'kustomize',
-                str(validator.ROOT / 'clusters/dev/flux-system'),
+                str(validator.ROOT / 'clusters/dev/flux-system/phase-a'),
             ],
             capture_output=True,
             check=False,
@@ -1607,7 +1612,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
             args=[
                 'kubectl',
                 'kustomize',
-                str(validator.ROOT / 'clusters/dev/flux-system'),
+                str(validator.ROOT / 'clusters/dev/flux-system/phase-a'),
             ],
             returncode=0,
             stdout=self.RENDERED_TEXT.encode('utf-8'),
@@ -1615,7 +1620,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
         )
         altered_render = copy.copy(baseline_render)
         altered_render.stdout = b'# byte-level drift\n' + baseline_render.stdout
-        manifest_roots = (validator.ROOT / 'clusters/dev/flux-system',)
+        manifest_roots = (validator.ROOT / 'clusters/dev/flux-system/phase-a',)
         with (
             mock.patch.object(validator, 'MANIFEST_ROOTS', manifest_roots),
             mock.patch.object(
@@ -1712,13 +1717,486 @@ class FluxPhaseAContractTest(unittest.TestCase):
         ]
 
     def phase_a_rbac_documents(self) -> list[dict[str, object]]:
-        path = validator.ROOT / 'clusters/dev/flux-system/phase-a-rbac.yaml'
+        path = (
+            validator.ROOT
+            / 'clusters/dev/flux-system/phase-a/phase-a-rbac.yaml'
+        )
         return [
             document
             for document in yaml.safe_load_all(path.read_text(encoding='utf-8'))
             if isinstance(document, dict)
         ]
 
+
+class BusinessReadyGitOpsContractTest(unittest.TestCase):
+    """Fail-closed contract for the no-backup DEV business-ready slice."""
+
+    APPROVED_NAMESPACES = {
+        'cert-manager',
+        'cnpg-system',
+        'flux-system',
+        'local-path-storage',
+        'platform',
+    }
+    FORBIDDEN_NAMES = {
+        'barman',
+        'backup',
+        'etcd-backup',
+        'minio',
+        'monitoring',
+        'objectstore',
+        'openbao',
+        'scheduledbackup',
+    }
+    BACKEND_IMAGE = (
+        'ghcr.io/unif-code/engineering-platform-backend@sha256:'
+        'f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857'
+    )
+    FRONTEND_IMAGE = (
+        'ghcr.io/unif-code/engineering-platform@sha256:'
+        '21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
+    )
+    POSTGRES_IMAGE = (
+        'ghcr.io/cloudnative-pg/postgresql@sha256:'
+        'ae0ec6943c3c24b0de87f93b73ac531a8e546a4cc895655f793547eed2fdbef1'
+    )
+    RUNTIME_ROLES = {
+        'audit_rw',
+        'authorization_rw',
+        'configuration_rw',
+        'identity_rw',
+        'organization_rw',
+        'workspace_rw',
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        roots = (
+            'clusters/dev',
+            'infrastructure/foundation',
+            'infrastructure/cert-manager/controller',
+            'infrastructure/cert-manager/config',
+            'infrastructure/cnpg/controller',
+            'infrastructure/cnpg/database',
+            'apps/migration',
+            'apps',
+        )
+        cls.RENDERED = []
+        cls.RENDERED_BY_ROOT = {}
+        for root in roots:
+            rendered = subprocess.run(
+                ['kubectl', 'kustomize', str(validator.ROOT / root)],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if rendered.returncode != 0:
+                raise AssertionError(rendered.stderr or rendered.stdout)
+            documents = [
+                document
+                for document in yaml.safe_load_all(rendered.stdout)
+                if isinstance(document, dict)
+            ]
+            cls.RENDERED_BY_ROOT[root] = documents
+            cls.RENDERED.extend(documents)
+
+    @staticmethod
+    def identity(document: dict[str, object]) -> tuple[str, str, str, str]:
+        metadata = document.get('metadata', {})
+        assert isinstance(metadata, dict)
+        return (
+            str(document.get('apiVersion', '')),
+            str(document.get('kind', '')),
+            str(metadata.get('namespace', '')),
+            str(metadata.get('name', '')),
+        )
+
+    def find(
+        self,
+        api_version: str,
+        kind: str,
+        namespace: str,
+        name: str,
+    ) -> dict[str, object]:
+        matches = [
+            document
+            for document in self.RENDERED
+            if self.identity(document)
+            == (api_version, kind, namespace, name)
+        ]
+        self.assertEqual(
+            len(matches),
+            1,
+            f'expected one {api_version}/{kind} {namespace}/{name}, '
+            f'found {len(matches)}',
+        )
+        return matches[0]
+
+    def test_public_validated_sync_has_no_git_secret(self) -> None:
+        source = self.find(
+            'source.toolkit.fluxcd.io/v1',
+            'GitRepository',
+            'flux-system',
+            'flux-system',
+        )
+        spec = source['spec']
+        assert isinstance(spec, dict)
+        self.assertEqual(
+            spec.get('url'),
+            'https://github.com/unif-code/engineering-platform-gitops.git',
+        )
+        self.assertEqual(spec.get('ref'), {'branch': 'validated'})
+        self.assertNotIn('secretRef', spec)
+
+        sync = self.find(
+            'kustomize.toolkit.fluxcd.io/v1',
+            'Kustomization',
+            'flux-system',
+            'flux-system',
+        )
+        sync_spec = sync['spec']
+        assert isinstance(sync_spec, dict)
+        self.assertEqual(sync_spec.get('path'), './clusters/dev')
+        self.assertEqual(sync_spec.get('serviceAccountName'), 'flux-root-reconciler')
+
+        egress = self.find(
+            'cilium.io/v2',
+            'CiliumNetworkPolicy',
+            'flux-system',
+            'allow-approved-git-egress',
+        )
+        self.assertEqual(
+            egress.get('spec'),
+            {
+                'endpointSelector': {
+                    'matchLabels': {
+                        'k8s:app.kubernetes.io/component': 'source-controller'
+                    }
+                },
+                'egress': [
+                    {
+                        'toFQDNs': [{'matchName': 'github.com'}],
+                        'toPorts': [
+                            {
+                                'ports': [
+                                    {'port': '443', 'protocol': 'TCP'}
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+    def test_active_namespaces_and_exclusions_are_exact(self) -> None:
+        namespaces = {
+            self.identity(document)[3]
+            for document in self.RENDERED
+            if document.get('kind') == 'Namespace'
+        }
+        self.assertEqual(namespaces, self.APPROVED_NAMESPACES)
+        active_identities = {
+            f'{kind}/{name}'.lower()
+            for _, kind, _, name in map(self.identity, self.RENDERED)
+            if kind != 'CustomResourceDefinition'
+        }
+        active_identities.discard('configmap/cnpg-default-monitoring')
+        for forbidden in self.FORBIDDEN_NAMES:
+            self.assertFalse(
+                any(forbidden in identity for identity in active_identities),
+                f'forbidden active resource matched {forbidden}',
+            )
+
+    def test_reconcile_rbac_has_no_privilege_escape(self) -> None:
+        bindings = [
+            document
+            for document in self.RENDERED
+            if document.get('kind') in {'RoleBinding', 'ClusterRoleBinding'}
+        ]
+        for binding in bindings:
+            role_ref = binding.get('roleRef', {})
+            assert isinstance(role_ref, dict)
+            self.assertNotEqual(role_ref.get('name'), 'cluster-admin')
+
+        roles = [
+            document
+            for document in self.RENDERED
+            if document.get('kind') in {'Role', 'ClusterRole'}
+            and str(document.get('metadata', {}).get('name', '')).startswith('flux-')
+        ]
+        deny_verbs = {'bind', 'escalate', 'impersonate'}
+        for role in roles:
+            for rule in role.get('rules', []):
+                self.assertFalse(deny_verbs & set(rule.get('verbs', [])))
+                self.assertNotIn('serviceaccounts/token', rule.get('resources', []))
+                self.assertNotIn('certificatesigningrequests/approval', rule.get('resources', []))
+                if 'secrets' in rule.get('resources', []):
+                    self.assertFalse({'get', 'list', 'watch'} & set(rule.get('verbs', [])))
+
+    def test_each_downstream_reconciler_has_exact_rendered_resource_permissions(
+        self,
+    ) -> None:
+        kind_resources = {
+            'Certificate': 'certificates',
+            'Cluster': 'clusters',
+            'ClusterIssuer': 'clusterissuers',
+            'ClusterRole': 'clusterroles',
+            'ClusterRoleBinding': 'clusterrolebindings',
+            'CiliumNetworkPolicy': 'ciliumnetworkpolicies',
+            'ConfigMap': 'configmaps',
+            'CustomResourceDefinition': 'customresourcedefinitions',
+            'Deployment': 'deployments',
+            'Gateway': 'gateways',
+            'HTTPRoute': 'httproutes',
+            'Job': 'jobs',
+            'MutatingWebhookConfiguration': 'mutatingwebhookconfigurations',
+            'Namespace': 'namespaces',
+            'NetworkPolicy': 'networkpolicies',
+            'PodDisruptionBudget': 'poddisruptionbudgets',
+            'ResourceQuota': 'resourcequotas',
+            'Role': 'roles',
+            'RoleBinding': 'rolebindings',
+            'Service': 'services',
+            'ServiceAccount': 'serviceaccounts',
+            'StorageClass': 'storageclasses',
+            'ValidatingWebhookConfiguration': 'validatingwebhookconfigurations',
+        }
+        assignments = {
+            'infrastructure/foundation': ('ClusterRole', '', 'flux-foundation-reconciler'),
+            'infrastructure/cert-manager/controller': (
+                'ClusterRole', '', 'cert-manager-controller-reconciler'
+            ),
+            'infrastructure/cert-manager/config': (
+                'ClusterRole', '', 'cert-manager-config-reconciler'
+            ),
+            'infrastructure/cnpg/controller': (
+                'ClusterRole', '', 'cnpg-controller-reconciler'
+            ),
+            'infrastructure/cnpg/database': (
+                'ClusterRole', '', 'flux-platform-database-reconciler'
+            ),
+            'apps/migration': ('Role', 'platform', 'flux-platform-migration-reconciler'),
+            'apps': ('Role', 'platform', 'flux-platform-app-reconciler'),
+        }
+        full_verbs = {'create', 'delete', 'get', 'list', 'patch', 'update', 'watch'}
+        for root, (kind, namespace, name) in assignments.items():
+            with self.subTest(root=root):
+                role = self.find('rbac.authorization.k8s.io/v1', kind, namespace, name)
+                granted = set()
+                for rule in role.get('rules', []):
+                    self.assertEqual(set(rule.get('verbs', [])), full_verbs)
+                    for api_group in rule.get('apiGroups', []):
+                        for resource in rule.get('resources', []):
+                            granted.add((api_group, resource))
+                expected = set()
+                for document in self.RENDERED_BY_ROOT[root]:
+                    api_version = str(document.get('apiVersion', ''))
+                    api_group = '' if api_version == 'v1' else api_version.split('/', 1)[0]
+                    resource = kind_resources.get(str(document.get('kind', '')))
+                    self.assertIsNotNone(resource, self.identity(document))
+                    expected.add((api_group, resource))
+                self.assertEqual(granted, expected)
+
+    def test_vendored_charts_render_to_digest_pinned_manifests(self) -> None:
+        self.assertFalse(
+            any(
+                document.get('kind') in {'HelmRelease', 'HelmRepository'}
+                for document in self.RENDERED
+            )
+        )
+        for chart in ('cert-manager', 'cloudnative-pg'):
+            chart_root = validator.ROOT / 'vendor/charts' / chart
+            self.assertTrue((chart_root / 'Chart.yaml').is_file())
+            self.assertTrue((chart_root / 'values.yaml').is_file())
+
+        expected_images = {
+            ('cert-manager', 'cert-manager'): (
+                'quay.io/jetstack/cert-manager-controller@sha256:'
+                '4c2b5201fd66085b777dc6b256d96d7d346b6445404cec34db5f8aea86182cc5'
+            ),
+            ('cert-manager', 'cert-manager-webhook'): (
+                'quay.io/jetstack/cert-manager-webhook@sha256:'
+                '741084291faf115a2909bfe3515458b54926c67f039ac20effd821bac69817a4'
+            ),
+            ('cert-manager', 'cert-manager-cainjector'): (
+                'quay.io/jetstack/cert-manager-cainjector@sha256:'
+                '1910ad7e134880e27d229e07affb43da1b07841a77f70c364f17467cb4e49bd9'
+            ),
+            ('cnpg-system', 'cloudnative-pg'): (
+                'ghcr.io/cloudnative-pg/cloudnative-pg@sha256:'
+                '091d306935cfdf646debfe78010d59ebfb572150eb6eb922b0203873c0c68841'
+            ),
+        }
+        for (namespace, name), image in expected_images.items():
+            deployment = self.find('apps/v1', 'Deployment', namespace, name)
+            self.assertEqual(
+                deployment['spec']['template']['spec']['containers'][0]['image'],
+                image,
+            )
+
+    def test_database_is_no_backup_and_has_all_runtime_roles(self) -> None:
+        cluster = self.find(
+            'postgresql.cnpg.io/v1', 'Cluster', 'platform', 'platform'
+        )
+        spec = cluster['spec']
+        assert isinstance(spec, dict)
+        self.assertEqual(spec.get('instances'), 1)
+        self.assertEqual(spec.get('imageName'), self.POSTGRES_IMAGE)
+        self.assertEqual(spec.get('storage'), {
+            'size': '20Gi',
+            'storageClass': 'stateful-rwo-lowlatency',
+        })
+        roles = spec.get('managed', {}).get('roles', [])
+        self.assertEqual({role.get('name') for role in roles}, self.RUNTIME_ROLES)
+        for role in roles:
+            self.assertTrue(role.get('login'))
+            self.assertFalse(role.get('superuser'))
+            self.assertIn('name', role.get('passwordSecret', {}))
+        self.assertNotIn('plugins', spec)
+        self.assertFalse(
+            any(
+                document.get('kind') in {'ObjectStore', 'ScheduledBackup'}
+                for document in self.RENDERED
+            )
+        )
+
+    def test_migration_and_apps_are_immutable_and_ordered(self) -> None:
+        migration = self.find('batch/v1', 'Job', 'platform', 'platform-migrate-4aaf721')
+        migration_container = migration['spec']['template']['spec']['containers'][0]
+        self.assertEqual(migration_container.get('image'), self.BACKEND_IMAGE)
+        self.assertEqual(migration['spec'].get('backoffLimit'), 0)
+
+        images = {
+            'frontend': self.FRONTEND_IMAGE,
+            'backend': self.BACKEND_IMAGE,
+        }
+        for name, image in images.items():
+            deployment = self.find('apps/v1', 'Deployment', 'platform', name)
+            pod_spec = deployment['spec']['template']['spec']
+            container = pod_spec['containers'][0]
+            self.assertEqual(container.get('image'), image)
+            self.assertTrue(container.get('securityContext', {}).get('runAsNonRoot'))
+            self.assertTrue(container.get('securityContext', {}).get('readOnlyRootFilesystem'))
+            self.assertEqual(
+                container.get('securityContext', {}).get('capabilities', {}).get('drop'),
+                ['ALL'],
+            )
+
+        apps = self.find(
+            'kustomize.toolkit.fluxcd.io/v1',
+            'Kustomization',
+            'flux-system',
+            'platform-apps',
+        )
+        self.assertEqual(
+            apps['spec'].get('dependsOn'),
+            [
+                {'name': 'platform-migration'},
+                {'name': 'cert-manager-config'},
+            ],
+        )
+
+    def test_backend_secret_contract_is_file_only(self) -> None:
+        deployment = self.find('apps/v1', 'Deployment', 'platform', 'backend')
+        pod_spec = deployment['spec']['template']['spec']
+        container = pod_spec['containers'][0]
+        self.assertNotIn('env', container)
+        self.assertNotIn('envFrom', container)
+        mounts = {mount['mountPath']: mount for mount in container.get('volumeMounts', [])}
+        self.assertIn('/app/.env', mounts)
+        self.assertTrue(mounts['/app/.env'].get('readOnly'))
+        secret_volumes = [
+            volume for volume in pod_spec.get('volumes', []) if 'secret' in volume
+        ]
+        self.assertEqual(len(secret_volumes), 4)
+
+    def test_gateway_is_https_only_and_routes_same_origin(self) -> None:
+        gateway = self.find(
+            'gateway.networking.k8s.io/v1',
+            'Gateway',
+            'platform',
+            'platform-gateway',
+        )
+        listeners = gateway['spec'].get('listeners', [])
+        self.assertEqual(len(listeners), 1)
+        self.assertEqual(listeners[0].get('protocol'), 'HTTPS')
+        self.assertEqual(listeners[0].get('port'), 443)
+
+        route = self.find(
+            'gateway.networking.k8s.io/v1',
+            'HTTPRoute',
+            'platform',
+            'platform',
+        )
+        self.assertEqual(route['spec'].get('hostnames'), ['platform.dev.local'])
+        backend_names = {
+            backend.get('name')
+            for rule in route['spec'].get('rules', [])
+            for backend in rule.get('backendRefs', [])
+        }
+        self.assertEqual(backend_names, {'backend', 'frontend'})
+        self.assertFalse(any(document.get('kind') == 'Ingress' for document in self.RENDERED))
+        for document in self.RENDERED:
+            if document.get('kind') == 'Service':
+                self.assertNotIn(
+                    document.get('spec', {}).get('type'),
+                    {'LoadBalancer', 'NodePort'},
+                )
+
+    def test_every_active_namespace_is_default_deny_with_exact_dns_egress(
+        self,
+    ) -> None:
+        default_deny_namespaces = {
+            self.identity(document)[2]
+            for document in self.RENDERED
+            if document.get('kind') == 'NetworkPolicy'
+            and self.identity(document)[3] == 'default-deny'
+            and document.get('spec') == {
+                'podSelector': {},
+                'policyTypes': ['Ingress', 'Egress'],
+            }
+        }
+        dns_namespaces = {
+            self.identity(document)[2]
+            for document in self.RENDERED
+            if document.get('kind') == 'NetworkPolicy'
+            and self.identity(document)[3] == 'allow-dns-egress'
+        }
+        self.assertEqual(default_deny_namespaces, self.APPROVED_NAMESPACES)
+        self.assertEqual(dns_namespaces, self.APPROVED_NAMESPACES)
+
+    def test_gateway_and_control_plane_exceptions_use_cilium_entities(self) -> None:
+        expected = {
+            ('cert-manager', 'allow-kube-apiserver-egress'),
+            ('cert-manager', 'allow-kube-apiserver-webhook-ingress'),
+            ('cnpg-system', 'allow-kube-apiserver-egress'),
+            ('cnpg-system', 'allow-kube-apiserver-webhook-ingress'),
+            ('local-path-storage', 'allow-kube-apiserver-egress'),
+            ('platform', 'allow-kube-apiserver-egress'),
+            ('platform', 'allow-gateway-backend-ingress'),
+            ('platform', 'allow-gateway-frontend-ingress'),
+        }
+        policies = {
+            (self.identity(document)[2], self.identity(document)[3]): document
+            for document in self.RENDERED
+            if document.get('kind') == 'CiliumNetworkPolicy'
+        }
+        for identity in expected:
+            with self.subTest(identity=identity):
+                self.assertIn(identity, policies)
+        for name in ('allow-gateway-backend-ingress', 'allow-gateway-frontend-ingress'):
+            ingress_rules = policies[('platform', name)]['spec'].get('ingress', [])
+            self.assertEqual(ingress_rules[0].get('fromEntities'), ['ingress'])
+        for namespace, name in expected - {
+            ('platform', 'allow-gateway-backend-ingress'),
+            ('platform', 'allow-gateway-frontend-ingress'),
+        }:
+            rules = policies[(namespace, name)]['spec']
+            direction = 'ingress' if name.endswith('webhook-ingress') else 'egress'
+            entity_key = 'fromEntities' if direction == 'ingress' else 'toEntities'
+            self.assertEqual(rules[direction][0].get(entity_key), ['kube-apiserver'])
+
+class FluxPhaseAContractTest(_FluxPhaseAContractBase, unittest.TestCase):
     def phase_a_network_policy_documents(self) -> list[dict[str, object]]:
         return [
             {
@@ -1867,7 +2345,8 @@ class FluxPhaseAContractTest(unittest.TestCase):
         root = Path(directory.name)
         cluster = root / 'clusters/dev'
         flux = cluster / 'flux-system'
-        flux.mkdir(parents=True)
+        phase_a = flux / 'phase-a'
+        phase_a.mkdir(parents=True)
 
         (cluster / 'kustomization.yaml').write_text(
             yaml.safe_dump(
@@ -1880,7 +2359,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
             ),
             encoding='utf-8',
         )
-        (flux / 'kustomization.yaml').write_text(
+        (phase_a / 'kustomization.yaml').write_text(
             yaml.safe_dump(
                 {
                     'apiVersion': 'kustomize.config.k8s.io/v1beta1',
@@ -1902,14 +2381,6 @@ class FluxPhaseAContractTest(unittest.TestCase):
             ),
             encoding='utf-8',
         )
-        (flux / 'gotk-sync.yaml').write_text(
-            '# STATUS: BLOCKED\n'
-            '# ACTIVE: false\n'
-            '# REASON: Phase A does not create Git sync resources\n'
-            '# ACTIVATION_GATES: read-only deploy key approval and Phase B review\n',
-            encoding='utf-8',
-        )
-
         namespace = {
             'apiVersion': 'v1',
             'kind': 'Namespace',
@@ -1958,19 +2429,19 @@ class FluxPhaseAContractTest(unittest.TestCase):
                 for name, contract in self.CONTROLLERS.items()
             ),
         ]
-        (flux / 'gotk-components.yaml').write_bytes(
+        (phase_a / 'gotk-components.yaml').write_bytes(
             (
                 validator.ROOT
-                / 'clusters/dev/flux-system/gotk-components.yaml'
+                / 'clusters/dev/flux-system/phase-a/gotk-components.yaml'
             ).read_bytes()
         )
         rbac_documents = self.phase_a_rbac_documents()
-        (flux / 'phase-a-rbac.yaml').write_text(
+        (phase_a / 'phase-a-rbac.yaml').write_text(
             yaml.safe_dump_all(rbac_documents, sort_keys=False),
             encoding='utf-8',
         )
         network_policy_documents = self.phase_a_network_policy_documents()
-        (flux / 'phase-a-network-policy.yaml').write_text(
+        (phase_a / 'phase-a-network-policy.yaml').write_text(
             yaml.safe_dump_all(network_policy_documents, sort_keys=False),
             encoding='utf-8',
         )
@@ -2009,7 +2480,11 @@ class FluxPhaseAContractTest(unittest.TestCase):
         rendered_documents: list[dict[str, object]],
     ) -> None:
         render = subprocess.CompletedProcess(
-            args=['kubectl', 'kustomize', str(root / 'clusters/dev/flux-system')],
+            args=[
+                'kubectl',
+                'kustomize',
+                str(root / 'clusters/dev/flux-system/phase-a'),
+            ],
             returncode=0,
             stdout='rendered fixture',
             stderr='',
@@ -2113,11 +2588,11 @@ class FluxPhaseAContractTest(unittest.TestCase):
         source = path.read_text(encoding='utf-8')
         client_apply = (
             'kubectl --kubeconfig="$KC" apply --dry-run=client \\\n'
-            '  -k clusters/dev/flux-system'
+            '  -k clusters/dev/flux-system/phase-a'
         )
         client_create = (
             'kubectl --kubeconfig="$KC" create --dry-run=client \\\n'
-            '  -k clusters/dev/flux-system'
+            '  -k clusters/dev/flux-system/phase-a'
         )
         if client_create not in source:
             self.assertEqual(source.count(client_apply), 1)
@@ -2148,11 +2623,11 @@ class FluxPhaseAContractTest(unittest.TestCase):
         source = path.read_text(encoding='utf-8')
         client_create = (
             'kubectl --kubeconfig="$KC" create --dry-run=client \\\n'
-            '  -k clusters/dev/flux-system'
+            '  -k clusters/dev/flux-system/phase-a'
         )
         client_apply = (
             'kubectl --kubeconfig="$KC" apply --dry-run=client \\\n'
-            '  -k clusters/dev/flux-system'
+            '  -k clusters/dev/flux-system/phase-a'
         )
         self.assertEqual(source.count(client_create), 1)
         path.write_text(
@@ -2180,7 +2655,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
                 "kubectl --kubeconfig=\"$KC\" apply --server-side \\\n"
                 "  --dry-run=server \\\n"
                 "  --field-manager=\"$FIELD_MANAGER\" \\\n"
-                "  -k clusters/dev/flux-system\n\n"
+                "  -k clusters/dev/flux-system/phase-a\n\n"
                 "render_flux_namespace |\n"
                 "  kubectl --kubeconfig=\"$KC\" apply --server-side \\\n"
                 "    --field-manager=\"$FIELD_MANAGER\" \\\n"
@@ -2411,7 +2886,9 @@ class FluxPhaseAContractTest(unittest.TestCase):
 
     def test_rejects_components_bundle_sha_drift(self) -> None:
         root, rendered_documents = self.make_root()
-        components = root / 'clusters/dev/flux-system/gotk-components.yaml'
+        components = (
+            root / 'clusters/dev/flux-system/phase-a/gotk-components.yaml'
+        )
         components.write_bytes(components.read_bytes() + b'\n# drift\n')
 
         self.assert_contract_fails(
@@ -2647,24 +3124,9 @@ class FluxPhaseAContractTest(unittest.TestCase):
                     root, rendered_documents, 'digest|image'
                 )
 
-    def test_rejects_yaml_document_in_inactive_sync_file(self) -> None:
-        root, rendered_documents = self.make_root()
-        sync = {
-            'apiVersion': 'source.toolkit.fluxcd.io/v1',
-            'kind': 'GitRepository',
-            'metadata': {'name': 'flux-system', 'namespace': 'flux-system'},
-        }
-        (root / 'clusters/dev/flux-system/gotk-sync.yaml').write_text(
-            yaml.safe_dump(sync, sort_keys=False), encoding='utf-8'
-        )
-
-        self.assert_contract_fails(
-            root, rendered_documents, 'gotk-sync|YAML|document|sync'
-        )
-
     def test_rejects_active_sync_reference(self) -> None:
         root, rendered_documents = self.make_root()
-        flux = root / 'clusters/dev/flux-system'
+        flux = root / 'clusters/dev/flux-system/phase-a'
         kustomization = yaml.safe_load(
             (flux / 'kustomization.yaml').read_text(encoding='utf-8')
         )
@@ -2686,7 +3148,7 @@ class FluxPhaseAContractTest(unittest.TestCase):
         for missing in required:
             with self.subTest(missing=missing):
                 root, rendered_documents = self.make_root()
-                path = root / 'clusters/dev/flux-system/kustomization.yaml'
+                path = root / 'clusters/dev/flux-system/phase-a/kustomization.yaml'
                 kustomization = yaml.safe_load(path.read_text(encoding='utf-8'))
                 kustomization['resources'].remove(missing)
                 path.write_text(
@@ -2727,17 +3189,6 @@ class FluxPhaseAContractTest(unittest.TestCase):
                     rendered_documents,
                     'Flux CR|custom resource|sync|Phase A',
                 )
-
-    def test_rejects_downstream_root_reference(self) -> None:
-        root, rendered_documents = self.make_root()
-        path = root / 'clusters/dev/kustomization.yaml'
-        kustomization = yaml.safe_load(path.read_text(encoding='utf-8'))
-        kustomization['resources'].append('infrastructure.yaml')
-        path.write_text(
-            yaml.safe_dump(kustomization, sort_keys=False), encoding='utf-8'
-        )
-
-        self.assert_contract_fails(root, rendered_documents, 'resources|活动根')
 
     def test_rejects_downstream_namespace(self) -> None:
         for name in (

@@ -1,0 +1,16 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-approved-git-egress
+  namespace: flux-system
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:app.kubernetes.io/component: source-controller
+  egress:
+    - toFQDNs:
+        - matchName: github.com
+      toPorts:
+        - ports:
+            - port: '443'
+              protocol: TCP

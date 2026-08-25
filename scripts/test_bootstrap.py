@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -37,6 +38,12 @@ STAGE_SCRIPTS = {
     '60': 'scripts/bootstrap/stages/60-install-cilium/run.sh',
     '90': 'scripts/bootstrap/stages/90-verify/run.sh',
     '100': 'scripts/bootstrap/stages/100-flux-phase-a/run.sh',
+    '110': 'scripts/bootstrap/stages/110-flux-sync/run.sh',
+    '120': 'scripts/bootstrap/stages/120-platform-core/run.sh',
+    '130': 'scripts/bootstrap/stages/130-platform-database/run.sh',
+    '140': 'scripts/bootstrap/stages/140-platform-migration/run.sh',
+    '150': 'scripts/bootstrap/stages/150-platform-apps/run.sh',
+    '160': 'scripts/bootstrap/stages/160-business-ready-evidence/run.sh',
 }
 PREFLIGHT = ROOT / STAGE_SCRIPTS['00']
 STAGE_ARTIFACTS = ROOT / STAGE_SCRIPTS['10']
@@ -622,7 +629,10 @@ class CommonLibraryTest(BootstrapTestCase):
         """
         self.assertEqual(
             sorted(STAGE_SCRIPTS, key=int),
-            ['00', '10', '20', '30', '40', '50', '60', '90', '100'],
+            [
+                '00', '10', '20', '30', '40', '50', '60', '90', '100',
+                '110', '120', '130', '140', '150', '160',
+            ],
         )
         for number in STAGE_SCRIPTS:
             with self.subTest(stage=number):
@@ -680,14 +690,18 @@ class CommonLibraryTest(BootstrapTestCase):
 
         # 走表而非通配：迁移后 `[0-9]*.sh` 只剩尚未迁移的那几个，枚举会静默变少。
         stages = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stages), 9, [str(s) for s in stages])
+        self.assertEqual(len(stages), 15, [str(s) for s in stages])
         for stage in stages:
             with self.subTest(stage=stage.name):
                 body = stage.read_text(encoding='utf-8')
                 for declaration in ('host_path()', 'complete()'):
                     self.assertNotIn(declaration + ' {', body, declaration)
+                expected_library = (
+                    'business-ready.sh' if int(stage.parent.name.split('-', 1)[0]) >= 110
+                    else 'common.sh'
+                )
                 self.assertRegex(
-                    body, self.library_source_pattern('common.sh')
+                    body, self.library_source_pattern(expected_library)
                 )
                 # 内联版本独有的硬编码字段不得残留在任何 stage 里。
                 self.assertNotIn("printf 'EVIDENCE=NONE\\n", body)
@@ -1846,9 +1860,48 @@ class StageReadmeTest(BootstrapTestCase):
             (ROOT / path).parent for path in STAGE_SCRIPTS.values()
         )
 
+    def actual_stop_reasons(self, directory: Path) -> list[str]:
+        if int(directory.name.split('-', 1)[0]) < 110:
+            source = (directory / 'run.sh').read_text(encoding='utf-8')
+            return sorted(set(self.REASON.findall(source)))
+
+        source = (
+            ROOT / 'scripts/bootstrap/lib/business-ready.sh'
+        ).read_text(encoding='utf-8')
+
+        def function_source(name: str) -> str:
+            match = re.search(
+                rf'^{re.escape(name)}\(\) \{{.*?'
+                r'(?=^[a-zA-Z0-9_]+\(\) \{|\Z)',
+                source,
+                re.M | re.S,
+            )
+            self.assertIsNotNone(match, name)
+            return match.group(0)
+
+        stage = directory.name.split('-', 1)[0]
+        relevant = ''.join(
+            (
+                function_source('business_initialize'),
+                function_source(f'business_stage_{stage}_check'),
+                function_source(f'business_stage_{stage}_apply'),
+            )
+        )
+        reasons = set(self.REASON.findall(relevant))
+        if stage == '120':
+            reasons.update(
+                {
+                    'infrastructure-foundation-not-ready',
+                    'cert-manager-controller-not-ready',
+                    'cert-manager-config-not-ready',
+                    'cnpg-controller-not-ready',
+                }
+            )
+        return sorted(reasons)
+
     def test_every_stage_has_a_readme(self) -> None:
         directories = self.stage_dirs()
-        self.assertEqual(len(directories), 9, [str(d) for d in directories])
+        self.assertEqual(len(directories), len(STAGE_SCRIPTS), [str(d) for d in directories])
         for directory in directories:
             with self.subTest(stage=directory.name):
                 readme = directory / 'README.md'
@@ -1861,10 +1914,7 @@ class StageReadmeTest(BootstrapTestCase):
         """列出的 REASON 必须与 run.sh 能发出的字面量集合完全一致，多一个少一个都红。"""
         for directory in self.stage_dirs():
             with self.subTest(stage=directory.name):
-                run = directory / 'run.sh'
-                actual = sorted(set(self.REASON.findall(
-                    run.read_text(encoding='utf-8')
-                )))
+                actual = self.actual_stop_reasons(directory)
                 listed = sorted(re.findall(
                     r'^- `([a-z0-9-]+)`$',
                     (directory / 'README.md').read_text(encoding='utf-8'),
@@ -3587,6 +3637,30 @@ class BootstrapOrchestratorMixin:
                 check_result=PASS_FLUX_PHASE_A_CHECK
                 apply_result=PASS_FLUX_PHASE_A_INSTALLED
                 ;;
+              110)
+                check_result=PASS_FLUX_SYNC_CHECK
+                apply_result=PASS_FLUX_SYNC_ENABLED
+                ;;
+              120)
+                check_result=PASS_PLATFORM_CORE_CHECK
+                apply_result=PASS_PLATFORM_CORE_READY
+                ;;
+              130)
+                check_result=PASS_PLATFORM_DATABASE_CHECK
+                apply_result=PASS_PLATFORM_DATABASE_READY
+                ;;
+              140)
+                check_result=PASS_PLATFORM_MIGRATION_CHECK
+                apply_result=PASS_PLATFORM_MIGRATION_COMPLETE
+                ;;
+              150)
+                check_result=PASS_PLATFORM_APPS_CHECK
+                apply_result=PASS_PLATFORM_APPS_READY
+                ;;
+              160)
+                check_result=PASS_BUSINESS_READY_EVIDENCE_CHECK
+                apply_result=PASS_BUSINESS_READY
+                ;;
               *) exit 30 ;;
             esac
 
@@ -3786,9 +3860,21 @@ class BootstrapOrchestratorMixin:
             ),
             (
                 ('10', '20', '30', '40', '50', '60', '100'),
-                'PASS_BOOTSTRAP_ALL_CHECK',
-                'NONE',
+                'PASS_BOOTSTRAP_CHECK',
+                '110',
             ),
+            (('10', '20', '30', '40', '50', '60', '100', '110'),
+             'PASS_BOOTSTRAP_CHECK', '120'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120'),
+             'PASS_BOOTSTRAP_CHECK', '130'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130'),
+             'PASS_BOOTSTRAP_CHECK', '140'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140'),
+             'PASS_BOOTSTRAP_CHECK', '150'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150'),
+             'PASS_BOOTSTRAP_CHECK', '160'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150', '160'),
+             'PASS_BOOTSTRAP_ALL_CHECK', 'NONE'),
         )
         for completed, expected_result, expected_next in cases:
             with self.subTest(completed=completed):
@@ -3801,7 +3887,10 @@ class BootstrapOrchestratorMixin:
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'RESULT={expected_result}', result.stdout)
                 self.assertIn(f'NEXT_STAGE={expected_next}', result.stdout)
-                expected_checks = ['00', '10', '20', '30', '40', '50', '60', '90', '100']
+                expected_checks = [
+                    '00', '10', '20', '30', '40', '50', '60', '90', '100',
+                    '110', '120', '130', '140', '150', '160',
+                ]
                 if expected_next != 'NONE':
                     expected_checks = expected_checks[
                         :expected_checks.index(expected_next) + 1
@@ -3812,7 +3901,10 @@ class BootstrapOrchestratorMixin:
                 )
 
     def test_apply_on_fully_complete_state_performs_no_stage_apply(self) -> None:
-        for stage in ('10', '20', '30', '40', '50', '60', '100'):
+        for stage in (
+            '10', '20', '30', '40', '50', '60', '100',
+            '110', '120', '130', '140', '150', '160',
+        ):
             (self.state_dir / stage).touch()
 
         result = self.run_orchestrator('--apply')
@@ -3825,7 +3917,10 @@ class BootstrapOrchestratorMixin:
             lines,
             [
                 f'{stage} --check'
-                for stage in ('00', '10', '20', '30', '40', '50', '60', '90', '100')
+                for stage in (
+                    '00', '10', '20', '30', '40', '50', '60', '90', '100',
+                    '110', '120', '130', '140', '150', '160',
+                )
             ],
         )
         self.assertTrue(all('--apply' not in line for line in lines))
@@ -3841,9 +3936,11 @@ class BootstrapOrchestratorMixin:
         self.assertIn('STAGE_100_RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
         self.assertIn('STAGE_100_RESULT=PASS_FLUX_PHASE_A_INSTALLED', result.stdout)
         self.assertIn('STAGE_100_RESULT=ALREADY_COMPLIANT', result.stdout)
+        log_lines = self.command_log.read_text(encoding='utf-8').splitlines()
+        flux_index = log_lines.index('100 --check')
         self.assertEqual(
-            self.command_log.read_text(encoding='utf-8').splitlines()[-4:],
-            ['90 --check', '100 --check', '100 --apply', '100 --check'],
+            log_lines[flux_index:flux_index + 4],
+            ['100 --check', '100 --apply', '100 --check', '110 --check'],
         )
 
     def test_apply_resumes_at_40_and_reaches_final_verify(self) -> None:
@@ -3854,12 +3951,12 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('RESULT=PASS_BOOTSTRAP_ALL', result.stdout)
-        log = self.command_log.read_text(encoding='utf-8')
-        self.assertNotIn('10 --apply', log)
-        self.assertNotIn('20 --apply', log)
-        self.assertNotIn('30 --apply', log)
-        self.assertIn('40 --apply', log)
-        self.assertIn('90 --check', log)
+        log_lines = self.command_log.read_text(encoding='utf-8').splitlines()
+        self.assertNotIn('10 --apply', log_lines)
+        self.assertNotIn('20 --apply', log_lines)
+        self.assertNotIn('30 --apply', log_lines)
+        self.assertIn('40 --apply', log_lines)
+        self.assertIn('90 --check', log_lines)
 
     def test_nonzero_stage_exit_is_preserved(self) -> None:
         self.environment['FAKE_STAGE_STOP'] = '40:20'
@@ -3907,19 +4004,20 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in (
-            '[1/9] stage 00 check ...',
-            '[1/9] stage 00 check -> PASS_PREFLIGHT',
-            '[5/9] stage 40 check -> PASS_KUBERNETES_CHECK',
-            '[5/9] stage 40 apply ...',
-            '[5/9] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
-            '[5/9] stage 40 postcheck -> ALREADY_COMPLIANT',
-            '[8/9] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
-            '[9/9] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
+            '[1/15] stage 00 check ...',
+            '[1/15] stage 00 check -> PASS_PREFLIGHT',
+            '[5/15] stage 40 check -> PASS_KUBERNETES_CHECK',
+            '[5/15] stage 40 apply ...',
+            '[5/15] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
+            '[5/15] stage 40 postcheck -> ALREADY_COMPLIANT',
+            '[8/15] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
+            '[9/15] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
+            '[15/15] stage 160 check -> PASS_BUSINESS_READY_EVIDENCE_CHECK',
         ):
             self.assertIn(line, result.stderr)
         # 进度行一旦漏进 stdout，下游解析与既有逐字段断言都会被打乱。
-        for index in range(1, 10):
-            self.assertNotIn(f'[{index}/9]', result.stdout)
+        for index in range(1, 16):
+            self.assertNotIn(f'[{index}/15]', result.stdout)
         # 进度行只回显编排器自己掌握的事实，不含 stage 自由文本与终端控制序列。
         self.assertNotIn(self.canary, result.stdout + result.stderr)
         self.assertNotIn('\x1b', result.stdout + result.stderr)
@@ -3937,18 +4035,18 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(
-            result.stderr, r'\[5/9\] stage 40 check \.\.\. \d+s elapsed'
+            result.stderr, r'\[5/15\] stage 40 check \.\.\. \d+s elapsed'
         )
         # 结束行带累计耗时，事后也能看出哪个 stage 慢。
         self.assertRegex(
             result.stderr,
-            r'\[5/9\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
+            r'\[5/15\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
         )
         # 心跳必须随 stage 结束而停。没被 kill 掉的话它会变成孤儿，一路刷进
         # 后续 stage——行数会远超该 stage 的实际时长。这条才是真正的区分点：
         # 「有心跳」很容易，「心跳能停」才是并发代码的难处。
         beats = re.findall(
-            r'\[5/9\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/15\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertTrue(beats)
         self.assertLessEqual(len(beats), 6, result.stderr)
@@ -3971,7 +4069,7 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         beats = re.findall(
-            r'\[5/9\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/15\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertEqual(beats, ['5'], result.stderr)
 
@@ -4095,7 +4193,10 @@ class BootstrapOrchestratorMixin:
         self.assertTrue(self.lock_file.is_symlink())
 
     def test_check_all_complete_reaches_final_verify(self) -> None:
-        for stage in ('10', '20', '30', '40', '50', '60', '100'):
+        for stage in (
+            '10', '20', '30', '40', '50', '60', '100', '110', '120',
+            '130', '140', '150', '160',
+        ):
             (self.state_dir / stage).touch()
 
         result = self.run_orchestrator('--check')
@@ -4103,7 +4204,16 @@ class BootstrapOrchestratorMixin:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('RESULT=PASS_BOOTSTRAP_ALL_CHECK', result.stdout)
         commands = self.command_log.read_text(encoding='utf-8').splitlines()
-        self.assertEqual(commands[-2:], ['90 --check', '100 --check'])
+        self.assertEqual(
+            commands,
+            [
+                f'{stage} --check'
+                for stage in (
+                    '00', '10', '20', '30', '40', '50', '60', '90', '100',
+                    '110', '120', '130', '140', '150', '160',
+                )
+            ],
+        )
 
     def test_summary_is_structured_and_does_not_leak_untrusted_next(self) -> None:
         self.environment['FAKE_STAGE_NEXT'] = self.canary
@@ -4385,8 +4495,8 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                     )
             elif command == [
                 'get', 'namespace', 'platform', 'openbao', 'cert-manager',
-                'monitoring', 'cnpg-system', 'minio', '--ignore-not-found',
-                '--output=name',
+                'monitoring', 'cnpg-system', 'minio', 'local-path-storage',
+                '--ignore-not-found', '--output=name',
             ]:
                 if current_state() == 'DOWNSTREAM':
                     sys.stdout.write('namespace/platform\n')
@@ -4613,7 +4723,7 @@ class FluxPhaseAStageTest(BootstrapTestCase):
             FAKE_COMMAND_LOG=str(command_log),
             FAKE_ADMIN_CONF_CONTENT=self.canary + '\n',
             FAKE_ADMIN_VIEW_JSON=json.dumps(self.admin_config_object()),
-            FAKE_DESIRED_ROOT=str(ROOT / 'clusters/dev/flux-system'),
+            FAKE_DESIRED_ROOT=str(ROOT / 'clusters/dev/flux-system/phase-a'),
             FAKE_RENDERED=str(rendered),
             FAKE_STATE_FILE=str(state_file),
             FAKE_INTERNAL_PROBE=str(
@@ -5226,7 +5336,7 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         # 表本身与编排器 stage_path() 的一致性由
         # CommonLibraryTest.test_stage_paths_come_from_one_table 交叉校验。
         stage_scripts = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stage_scripts), 9, [str(s) for s in stage_scripts])
+        self.assertEqual(len(stage_scripts), 15, [str(s) for s in stage_scripts])
         for script in stage_scripts:
             self.assertTrue(script.is_file(), script)
         sourced: set[str] = set()
@@ -5255,6 +5365,156 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         self.assertTrue(
             library_sourced, '放宽后的断言需要真实的跨 lib 依赖来喂，否则空转'
         )
+
+
+class BusinessReadyStageTest(BootstrapTestCase):
+    """Stages 110-160 keep the business-ready boundary fail closed."""
+
+    BUSINESS_STAGES = ('110', '120', '130', '140', '150', '160')
+
+    def setUp(self) -> None:
+        self.library = ROOT / 'scripts/bootstrap/lib/business-ready.sh'
+        self.source = self.library.read_text(encoding='utf-8')
+
+    def test_orchestrator_has_exact_business_ready_order_and_results(self) -> None:
+        orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        self.assertIn(
+            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160)',
+            orchestrator,
+        )
+        contracts = {
+            '110': ('PASS_FLUX_SYNC_CHECK', 'PASS_FLUX_SYNC_ENABLED'),
+            '120': ('PASS_PLATFORM_CORE_CHECK', 'PASS_PLATFORM_CORE_READY'),
+            '130': ('PASS_PLATFORM_DATABASE_CHECK', 'PASS_PLATFORM_DATABASE_READY'),
+            '140': ('PASS_PLATFORM_MIGRATION_CHECK', 'PASS_PLATFORM_MIGRATION_COMPLETE'),
+            '150': ('PASS_PLATFORM_APPS_CHECK', 'PASS_PLATFORM_APPS_READY'),
+            '160': ('PASS_BUSINESS_READY_EVIDENCE_CHECK', 'PASS_BUSINESS_READY'),
+        }
+        for stage, results in contracts.items():
+            with self.subTest(stage=stage):
+                self.assertIn(f'{stage}:{results[0]}', orchestrator)
+                self.assertIn(f'{stage}:{results[1]}', orchestrator)
+
+    def test_stage_wrappers_are_executable_and_delegate_to_gated_library(self) -> None:
+        for stage in self.BUSINESS_STAGES:
+            with self.subTest(stage=stage):
+                path = self.stage_script(stage)
+                self.assertTrue(path.is_file() and os.access(path, os.X_OK), path)
+                body = path.read_text(encoding='utf-8')
+                self.assertIn('source "${bootstrap_dir}/lib/business-ready.sh"', body)
+                self.assertIn(f'readonly BUSINESS_STAGE={stage}', body)
+                self.assertNotIn('set -x', body)
+
+    def test_phase_a_base_is_separate_from_sync_and_business_state(self) -> None:
+        stage_100 = self.stage_text('100')
+        self.assertIn(
+            'readonly DESIRED_ROOT="${repo_root}/clusters/dev/flux-system/phase-a"',
+            stage_100,
+        )
+        self.assertIn('EXPECTED_BUSINESS_NAMESPACES=', stage_100)
+        self.assertIn('EXPECTED_BUSINESS_SYNC=', stage_100)
+        self.assertIn('gotk-sync.yaml', self.source)
+        self.assertIn('phase-b-network-policy.yaml', self.source)
+
+    def test_secret_stage_never_uses_value_output_or_overwrite_primitives(self) -> None:
+        forbidden = (
+            'set -x',
+            '--from-literal=password=',
+            'kubectl_run --namespace=platform get secret --output=yaml',
+            'log_evidence "$token',
+            'log_evidence "$password',
+            'envFrom',
+            '--force-conflicts',
+        )
+        for token in forbidden:
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.source)
+        for required in (
+            '/root/.config/engineering-platform',
+            'ghcr-read-token',
+            'safe_file "$file" 600',
+            '--from-file="password=${password_file}"',
+            'business_extract_basic_auth_secret',
+            'business_secret_inventory_state',
+            'SECRET_VALUES=NOT_RECORDED',
+        ):
+            self.assertIn(required, self.source)
+
+    def test_database_secret_names_match_the_cnpg_contract(self) -> None:
+        command = (
+            f'source {shlex.quote(str(self.library))}; '
+            'business_secret_contracts'
+        )
+        result = subprocess.run(
+            ['/bin/bash', '-c', command],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines()[:7],
+            [
+                'platform-owner|kubernetes.io/basic-auth|username,password',
+                'platform-audit-rw|kubernetes.io/basic-auth|username,password',
+                'platform-authorization-rw|kubernetes.io/basic-auth|username,password',
+                'platform-configuration-rw|kubernetes.io/basic-auth|username,password',
+                'platform-identity-rw|kubernetes.io/basic-auth|username,password',
+                'platform-organization-rw|kubernetes.io/basic-auth|username,password',
+                'platform-workspace-rw|kubernetes.io/basic-auth|username,password',
+            ],
+        )
+
+    def test_database_password_generation_has_no_trailing_newline(self) -> None:
+        self.assertIn(
+            '"$BUSINESS_OPENSSL_BINARY" rand -hex 32 | head -c 64 >"$password_path"',
+            self.source,
+        )
+
+    def test_https_smoke_uses_gateway_status_and_the_issued_certificate(self) -> None:
+        for required in (
+            'business_gateway_address',
+            'gateway.gateway.networking.k8s.io',
+            'platform-gateway Programmed',
+            '--cacert "$ca_file"',
+            '--connect-to "$connect_to"',
+            'https://platform.dev.local/api/v1/me',
+            '[[ "$http_status" == 401 ]]',
+        ):
+            self.assertIn(required, self.source)
+        self.assertNotIn(
+            '--resolve platform.dev.local:443:127.0.0.1',
+            self.source,
+        )
+
+    def test_checks_replay_live_smoke_before_claiming_compliance_or_evidence(self) -> None:
+        stage_150 = self.source[
+            self.source.index('business_stage_150_check()'):
+            self.source.index('business_stage_150_apply()')
+        ]
+        stage_160 = self.source[
+            self.source.index('business_stage_160_check()'):
+            self.source.index('business_stage_main()')
+        ]
+        self.assertIn('business_https_smoke', stage_150)
+        self.assertGreaterEqual(stage_160.count('business_https_smoke'), 2)
+
+    def test_excluded_systems_are_only_recorded_as_not_executed(self) -> None:
+        for value in ('OPENBAO', 'MINIO', 'BACKUPS', 'RESTORE', 'OBSERVABILITY'):
+            self.assertIn(f"log_evidence '{value}=NOT_EXECUTED'", self.source)
+        self.assertNotIn('kubectl_run apply -k infrastructure/openbao', self.source)
+        self.assertNotIn('kubectl_run apply -k infrastructure/minio', self.source)
+        self.assertNotIn('ScheduledBackup', self.source)
+        self.assertNotIn('ObjectStore', self.source)
+
+    def test_final_evidence_is_mode_600_with_sha256_sidecar(self) -> None:
+        for required in (
+            'open_evidence 16-business-ready',
+            'chmod 600 "$sidecar"',
+            'sha256_file "$EVIDENCE_FILE"',
+            '16-business-ready-*.txt',
+        ):
+            self.assertIn(required, self.source)
 
 
 class ArtifactStageTest(BootstrapTestCase):

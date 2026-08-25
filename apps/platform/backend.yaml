@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: engineering-platform
+    app.kubernetes.io/version: 4aaf721
+  name: backend
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/part-of: engineering-platform
+        app.kubernetes.io/version: 4aaf721
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        fsGroup: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: backend
+      containers:
+        - image: ghcr.io/unif-code/engineering-platform-backend@sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857
+          imagePullPolicy: IfNotPresent
+          name: backend
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            limits:
+              cpu: '1'
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 999
+            runAsNonRoot: true
+            runAsUser: 999
+          volumeMounts:
+            - mountPath: /app/.env
+              name: runtime-config
+              readOnly: true
+              subPath: .env
+            - mountPath: /var/run/secrets/engineering-platform/pepper
+              name: password-pepper
+              readOnly: true
+              subPath: pepper
+            - mountPath: /var/run/secrets/engineering-platform/totp_key
+              name: totp-key
+              readOnly: true
+              subPath: totp_key
+            - mountPath: /var/run/secrets/engineering-platform/idempotency_key
+              name: idempotency-key
+              readOnly: true
+              subPath: idempotency_key
+            - mountPath: /tmp
+              name: tmp
+      volumes:
+        - name: runtime-config
+          secret:
+            defaultMode: 288
+            secretName: backend-runtime-config
+        - name: password-pepper
+          secret:
+            defaultMode: 288
+            secretName: backend-password-pepper
+        - name: totp-key
+          secret:
+            defaultMode: 288
+            secretName: backend-totp-key
+        - name: idempotency-key
+          secret:
+            defaultMode: 288
+            secretName: backend-idempotency-key
+        - emptyDir: {}
+          name: tmp

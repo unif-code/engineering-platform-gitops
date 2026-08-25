@@ -1,4 +1,28 @@
-# STATUS: BLOCKED
-# ACTIVE: false
-# REASON: Flux GitRepository 与同步 Kustomization 尚未由锁定版本生成
-# ACTIVATION_GATES: bootstrap 最终验证、只读 deploy key 与受保护 main 同步配置审阅通过
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 1m
+  ref:
+    branch: validated
+  timeout: 60s
+  url: https://github.com/unif-code/engineering-platform-gitops.git
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./clusters/dev
+  prune: true
+  retryInterval: 1m
+  serviceAccountName: flux-root-reconciler
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  timeout: 10m
+  wait: true

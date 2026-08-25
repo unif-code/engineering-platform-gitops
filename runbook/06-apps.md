@@ -1,10 +1,13 @@
 # Gateway 应用 Smoke
 
-> 当前状态：`BLOCKED`。集群没有 platform Namespace、migration Job、frontend/backend Deployment 或 Gateway Route。
+> 当前状态：`BLOCKED`。仓库已形成 business-ready 候选 Desired State，但尚未取得合并 SHA、
+> `validation-gate` 与 Stage 160 运行证据；不得把候选清单表述为已部署。
 
 | 字段 | 值 |
 | --- | --- |
-| GitOps commit / PR | 未执行应用 Desired State |
+| GitOps commit / PR | business-ready 候选待合并；运行 `NOT_EXECUTED` |
+| frontend Source Commit | `da72238abc87a19c07a5cac96e41d88d5f6bf2d3` |
+| frontend linux/amd64 digest | `sha256:21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c`（候选锁定，未部署） |
 | backend Source Commit | `4aaf721fa91abd729b33765e4e329b02aa2ece02` |
 | backend digest | `sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857`（可用输入，未部署） |
 | 执行状态 | `NOT_EXECUTED` |
@@ -69,8 +72,20 @@ CI run `32683635240` 与 publish-image job `97305929974` 均 `success`，发布 
 | Migration | `NOT_EXECUTED` |
 | Account initialization | `NOT_EXECUTED` |
 
-当前批准计划尚未进入 backend 部署阶段；本节只登记可用输入，不授权创建 Deployment、
-执行 migration、健康检查、运行 readback 或账号初始化。临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
+business-ready 候选已经把该 digest 锁定到 migration/backend 清单，但 Git 合并、CI 与运行
+Stage 110–160 尚未完成，因此 Deployment、migration、健康检查、运行 readback 和账号初始化
+仍全部 `NOT_EXECUTED`。服务器必须预先以 root-owned、mode `0600` 文件提供
+`/root/.config/engineering-platform/ghcr-username` 与 `ghcr-read-token`；只允许检查 metadata，
+不得输出内容。账号初始化继续使用独立受控交互命令；临时密码只允许当前 TTY 一次显示，
+不得写入 Git、聊天、日志或长期证据。
+临时密码只允许在受控初始化输出中一次性显示，不得写入 Git、日志或长期证据。
+
+## 候选运行边界
+
+Stage 150/160 只执行非变更性 HTTPS smoke：`GET /`、`GET /healthz`、`GET /readyz` 目标为
+`200`，未认证 `GET /api/v1/me` 目标为 `401`。它从 Gateway status 读取唯一地址，用公开
+`tls.crt` 验证 `platform.dev.local`，不记录响应正文、Cookie、Token 或 Secret。Stage 160
+成功后才允许把下表运行状态从 `NOT_EXECUTED` 更新为实际结果；账号登录验证仍需单独流程。
 
 ## 2026-08-22 frontend 历史证据
 

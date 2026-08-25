@@ -1,0 +1,20 @@
+crds:
+  create: true
+image:
+  pullPolicy: IfNotPresent
+  tag: 1.30.0
+monitoring:
+  podMonitorEnabled: false
+replicaCount: 1
+resources:
+  limits:
+    cpu: 300m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 128Mi
+updateStrategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
