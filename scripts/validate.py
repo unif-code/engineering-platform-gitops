@@ -262,8 +262,11 @@ FLUX_PHASE_A_RESOURCES = (
 FLUX_PHASE_A_COMPONENTS_SHA256 = (
     'c6e84495c3b611978d053adc40aca1e2a12af38f6e239c44a6b6c1224e01cab7'
 )
-FLUX_PHASE_A_RENDERED_SHA256 = (
+FLUX_PHASE_A_CANONICAL_RENDERED_SHA256 = (
     '77244b8af4c1d4f584e132c843f927035731f559e1b8bc583f2247f891647efc'
+)
+FLUX_PHASE_A_RAW_RENDERED_SHA256 = (
+    '1a82990f5b4a84bc52692a84871a04ebbda4cc02fb1e72e4283d6f320f4f4994'
 )
 FLUX_PHASE_A_ROLLOUT_STRATEGY = {
     'rollingUpdate': {'maxSurge': 1, 'maxUnavailable': 0},
@@ -2897,11 +2900,12 @@ def validate_flux_phase_a(root: Path = ROOT) -> None:
         separators=(',', ':'),
         sort_keys=True,
     ).encode('utf-8')
-    rendered_sha256 = hashlib.sha256(canonical_payload).hexdigest()
-    if rendered_sha256 != FLUX_PHASE_A_RENDERED_SHA256:
+    canonical_rendered_sha256 = hashlib.sha256(canonical_payload).hexdigest()
+    if canonical_rendered_sha256 != FLUX_PHASE_A_CANONICAL_RENDERED_SHA256:
         fail(
             'Flux Phase A rendered bundle canonical SHA-256 漂移：'
-            f'期望 {FLUX_PHASE_A_RENDERED_SHA256}，实测 {rendered_sha256}'
+            f'期望 {FLUX_PHASE_A_CANONICAL_RENDERED_SHA256}，'
+            f'实测 {canonical_rendered_sha256}'
         )
 
 
@@ -3219,13 +3223,24 @@ def validate_kustomize_builds() -> None:
             cwd=ROOT,
             capture_output=True,
             check=False,
-            text=True,
         )
         if result.returncode != 0:
+            diagnostic = (result.stderr or result.stdout).decode(
+                'utf-8', errors='replace'
+            )
             fail(
                 f'{path.parent.relative_to(ROOT)} 无法渲染：'
-                f'{result.stderr.strip() or result.stdout.strip()}'
+                f'{diagnostic.strip()}'
             )
+        relative_directory = path.parent.relative_to(ROOT).as_posix()
+        if relative_directory == 'clusters/dev/flux-system':
+            raw_rendered_sha256 = hashlib.sha256(result.stdout).hexdigest()
+            if raw_rendered_sha256 != FLUX_PHASE_A_RAW_RENDERED_SHA256:
+                fail(
+                    'Flux Phase A rendered bundle raw SHA-256 漂移：'
+                    f'期望 {FLUX_PHASE_A_RAW_RENDERED_SHA256}，'
+                    f'实测 {raw_rendered_sha256}'
+                )
 
 
 def scalar_strings(

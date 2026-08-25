@@ -4594,7 +4594,7 @@ class FluxPhaseAStageTest(BootstrapTestCase):
             BOOTSTRAP_TEST_ROOT=str(host),
             BOOTSTRAP_TEST_HOSTS_DIR=str(hosts_root),
             BOOTSTRAP_TEST_RENDERED_FILE=str(rendered),
-            BOOTSTRAP_TEST_RENDERED_SHA256=hashlib.sha256(
+            BOOTSTRAP_TEST_RAW_RENDERED_SHA256=hashlib.sha256(
                 rendered.read_bytes()
             ).hexdigest(),
             BOOTSTRAP_TEST_FLUX_ARCHIVE_SHA256=hashlib.sha256(

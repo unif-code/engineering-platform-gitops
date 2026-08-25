@@ -65,7 +65,7 @@ if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
 fi
 readonly TAR_BINARY
 readonly DESIRED_ROOT="${repo_root}/clusters/dev/flux-system"
-readonly RENDERED_SHA256=77244b8af4c1d4f584e132c843f927035731f559e1b8bc583f2247f891647efc
+readonly RAW_RENDERED_SHA256=1a82990f5b4a84bc52692a84871a04ebbda4cc02fb1e72e4283d6f320f4f4994
 readonly FIELD_MANAGER=engineering-platform-flux-phase-a
 readonly FLUX_VERSION=2.9.3
 readonly FLUX_ARCHIVE_SHA256=eae4e8608c0ade2bf4e8dec1669dbb6b0c28b5822b252d97feccfb4fb1181fd2
@@ -174,10 +174,10 @@ fi
 capture_admin_conf ||
   complete STOP_UNKNOWN_STATE admin-conf-content-or-structure-drift "$EXIT_UNKNOWN_STATE" NONE
 
-expected_rendered_sha=$RENDERED_SHA256
+expected_raw_rendered_sha=$RAW_RENDERED_SHA256
 if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
-  expected_rendered_sha=${BOOTSTRAP_TEST_RENDERED_SHA256:-}
-  [[ "$expected_rendered_sha" =~ ^[0-9a-f]{64}$ ]] ||
+  expected_raw_rendered_sha=${BOOTSTRAP_TEST_RAW_RENDERED_SHA256:-}
+  [[ "$expected_raw_rendered_sha" =~ ^[0-9a-f]{64}$ ]] ||
     complete STOP_PRECONDITION test-rendered-sha256-unsafe "$EXIT_PRECONDITION" NONE
 fi
 rendered_sha=$(
@@ -189,7 +189,7 @@ rendered_sha=$(
     fi |
     awk '{print $1}'
 ) || complete STOP_SUPPLY_CHAIN_MISMATCH render-failed "$EXIT_SUPPLY_CHAIN" NONE
-[[ "$rendered_sha" == "$expected_rendered_sha" ]] ||
+[[ "$rendered_sha" == "$expected_raw_rendered_sha" ]] ||
   complete STOP_SUPPLY_CHAIN_MISMATCH rendered-bundle-digest-drift "$EXIT_SUPPLY_CHAIN" NONE
 kubectl_run apply --dry-run=client --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 ||
   complete STOP_VERIFY_FAILED client-dry-run-failed "$EXIT_VERIFY_FAILED" NONE
@@ -410,7 +410,7 @@ admin_conf_is_safe ||
 
 kubectl_run kustomize "$DESIRED_ROOT" >"$rendered_file" ||
   complete STOP_SUPPLY_CHAIN_MISMATCH render-raced "$EXIT_SUPPLY_CHAIN" NONE
-[[ "$(sha256_file "$rendered_file")" == "$expected_rendered_sha" ]] ||
+[[ "$(sha256_file "$rendered_file")" == "$expected_raw_rendered_sha" ]] ||
   complete STOP_SUPPLY_CHAIN_MISMATCH rendered-bundle-raced "$EXIT_SUPPLY_CHAIN" NONE
 awk 'NR == 1 && $0 == "---" {next} /^---$/ {exit} {print}' \
   "$rendered_file" >"$namespace_file" ||
@@ -549,7 +549,7 @@ evidence_dir=$(host_path /root/dev-infra-evidence)
 open_evidence 15-flux-phase-a "$evidence_dir" ||
   complete STOP_EVIDENCE evidence-open-failed "$EXIT_UNKNOWN_STATE" NONE
 log_evidence FLUX_VERSION=v2.9.3
-log_evidence RENDERED_SHA256="$expected_rendered_sha"
+log_evidence RAW_RENDERED_SHA256="$expected_raw_rendered_sha"
 log_evidence CONTROLLERS=source,kustomize,helm,notification
 log_evidence FLUX_CRD_COUNT=11
 log_evidence FLUX_CHECK=all-checks-passed
