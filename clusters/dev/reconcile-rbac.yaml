@@ -187,6 +187,8 @@ rules:
     resources:
       - configmaps
       - namespaces
+      - persistentvolumes
+      - pods
       - resourcequotas
       - serviceaccounts
     verbs:
@@ -196,6 +198,23 @@ rules:
       - list
       - patch
       - update
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - ''
+    resources:
+      - nodes
+      - persistentvolumeclaims
+      - pods/log
+    verbs:
+      - get
+      - list
       - watch
   - apiGroups:
       - apps
@@ -282,6 +301,7 @@ rules:
   - apiGroups:
       - ''
     resources:
+      - secrets
       - serviceaccounts
       - services
     verbs:
@@ -292,6 +312,54 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - ''
+    resources:
+      - pods
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - acme.cert-manager.io
+    resources:
+      - challenges
+      - orders
+    verbs:
+      - create
+      - delete
+      - deletecollection
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - acme.cert-manager.io
+    resources:
+      - challenges/status
+      - orders/status
+    verbs:
+      - patch
+      - update
+  - apiGroups:
+      - acme.cert-manager.io
+    resources:
+      - challenges/finalizers
+      - orders/finalizers
+    verbs:
+      - update
   - apiGroups:
       - apiextensions.k8s.io
     resources:
@@ -330,6 +398,22 @@ rules:
       - update
       - watch
   - apiGroups:
+      - apiregistration.k8s.io
+    resources:
+      - apiservices
+    verbs:
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - authorization.k8s.io
+    resources:
+      - subjectaccessreviews
+    verbs:
+      - create
+  - apiGroups:
       - batch
     resources:
       - jobs
@@ -341,6 +425,147 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - signers
+    resourceNames:
+      - clusterissuers.cert-manager.io/*
+      - issuers.cert-manager.io/*
+    verbs:
+      - approve
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificaterequests
+      - certificates
+      - issuers
+    verbs:
+      - create
+      - delete
+      - deletecollection
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - clusterissuers
+    verbs:
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificaterequests/status
+      - certificates/status
+      - clusterissuers/status
+      - issuers/status
+    verbs:
+      - patch
+      - update
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificaterequests/finalizers
+      - certificates/finalizers
+      - clusterissuers/finalizers
+      - issuers/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - certificates.k8s.io
+    resources:
+      - certificatesigningrequests
+    verbs:
+      - get
+      - list
+      - update
+      - watch
+  - apiGroups:
+      - certificates.k8s.io
+    resources:
+      - certificatesigningrequests/status
+    verbs:
+      - patch
+      - update
+  - apiGroups:
+      - certificates.k8s.io
+    resources:
+      - signers
+    resourceNames:
+      - clusterissuers.cert-manager.io/*
+      - issuers.cert-manager.io/*
+    verbs:
+      - sign
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    resourceNames:
+      - cert-manager-cainjector-leader-election
+      - cert-manager-cainjector-leader-election-core
+      - cert-manager-controller
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - httproutes
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - update
+      - watch
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - gateways
+      - listenersets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - gateways/finalizers
+      - httproutes/finalizers
+      - listenersets/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - update
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses/finalizers
+    verbs:
+      - update
   - apiGroups:
       - rbac.authorization.k8s.io
     resources:
@@ -356,6 +581,12 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - route.openshift.io
+    resources:
+      - routes/custom-host
+    verbs:
+      - create
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -410,6 +641,7 @@ rules:
       - ''
     resources:
       - configmaps
+      - secrets
       - serviceaccounts
       - services
     verbs:
@@ -420,6 +652,49 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - ''
+    resources:
+      - persistentvolumeclaims
+      - pods
+      - pods/exec
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - ''
+    resources:
+      - pods/status
+    verbs:
+      - get
+  - apiGroups:
+      - ''
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - configmaps/status
+      - secrets/status
+    verbs:
+      - get
+      - patch
+      - update
   - apiGroups:
       - apiextensions.k8s.io
     resources:
@@ -458,6 +733,113 @@ rules:
       - update
       - watch
   - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - watch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - get
+      - list
+      - update
+      - watch
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - monitoring.coreos.com
+    resources:
+      - podmonitors
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - watch
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - postgresql.cnpg.io
+    resources:
+      - backups
+      - clusterimagecatalogs
+      - clusters
+      - clusters/status
+      - databaseroles
+      - databases
+      - failoverquorums
+      - imagecatalogs
+      - poolers
+      - publications
+      - scheduledbackups
+      - subscriptions
+    verbs:
+      - create
+      - delete
+      - deletecollection
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - postgresql.cnpg.io
+    resources:
+      - backups/status
+      - databases/status
+      - publications/status
+      - scheduledbackups/status
+      - subscriptions/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - postgresql.cnpg.io
+    resources:
+      - databaseroles/status
+      - failoverquorums/status
+      - poolers/status
+    verbs:
+      - get
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - postgresql.cnpg.io
+    resources:
+      - clusters/finalizers
+      - databaseroles/finalizers
+      - poolers/finalizers
+    verbs:
+      - update
+  - apiGroups:
       - rbac.authorization.k8s.io
     resources:
       - clusterrolebindings
@@ -469,6 +851,28 @@ rules:
       - list
       - patch
       - update
+      - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - rolebindings
+      - roles
+    verbs:
+      - create
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - snapshot.storage.k8s.io
+    resources:
+      - volumesnapshots
+    verbs:
+      - create
+      - get
+      - list
+      - patch
       - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1

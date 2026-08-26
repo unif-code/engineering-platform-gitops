@@ -2146,22 +2146,54 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
             'apps': ('Role', 'platform', 'flux-platform-app-reconciler'),
         }
         full_verbs = {'create', 'delete', 'get', 'list', 'patch', 'update', 'watch'}
+
+        def permission_atoms(
+            rules: object,
+        ) -> set[tuple[str, str, str, tuple[str, ...] | None]]:
+            self.assertIsInstance(rules, list)
+            scopes: dict[tuple[str, str, str], set[str] | None] = {}
+            for rule in rules:
+                self.assertIsInstance(rule, dict)
+                self.assertNotIn('nonResourceURLs', rule)
+                resource_names = rule.get('resourceNames', [])
+                names = (
+                    {str(name) for name in resource_names}
+                    if resource_names
+                    else None
+                )
+                for api_group in rule.get('apiGroups', []):
+                    for resource in rule.get('resources', []):
+                        for verb in rule.get('verbs', []):
+                            key = (str(api_group), str(resource), str(verb))
+                            if names is None:
+                                scopes[key] = None
+                            elif key not in scopes:
+                                scopes[key] = set(names)
+                            elif scopes[key] is not None:
+                                scopes[key].update(names)
+            return {
+                (*key, None if names is None else tuple(sorted(names)))
+                for key, names in scopes.items()
+            }
+
         for root, (kind, namespace, name) in assignments.items():
             with self.subTest(root=root):
                 role = self.find('rbac.authorization.k8s.io/v1', kind, namespace, name)
-                granted = set()
-                for rule in role.get('rules', []):
-                    self.assertEqual(set(rule.get('verbs', [])), full_verbs)
-                    for api_group in rule.get('apiGroups', []):
-                        for resource in rule.get('resources', []):
-                            granted.add((api_group, resource))
-                expected = set()
+                granted = permission_atoms(role.get('rules', []))
+                expected_rules: list[dict[str, object]] = []
                 for document in self.RENDERED_BY_ROOT[root]:
                     api_version = str(document.get('apiVersion', ''))
                     api_group = '' if api_version == 'v1' else api_version.split('/', 1)[0]
                     resource = kind_resources.get(str(document.get('kind', '')))
                     self.assertIsNotNone(resource, self.identity(document))
-                    expected.add((api_group, resource))
+                    expected_rules.append({
+                        'apiGroups': [api_group],
+                        'resources': [str(resource)],
+                        'verbs': sorted(full_verbs),
+                    })
+                    if document.get('kind') in {'Role', 'ClusterRole'}:
+                        expected_rules.extend(document.get('rules', []))
+                expected = permission_atoms(expected_rules)
                 self.assertEqual(granted, expected)
 
     def test_vendored_charts_render_to_digest_pinned_manifests(self) -> None:
