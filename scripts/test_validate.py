@@ -1875,6 +1875,28 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
                 },
                 'egress': [
                     {
+                        'toEndpoints': [
+                            {
+                                'matchLabels': {
+                                    'k8s:io.kubernetes.pod.namespace': (
+                                        'kube-system'
+                                    ),
+                                    'k8s:k8s-app': 'kube-dns',
+                                }
+                            }
+                        ],
+                        'toPorts': [
+                            {
+                                'ports': [
+                                    {'port': '53', 'protocol': 'ANY'}
+                                ],
+                                'rules': {
+                                    'dns': [{'matchPattern': '*'}]
+                                },
+                            }
+                        ],
+                    },
+                    {
                         'toFQDNs': [{'matchName': 'github.com'}],
                         'toPorts': [
                             {
