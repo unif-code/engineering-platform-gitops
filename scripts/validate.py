@@ -250,11 +250,41 @@ REQUIRED_METRICS_SERVER_RESOURCES = {
 }
 
 ACTIVE_ROOT_RESOURCES = (
-    'flux-system',
-    'reconcile-rbac.yaml',
     'infrastructure.yaml',
     'apps.yaml',
 )
+FLUX_ROOT_RECONCILER_RULES = [
+    {
+        'apiGroups': ['kustomize.toolkit.fluxcd.io'],
+        'resources': ['kustomizations'],
+        'verbs': [
+            'create',
+            'delete',
+            'get',
+            'list',
+            'patch',
+            'update',
+            'watch',
+        ],
+    }
+]
+FLUX_ROOT_RECONCILER_BINDING = {
+    'apiVersion': 'rbac.authorization.k8s.io/v1',
+    'kind': 'ClusterRoleBinding',
+    'metadata': {'name': 'flux-root-reconciler'},
+    'roleRef': {
+        'apiGroup': 'rbac.authorization.k8s.io',
+        'kind': 'ClusterRole',
+        'name': 'flux-root-reconciler',
+    },
+    'subjects': [
+        {
+            'kind': 'ServiceAccount',
+            'name': 'flux-root-reconciler',
+            'namespace': 'flux-system',
+        }
+    ],
+}
 
 FLUX_PHASE_A_RESOURCES = (
     'gotk-components.yaml',
@@ -780,9 +810,62 @@ def validate_active_root(root: Path = ROOT) -> None:
     resources = document.get('resources')
     if resources != list(ACTIVE_ROOT_RESOURCES):
         fail(
-            'clusters/dev 活动根必须精确引用获批的业务就绪入口，'
+            'clusters/dev 活动根必须只引用获批的业务 DAG 入口，'
+            '不得重新持有 bootstrap-owned flux-system 或 reconcile-rbac.yaml，'
             '且不得引用 OpenBao、备份、MinIO 或 observability；'
             f'实测 resources={resources!r}'
+        )
+
+    rbac_path = root / 'clusters/dev/reconcile-rbac.yaml'
+    if not rbac_path.is_file():
+        fail('clusters/dev/reconcile-rbac.yaml 不存在')
+    try:
+        rbac_documents = [
+            item
+            for item in yaml.safe_load_all(rbac_path.read_text(encoding='utf-8'))
+            if item is not None
+        ]
+    except yaml.YAMLError as error:
+        fail(f'clusters/dev/reconcile-rbac.yaml YAML 解析失败：{error}')
+    root_roles = [
+        item
+        for item in rbac_documents
+        if isinstance(item, dict)
+        and item.get('apiVersion') == 'rbac.authorization.k8s.io/v1'
+        and item.get('kind') == 'ClusterRole'
+        and isinstance(item.get('metadata'), dict)
+        and item['metadata'].get('name') == 'flux-root-reconciler'
+    ]
+    if (
+        len(root_roles) != 1
+        or root_roles[0].get('rules') != FLUX_ROOT_RECONCILER_RULES
+    ):
+        fail(
+            'flux-root-reconciler 必须只管理下游 Flux Kustomization CR，'
+            '不得持有 bootstrap、Secret 或业务资源权限'
+        )
+    root_bindings = []
+    for item in rbac_documents:
+        if not isinstance(item, dict) or item.get('kind') not in {
+            'RoleBinding',
+            'ClusterRoleBinding',
+        }:
+            continue
+        subjects = item.get('subjects')
+        if not isinstance(subjects, list):
+            continue
+        if any(
+            isinstance(subject, dict)
+            and subject.get('kind') == 'ServiceAccount'
+            and subject.get('name') == 'flux-root-reconciler'
+            and subject.get('namespace') == 'flux-system'
+            for subject in subjects
+        ):
+            root_bindings.append(item)
+    if root_bindings != [FLUX_ROOT_RECONCILER_BINDING]:
+        fail(
+            'flux-root-reconciler ServiceAccount 必须只绑定同名最小权限 '
+            'ClusterRole，不得追加 RoleBinding 或其他 ClusterRoleBinding'
         )
 
 

@@ -160,8 +160,16 @@ compliant 时直接返回 `ALREADY_COMPLIANT`，不会重复部署或创建探�
 `NOT_EXECUTED`。业务可用也不等于 V0.1 完整验收；OpenBao、MinIO、备份/恢复、observability
 和整机重启验收继续 `BLOCKED`。
 
-活动 DAG 固定为 `foundation -> cert-manager + cnpg -> database -> migration -> apps`。所有
-Flux CR 位于 `flux-system` 并使用独立最小权限 ServiceAccount；活动 root 只允许五个 Namespace：
+活动 DAG 固定为 `foundation -> cert-manager + cnpg -> database -> migration -> apps`。Stage 100
+独占 Controller/CRD/Phase-A RBAC，Stage 110 独占 Namespace、reconcile RBAC、sync CR 与 Phase-B
+网络策略；根 Kustomization 只渲染 `infrastructure.yaml` 与 `apps.yaml`，并以 `wait: false`
+在创建下游 DAG 后返回，避免重新授权 bootstrap RBAC 或等待尚需带外 Secret 的整个 DAG。
+Stage 110 在任何写入前读取根对象的 `.status.inventory`：只接受 inventory 不存在、为空，
+或仅包含七个获批下游 Kustomization；历史 bootstrap 对象或任意未知条目都会以
+`root-sync-inventory-unsafe` 停止，禁止在 `prune: true` 下盲目转移所有权。更新根对象后，
+Stage 110 必须先观察到当前 `metadata.generation`，再接受 `Ready=True`，不得把旧代 Ready
+误判为本次同步成功。`flux-root-reconciler` 只拥有 Kustomization CR 权限。
+所有 Flux CR 位于 `flux-system` 并使用独立最小权限 ServiceAccount；活动部署只允许五个 Namespace：
 `flux-system`、`local-path-storage`、`cert-manager`、`cnpg-system`、`platform`。每个 Namespace
 都有双向 default deny 与 DNS egress；按职责精确放行 kube-apiserver/webhook，并只允许 Cilium
 Gateway 的 `ingress` identity 访问 frontend/backend。
@@ -174,7 +182,7 @@ Gateway 的 `ingress` identity 访问 frontend/backend。
 
 | Stage | `--check` | `--apply` | 责任 |
 | --- | --- | --- | --- |
-| 110 | `PASS_FLUX_SYNC_CHECK` | `PASS_FLUX_SYNC_ENABLED` | 持久化 sync Namespace、公共 GitRepository、根 Kustomization 与 Git FQDN egress |
+| 110 | `PASS_FLUX_SYNC_CHECK` | `PASS_FLUX_SYNC_ENABLED` | 持久化 Namespace/RBAC、公共 GitRepository、根 Kustomization 与 Git FQDN egress，并等待 Git source/root sync Ready |
 | 120 | `PASS_PLATFORM_CORE_CHECK` | `PASS_PLATFORM_CORE_READY` | 等待 foundation、cert-manager 与 CNPG Operator Ready |
 | 130 | `PASS_PLATFORM_DATABASE_CHECK` | `PASS_PLATFORM_DATABASE_READY` | 创建 13 个不覆盖的 Secret，等待单实例 PostgreSQL，生成 file-only runtime config |
 | 140 | `PASS_PLATFORM_MIGRATION_CHECK` | `PASS_PLATFORM_MIGRATION_COMPLETE` | 等待不可变 Job `platform-migrate-4aaf721` 完成并验证 migration heads |
