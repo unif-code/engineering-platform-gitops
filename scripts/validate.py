@@ -295,10 +295,10 @@ FLUX_PHASE_A_COMPONENTS_SHA256 = (
     'c6e84495c3b611978d053adc40aca1e2a12af38f6e239c44a6b6c1224e01cab7'
 )
 FLUX_PHASE_A_CANONICAL_RENDERED_SHA256 = (
-    '77244b8af4c1d4f584e132c843f927035731f559e1b8bc583f2247f891647efc'
+    'c048e900c7b516d63fa74a3e8b585807023d8a5a571dc1acff7ad46100384175'
 )
 FLUX_PHASE_A_RAW_RENDERED_SHA256 = (
-    '1a82990f5b4a84bc52692a84871a04ebbda4cc02fb1e72e4283d6f320f4f4994'
+    '7d27a43f17ba425def1b454ca31dbdecfd2370d1e13207be0c28700c8f73d69a'
 )
 FLUX_PHASE_A_ROLLOUT_STRATEGY = {
     'rollingUpdate': {'maxSurge': 1, 'maxUnavailable': 0},
@@ -345,6 +345,7 @@ FLUX_PHASE_A_CONTROLLERS = {
             '--default-service-account=default',
             '--no-cross-namespace-refs=true',
             '--no-remote-bases=true',
+            '--custom-apply-stage-kinds=rbac.authorization.k8s.io/Role',
         ),
         'forbidden_args': {
             '--default-decryption-service-account=default',

@@ -189,6 +189,12 @@ Gateway 的 `ingress` identity 访问 frontend/backend。
 | 150 | `PASS_PLATFORM_APPS_CHECK` | `PASS_PLATFORM_APPS_READY` | 等待 workload/TLS/Gateway 并执行 HTTPS `/`、`/healthz`、`/readyz`、未认证 `/api/v1/me` smoke |
 | 160 | `PASS_BUSINESS_READY_EVIDENCE_CHECK` | `PASS_BUSINESS_READY` | 重放 smoke，写入 mode `0600` evidence 与 SHA-256 sidecar |
 
+`kustomize-controller` 必须以
+`--custom-apply-stage-kinds=rbac.authorization.k8s.io/Role` 运行。下游 Kustomization 使用
+受限 ServiceAccount 时，该阶段保证 namespaced Role 先于依赖它的 RoleBinding 持久化，
+避免 server-side dry-run 的同批次依赖失败；禁止改为授予 `bind`、`escalate` 或
+`cluster-admin`。
+
 重复运行时，已精确合规的 stage 返回 `ALREADY_COMPLIANT`；任何 partial、extra、Secret 语义漂移、
 供应链漂移、readiness 或 smoke 未知状态都 fail closed。Stage 160 证据路径固定为
 `/root/dev-infra-evidence/16-business-ready-<UTC>.txt` 及同名 `.sha256`，且明确记录

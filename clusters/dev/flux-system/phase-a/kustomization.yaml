@@ -100,6 +100,9 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/args/-
         value: --no-remote-bases=true
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --custom-apply-stage-kinds=rbac.authorization.k8s.io/Role
   - target:
       kind: Deployment
       name: helm-controller

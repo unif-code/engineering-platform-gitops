@@ -55,6 +55,10 @@ Kustomize 将上游 tag 替换为精确的 linux/amd64 manifest digest。OCI ind
   `create/get/update`。规则以表中各精确版本的官方 `config/rbac/role.yaml` 为基线，
   去掉 Phase A 未启用的 Workload Identity token 与跨 Controller 写权。集群级权限只剩
   Kubernetes API `/livez/ping` 的 `HEAD` 健康探测。
+- `kustomize-controller` 固定
+  `--custom-apply-stage-kinds=rbac.authorization.k8s.io/Role`，让受限 reconciler 在
+  server-side apply 中先持久化 namespaced Role，再校验依赖它的 RoleBinding；不得用
+  `bind`、`escalate` 或 `cluster-admin` 绕过 Kubernetes RBAC anti-escalation。
 - 使用 Pod Security `restricted`、non-root、只读根文件系统、drop `ALL`、
   `RuntimeDefault` seccomp 和固定资源边界。
 - 删除上游宽松 NetworkPolicy，改为双向 default deny，仅放行 DNS、Kubernetes API
