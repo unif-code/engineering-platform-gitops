@@ -201,6 +201,14 @@ Gateway 的 `ingress` identity 访问 frontend/backend。
 `OPENBAO=NOT_EXECUTED`、`MINIO=NOT_EXECUTED`、`BACKUPS=NOT_EXECUTED`、
 `RESTORE=NOT_EXECUTED`、`OBSERVABILITY=NOT_EXECUTED` 与 `SECRET_VALUES=NOT_RECORDED`。
 
+Stage 100 已安装后的升级同样纳入一键闭环：仅当四个 Controller、11 个 CRD、无 Secret
+等 inventory 边界精确，且现存 sync CR 以 `resource/namespace/name` 身份核对、与下游
+Namespace 均属于批准续跑子集时，`kubectl diff=1` 才返回 `upgrade-apply-required`。
+`--apply` 不重建 Namespace；脚本先把固定摘要清单渲染到 mode `0600` 私有文件并复验摘要，
+随后只对该同一文件依次执行 server-side dry-run、diff、SSA，再完成 rollout、网络边界验证
+与 postcheck。证据写入前重新读取并校验最终 sync CR/Namespace inventory，避免记录部署前
+快照；`kubectl diff>1` 继续按未知状态停止，禁止用临时 apply 或扩大 RBAC 绕过。
+
 正常部署只使用合并后完整 SHA：先单独审批并执行
 `./scripts/bootstrap/run-approved.sh <merged-sha> --check`；完整回执合规后，再展示并单独审批
 `./scripts/bootstrap/run-approved.sh <merged-sha> --apply`。`--check` 对主机/集群配置只读，

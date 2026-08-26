@@ -4431,6 +4431,53 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                     return path.read_text(encoding='utf-8').strip()
                 return os.environ.get('FAKE_FLUX_STATE', 'ABSENT')
 
+            def desired_drift():
+                return (
+                    os.environ.get('FAKE_DESIRED_DRIFT') == '1'
+                    and not Path(os.environ['FAKE_STATE_FILE']).exists()
+                )
+
+            def configured_inventory(name):
+                after_name = name + '_AFTER_APPLY'
+                if Path(os.environ['FAKE_STATE_FILE']).exists() and after_name in os.environ:
+                    return os.environ[after_name]
+                return os.environ.get(name)
+
+            def sync_inventory_json():
+                resource_kinds = {
+                    'alert.notification.toolkit.fluxcd.io': 'Alert',
+                    'bucket.source.toolkit.fluxcd.io': 'Bucket',
+                    'externalartifact.source.toolkit.fluxcd.io': 'ExternalArtifact',
+                    'gitrepository.source.toolkit.fluxcd.io': 'GitRepository',
+                    'helmchart.source.toolkit.fluxcd.io': 'HelmChart',
+                    'helmrelease.helm.toolkit.fluxcd.io': 'HelmRelease',
+                    'helmrepository.source.toolkit.fluxcd.io': 'HelmRepository',
+                    'kustomization.kustomize.toolkit.fluxcd.io': 'Kustomization',
+                    'ocirepository.source.toolkit.fluxcd.io': 'OCIRepository',
+                    'provider.notification.toolkit.fluxcd.io': 'Provider',
+                    'receiver.notification.toolkit.fluxcd.io': 'Receiver',
+                }
+                inventory = configured_inventory('FAKE_SYNC_INVENTORY')
+                if inventory == '1':
+                    inventory = (
+                        'gitrepository.source.toolkit.fluxcd.io/'
+                        'default/unexpected\n'
+                    )
+                items = []
+                for identity in (inventory or '').splitlines():
+                    resource, namespace, name = identity.split('/', 2)
+                    items.append({
+                        'kind': resource_kinds[resource],
+                        'metadata': {'namespace': namespace, 'name': name},
+                    })
+                return json.dumps({'items': items})
+
+            def require_frozen_bundle(filename):
+                if Path(filename).read_text(encoding='utf-8') != Path(
+                    os.environ['FAKE_RENDERED']
+                ).read_text(encoding='utf-8'):
+                    raise SystemExit(64)
+
             args = sys.argv[1:]
             with open(os.environ['FAKE_COMMAND_LOG'], 'a', encoding='utf-8') as log:
                 log.write('kubectl ' + ' '.join(args) + '\n')
@@ -4515,8 +4562,9 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                 'monitoring', 'cnpg-system', 'minio', 'local-path-storage',
                 '--ignore-not-found', '--output=name',
             ]:
-                if 'FAKE_DOWNSTREAM_INVENTORY' in os.environ:
-                    sys.stdout.write(os.environ['FAKE_DOWNSTREAM_INVENTORY'])
+                inventory = configured_inventory('FAKE_DOWNSTREAM_INVENTORY')
+                if inventory is not None:
+                    sys.stdout.write(inventory)
                 elif current_state() == 'DOWNSTREAM':
                     sys.stdout.write('namespace/platform\n')
             elif command == [
@@ -4548,24 +4596,22 @@ class FluxPhaseAStageTest(BootstrapTestCase):
             elif command == [
                 'get',
                 'alerts.notification.toolkit.fluxcd.io,buckets.source.toolkit.fluxcd.io,externalartifacts.source.toolkit.fluxcd.io,gitrepositories.source.toolkit.fluxcd.io,helmcharts.source.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io,helmrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,ocirepositories.source.toolkit.fluxcd.io,providers.notification.toolkit.fluxcd.io,receivers.notification.toolkit.fluxcd.io',
-                '--all-namespaces', '--ignore-not-found', '--output=name',
+                '--all-namespaces', '--ignore-not-found', '--output=json',
             ]:
-                if os.environ.get('FAKE_SYNC_INVENTORY') == '1':
-                    sys.stdout.write(
-                        'gitrepository.source.toolkit.fluxcd.io/unexpected\n'
-                    )
-                elif 'FAKE_SYNC_INVENTORY' in os.environ:
-                    sys.stdout.write(os.environ['FAKE_SYNC_INVENTORY'])
+                sys.stdout.write(sync_inventory_json())
             elif command == [
                 'diff', '--server-side',
                 '--field-manager=engineering-platform-flux-phase-a',
                 '--kustomize', os.environ['FAKE_DESIRED_ROOT'],
             ]:
-                if current_state() != 'COMPLIANT':
+                if os.environ.get('FAKE_DIFF_ERROR') == '1':
+                    raise SystemExit(2)
+                if current_state() != 'COMPLIANT' or desired_drift():
                     raise SystemExit(1)
             elif command == [
                 '--namespace=flux-system', 'get', 'deployment.apps', '--output=json',
             ]:
+                ready = os.environ.get('FAKE_CONTROLLERS_NOT_READY') != '1'
                 names = (
                     'source-controller', 'kustomize-controller',
                     'helm-controller', 'notification-controller',
@@ -4575,8 +4621,10 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                         'metadata': {'name': name, 'generation': 1},
                         'spec': {'replicas': 1},
                         'status': {
-                            'observedGeneration': 1, 'readyReplicas': 1,
-                            'availableReplicas': 1, 'updatedReplicas': 1,
+                            'observedGeneration': 1,
+                            'readyReplicas': 1 if ready else 0,
+                            'availableReplicas': 1 if ready else 0,
+                            'updatedReplicas': 1 if ready else 0,
                         },
                     }
                     for name in names
@@ -4619,23 +4667,31 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                 'wait', '--for=jsonpath={.status.phase}=Active',
                 'namespace/flux-system', '--timeout=60s',
             ]:
-                if current_state() != 'NAMESPACE_ONLY':
+                if current_state() not in ('NAMESPACE_ONLY', 'COMPLIANT'):
                     raise SystemExit(1)
-            elif command == [
+            elif len(command) == 5 and command[:4] == [
                 'apply', '--server-side', '--dry-run=server',
                 '--field-manager=engineering-platform-flux-phase-a',
-                '--kustomize', os.environ['FAKE_DESIRED_ROOT'],
-            ]:
-                if current_state() != 'NAMESPACE_ONLY':
+            ] and command[4].startswith('--filename='):
+                require_frozen_bundle(command[4].split('=', 1)[1])
+                if current_state() not in ('NAMESPACE_ONLY', 'COMPLIANT'):
                     raise SystemExit(1)
                 if os.environ.get('FAKE_FAIL_BUNDLE_SERVER_DRY_RUN') == '1':
                     raise SystemExit(1)
-            elif command == [
+            elif len(command) == 4 and command[:3] == [
+                'diff', '--server-side',
+                '--field-manager=engineering-platform-flux-phase-a',
+            ] and command[3].startswith('--filename='):
+                require_frozen_bundle(command[3].split('=', 1)[1])
+                if current_state() not in ('NAMESPACE_ONLY', 'COMPLIANT'):
+                    raise SystemExit(1)
+                raise SystemExit(int(os.environ.get('FAKE_BUNDLE_DIFF_RC', '1')))
+            elif len(command) == 4 and command[:3] == [
                 'apply', '--server-side',
                 '--field-manager=engineering-platform-flux-phase-a',
-                '--kustomize', os.environ['FAKE_DESIRED_ROOT'],
-            ]:
-                if current_state() != 'NAMESPACE_ONLY':
+            ] and command[3].startswith('--filename='):
+                require_frozen_bundle(command[3].split('=', 1)[1])
+                if current_state() not in ('NAMESPACE_ONLY', 'COMPLIANT'):
                     raise SystemExit(1)
                 Path(os.environ['FAKE_STATE_FILE']).write_text(
                     'COMPLIANT\n', encoding='utf-8'
@@ -4808,17 +4864,60 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         self.assertIn('diff --server-side', commands)
         self.assertNotIn(' apply --server-side', commands)
 
+    def test_check_existing_approved_drift_requests_apply_without_mutation(
+        self,
+    ) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DESIRED_DRIFT'] = '1'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
+        self.assertIn('REASON=upgrade-apply-required', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn('diff --server-side', commands)
+        self.assertNotIn(' apply --server-side', commands)
+
+    def test_check_existing_inventory_rejects_diff_execution_failure(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DIFF_ERROR'] = '1'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertIn('REASON=flux-desired-state-query-failed', result.stdout)
+
+    def test_check_existing_drift_rejects_unready_controllers(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DESIRED_DRIFT'] = '1'
+        environment['FAKE_CONTROLLERS_NOT_READY'] = '1'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 50, result.stdout + result.stderr)
+        self.assertIn('RESULT=STOP_VERIFY_FAILED', result.stdout)
+        self.assertIn('REASON=flux-controller-not-ready', result.stdout)
+        self.assertNotIn(
+            ' apply --server-side', command_log.read_text(encoding='utf-8')
+        )
+
     def test_check_accepts_approved_business_checkpoint_subsets(self) -> None:
         root_sync = (
-            'gitrepository.source.toolkit.fluxcd.io/flux-system\n'
-            'kustomization.kustomize.toolkit.fluxcd.io/flux-system\n'
+            'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\n'
         )
         cases = (
             ('', root_sync),
             (
                 'namespace/platform\n',
                 root_sync
-                + 'kustomization.kustomize.toolkit.fluxcd.io/platform-apps\n',
+                + 'kustomization.kustomize.toolkit.fluxcd.io/'
+                'flux-system/platform-apps\n',
             ),
         )
         for downstream_inventory, sync_inventory in cases:
@@ -4890,6 +4989,18 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
         self.assertIn('REASON=flux-phase-a-state-unknown', result.stdout)
 
+    def test_check_rejects_approved_sync_name_in_wrong_namespace(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_SYNC_INVENTORY'] = (
+            'gitrepository.source.toolkit.fluxcd.io/default/flux-system\n'
+        )
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-phase-a-state-unknown', result.stdout)
+
     def test_apply_installs_from_absent_state_in_dependency_order(self) -> None:
         environment, command_log, host = self.make_environment()
 
@@ -4907,15 +5018,27 @@ class FluxPhaseAStageTest(BootstrapTestCase):
             i for i, line in enumerate(commands)
             if 'apply --server-side --field-manager=' in line and '--filename=-' in line
         )
-        bundle_dry_run = next(
-            i for i, line in enumerate(commands)
-            if 'apply --server-side --dry-run=server' in line and '--kustomize' in line
+        frozen_bundle_commands = [
+            (i, line) for i, line in enumerate(commands)
+            if '--filename=' in line
+            and '--filename=-' not in line
+            and ('apply --server-side' in line or 'diff --server-side' in line)
+        ]
+        self.assertEqual(len(frozen_bundle_commands), 3, frozen_bundle_commands)
+        bundle_dry_run, bundle_diff, bundle_apply = (
+            item[0] for item in frozen_bundle_commands
         )
-        bundle_diff = next(i for i, line in enumerate(commands) if 'diff --server-side' in line)
-        bundle_apply = next(
-            i for i, line in enumerate(commands)
-            if 'apply --server-side --field-manager=' in line and '--kustomize' in line
-        )
+        frozen_filenames = {
+            next(
+                argument for argument in line.split()
+                if argument.startswith('--filename=')
+            )
+            for _, line in frozen_bundle_commands
+        }
+        self.assertEqual(len(frozen_filenames), 1, frozen_filenames)
+        self.assertFalse(any(
+            '--kustomize' in line for _, line in frozen_bundle_commands
+        ))
         self.assertLess(
             namespace_dry_run, namespace_apply,
         )
@@ -4956,6 +5079,87 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         )
         self.assertRegex(result.stdout, r'SHA256=[0-9a-f]{64}')
         self.assertIn(f'SHA256_FILE={sidecar}', result.stdout)
+
+    def test_apply_reconciles_existing_approved_drift_without_namespace_apply(
+        self,
+    ) -> None:
+        environment, command_log, host = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DESIRED_DRIFT'] = '1'
+        environment['FAKE_DOWNSTREAM_INVENTORY'] = (
+            'namespace/local-path-storage\n'
+        )
+        environment['FAKE_SYNC_INVENTORY'] = (
+            'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\n'
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_INSTALLED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        frozen_bundle_commands = [
+            line for line in commands
+            if '--filename=' in line
+            and '--filename=-' not in line
+            and ('apply --server-side' in line or 'diff --server-side' in line)
+        ]
+        self.assertEqual(len(frozen_bundle_commands), 3, frozen_bundle_commands)
+        frozen_filenames = {
+            next(
+                argument for argument in line.split()
+                if argument.startswith('--filename=')
+            )
+            for line in frozen_bundle_commands
+        }
+        self.assertEqual(len(frozen_filenames), 1, frozen_filenames)
+        self.assertFalse(any(
+            '--kustomize' in line for line in frozen_bundle_commands
+        ))
+        self.assertFalse(any(
+            'apply --server-side --field-manager=' in line
+            and '--filename=-' in line
+            for line in commands
+        ))
+        evidence_files = list((host / 'root/dev-infra-evidence').glob(
+            '15-flux-phase-a-*.txt'
+        ))
+        self.assertEqual(len(evidence_files), 1, evidence_files)
+        evidence_text = evidence_files[0].read_text(encoding='utf-8')
+        self.assertIn(
+            'SYNC_INVENTORY=approved-checkpoint-subset\n', evidence_text
+        )
+        self.assertIn(
+            'DOWNSTREAM_NAMESPACE_INVENTORY=approved-checkpoint-subset\n',
+            evidence_text,
+        )
+
+    def test_apply_evidence_uses_final_checkpoint_inventory(self) -> None:
+        environment, _, host = self.make_environment()
+        environment['FAKE_DOWNSTREAM_INVENTORY_AFTER_APPLY'] = (
+            'namespace/local-path-storage\n'
+        )
+        environment['FAKE_SYNC_INVENTORY_AFTER_APPLY'] = (
+            'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\n'
+        )
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        evidence_files = list((host / 'root/dev-infra-evidence').glob(
+            '15-flux-phase-a-*.txt'
+        ))
+        self.assertEqual(len(evidence_files), 1, evidence_files)
+        evidence_text = evidence_files[0].read_text(encoding='utf-8')
+        self.assertIn(
+            'SYNC_INVENTORY=approved-checkpoint-subset\n', evidence_text
+        )
+        self.assertIn(
+            'DOWNSTREAM_NAMESPACE_INVENTORY=approved-checkpoint-subset\n',
+            evidence_text,
+        )
 
     def test_apply_runs_and_uid_cleans_both_network_probes(self) -> None:
         environment, command_log, _ = self.make_environment()
@@ -5021,10 +5225,35 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         commands = command_log.read_text(encoding='utf-8').splitlines()
         bundle_applies = [
             line for line in commands
-            if 'apply --server-side --field-manager=' in line and '--kustomize' in line
+            if 'apply --server-side --field-manager=' in line
+            and '--filename=' in line
+            and '--filename=-' not in line
         ]
         self.assertEqual(bundle_applies, [])
         self.assertFalse(any(' create --filename=' in line for line in commands))
+
+    def test_apply_stops_before_bundle_apply_when_diff_is_not_one(self) -> None:
+        for diff_rc in ('0', '2'):
+            with self.subTest(diff_rc=diff_rc):
+                environment, command_log, _ = self.make_environment()
+                environment['FAKE_BUNDLE_DIFF_RC'] = diff_rc
+
+                result = self.run_stage(environment, '--apply')
+
+                self.assertEqual(
+                    result.returncode, 30, result.stdout + result.stderr
+                )
+                self.assertIn(
+                    'REASON=bundle-diff-state-unexpected', result.stdout
+                )
+                commands = command_log.read_text(encoding='utf-8').splitlines()
+                bundle_applies = [
+                    line for line in commands
+                    if 'apply --server-side --field-manager=' in line
+                    and '--filename=' in line
+                    and '--filename=-' not in line
+                ]
+                self.assertEqual(bundle_applies, [])
 
     def test_apply_cleans_both_owned_probes_when_positive_probe_fails(self) -> None:
         environment, command_log, host = self.make_environment()

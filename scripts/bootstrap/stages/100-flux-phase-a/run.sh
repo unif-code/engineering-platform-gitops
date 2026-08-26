@@ -77,7 +77,7 @@ readonly EXPECTED_DEPLOYMENTS=$'deployment.apps/helm-controller\ndeployment.apps
 readonly EXPECTED_CLUSTER_RBAC=$'clusterrole.rbac.authorization.k8s.io/flux-controller-api-health\nclusterrolebinding.rbac.authorization.k8s.io/flux-controller-api-health'
 readonly FLUX_CUSTOM_RESOURCE_TYPES=alerts.notification.toolkit.fluxcd.io,buckets.source.toolkit.fluxcd.io,externalartifacts.source.toolkit.fluxcd.io,gitrepositories.source.toolkit.fluxcd.io,helmcharts.source.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io,helmrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,ocirepositories.source.toolkit.fluxcd.io,providers.notification.toolkit.fluxcd.io,receivers.notification.toolkit.fluxcd.io
 readonly EXPECTED_BUSINESS_NAMESPACES=$'namespace/cert-manager\nnamespace/cnpg-system\nnamespace/local-path-storage\nnamespace/platform'
-readonly EXPECTED_BUSINESS_SYNC=$'gitrepository.source.toolkit.fluxcd.io/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/cert-manager-config\nkustomization.kustomize.toolkit.fluxcd.io/cert-manager-controller\nkustomization.kustomize.toolkit.fluxcd.io/cnpg-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/infrastructure-foundation\nkustomization.kustomize.toolkit.fluxcd.io/platform-apps\nkustomization.kustomize.toolkit.fluxcd.io/platform-database\nkustomization.kustomize.toolkit.fluxcd.io/platform-migration'
+readonly EXPECTED_BUSINESS_SYNC=$'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cert-manager-config\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cert-manager-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cnpg-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/infrastructure-foundation\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-apps\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-database\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-migration'
 
 namespace_json_is_exact() {
   python_isolated -c '
@@ -159,6 +159,45 @@ if len(observed) != len(set(observed)) or not set(observed).issubset(expected):
 ' "$1" "$2"
 }
 
+sync_inventory_from_json() {
+  python_isolated -c '
+import json
+import sys
+
+resources = {
+    "Alert": "alert.notification.toolkit.fluxcd.io",
+    "Bucket": "bucket.source.toolkit.fluxcd.io",
+    "ExternalArtifact": "externalartifact.source.toolkit.fluxcd.io",
+    "GitRepository": "gitrepository.source.toolkit.fluxcd.io",
+    "HelmChart": "helmchart.source.toolkit.fluxcd.io",
+    "HelmRelease": "helmrelease.helm.toolkit.fluxcd.io",
+    "HelmRepository": "helmrepository.source.toolkit.fluxcd.io",
+    "Kustomization": "kustomization.kustomize.toolkit.fluxcd.io",
+    "OCIRepository": "ocirepository.source.toolkit.fluxcd.io",
+    "Provider": "provider.notification.toolkit.fluxcd.io",
+    "Receiver": "receiver.notification.toolkit.fluxcd.io",
+}
+try:
+    document = json.load(sys.stdin)
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise ValueError
+    identities = []
+    for item in items:
+        metadata = item["metadata"]
+        resource = resources[item["kind"]]
+        namespace = metadata["namespace"]
+        name = metadata["name"]
+        if not all(isinstance(value, str) and value and "/" not in value
+                   for value in (namespace, name)):
+            raise ValueError
+        identities.append(f"{resource}/{namespace}/{name}")
+    print("\n".join(sorted(identities)))
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+'
+}
+
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
 for required_command in awk chmod cmp dirname id mktemp rm rmdir sort stat; do
@@ -222,6 +261,8 @@ downstream_namespaces=$(kubectl_run get namespace platform openbao cert-manager 
   monitoring cnpg-system minio local-path-storage --ignore-not-found \
   --output=name 2>/dev/null) ||
   complete STOP_UNKNOWN_STATE downstream-namespace-query-failed "$EXIT_UNKNOWN_STATE" NONE
+sync_inventory=
+sync_inventory_json=
 
 if [[ -z "$namespace_name" && -z "$flux_crds" ]]; then
   [[ -z "$flux_cluster_resources" && -z "$api_health_rbac" &&
@@ -277,28 +318,41 @@ if [[ -n "$flux_crds" ]]; then
   inventory_is_approved_subset \
     "$downstream_namespaces" "$EXPECTED_BUSINESS_NAMESPACES" ||
     complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
-  sync_inventory=$(kubectl_run get "$FLUX_CUSTOM_RESOURCE_TYPES" \
-    --all-namespaces --ignore-not-found --output=name 2>/dev/null) ||
+  sync_inventory_json=$(kubectl_run get "$FLUX_CUSTOM_RESOURCE_TYPES" \
+    --all-namespaces --ignore-not-found --output=json 2>/dev/null) ||
     complete STOP_UNKNOWN_STATE flux-sync-query-failed "$EXIT_UNKNOWN_STATE" NONE
+  sync_inventory=$(printf '%s' "$sync_inventory_json" | sync_inventory_from_json) ||
+    complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
   inventory_is_approved_subset "$sync_inventory" "$EXPECTED_BUSINESS_SYNC" ||
     complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
 
-  diff_rc=0
-  kubectl_run diff --server-side --field-manager="$FIELD_MANAGER" \
-    --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 || diff_rc=$?
-  [[ "$diff_rc" == 0 ]] ||
-    complete STOP_UNKNOWN_STATE flux-desired-state-drift "$EXIT_UNKNOWN_STATE" NONE
   deployment_json=$(kubectl_run --namespace=flux-system get deployment.apps \
     --output=json 2>/dev/null) ||
     complete STOP_UNKNOWN_STATE flux-deployment-query-failed "$EXIT_UNKNOWN_STATE" NONE
   printf '%s' "$deployment_json" | deployments_are_ready ||
     complete STOP_VERIFY_FAILED flux-controller-not-ready "$EXIT_VERIFY_FAILED" NONE
 
-  complete ALREADY_COMPLIANT flux-phase-a-ready 0 NONE
+  diff_rc=0
+  kubectl_run diff --server-side --field-manager="$FIELD_MANAGER" \
+    --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 || diff_rc=$?
+  if [[ "$diff_rc" == 1 ]]; then
+    if [[ "$MODE" == CHECK ]]; then
+      complete PASS_FLUX_PHASE_A_CHECK upgrade-apply-required 0 \
+        'stages/100-flux-phase-a/run.sh --apply'
+    fi
+    cluster_state=UPGRADE_REQUIRED
+  elif [[ "$diff_rc" != 0 ]]; then
+    complete STOP_UNKNOWN_STATE flux-desired-state-query-failed \
+      "$EXIT_UNKNOWN_STATE" NONE
+  fi
+
+  [[ "${cluster_state:-}" == UPGRADE_REQUIRED ]] ||
+    complete ALREADY_COMPLIANT flux-phase-a-ready 0 NONE
 fi
 
 [[ "$MODE" == APPLY && ( "$cluster_state" == ABSENT ||
-   "$cluster_state" == NAMESPACE_ONLY ) ]] ||
+   "$cluster_state" == NAMESPACE_ONLY ||
+   "$cluster_state" == UPGRADE_REQUIRED ) ]] ||
   complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
 
 curl_binary=$(host_path /usr/bin/curl)
@@ -448,15 +502,15 @@ kubectl_run wait '--for=jsonpath={.status.phase}=Active' namespace/flux-system \
   complete STOP_VERIFY_FAILED namespace-active-wait-failed "$EXIT_VERIFY_FAILED" NONE
 
 kubectl_run apply --server-side --dry-run=server \
-  --field-manager="$FIELD_MANAGER" --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 ||
+  --field-manager="$FIELD_MANAGER" --filename="$rendered_file" >/dev/null 2>&1 ||
   complete STOP_VERIFY_FAILED bundle-server-dry-run-failed "$EXIT_VERIFY_FAILED" NONE
 diff_rc=0
 kubectl_run diff --server-side --field-manager="$FIELD_MANAGER" \
-  --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 || diff_rc=$?
+  --filename="$rendered_file" >/dev/null 2>&1 || diff_rc=$?
 [[ "$diff_rc" == 1 ]] ||
   complete STOP_UNKNOWN_STATE bundle-diff-state-unexpected "$EXIT_UNKNOWN_STATE" NONE
 kubectl_run apply --server-side --field-manager="$FIELD_MANAGER" \
-  --kustomize "$DESIRED_ROOT" >/dev/null 2>&1 ||
+  --filename="$rendered_file" >/dev/null 2>&1 ||
   complete STOP_APPLY_FAILED bundle-server-apply-failed "$EXIT_APPLY_FAILED" NONE
 
 for controller in source-controller kustomize-controller helm-controller \
@@ -559,6 +613,21 @@ expected_postcheck=$'PHASE=flux-phase-a\nMODE=CHECK\nRESULT=ALREADY_COMPLIANT\nR
 [[ "$postcheck" == "$expected_postcheck" ]] ||
   complete STOP_VERIFY_FAILED flux-postcheck-output-drift "$EXIT_VERIFY_FAILED" NONE
 
+downstream_namespaces=$(kubectl_run get namespace platform openbao cert-manager \
+  monitoring cnpg-system minio local-path-storage --ignore-not-found \
+  --output=name 2>/dev/null) ||
+  complete STOP_UNKNOWN_STATE downstream-namespace-query-failed "$EXIT_UNKNOWN_STATE" NONE
+inventory_is_approved_subset \
+  "$downstream_namespaces" "$EXPECTED_BUSINESS_NAMESPACES" ||
+  complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
+sync_inventory_json=$(kubectl_run get "$FLUX_CUSTOM_RESOURCE_TYPES" \
+  --all-namespaces --ignore-not-found --output=json 2>/dev/null) ||
+  complete STOP_UNKNOWN_STATE flux-sync-query-failed "$EXIT_UNKNOWN_STATE" NONE
+sync_inventory=$(printf '%s' "$sync_inventory_json" | sync_inventory_from_json) ||
+  complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
+inventory_is_approved_subset "$sync_inventory" "$EXPECTED_BUSINESS_SYNC" ||
+  complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
+
 cleanup_flux_work_dir ||
   complete STOP_UNKNOWN_STATE flux-work-directory-cleanup-failed "$EXIT_UNKNOWN_STATE" NONE
 trap - EXIT
@@ -571,8 +640,13 @@ log_evidence CONTROLLERS=source,kustomize,helm,notification
 log_evidence FLUX_CRD_COUNT=11
 log_evidence FLUX_CHECK=all-checks-passed
 log_evidence SECRET_COUNT=0
-log_evidence SYNC_INVENTORY=empty
-log_evidence DOWNSTREAM_NAMESPACE_INVENTORY=empty
+sync_inventory_evidence=empty
+[[ -z "$sync_inventory" ]] || sync_inventory_evidence=approved-checkpoint-subset
+downstream_inventory_evidence=empty
+[[ -z "$downstream_namespaces" ]] || \
+  downstream_inventory_evidence=approved-checkpoint-subset
+log_evidence SYNC_INVENTORY="$sync_inventory_evidence"
+log_evidence DOWNSTREAM_NAMESPACE_INVENTORY="$downstream_inventory_evidence"
 log_evidence NETWORK_PROBE_RESULT=PASS
 log_evidence NETWORK_PROBE_POSITIVE_COUNT=7
 log_evidence NETWORK_PROBE_NEGATIVE_COUNT=6
