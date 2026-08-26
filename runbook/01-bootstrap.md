@@ -149,7 +149,9 @@ OpenBao、MinIO、备份、恢复、observability 或账号初始化。
 orchestrator，它必须依据各 stage 的检查结果跳过这些已完成 stage，并直接抵达 stage `90`。
 Flux Phase A 四 Controller 另有历史验收；包含 stage `100` 的新候选继续运行时，由 stage
 `100` 对 Flux Phase A 做 fail-closed 的只读判定；完整
-compliant 时直接返回 `ALREADY_COMPLIANT`，不会重复部署或创建探针。
+compliant 时直接返回 `ALREADY_COMPLIANT`，不会重复部署或创建探针。若 stage `110`～`160`
+已留下合法部分检查点，stage `100` 只接受已批准 sync CR 与下游 Namespace 清单的无重复
+子集，未批准名称仍立即停止；精确 Desired State、Ready 与后续依赖由对应 stage 继续判定。
 
 ### Business-ready 候选阶段 110–160
 

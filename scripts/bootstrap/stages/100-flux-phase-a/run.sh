@@ -148,6 +148,17 @@ except (KeyError, TypeError, ValueError):
 '
 }
 
+inventory_is_approved_subset() {
+  python_isolated -c '
+import sys
+
+observed = [line for line in sys.argv[1].splitlines() if line]
+expected = set(line for line in sys.argv[2].splitlines() if line)
+if len(observed) != len(set(observed)) or not set(observed).issubset(expected):
+    raise SystemExit(1)
+' "$1" "$2"
+}
+
 parse_mode "$@" || exit "$?"
 require_root || complete STOP_PRECONDITION not-root "$EXIT_PRECONDITION" NONE
 for required_command in awk chmod cmp dirname id mktemp rm rmdir sort stat; do
@@ -212,12 +223,9 @@ downstream_namespaces=$(kubectl_run get namespace platform openbao cert-manager 
   --output=name 2>/dev/null) ||
   complete STOP_UNKNOWN_STATE downstream-namespace-query-failed "$EXIT_UNKNOWN_STATE" NONE
 
-sorted_downstream_namespaces=$(printf '%s\n' "$downstream_namespaces" | sort)
-[[ -z "$downstream_namespaces" ||
-   "$sorted_downstream_namespaces" == "$EXPECTED_BUSINESS_NAMESPACES" ]] ||
-  complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
 if [[ -z "$namespace_name" && -z "$flux_crds" ]]; then
-  [[ -z "$flux_cluster_resources" && -z "$api_health_rbac" ]] ||
+  [[ -z "$flux_cluster_resources" && -z "$api_health_rbac" &&
+     -z "$downstream_namespaces" ]] ||
     complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
   if [[ "$MODE" == CHECK ]]; then
     complete PASS_FLUX_PHASE_A_CHECK apply-required 0 \
@@ -244,7 +252,8 @@ if [[ "${cluster_state:-}" != ABSENT ]]; then
       --output=name 2>/dev/null) ||
       complete STOP_UNKNOWN_STATE flux-resource-query-failed "$EXIT_UNKNOWN_STATE" NONE
     if [[ -z "$deployments" && -z "$secrets" && -z "$namespace_resources" &&
-          -z "$flux_cluster_resources" && -z "$api_health_rbac" ]]; then
+          -z "$flux_cluster_resources" && -z "$api_health_rbac" &&
+          -z "$downstream_namespaces" ]]; then
       if [[ "$MODE" == CHECK ]]; then
         complete PASS_FLUX_PHASE_A_CHECK namespace-only-apply-required 0 \
           'stages/100-flux-phase-a/run.sh --apply'
@@ -265,12 +274,13 @@ if [[ -n "$flux_crds" ]]; then
      "$sorted_api_health_rbac" == "$EXPECTED_CLUSTER_RBAC" &&
      -z "$flux_cluster_resources" && -z "$secrets" ]] ||
     complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
+  inventory_is_approved_subset \
+    "$downstream_namespaces" "$EXPECTED_BUSINESS_NAMESPACES" ||
+    complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
   sync_inventory=$(kubectl_run get "$FLUX_CUSTOM_RESOURCE_TYPES" \
     --all-namespaces --ignore-not-found --output=name 2>/dev/null) ||
     complete STOP_UNKNOWN_STATE flux-sync-query-failed "$EXIT_UNKNOWN_STATE" NONE
-  sorted_sync_inventory=$(printf '%s\n' "$sync_inventory" | sort)
-  [[ -z "$sync_inventory" ||
-     "$sorted_sync_inventory" == "$EXPECTED_BUSINESS_SYNC" ]] ||
+  inventory_is_approved_subset "$sync_inventory" "$EXPECTED_BUSINESS_SYNC" ||
     complete STOP_UNKNOWN_STATE flux-phase-a-state-unknown "$EXIT_UNKNOWN_STATE" NONE
 
   diff_rc=0

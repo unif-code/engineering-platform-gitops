@@ -12,10 +12,12 @@ Flux Phase A 的一键部署与验收，只允许安装 source、kustomize、hel
 | 证据 | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
 | 网络探针 | 两个瞬态 Pod；只按本轮创建回执的名称和 UID 精确删除 |
 
-`--check` 只读识别 `ABSENT`、精确 `NAMESPACE_ONLY` 或完整 `COMPLIANT` 状态；任何
-部分安装、未知资源、sync 资源或下游 Namespace 都 fail-closed。`--apply` 固定 Flux CLI
-版本与摘要，先单独处理 Namespace 依赖，再执行完整 bundle 的 server-side dry-run、diff
-和 apply，最后完成 rollout、`flux check`、网络边界验证、只读 postcheck 与证据落盘。
+`--check` 只读识别 `ABSENT`、精确 `NAMESPACE_ONLY` 或完整 `COMPLIANT` 状态。Phase A
+基线完整后，允许 Stage `110`～`160` 已批准 sync CR 与下游 Namespace 清单的任意无重复
+子集作为合法续跑检查点；任何未批准名称仍 fail-closed，并由后续所属 stage 负责精确收敛。
+`--apply` 固定 Flux CLI 版本与摘要，先单独处理 Namespace 依赖，再执行完整 bundle 的
+server-side dry-run、diff 和 apply，最后完成 rollout、`flux check`、网络边界验证、只读
+postcheck 与证据落盘。
 
 ## 停止原因
 
