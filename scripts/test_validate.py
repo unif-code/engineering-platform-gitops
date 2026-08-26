@@ -1556,6 +1556,7 @@ class _FluxPhaseAContractBase:
                 '--default-service-account=default',
                 '--no-cross-namespace-refs=true',
                 '--no-remote-bases=true',
+                '--custom-apply-stage-kinds=rbac.authorization.k8s.io/Role',
             ),
         },
         'helm-controller': {
@@ -3498,6 +3499,7 @@ class FluxPhaseAContractTest(_FluxPhaseAContractBase, unittest.TestCase):
 
     def test_rejects_missing_multitenancy_argument(self) -> None:
         multitenancy_flags = {
+            '--custom-apply-stage-kinds',
             '--default-service-account',
             '--no-cross-namespace-refs',
             '--no-remote-bases',
@@ -3532,6 +3534,25 @@ class FluxPhaseAContractTest(_FluxPhaseAContractBase, unittest.TestCase):
                 self.assert_contract_fails(
                     root, rendered_documents, 'watch-all-namespaces|arg|参数'
                 )
+
+    def test_requires_role_custom_apply_stage_only_on_kustomize_controller(
+        self,
+    ) -> None:
+        argument = (
+            '--custom-apply-stage-kinds=rbac.authorization.k8s.io/Role'
+        )
+        _, rendered_documents = self.make_root()
+        kustomize_args = self.deployment(
+            rendered_documents, 'kustomize-controller'
+        )['spec']['template']['spec']['containers'][0]['args']
+        self.assertIn(argument, kustomize_args)
+
+        for controller in self.CONTROLLERS.keys() - {'kustomize-controller'}:
+            with self.subTest(controller=controller):
+                args = self.deployment(rendered_documents, controller)['spec'][
+                    'template'
+                ]['spec']['containers'][0]['args']
+                self.assertNotIn(argument, args)
 
     def test_rejects_duplicate_conflicting_or_unapproved_feature_flags(
         self,
