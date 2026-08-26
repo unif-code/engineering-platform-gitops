@@ -1359,13 +1359,31 @@ class RepositoryProfileContractTest(unittest.TestCase):
 
 class ActiveRootIsolationTest(unittest.TestCase):
     APPROVED_RESOURCES = [
-        'flux-system',
-        'reconcile-rbac.yaml',
         'infrastructure.yaml',
         'apps.yaml',
     ]
+    APPROVED_ROOT_RECONCILER_RULES = [
+        {
+            'apiGroups': ['kustomize.toolkit.fluxcd.io'],
+            'resources': ['kustomizations'],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        }
+    ]
 
-    def make_root(self, resources: list[str]) -> Path:
+    def make_root(
+        self,
+        resources: list[str],
+        root_reconciler_rules: list[dict[str, object]] | None = None,
+        extra_bindings: list[dict[str, object]] | None = None,
+    ) -> Path:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -1378,6 +1396,42 @@ class ActiveRootIsolationTest(unittest.TestCase):
                     'kind': 'Kustomization',
                     'resources': resources,
                 },
+                sort_keys=False,
+            ),
+            encoding='utf-8',
+        )
+        (cluster / 'reconcile-rbac.yaml').write_text(
+            yaml.safe_dump_all(
+                [
+                    {
+                        'apiVersion': 'rbac.authorization.k8s.io/v1',
+                        'kind': 'ClusterRole',
+                        'metadata': {'name': 'flux-root-reconciler'},
+                        'rules': (
+                            self.APPROVED_ROOT_RECONCILER_RULES
+                            if root_reconciler_rules is None
+                            else root_reconciler_rules
+                        ),
+                    },
+                    {
+                        'apiVersion': 'rbac.authorization.k8s.io/v1',
+                        'kind': 'ClusterRoleBinding',
+                        'metadata': {'name': 'flux-root-reconciler'},
+                        'roleRef': {
+                            'apiGroup': 'rbac.authorization.k8s.io',
+                            'kind': 'ClusterRole',
+                            'name': 'flux-root-reconciler',
+                        },
+                        'subjects': [
+                            {
+                                'kind': 'ServiceAccount',
+                                'name': 'flux-root-reconciler',
+                                'namespace': 'flux-system',
+                            }
+                        ],
+                    },
+                    *(extra_bindings or []),
+                ],
                 sort_keys=False,
             ),
             encoding='utf-8',
@@ -1395,6 +1449,16 @@ class ActiveRootIsolationTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 validator.validate_active_root(root)
 
+    def test_active_root_rejects_bootstrap_owned_entrypoints(self) -> None:
+        for entrypoint in ('flux-system', 'reconcile-rbac.yaml'):
+            with self.subTest(entrypoint=entrypoint):
+                root = self.make_root(
+                    [entrypoint, *self.APPROVED_RESOURCES]
+                )
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        validator.validate_active_root(root)
+
     def test_active_root_accepts_exact_business_ready_entrypoints(self) -> None:
         self.assertTrue(
             hasattr(validator, 'validate_active_root'),
@@ -1403,6 +1467,49 @@ class ActiveRootIsolationTest(unittest.TestCase):
         root = self.make_root(self.APPROVED_RESOURCES)
 
         validator.validate_active_root(root)
+
+    def test_active_root_rejects_broad_root_reconciler_rbac(self) -> None:
+        broad_rules = [
+            *self.APPROVED_ROOT_RECONCILER_RULES,
+            {
+                'apiGroups': [''],
+                'resources': ['configmaps', 'namespaces'],
+                'verbs': ['create', 'delete', 'get', 'list', 'patch', 'update'],
+            },
+        ]
+        root = self.make_root(self.APPROVED_RESOURCES, broad_rules)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                validator.validate_active_root(root)
+
+    def test_active_root_rejects_extra_root_reconciler_binding(self) -> None:
+        root = self.make_root(
+            self.APPROVED_RESOURCES,
+            extra_bindings=[
+                {
+                    'apiVersion': 'rbac.authorization.k8s.io/v1',
+                    'kind': 'ClusterRoleBinding',
+                    'metadata': {'name': 'flux-root-reconciler-extra'},
+                    'roleRef': {
+                        'apiGroup': 'rbac.authorization.k8s.io',
+                        'kind': 'ClusterRole',
+                        'name': 'cluster-admin',
+                    },
+                    'subjects': [
+                        {
+                            'kind': 'ServiceAccount',
+                            'name': 'flux-root-reconciler',
+                            'namespace': 'flux-system',
+                        }
+                    ],
+                }
+            ],
+        )
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                validator.validate_active_root(root)
 
     def test_repository_uses_exact_business_ready_entrypoints(self) -> None:
         validator.validate_active_root(validator.ROOT)
@@ -1773,6 +1880,7 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         roots = (
             'clusters/dev',
+            'clusters/dev/flux-system',
             'infrastructure/foundation',
             'infrastructure/cert-manager/controller',
             'infrastructure/cert-manager/config',
@@ -1799,6 +1907,42 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
             ]
             cls.RENDERED_BY_ROOT[root] = documents
             cls.RENDERED.extend(documents)
+        rbac_root = 'clusters/dev/reconcile-rbac.yaml'
+        rbac_documents = [
+            document
+            for document in yaml.safe_load_all(
+                (validator.ROOT / rbac_root).read_text(encoding='utf-8')
+            )
+            if isinstance(document, dict)
+        ]
+        cls.RENDERED_BY_ROOT[rbac_root] = rbac_documents
+        cls.RENDERED.extend(rbac_documents)
+
+    def test_root_sync_only_owns_business_dag_kustomizations(self) -> None:
+        identities = {
+            self.identity(document)
+            for document in self.RENDERED_BY_ROOT['clusters/dev']
+        }
+        self.assertEqual(
+            identities,
+            {
+                (
+                    'kustomize.toolkit.fluxcd.io/v1',
+                    'Kustomization',
+                    'flux-system',
+                    name,
+                )
+                for name in {
+                    'infrastructure-foundation',
+                    'cert-manager-controller',
+                    'cert-manager-config',
+                    'cnpg-controller',
+                    'platform-database',
+                    'platform-migration',
+                    'platform-apps',
+                }
+            },
+        )
 
     @staticmethod
     def identity(document: dict[str, object]) -> tuple[str, str, str, str]:
@@ -1858,6 +2002,7 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
         assert isinstance(sync_spec, dict)
         self.assertEqual(sync_spec.get('path'), './clusters/dev')
         self.assertEqual(sync_spec.get('serviceAccountName'), 'flux-root-reconciler')
+        self.assertIs(sync_spec.get('wait'), False)
 
         egress = self.find(
             'cilium.io/v2',

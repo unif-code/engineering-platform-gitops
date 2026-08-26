@@ -5519,6 +5519,229 @@ class BusinessReadyStageTest(BootstrapTestCase):
         self.assertIn('gotk-sync.yaml', self.source)
         self.assertIn('phase-b-network-policy.yaml', self.source)
 
+    def test_sync_check_requires_git_source_and_root_kustomization_ready(
+        self,
+    ) -> None:
+        program = (
+            'set -Eeuo pipefail\n'
+            'source "$1"\n'
+            'business_root_inventory_safe() { return 0; }\n'
+            'business_namespace_set_state() { printf "COMPLIANT\\n"; }\n'
+            'business_flux_sync_diff() { return 0; }\n'
+            'business_condition_true() {\n'
+            '  if [[ "$2:$3" == '
+            '"gitrepository.source.toolkit.fluxcd.io:flux-system" ]]; then\n'
+            '    return 0\n'
+            '  fi\n'
+            '  return 1\n'
+            '}\n'
+            'business_stage_110_check\n'
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', program, 'test-sync-check', str(self.library)],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_SYNC_CHECK', result.stdout)
+        self.assertIn('REASON=root-sync-wait-required', result.stdout)
+
+    def test_sync_check_stops_before_other_checks_for_unsafe_root_inventory(
+        self,
+    ) -> None:
+        program = (
+            'set -Eeuo pipefail\n'
+            'source "$1"\n'
+            'business_root_inventory_safe() { return 1; }\n'
+            'business_namespace_set_state() { printf "UNEXPECTED\\n"; }\n'
+            'business_flux_sync_diff() { return 0; }\n'
+            'business_condition_true() { return 0; }\n'
+            'business_stage_110_check\n'
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', program, 'test-sync-inventory', str(self.library)],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+        self.assertIn('REASON=root-sync-inventory-unsafe', result.stdout)
+        self.assertNotIn('UNEXPECTED', result.stdout)
+
+    def test_root_inventory_gate_accepts_empty_or_only_downstream_entries(
+        self,
+    ) -> None:
+        allowed_entry = {
+            'id': (
+                'flux-system_platform-apps_'
+                'kustomize.toolkit.fluxcd.io_Kustomization'
+            ),
+            'v': 'v1',
+        }
+        for inventory in (None, {'entries': []}, {'entries': [allowed_entry]}):
+            with self.subTest(inventory=inventory):
+                document = {
+                    'metadata': {'name': 'flux-system', 'namespace': 'flux-system'},
+                    'status': {},
+                }
+                if inventory is not None:
+                    document['status']['inventory'] = inventory
+                program = (
+                    'set -Eeuo pipefail\n'
+                    'source "$1"\n'
+                    'TEST_DOCUMENT=$2\n'
+                    'business_resource_json() { printf "%s" "$TEST_DOCUMENT"; }\n'
+                    'business_root_inventory_safe\n'
+                )
+                result = self.run_command(
+                    [
+                        '/bin/bash',
+                        '-c',
+                        program,
+                        'test-root-inventory-safe',
+                        str(self.library),
+                        json.dumps(document),
+                    ],
+                    env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_root_inventory_gate_rejects_bootstrap_owned_entry(self) -> None:
+        document = {
+            'metadata': {'name': 'flux-system', 'namespace': 'flux-system'},
+            'status': {
+                'inventory': {
+                    'entries': [
+                        {
+                            'id': (
+                                'flux-system_flux-system_'
+                                'source.toolkit.fluxcd.io_GitRepository'
+                            ),
+                            'v': 'v1',
+                        }
+                    ]
+                }
+            },
+        }
+        program = (
+            'set -Eeuo pipefail\n'
+            'source "$1"\n'
+            'TEST_DOCUMENT=$2\n'
+            'business_resource_json() { printf "%s" "$TEST_DOCUMENT"; }\n'
+            'set +e\n'
+            'business_root_inventory_safe\n'
+            'rc=$?\n'
+            'set -e\n'
+            'printf "RC=%s\\n" "$rc"\n'
+            'exit "$rc"\n'
+        )
+        result = self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                program,
+                'test-root-inventory-unsafe',
+                str(self.library),
+                json.dumps(document),
+            ],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('RC=1', result.stdout)
+
+    def test_current_ready_wait_targets_observed_generation(self) -> None:
+        document = json.dumps(
+            {
+                'metadata': {'generation': 2},
+                'status': {
+                    'observedGeneration': 1,
+                    'conditions': [
+                        {
+                            'type': 'Ready',
+                            'status': 'True',
+                            'observedGeneration': 1,
+                        }
+                    ],
+                },
+            }
+        )
+        program = (
+            'set -Eeuo pipefail\n'
+            'source "$1"\n'
+            'TEST_DOCUMENT=$2\n'
+            'KUBECTL_ARGS=\n'
+            'business_resource_json() { printf "%s" "$TEST_DOCUMENT"; }\n'
+            'kubectl_run() { KUBECTL_ARGS=$*; }\n'
+            'business_wait_ready() { printf "READY|%s|%s|%s|%s\\n" "$@"; }\n'
+            'business_condition_true() { printf "CURRENT|%s|%s|%s|%s\\n" "$@"; }\n'
+            'business_wait_current_ready flux-system '
+            'kustomization.kustomize.toolkit.fluxcd.io flux-system 10m\n'
+            'printf "KUBECTL|%s\\n" "$KUBECTL_ARGS"\n'
+        )
+        result = self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                program,
+                'test-current-ready',
+                str(self.library),
+                document,
+            ],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            'wait --for=jsonpath={.status.observedGeneration}=2',
+            result.stdout,
+        )
+        self.assertIn(
+            'CURRENT|flux-system|kustomization.kustomize.toolkit.fluxcd.io|'
+            'flux-system|Ready',
+            result.stdout,
+        )
+
+    def test_sync_apply_waits_for_git_source_then_root_kustomization(
+        self,
+    ) -> None:
+        program = (
+            'set -Eeuo pipefail\n'
+            'source "$1"\n'
+            'host_path() { printf "/tmp"; }\n'
+            'business_render_namespaces() { printf "%s\\n" "---"; }\n'
+            'business_root_inventory_safe() { printf "INVENTORY_SAFE\\n"; }\n'
+            'kubectl_run() { return 0; }\n'
+            'business_wait_ready() {\n'
+            '  printf "%s|%s|%s|%s\\n" "$1" "$2" "$3" "$4"\n'
+            '}\n'
+            'business_wait_current_ready() {\n'
+            '  printf "CURRENT|%s|%s|%s|%s\\n" "$1" "$2" "$3" "$4"\n'
+            '}\n'
+            'business_stage_110_apply\n'
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', program, 'test-sync-apply', str(self.library)],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        waits = [
+            line
+            for line in result.stdout.splitlines()
+            if line.startswith('flux-system|')
+        ]
+        self.assertEqual(
+            waits[-1:],
+            ['flux-system|gitrepository.source.toolkit.fluxcd.io|flux-system|5m'],
+        )
+        self.assertIn('INVENTORY_SAFE', result.stdout)
+        self.assertIn(
+            'CURRENT|flux-system|kustomization.kustomize.toolkit.fluxcd.io|'
+            'flux-system|10m',
+            result.stdout,
+        )
+
     def test_secret_stage_never_uses_value_output_or_overwrite_primitives(self) -> None:
         forbidden = (
             'set -x',

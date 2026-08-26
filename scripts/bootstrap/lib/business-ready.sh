@@ -25,6 +25,10 @@ readonly BUSINESS_FIELD_MANAGER=engineering-platform-business-ready
 readonly BUSINESS_SECRET_COUNT=13
 readonly BUSINESS_MIGRATION_JOB=platform-migrate-4aaf721
 readonly -a BUSINESS_NAMESPACES=(cert-manager cnpg-system local-path-storage platform)
+readonly -a BUSINESS_ROOT_KUSTOMIZATIONS=(
+  infrastructure-foundation cert-manager-controller cert-manager-config
+  cnpg-controller platform-database platform-migration platform-apps
+)
 readonly -a BUSINESS_DB_ROLES=(
   platform_owner audit_rw authorization_rw configuration_rw identity_rw
   organization_rw workspace_rw
@@ -140,6 +144,66 @@ business_wait_ready() {
   fi
 }
 
+business_wait_current_ready() {
+  local namespace=$1 resource=$2 name=$3 timeout=${4:-10m}
+  local document generation
+  document=$(business_resource_json "$namespace" "$resource" "$name") || return 2
+  [[ -n "$document" ]] || return 1
+  generation=$(printf '%s' "$document" | /usr/bin/python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+generation = document.get("metadata", {}).get("generation")
+if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+    raise SystemExit(1)
+print(generation)
+') || return 2
+  if [[ -n "$namespace" ]]; then
+    kubectl_run --namespace="$namespace" wait \
+      --for="jsonpath={.status.observedGeneration}=${generation}" \
+      "${resource}/${name}" --timeout="$timeout" >/dev/null 2>&1 || return 1
+  else
+    kubectl_run wait \
+      --for="jsonpath={.status.observedGeneration}=${generation}" \
+      "${resource}/${name}" --timeout="$timeout" >/dev/null 2>&1 || return 1
+  fi
+  business_wait_ready "$namespace" "$resource" "$name" "$timeout" || return 1
+  business_condition_true "$namespace" "$resource" "$name" Ready
+}
+
+business_root_inventory_safe() {
+  local document
+  document=$(business_resource_json flux-system \
+    kustomization.kustomize.toolkit.fluxcd.io flux-system) || return 2
+  [[ -n "$document" ]] || return 0
+  printf '%s' "$document" | /usr/bin/python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+inventory = document.get("status", {}).get("inventory")
+if inventory is None:
+    raise SystemExit(0)
+if not isinstance(inventory, dict) or not isinstance(inventory.get("entries"), list):
+    raise SystemExit(1)
+allowed = {
+    (f"flux-system_{name}_kustomize.toolkit.fluxcd.io_Kustomization", "v1")
+    for name in sys.argv[1:]
+}
+observed = []
+for entry in inventory["entries"]:
+    if not isinstance(entry, dict):
+        raise SystemExit(1)
+    identity = (entry.get("id"), entry.get("v"))
+    if identity not in allowed:
+        raise SystemExit(1)
+    observed.append(identity)
+if len(observed) != len(set(observed)):
+    raise SystemExit(1)
+' "${BUSINESS_ROOT_KUSTOMIZATIONS[@]}"
+}
+
 business_namespace_set_state() {
   local name captured observed=
   for name in "${BUSINESS_NAMESPACES[@]}"; do
@@ -166,7 +230,19 @@ business_flux_sync_diff() {
 }
 
 business_stage_110_check() {
-  local namespace_state diff_rc=0
+  local namespace_state diff_rc=0 inventory_rc=0
+  business_root_inventory_safe || inventory_rc=$?
+  case "$inventory_rc" in
+    0) ;;
+    1)
+      complete STOP_UNKNOWN_STATE root-sync-inventory-unsafe \
+        "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+    *)
+      complete STOP_UNKNOWN_STATE root-sync-inventory-query-failed \
+        "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+  esac
   namespace_state=$(business_namespace_set_state) ||
     complete STOP_UNKNOWN_STATE namespace-inventory-query-failed \
       "$EXIT_UNKNOWN_STATE" NONE
@@ -189,6 +265,10 @@ business_stage_110_check() {
     flux-system Ready ||
     complete PASS_FLUX_SYNC_CHECK git-source-wait-required 0 \
       'stages/110-flux-sync/run.sh --apply'
+  business_condition_true flux-system \
+    kustomization.kustomize.toolkit.fluxcd.io flux-system Ready ||
+    complete PASS_FLUX_SYNC_CHECK root-sync-wait-required 0 \
+      'stages/110-flux-sync/run.sh --apply'
   complete ALREADY_COMPLIANT public-validated-sync-ready 0 NONE
 }
 
@@ -204,7 +284,19 @@ for document in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
 }
 
 business_stage_110_apply() {
-  local namespace_file work_dir
+  local namespace_file work_dir inventory_rc=0
+  business_root_inventory_safe || inventory_rc=$?
+  case "$inventory_rc" in
+    0) ;;
+    1)
+      complete STOP_UNKNOWN_STATE root-sync-inventory-unsafe \
+        "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+    *)
+      complete STOP_UNKNOWN_STATE root-sync-inventory-query-failed \
+        "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+  esac
   work_dir=$(mktemp -d "$(host_path /root)/.business-sync.XXXXXX") ||
     complete STOP_APPLY_FAILED sync-work-directory-create-failed \
       "$EXIT_APPLY_FAILED" NONE
@@ -246,6 +338,10 @@ business_stage_110_apply() {
   business_wait_ready flux-system gitrepository.source.toolkit.fluxcd.io \
     flux-system 5m ||
     complete STOP_VERIFY_FAILED git-source-not-ready "$EXIT_VERIFY_FAILED" NONE
+  business_wait_current_ready flux-system \
+    kustomization.kustomize.toolkit.fluxcd.io \
+    flux-system 10m ||
+    complete STOP_VERIFY_FAILED root-sync-not-ready "$EXIT_VERIFY_FAILED" NONE
   complete PASS_FLUX_SYNC_ENABLED public-validated-sync-ready 0 NONE
 }
 
