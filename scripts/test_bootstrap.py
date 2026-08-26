@@ -535,6 +535,23 @@ class CommonLibraryTest(BootstrapTestCase):
             ['/bin/bash', '-c', f'source "$1"\n{body}', 'test-common', str(COMMON)]
         )
 
+    def test_common_preserves_predeclared_readonly_phase(self) -> None:
+        result = self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                'set -Eeuo pipefail\n'
+                'readonly PHASE=flux-sync\n'
+                'source "$1"\n'
+                'printf "%s\\n" "$PHASE"',
+                'test-common',
+                str(COMMON),
+            ]
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'flux-sync\n')
+
     def test_helm_release_scope_is_identical_in_stage_60_and_90(self) -> None:
         """两处 helm 判定是近似重复而非共享函数，作用域必须防单边漂移。
 
