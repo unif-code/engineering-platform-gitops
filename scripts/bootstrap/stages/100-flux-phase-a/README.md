@@ -12,12 +12,15 @@ Flux Phase A 的一键部署与验收，只允许安装 source、kustomize、hel
 | 证据 | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
 | 网络探针 | 两个瞬态 Pod；只按本轮创建回执的名称和 UID 精确删除 |
 
-`--check` 只读识别 `ABSENT`、精确 `NAMESPACE_ONLY` 或完整 `COMPLIANT` 状态。Phase A
-基线完整后，允许 Stage `110`～`160` 已批准 sync CR 与下游 Namespace 清单的任意无重复
-子集作为合法续跑检查点；任何未批准名称仍 fail-closed，并由后续所属 stage 负责精确收敛。
-`--apply` 固定 Flux CLI 版本与摘要，先单独处理 Namespace 依赖，再执行完整 bundle 的
-server-side dry-run、diff 和 apply，最后完成 rollout、`flux check`、网络边界验证、只读
-postcheck 与证据落盘。
+`--check` 只读识别 `ABSENT`、精确 `NAMESPACE_ONLY`、完整 `COMPLIANT`，或 inventory
+边界仍精确但批准清单存在 SSA diff 的 `UPGRADE_REQUIRED` 状态。Phase A 基线完整后，允许
+Stage `110`～`160` 已批准 sync CR 与下游 Namespace 清单的任意无重复子集作为合法续跑
+检查点；sync CR 按 `resource/namespace/name` 身份核对，错误 Namespace、未批准名称或
+`kubectl diff` 执行错误都 fail-closed，并由后续所属 stage 负责精确收敛。`--apply` 固定
+Flux CLI 版本与摘要：首次安装先单独处理 Namespace 依赖，升级不重建 Namespace；两条路径
+都只对同一份已验摘要的私有 `rendered.yaml` 依次执行完整 bundle 的 server-side dry-run、
+diff 和 apply，最后完成 rollout、`flux check`、网络边界验证、只读 postcheck，并重新读取
+最终 sync CR/Namespace inventory 后落盘证据。
 
 ## 停止原因
 
@@ -48,7 +51,7 @@ postcheck 与证据落盘。
 - `flux-controller-rollout-failed`
 - `flux-crd-query-failed`
 - `flux-deployment-query-failed`
-- `flux-desired-state-drift`
+- `flux-desired-state-query-failed`
 - `flux-external-probe-create-failed`
 - `flux-external-probe-identity-unsafe`
 - `flux-external-probe-not-ready`
