@@ -58,6 +58,12 @@ business_initialize() {
       complete STOP_PRECONDITION "missing-command-${required_command}" \
         "$EXIT_PRECONDITION" NONE
   done
+  readonly PYTHON_BINARY=/usr/bin/python3
+  if [[ ! -x "$PYTHON_BINARY" ]]; then
+    required_command=python3
+    complete STOP_PRECONDITION "missing-command-${required_command}" \
+      "$EXIT_PRECONDITION" NONE
+  fi
   load_host_config ||
     complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
 

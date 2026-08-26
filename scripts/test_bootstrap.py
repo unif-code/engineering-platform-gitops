@@ -5422,6 +5422,42 @@ class BusinessReadyStageTest(BootstrapTestCase):
                 self.assertIn(f'readonly BUSINESS_STAGE={stage}', body)
                 self.assertNotIn('set -x', body)
 
+    def test_initialize_pins_python_before_admin_conf_capture(self) -> None:
+        result = self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                'set -Eeuo pipefail\n'
+                'source "$1"\n'
+                'require_root() { return 0; }\n'
+                'require_command() { return 0; }\n'
+                'load_host_config() {\n'
+                '  HOST_CLUSTER_NAME=engineering-platform-dev\n'
+                '  HOST_NODE_IP=10.93.1.27\n'
+                '  return 0\n'
+                '}\n'
+                'host_path() {\n'
+                '  case "$1" in\n'
+                '    /etc/kubernetes/admin.conf) printf \'/tmp/admin.conf\' ;;\n'
+                '    *) printf \'/bin/true\' ;;\n'
+                '  esac\n'
+                '}\n'
+                'safe_file() { return 0; }\n'
+                'capture_admin_conf() {\n'
+                '  [[ "$(declare -p PYTHON_BINARY)" == '
+                '\'declare -r PYTHON_BINARY="/usr/bin/python3"\' ]] || return 1\n'
+                '  python_isolated -c \'print("PIN_OK")\'\n'
+                '}\n'
+                'business_initialize --check\n',
+                'test-business-ready-python-pin',
+                str(self.library),
+            ],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'PIN_OK\n')
+
     def test_phase_a_base_is_separate_from_sync_and_business_state(self) -> None:
         stage_100 = self.stage_text('100')
         self.assertIn(
