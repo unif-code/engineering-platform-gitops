@@ -4515,7 +4515,9 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                 'monitoring', 'cnpg-system', 'minio', 'local-path-storage',
                 '--ignore-not-found', '--output=name',
             ]:
-                if current_state() == 'DOWNSTREAM':
+                if 'FAKE_DOWNSTREAM_INVENTORY' in os.environ:
+                    sys.stdout.write(os.environ['FAKE_DOWNSTREAM_INVENTORY'])
+                elif current_state() == 'DOWNSTREAM':
                     sys.stdout.write('namespace/platform\n')
             elif command == [
                 '--namespace=flux-system', 'get', 'deployment.apps', '--output=name',
@@ -4552,6 +4554,8 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                     sys.stdout.write(
                         'gitrepository.source.toolkit.fluxcd.io/unexpected\n'
                     )
+                elif 'FAKE_SYNC_INVENTORY' in os.environ:
+                    sys.stdout.write(os.environ['FAKE_SYNC_INVENTORY'])
             elif command == [
                 'diff', '--server-side',
                 '--field-manager=engineering-platform-flux-phase-a',
@@ -4803,6 +4807,52 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         commands = command_log.read_text(encoding='utf-8')
         self.assertIn('diff --server-side', commands)
         self.assertNotIn(' apply --server-side', commands)
+
+    def test_check_accepts_approved_business_checkpoint_subsets(self) -> None:
+        root_sync = (
+            'gitrepository.source.toolkit.fluxcd.io/flux-system\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/flux-system\n'
+        )
+        cases = (
+            ('', root_sync),
+            (
+                'namespace/platform\n',
+                root_sync
+                + 'kustomization.kustomize.toolkit.fluxcd.io/platform-apps\n',
+            ),
+        )
+        for downstream_inventory, sync_inventory in cases:
+            with self.subTest(
+                downstream_inventory=downstream_inventory,
+                sync_inventory=sync_inventory,
+            ):
+                environment, command_log, _ = self.make_environment()
+                environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+                environment['FAKE_DOWNSTREAM_INVENTORY'] = downstream_inventory
+                environment['FAKE_SYNC_INVENTORY'] = sync_inventory
+
+                result = self.run_stage(environment, '--check')
+
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+                self.assertNotIn(
+                    ' apply --server-side',
+                    command_log.read_text(encoding='utf-8'),
+                )
+
+    def test_check_rejects_unapproved_downstream_checkpoint_inventory(
+        self,
+    ) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DOWNSTREAM_INVENTORY'] = 'namespace/monitoring\n'
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 30, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-phase-a-state-unknown', result.stdout)
 
     def test_check_avoids_client_apply_patch_for_existing_ssa_crds(self) -> None:
         environment, command_log, _ = self.make_environment()
