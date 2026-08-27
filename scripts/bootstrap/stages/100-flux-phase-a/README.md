@@ -17,17 +17,18 @@ Flux Phase A 的一键部署与验收，只允许安装 source、kustomize、hel
 Stage `110`～`160` 已批准 sync CR 与下游 Namespace 清单的任意无重复子集作为合法续跑
 检查点；sync CR 按 `resource/namespace/name` 身份核对，错误 Namespace、未批准名称或
 `kubectl diff` 执行错误都 fail-closed，并由后续所属 stage 负责精确收敛。`--apply` 固定
-Flux CLI 版本与摘要：首次安装先单独处理 Namespace 依赖，升级不重建 Namespace；两条路径
-都只对同一份已验摘要的私有 `rendered.yaml` 依次执行完整 bundle 的 server-side dry-run、
-diff 和 apply，最后完成 rollout、`flux check`、网络边界验证、只读 postcheck，并重新读取
-最终 sync CR/Namespace inventory 后落盘证据。
+Flux CLI 版本与摘要；CLI 归档成员只流式写入 root 新建的私有文件，再显式规范化为
+`root:root 0755`，不继承归档 owner。首次安装先单独处理 Namespace 依赖，升级不重建
+Namespace；两条路径都只对同一份已验摘要的私有 `rendered.yaml` 依次执行完整 bundle 的
+server-side dry-run、diff 和 apply，最后完成 rollout、`flux check`、网络边界验证、只读
+postcheck，并重新读取最终 sync CR/Namespace inventory 后落盘证据。
 
 ## 停止原因
 
 一律 fail-closed，退出码固定：10 前置条件 / 20 供应链 / 30 未知或漂移 /
 40 apply 失败 / 50 verify 失败，不降级为告警。
 
-下列 64 个字面量 REASON 由 `StageReadmeTest` 与 `run.sh` 逐项比对，
+下列 65 个字面量 REASON 由 `StageReadmeTest` 与 `run.sh` 逐项比对，
 文档漂移会判红。模板化的 REASON（如 `missing-command-${cmd}`）不在此列。
 
 - `admin-conf-content-or-structure-drift`
@@ -43,6 +44,7 @@ diff 和 apply，最后完成 rollout、`flux check`、网络边界验证、只�
 - `flux-check-failed`
 - `flux-cluster-resource-query-failed`
 - `flux-cli-archive-digest-drift`
+- `flux-cli-binary-mode-failed`
 - `flux-cli-binary-unsafe`
 - `flux-cli-download-failed`
 - `flux-cli-extraction-failed`
