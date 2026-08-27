@@ -200,6 +200,11 @@ Gateway 的 `ingress` identity 访问 frontend/backend。
 Git 变更同时递增 `platform.unif.internal/migration-generation` 与 Job 名称，再重新通过
 `validation-gate` 和 `run-approved.sh`。
 
+Stage 140 `--check` 若已确认当前不可变 Job `Complete=True`，但 `platform-migration`
+Kustomization 恰好正在切换新的 revision，会对该对象当前 generation 做最长 1 分钟的只读
+稳定等待，并在返回 `ALREADY_COMPLIANT` 前再次确认 Job 仍为 `Complete=True`。等待失败仍
+返回 `PASS_PLATFORM_MIGRATION_CHECK` 进入既有人工门禁；该路径不删除、创建或重跑迁移 Job。
+
 重复运行时，已精确合规的 stage 返回 `ALREADY_COMPLIANT`；任何 partial、extra、Secret 语义漂移、
 供应链漂移、readiness 或 smoke 未知状态都 fail closed。Stage 160 证据路径固定为
 `/root/dev-infra-evidence/16-business-ready-<UTC>.txt` 及同名 `.sha256`，且明确记录
