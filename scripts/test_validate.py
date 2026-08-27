@@ -2147,6 +2147,28 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
             'apps': ('Role', 'platform', 'flux-platform-app-reconciler'),
         }
         full_verbs = {'create', 'delete', 'get', 'list', 'patch', 'update', 'watch'}
+        read_verbs = {'get', 'list', 'watch'}
+        health_observation_rules = {
+            'Deployment': [
+                {
+                    'apiGroups': [''],
+                    'resources': ['pods'],
+                    'verbs': sorted(read_verbs),
+                },
+                {
+                    'apiGroups': ['apps'],
+                    'resources': ['replicasets'],
+                    'verbs': sorted(read_verbs),
+                },
+            ],
+            'Job': [
+                {
+                    'apiGroups': [''],
+                    'resources': ['pods'],
+                    'verbs': sorted(read_verbs),
+                },
+            ],
+        }
 
         def permission_atoms(
             rules: object,
@@ -2184,14 +2206,18 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
                 expected_rules: list[dict[str, object]] = []
                 for document in self.RENDERED_BY_ROOT[root]:
                     api_version = str(document.get('apiVersion', ''))
+                    document_kind = str(document.get('kind', ''))
                     api_group = '' if api_version == 'v1' else api_version.split('/', 1)[0]
-                    resource = kind_resources.get(str(document.get('kind', '')))
+                    resource = kind_resources.get(document_kind)
                     self.assertIsNotNone(resource, self.identity(document))
                     expected_rules.append({
                         'apiGroups': [api_group],
                         'resources': [str(resource)],
                         'verbs': sorted(full_verbs),
                     })
+                    expected_rules.extend(
+                        health_observation_rules.get(document_kind, [])
+                    )
                     if document.get('kind') in {'Role', 'ClusterRole'}:
                         expected_rules.extend(document.get('rules', []))
                 expected = permission_atoms(expected_rules)

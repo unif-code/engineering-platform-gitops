@@ -229,6 +229,14 @@ rules:
       - update
       - watch
   - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - networking.k8s.io
     resources:
       - networkpolicies
@@ -396,6 +404,14 @@ rules:
       - list
       - patch
       - update
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
       - watch
   - apiGroups:
       - apiregistration.k8s.io
@@ -733,6 +749,14 @@ rules:
       - update
       - watch
   - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - batch
     resources:
       - jobs
@@ -950,6 +974,14 @@ rules:
       - update
       - watch
   - apiGroups:
+      - ''
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - batch
     resources:
       - jobs
@@ -1019,6 +1051,22 @@ rules:
       - list
       - patch
       - update
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ''
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
       - watch
   - apiGroups:
       - policy
