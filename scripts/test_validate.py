@@ -2362,6 +2362,35 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
         self.assertEqual(len(secret_volumes), 4)
 
     def test_gateway_is_https_only_and_routes_same_origin(self) -> None:
+        certificate = self.find(
+            'cert-manager.io/v1',
+            'Certificate',
+            'platform',
+            'platform-gateway-tls',
+        )
+        self.assertEqual(
+            certificate['spec'].get('commonName'),
+            'platform.dev.local',
+        )
+        self.assertEqual(
+            certificate['spec'].get('dnsNames'),
+            ['platform.dev.local'],
+        )
+        self.assertEqual(
+            certificate['spec'].get('issuerRef'),
+            {
+                'kind': 'ClusterIssuer',
+                'name': 'dev-selfsigned',
+            },
+        )
+        issuer = self.find(
+            'cert-manager.io/v1',
+            'ClusterIssuer',
+            '',
+            'dev-selfsigned',
+        )
+        self.assertEqual(issuer.get('spec'), {'selfSigned': {}})
+
         gateway = self.find(
             'gateway.networking.k8s.io/v1',
             'Gateway',
