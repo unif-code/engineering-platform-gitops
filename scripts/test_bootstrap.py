@@ -14147,6 +14147,23 @@ operator:
             command_log.read_text(encoding='utf-8'),
         )
 
+    def test_legacy_revision_one_accepts_explicit_false_hostnetwork(self) -> None:
+        environment, host, _, _ = self.make_environment()
+        self.install_legacy_cluster_contract(environment, host)
+        payload = json.loads(environment['FAKE_CILIUM_LEGACY_CONFIG_JSON'])
+        payload['data']['gateway-api-hostnetwork-enabled'] = 'false'
+        environment['FAKE_CILIUM_LEGACY_CONFIG_JSON'] = json.dumps(payload)
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', result.stdout)
+        self.assertIn('REASON=cilium-upgrade-required', result.stdout)
+
     def test_controlled_upgrade_failure_stops_without_install(self) -> None:
         environment, host, command_log, _ = self.make_environment()
         self.install_legacy_cluster_contract(environment, host)
