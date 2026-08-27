@@ -459,8 +459,14 @@ if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
 fi
 [[ "$(sha256_file "$archive")" == "$expected_archive_sha" ]] ||
   complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-archive-digest-drift "$EXIT_SUPPLY_CHAIN" NONE
-tar_safe -xzf "$archive" -C "$work_dir" flux ||
+if ! (umask 077; set -o noclobber; tar_safe -xOf "$archive" flux >"$flux_binary") \
+    2>/dev/null; then
   complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-extraction-failed "$EXIT_SUPPLY_CHAIN" NONE
+fi
+safe_file "$flux_binary" 600 ||
+  complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-binary-unsafe "$EXIT_SUPPLY_CHAIN" NONE
+chmod 755 "$flux_binary" ||
+  complete STOP_APPLY_FAILED flux-cli-binary-mode-failed "$EXIT_APPLY_FAILED" NONE
 if [[ ! -x "$flux_binary" ]] || ! safe_file "$flux_binary" 755; then
   complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-binary-unsafe "$EXIT_SUPPLY_CHAIN" NONE
 fi

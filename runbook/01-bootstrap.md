@@ -585,7 +585,10 @@ cd /root/flux-phase-a-v2.9.3
 printf '%s  %s\n' \
   eae4e8608c0ade2bf4e8dec1669dbb6b0c28b5822b252d97feccfb4fb1181fd2 \
   flux_2.9.3_linux_amd64.tar.gz | sha256sum --check --strict
-tar -xzf flux_2.9.3_linux_amd64.tar.gz flux
+(umask 077; set -o noclobber; \
+  tar -xOf flux_2.9.3_linux_amd64.tar.gz flux >flux)
+chmod 0755 flux
+test "$(stat -c '%U:%G %a' flux)" = 'root:root 755'
 ./flux version --client
 ./flux check --pre --kubeconfig=/etc/kubernetes/admin.conf
 ```

@@ -4400,8 +4400,8 @@ class FluxPhaseAStageTest(BootstrapTestCase):
             r'''
             #!/bin/sh
             printf 'tar %s\n' "$*" >>"$FAKE_COMMAND_LOG"
-            [ "$1" = -xzf ] && [ "$3" = -C ] && [ "$5" = flux ] || exit 64
-            cat >"$4/flux" <<'EOF'
+            emit_flux() {
+              cat <<'EOF'
             #!/bin/sh
             printf 'flux %s\n' "$*" >>"$FAKE_COMMAND_LOG"
             case "$*" in
@@ -4413,7 +4413,19 @@ class FluxPhaseAStageTest(BootstrapTestCase):
               *) exit 64 ;;
             esac
             EOF
-            chmod 0755 "$4/flux"
+            }
+            case "$1" in
+              -xzf)
+                [ "$3" = -C ] && [ "$5" = flux ] || exit 64
+                emit_flux >"$4/flux"
+                chmod "${FAKE_TAR_EXTRACT_MODE:-0755}" "$4/flux"
+                ;;
+              -xOf)
+                [ "$3" = flux ] || exit 64
+                emit_flux
+                ;;
+              *) exit 64 ;;
+            esac
         ''',
         )
         self.write_executable(
@@ -5079,6 +5091,18 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         )
         self.assertRegex(result.stdout, r'SHA256=[0-9a-f]{64}')
         self.assertIn(f'SHA256_FILE={sidecar}', result.stdout)
+
+    def test_apply_normalizes_downloaded_flux_binary_metadata(self) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_TAR_EXTRACT_MODE'] = '0555'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_INSTALLED', result.stdout)
+        commands = command_log.read_text(encoding='utf-8').splitlines()
+        self.assertTrue(any('tar -xOf ' in line for line in commands), commands)
+        self.assertFalse(any('tar -xzf ' in line for line in commands), commands)
 
     def test_apply_reconciles_existing_approved_drift_without_namespace_apply(
         self,
