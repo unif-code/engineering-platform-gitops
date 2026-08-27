@@ -84,6 +84,11 @@ readonly HELM_ARCHIVE_SHA256=0093eb572e3d2380f094df162ddb525e219249de88957afe24c
 # 无法跟随，故显式关闭。
 # shellcheck disable=SC2034
 readonly HELM_MEMBER=linux-amd64/helm
+readonly CILIUM_CHART_NAME=cilium-1.20.0.tgz
+# 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
+# 无法跟随，故显式关闭。
+# shellcheck disable=SC2034
+readonly CILIUM_CHART_SHA256=c5f013912360d1a334f44ef25f36da59ba3414cdb48f466ee12d0c4fdff27883
 readonly GATEWAY_MANIFEST_NAME=standard-install.yaml
 # 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
 # 无法跟随，故显式关闭。
@@ -263,6 +268,13 @@ for required_command in awk cmp date dpkg dpkg-query find grep hostname id mktem
   require_command "$required_command" || complete STOP_PRECONDITION "missing-command-${required_command}" "$EXIT_PRECONDITION" NONE
 done
 load_host_config || complete STOP_PRECONDITION "$HOST_CONFIG_ERROR" "$EXIT_PRECONDITION" NONE
+VALUES_SHA256=$(host_pin cilium-values.yaml) ||
+  complete STOP_VERIFY_FAILED host-pins-invalid "$EXIT_VERIFY_FAILED" NONE
+# 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
+# 无法跟随，故显式关闭。
+# shellcheck disable=SC2034
+readonly VALUES_SHA256
+readonly VALUES_FILE="${HOST_CONFIG_DIR}/cilium-values.yaml"
 [[ -x "$PYTHON_BINARY" ]] || complete STOP_PRECONDITION missing-command-python3 "$EXIT_PRECONDITION" NONE
 [[ -x "$TAR_BINARY" ]] || complete STOP_PRECONDITION missing-command-tar "$EXIT_PRECONDITION" NONE
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -274,6 +286,10 @@ staged_root=$(host_path "$STAGED_ROOT")
 # 无法跟随，故显式关闭。
 # shellcheck disable=SC2034
 helm_archive="${staged_root}/${HELM_ARCHIVE_NAME}"
+# 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
+# 无法跟随，故显式关闭。
+# shellcheck disable=SC2034
+cilium_chart="${staged_root}/${CILIUM_CHART_NAME}"
 # 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
 # 无法跟随，故显式关闭。
 # shellcheck disable=SC2034
@@ -327,6 +343,15 @@ api_is_exact_and_ready || complete STOP_VERIFY_FAILED api-endpoint-or-health-dri
 kube_proxy_is_absent || complete STOP_VERIFY_FAILED kube-proxy-object-present-or-unreadable "$EXIT_VERIFY_FAILED" NONE
 helm_release_is_exact || complete STOP_VERIFY_FAILED helm-release-allowlist-drift "$EXIT_VERIFY_FAILED" NONE
 gateway_bundle_is_exact || complete STOP_VERIFY_FAILED gateway-bundle-drift "$EXIT_VERIFY_FAILED" NONE
+EXPECTED_CILIUM_OPERATOR_CHECKSUM=$(helm_rendered_cilium_operator_checksum \
+  "$cilium_chart" "$VALUES_FILE") ||
+  complete STOP_VERIFY_FAILED cilium-operator-render-drift "$EXIT_VERIFY_FAILED" NONE
+# 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
+# 无法跟随，故显式关闭。
+# shellcheck disable=SC2034
+readonly EXPECTED_CILIUM_OPERATOR_CHECKSUM
+staged_inputs_are_exact || complete STOP_VERIFY_FAILED staged-input-raced "$EXIT_VERIFY_FAILED" NONE
+helm_binary_is_exact || complete STOP_VERIFY_FAILED helm-binary-raced "$EXIT_VERIFY_FAILED" NONE
 cilium_is_ready || complete STOP_VERIFY_FAILED cilium-workload-unhealthy "$EXIT_VERIFY_FAILED" NONE
 node_is_ready || complete STOP_VERIFY_FAILED node-readiness-or-address-drift "$EXIT_VERIFY_FAILED" NONE
 swap_is_exact || complete STOP_VERIFY_FAILED swap-contract-drift "$EXIT_VERIFY_FAILED" NONE

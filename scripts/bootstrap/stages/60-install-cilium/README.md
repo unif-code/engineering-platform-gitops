@@ -1,8 +1,11 @@
 # 60-install-cilium
 
-用 Helm 安装 Cilium 与 Gateway API，或把唯一允许的旧 rev1 合同受控升级到 rev2；
-完成后有界轮询直到集群状态 `COMPLIANT`。Gateway 使用 Cilium host-network 模式，
-Envoy 保留默认能力并增加 `NET_BIND_SERVICE`，不依赖 LoadBalancer 地址提供者。
+用 Helm 安装 Cilium 与 Gateway API，或把唯一允许的旧 rev1 / pre-rollout rev2
+合同受控升级到带 operator ConfigMap checksum 的当前合同；完成后有界轮询直到集群状态
+`COMPLIANT`。Gateway 使用 Cilium host-network 模式，Operator 随配置 checksum 自动滚动，
+Envoy 保留默认能力并增加 `NET_BIND_SERVICE`，不依赖 LoadBalancer 地址提供者。Helm 每一版
+values 血统必须精确匹配允许序列；Operator readiness、generation 与离线渲染的精确 checksum
+从同一个 Deployment 快照判定。
 
 | 项 | 值 |
 | --- | --- |
@@ -36,6 +39,7 @@ Envoy 保留默认能力并增加 `NET_BIND_SERVICE`，不依赖 LoadBalancer �
 - `apply-input-snapshot-raced`
 - `apply-input-snapshot-raced-after-gateway`
 - `apply-input-snapshot-raced-after-helm`
+- `apply-input-snapshot-raced-after-render`
 - `apply-input-snapshot-raced-at-consumer`
 - `apply-input-snapshot-raced-at-gateway`
 - `apply-input-snapshot-raced-at-helm`
@@ -52,6 +56,7 @@ Envoy 保留默认能力并增加 `NET_BIND_SERVICE`，不依赖 LoadBalancer �
 - `helm-archive-unsafe`
 - `helm-binary-or-shadow-unknown`
 - `helm-binary-raced-at-install`
+- `helm-binary-raced-after-render`
 - `helm-binary-raced-before-install`
 - `helm-binary-verification-failed`
 - `helm-extraction-or-input-raced`
@@ -77,6 +82,7 @@ Envoy 保留默认能力并增加 `NET_BIND_SERVICE`，不依赖 LoadBalancer �
 - `staged-input-contract-raced`
 - `staged-input-raced-after-gateway`
 - `staged-input-raced-after-helm`
+- `staged-input-raced-after-render`
 - `staged-input-raced-at-gateway`
 - `staged-input-raced-at-helm`
 - `staged-input-raced-before-helm`

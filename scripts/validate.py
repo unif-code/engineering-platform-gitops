@@ -1001,6 +1001,7 @@ ipam:
   mode: kubernetes
 
 operator:
+  rollOutPods: true
   image:
     genericDigest: sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3
     useDigest: true
@@ -1135,6 +1136,7 @@ def validate_host_cilium(path: Path, host: dict[str, str]) -> None:
          ['NET_ADMIN', 'SYS_ADMIN', 'NET_BIND_SERVICE'], 'Cilium Envoy capabilities'),
         (('cgroup', 'autoMount', 'enabled'), False, 'Cilium cgroup automount'),
         (('cgroup', 'hostRoot'), '/sys/fs/cgroup', 'Cilium cgroup root'),
+        (('operator', 'rollOutPods'), True, 'Cilium operator config rollout'),
         (('operator', 'replicas'), 1, 'Cilium operator replicas'),
         (('hubble', 'enabled'), False, 'Hubble staged state'),
         (('image', 'useDigest'), True, 'Cilium image useDigest'),

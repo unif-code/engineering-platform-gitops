@@ -4372,8 +4372,8 @@ class BootstrapContractTest(unittest.TestCase):
 
         self.assert_contract_fails(root)
 
-    def test_cilium_gateway_contract_uses_host_network(self) -> None:
-        """DEV 没有 LoadBalancer 地址提供者，Gateway 必须直接监听主机网络。"""
+    def test_cilium_gateway_contract_rolls_operator_on_config_change(self) -> None:
+        """HostNetwork 只有进入新 operator 进程后才能驱动 Gateway 地址分配。"""
         values = yaml.safe_load(
             (
                 validator.ROOT
@@ -4382,6 +4382,7 @@ class BootstrapContractTest(unittest.TestCase):
         )
 
         self.assertIs(values['gatewayAPI']['hostNetwork']['enabled'], True)
+        self.assertIs(values['operator']['rollOutPods'], True)
         capabilities = values['envoy']['securityContext']['capabilities']
         self.assertIs(capabilities['keepCapNetBindService'], True)
         self.assertEqual(

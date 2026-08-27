@@ -237,7 +237,7 @@ probe，因此仍属于必须先展示完整命令的运维动作。
 | 10 | `stages/30-install-containerd/run.sh` | `--check` 后批准 `--apply` | `PASS_CONTAINERD_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/10-containerd-*.txt` |
 | 11 | `stages/40-install-kubernetes/run.sh` | `--check` 后批准 `--apply` | `PASS_KUBERNETES_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/11-kubernetes-*.txt` |
 | 12 | `stages/50-kubeadm-init/run.sh` | `--check` 后批准 `--apply` | `PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/12-kubeadm-*.txt` |
-| 13 | `stages/60-install-cilium/run.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | 安装当前合同，或仅把精确旧 rev1 升级到当前 rev2；`/root/dev-infra-evidence/13-cilium-*.txt` |
+| 13 | `stages/60-install-cilium/run.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | 安装当前合同，或仅把精确旧 rev1 / pre-rollout rev2 升级到带 Operator checksum rollout 的当前合同；`/root/dev-infra-evidence/13-cilium-*.txt` |
 | 14 | `stages/90-verify/run.sh` | 仅 `--check` | `PASS_BOOTSTRAP_VERIFIED` | `/root/dev-infra-evidence/14-verify-*.txt` |
 | 15 | `stages/100-flux-phase-a/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_PHASE_A_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
 | 16 | `stages/110-flux-sync/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_SYNC_ENABLED` 或 `ALREADY_COMPLIANT` | 终端回执 |
@@ -299,7 +299,7 @@ EXIT_CODE=30
 | `partial-kubernetes-contract` | `/opt/cni/bin` 条目集或包 payload 不符 | 允许的集合只有「kubernetes-cni 包清单」或「包清单 + 锁定的 `cilium-cni`」；其他多余文件需人工核实来源 |
 | `control-plane-runtime-set-drift` | 4 个控制面容器未各恰好一个 Running 于 kube-system | 检查 `crictl ps`；装完 CNI 后额外的 cilium/coredns 容器属正常，已被容忍 |
 | `cilium-post-install-state-invalid` | helm 装完后 Cilium 工作负载在超时窗口内未就绪 | 脚本在装后有界轮询（默认 10 分钟）；仍超时说明 Pod 真的没起来，查 `kubectl -n kube-system get pods` |
-| `gateway-cilium-cluster-state-unknown` | Stage 60 的复合判定处于混合态：八个分量既非全部 COMPLIANT、也非全部 MISSING | **先读分量报告**，停止时会逐条打印（见下） |
+| `gateway-cilium-cluster-state-unknown` | Stage 60 的复合判定处于混合态：十个分量不属于任一受控组合 | **先读分量报告**，停止时会逐条打印（见下） |
 
 `gateway-cilium-cluster-state-unknown` 停止时输出的分量：
 
@@ -310,6 +310,7 @@ HELM_BINARY_STATE=COMPLIANT
 GATEWAY_STATE=COMPLIANT
 HELM_SECRET_STATE=UNKNOWN      ← 阻塞点
 CILIUM_WORKLOAD_STATE=COMPLIANT
+CILIUM_OPERATOR_ROLLOUT_STATE=DESIRED
 ENVOY_DAEMONSET_STATE=COMPLIANT
 ENVOY_PODS_STATE=COMPLIANT
 CILIUM_CONFIG_STATE=DESIRED
@@ -317,22 +318,29 @@ HELM_RELEASE_STATE=DESIRED_REVISION_1
 ```
 
 大部分分量取值为 `COMPLIANT`/`MISSING`/`UNKNOWN`；Helm Secret、release 和 Cilium Config
-使用固定的 revision/`DESIRED`/`LEGACY` 状态名，以便精确区分唯一允许的旧 rev1 迁移。
+使用固定的 revision/`DESIRED`/`PRE_ROLLOUT`/`LEGACY` 状态名，以便精确区分唯一允许的
+旧 rev1 与 pre-rollout rev2 迁移。
 注意 `KUBE_PROXY_STATE` 非 COMPLIANT 时其余分量**根本没被查询**，会统一显示 `UNKNOWN`——
 那是「没查」不是「查了不对」，先解决 kube-proxy 残留再重跑。
 
-> 2026-08-21 之前这八个分量在停止时一个都不打印，定位只能靠额外跑一轮只读普查。
+> 2026-08-21 之前这些分量在停止时一个都不打印，定位只能靠额外跑一轮只读普查。
 
 **外来 Helm release 不再判死。** Stage 60/90 的 helm 判定作用域已收窄为「我们的 cilium
 release 对不对」，集群里其他运维装的 release（例如 gitlab-runner）会被服务端
-`--selector owner=helm,name=cilium` 直接滤掉，不影响判定。当前只接受两种终态：全新安装的
-精确 rev1，或 Stage 60 从已知旧 rev1 执行一次受控 upgrade 后得到的精确 rev2。任意 rev3、
-错误 superseded/deployed 历史、非 `kube-system`、同名影子 release 或 values 漂移仍会停止。
+`--selector owner=helm,name=cilium` 直接滤掉，不影响判定。当前只接受三种精确终态：全新安装
+得到的 rev1、从已知旧 rev1 一次升级得到的 rev2，以及从已知 pre-rollout rev2 再升级得到的
+rev3。任意 rev4、错误 superseded/deployed 历史、非 `kube-system`、同名影子 release、values
+或 Operator checksum/代际漂移仍会停止。rev2/rev3 不只核当前 revision：脚本会逐版读取
+Helm values，分别证明 `LEGACY → DESIRED` 或 `LEGACY → PRE_ROLLOUT → DESIRED` 血统。
 
 **Gateway 不再等待外部地址。** 单节点 DEV 没有 LoadBalancer 地址提供者；若保持 Cilium
 默认 Service 模式，Gateway 会停在 `Programmed=False / AddressNotAssigned`。固定 values
 启用 `gatewayAPI.hostNetwork.enabled=true`，它会关闭 Gateway 的 LoadBalancer Service 模式，
-让 Envoy 直接监听主机网络；HTTPS 443 所需的 `NET_BIND_SERVICE` 与默认能力一起锁死。
+让 Envoy 直接监听主机网络；同时必须启用 `operator.rollOutPods=true`，让 ConfigMap checksum
+进入 Pod template 并滚动 Operator，否则旧进程仍会按启动时的 false 配置工作。HTTPS 443
+所需的 `NET_BIND_SERVICE` 与默认能力一起锁死。该 checksum 由钉死的 Helm、Chart、values、
+release/namespace 与 Kubernetes capability 离线重渲染后逐字比对；Stage 60 在同一对象快照中
+同时核 Operator readiness、generation 与 checksum，避免跨查询拼接假阳性。
 
 各 stage 能发出的**完整** STOP 原因清单见 `scripts/bootstrap/stages/<NN-name>/README.md`
 ——那些文件由源码生成并有 `StageReadmeTest` 防漂移。本表只收录实际遇到过、且处置方式

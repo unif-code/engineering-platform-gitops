@@ -58,6 +58,7 @@ ipam:
   mode: kubernetes
 
 operator:
+  rollOutPods: true
   image:
     genericDigest: sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3
     useDigest: true
@@ -441,16 +442,16 @@ else:
         item.get("metadata", {}).get("name"): item
         for item in items if isinstance(item, dict)
     }
-    if len(items) == 1 and valid(
-        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "deployed"
-    ):
-        print("REVISION_1")
-    elif len(items) == 2 and valid(
-        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "superseded"
-    ) and valid(by_name.get("sh.helm.release.v1.cilium.v2", {}), 2, "deployed"):
-        print("REVISION_2")
-    else:
-        print("UNKNOWN")
+    revision = len(items)
+    history_ok = revision in {1, 2, 3} and all(
+        valid(
+            by_name.get(f"sh.helm.release.v1.cilium.v{number}", {}),
+            number,
+            "deployed" if number == revision else "superseded",
+        )
+        for number in range(1, revision + 1)
+    )
+    print(f"REVISION_{revision}" if history_ok else "UNKNOWN")
 ' 2>/dev/null
 }
 
@@ -468,23 +469,26 @@ helm_secret_state() {
 cilium_workload_json_state() {
   python_isolated -c '
 import json
+import re
 import sys
 try:
     document = json.load(sys.stdin)
 except (TypeError, ValueError):
-    print("UNKNOWN")
+    print("UNKNOWN\tUNKNOWN")
     raise SystemExit(0)
 items = document.get("items") if isinstance(document, dict) else None
 if not isinstance(items, list):
-    print("UNKNOWN")
+    print("UNKNOWN\tUNKNOWN")
     raise SystemExit(0)
 if not items:
-    print("MISSING")
+    print("MISSING\tMISSING")
     raise SystemExit(0)
 if len(items) != 2:
-    print("UNKNOWN")
+    print("UNKNOWN\tUNKNOWN")
     raise SystemExit(0)
+expected_checksum = sys.argv[1]
 seen = set()
+rollout_state = "UNKNOWN"
 agent_labels = {
     "k8s-app": "cilium",
     "app.kubernetes.io/name": "cilium-agent",
@@ -511,12 +515,12 @@ def container_image_is_exact(item, expected_name, expected_image):
     )
 for item in items:
     if not isinstance(item, dict):
-        print("UNKNOWN")
+        print("UNKNOWN\tUNKNOWN")
         raise SystemExit(0)
     metadata = item.get("metadata", {})
     labels = metadata.get("labels") if isinstance(metadata, dict) else None
     if metadata.get("namespace") != "kube-system" or not isinstance(labels, dict):
-        print("UNKNOWN")
+        print("UNKNOWN\tUNKNOWN")
         raise SystemExit(0)
     name = metadata.get("name")
     status = item.get("status", {})
@@ -532,6 +536,31 @@ for item in items:
             status.get("numberAvailable") == 1 and status.get("numberUnavailable", 0) == 0
         )
     elif item.get("kind") == "Deployment" and name == "cilium-operator":
+        spec = item.get("spec") if isinstance(item, dict) else None
+        template = spec.get("template") if isinstance(spec, dict) else None
+        template_metadata = template.get("metadata") if isinstance(template, dict) else None
+        annotations = (
+            template_metadata.get("annotations")
+            if isinstance(template_metadata, dict) else None
+        )
+        generation = metadata.get("generation")
+        checksum = (
+            annotations.get("cilium.io/cilium-configmap-checksum")
+            if isinstance(annotations, dict) else None
+        )
+        if (
+            isinstance(generation, int) and not isinstance(generation, bool) and
+            generation > 0 and isinstance(annotations, dict) and
+            status.get("observedGeneration") == generation
+        ):
+            if checksum is None:
+                rollout_state = "LEGACY"
+            elif (
+                isinstance(checksum, str) and
+                re.fullmatch(r"[0-9a-f]{64}", expected_checksum) and
+                checksum == expected_checksum
+            ):
+                rollout_state = "DESIRED"
         exact = (
             all(labels.get(key) == value for key, value in operator_labels.items()) and
             container_image_is_exact(
@@ -546,25 +575,29 @@ for item in items:
     else:
         exact = False
     if not exact or name in seen:
-        print("UNKNOWN")
+        print("UNKNOWN\tUNKNOWN")
         raise SystemExit(0)
     seen.add(name)
-print("COMPLIANT" if seen == {"cilium", "cilium-operator"} else "UNKNOWN")
-' 2>/dev/null
+if seen == {"cilium", "cilium-operator"}:
+    print(f"COMPLIANT\t{rollout_state}")
+else:
+    print("UNKNOWN\tUNKNOWN")
+' "$EXPECTED_CILIUM_OPERATOR_CHECKSUM" 2>/dev/null
 }
 
-cilium_workload_state() {
+cilium_workload_states() {
   local output parsed
   output=$(kubectl_run --namespace kube-system get \
     daemonset/cilium deployment/cilium-operator --ignore-not-found --output=json 2>/dev/null) || {
-    printf 'UNKNOWN\n'
+    printf 'UNKNOWN\tUNKNOWN\n'
     return
   }
   [[ -n "$output" ]] || {
-    printf 'MISSING\n'
+    printf 'MISSING\tMISSING\n'
     return
   }
-  parsed=$(printf '%s' "$output" | cilium_workload_json_state) || parsed=UNKNOWN
+  parsed=$(printf '%s' "$output" | cilium_workload_json_state) ||
+    parsed=$'UNKNOWN\tUNKNOWN'
   printf '%s\n' "$parsed"
 }
 
@@ -745,7 +778,7 @@ if not isinstance(items, list):
     print("UNKNOWN")
     raise SystemExit(0)
 # 只判定我们自己的 release；同集群可能有其他运维装的 release，与本 stage 无关。
-# 过滤依据是 helm 的 name 字段；只接受受控状态中的 revision 1 或 2。
+# 过滤依据是 helm 的 name 字段；只接受受控状态中的 revision 1、2 或 3。
 mine = [item for item in items if isinstance(item, dict) and item.get("name") == "cilium"]
 if not mine:
     print("MISSING")
@@ -755,7 +788,7 @@ elif len(mine) == 1:
     exact = (
         set(item) == expected_keys and
         item.get("name") == "cilium" and item.get("namespace") == "kube-system" and
-        isinstance(item.get("revision"), str) and item["revision"] in {"1", "2"} and
+        isinstance(item.get("revision"), str) and item["revision"] in {"1", "2", "3"} and
         isinstance(item.get("updated"), str) and bool(item["updated"].strip()) and
         item.get("status") == "deployed" and
         item.get("chart") == "cilium-1.20.0" and item.get("app_version") == "1.20.0"
@@ -767,7 +800,7 @@ else:
 }
 
 helm_release_state() {
-  local binary_state version output parsed values_output
+  local binary_state version output parsed
   binary_state=$(helm_binary_state) || {
     printf 'UNKNOWN\n'
     return
@@ -790,24 +823,13 @@ helm_release_state() {
     return
   }
   parsed=$(printf '%s' "$output" | helm_list_json_state) || parsed=UNKNOWN
-  [[ "$parsed" == REVISION_1 || "$parsed" == REVISION_2 ]] || {
+  [[ "$parsed" == REVISION_1 || "$parsed" == REVISION_2 ||
+     "$parsed" == REVISION_3 ]] || {
     printf '%s\n' "$parsed"
     return
   }
   local revision=${parsed#REVISION_}
-  values_output=$(helm_cluster_run get values cilium \
-    --namespace kube-system --revision "$revision" --output json 2>/dev/null) || {
-    printf 'UNKNOWN\n'
-    return
-  }
-  if printf '%s' "$values_output" | helm_values_json_is_exact; then
-    printf 'DESIRED_%s\n' "$parsed"
-  elif [[ "$parsed" == REVISION_1 ]] &&
-       printf '%s' "$values_output" | helm_values_json_is_legacy; then
-    printf 'LEGACY_REVISION_1\n'
-  else
-    printf 'UNKNOWN\n'
-  fi
+  helm_cilium_values_lineage_state "$revision"
 }
 
 # 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
@@ -826,6 +848,14 @@ HELM_SECRET_STATE=
 # 无法跟随，故显式关闭。
 # shellcheck disable=SC2034
 CILIUM_WORKLOAD_STATE=
+# 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
+# 无法跟随，故显式关闭。
+# shellcheck disable=SC2034
+CILIUM_OPERATOR_ROLLOUT_STATE=
+# 从钉死的 Chart 与 values 离线渲染得到；空值表示尚未安装 Helm，UNKNOWN
+# 表示渲染失败。load_cluster_state 只会在 Helm provenance 合规后填充。
+# shellcheck disable=SC2034
+EXPECTED_CILIUM_OPERATOR_CHECKSUM=
 # 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck
 # 无法跟随，故显式关闭。
 # shellcheck disable=SC2034

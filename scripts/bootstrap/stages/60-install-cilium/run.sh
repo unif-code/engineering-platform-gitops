@@ -133,6 +133,7 @@ report_cluster_state() {
   log_evidence "GATEWAY_STATE=${GATEWAY_STATE}"
   log_evidence "HELM_SECRET_STATE=${HELM_SECRET_STATE}"
   log_evidence "CILIUM_WORKLOAD_STATE=${CILIUM_WORKLOAD_STATE}"
+  log_evidence "CILIUM_OPERATOR_ROLLOUT_STATE=${CILIUM_OPERATOR_ROLLOUT_STATE}"
   log_evidence "ENVOY_DAEMONSET_STATE=${ENVOY_DAEMONSET_STATE}"
   log_evidence "ENVOY_PODS_STATE=${ENVOY_PODS_STATE}"
   log_evidence "CILIUM_CONFIG_STATE=${CILIUM_CONFIG_STATE}"
@@ -140,13 +141,14 @@ report_cluster_state() {
 }
 
 load_cluster_state() {
-  local helm_state=$1
+  local helm_state=$1 workload_states
   # kube_proxy_absent 失败时下面整段都不会跑；先给全部分量确定初值，
   # 报告才不会撞上 set -u，且「没查到」如实呈现为 UNKNOWN。
   KUBE_PROXY_STATE=UNKNOWN
   GATEWAY_STATE=UNKNOWN
   HELM_SECRET_STATE=UNKNOWN
   CILIUM_WORKLOAD_STATE=UNKNOWN
+  CILIUM_OPERATOR_ROLLOUT_STATE=UNKNOWN
   ENVOY_DAEMONSET_STATE=UNKNOWN
   ENVOY_PODS_STATE=UNKNOWN
   CILIUM_CONFIG_STATE=UNKNOWN
@@ -158,7 +160,22 @@ load_cluster_state() {
   KUBE_PROXY_STATE=COMPLIANT
   GATEWAY_STATE=$(gateway_bundle_state) || GATEWAY_STATE=UNKNOWN
   HELM_SECRET_STATE=$(helm_secret_state) || HELM_SECRET_STATE=UNKNOWN
-  CILIUM_WORKLOAD_STATE=$(cilium_workload_state) || CILIUM_WORKLOAD_STATE=UNKNOWN
+  if [[ "$helm_state" == COMPLIANT ]]; then
+    EXPECTED_CILIUM_OPERATOR_CHECKSUM=$(helm_rendered_cilium_operator_checksum \
+      "$cilium_chart_input" "$values_input") ||
+      EXPECTED_CILIUM_OPERATOR_CHECKSUM=UNKNOWN
+    staged_inputs_gate ||
+      complete STOP_SUPPLY_CHAIN_MISMATCH staged-input-raced-after-render "$EXIT_SUPPLY_CHAIN" NONE
+    if [[ -n "$apply_snapshot_dir" ]]; then
+      apply_snapshot_gate ||
+        complete STOP_SUPPLY_CHAIN_MISMATCH apply-input-snapshot-raced-after-render "$EXIT_SUPPLY_CHAIN" NONE
+    fi
+    [[ "$(helm_binary_state)" == COMPLIANT ]] ||
+      complete STOP_UNKNOWN_STATE helm-binary-raced-after-render "$EXIT_UNKNOWN_STATE" NONE
+  fi
+  workload_states=$(cilium_workload_states) || workload_states=$'UNKNOWN\tUNKNOWN'
+  IFS=$'\t' read -r CILIUM_WORKLOAD_STATE CILIUM_OPERATOR_ROLLOUT_STATE \
+    <<<"$workload_states"
   ENVOY_DAEMONSET_STATE=$(envoy_daemonset_state) || ENVOY_DAEMONSET_STATE=UNKNOWN
   ENVOY_PODS_STATE=$(envoy_pods_state) || ENVOY_PODS_STATE=UNKNOWN
   CILIUM_CONFIG_STATE=$(cilium_config_state) || CILIUM_CONFIG_STATE=UNKNOWN
@@ -167,24 +184,38 @@ load_cluster_state() {
   else
     HELM_RELEASE_STATE=MISSING
   fi
+  if [[ "$helm_state" == COMPLIANT &&
+        ! "$EXPECTED_CILIUM_OPERATOR_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]; then
+    CLUSTER_STATE=UNKNOWN
+    return
+  fi
   if [[ "$GATEWAY_STATE" == COMPLIANT && "$helm_state" == COMPLIANT &&
         ( ( "$HELM_SECRET_STATE" == REVISION_1 &&
             "$HELM_RELEASE_STATE" == DESIRED_REVISION_1 ) ||
           ( "$HELM_SECRET_STATE" == REVISION_2 &&
-            "$HELM_RELEASE_STATE" == DESIRED_REVISION_2 ) ) &&
+            "$HELM_RELEASE_STATE" == DESIRED_REVISION_2 ) ||
+          ( "$HELM_SECRET_STATE" == REVISION_3 &&
+            "$HELM_RELEASE_STATE" == DESIRED_REVISION_3 ) ) &&
         "$CILIUM_WORKLOAD_STATE" == COMPLIANT &&
+        "$CILIUM_OPERATOR_ROLLOUT_STATE" == DESIRED &&
         "$ENVOY_DAEMONSET_STATE" == COMPLIANT && "$ENVOY_PODS_STATE" == COMPLIANT &&
         "$CILIUM_CONFIG_STATE" == DESIRED ]]; then
     CLUSTER_STATE=COMPLIANT
   elif [[ "$GATEWAY_STATE" == COMPLIANT && "$helm_state" == COMPLIANT &&
-          "$HELM_SECRET_STATE" == REVISION_1 &&
-          "$HELM_RELEASE_STATE" == LEGACY_REVISION_1 &&
           "$CILIUM_WORKLOAD_STATE" == COMPLIANT &&
           "$ENVOY_DAEMONSET_STATE" == COMPLIANT && "$ENVOY_PODS_STATE" == COMPLIANT &&
-          "$CILIUM_CONFIG_STATE" == LEGACY ]]; then
+          ( ( "$HELM_SECRET_STATE" == REVISION_1 &&
+              "$HELM_RELEASE_STATE" == LEGACY_REVISION_1 &&
+              "$CILIUM_CONFIG_STATE" == LEGACY &&
+              "$CILIUM_OPERATOR_ROLLOUT_STATE" == LEGACY ) ||
+            ( "$HELM_SECRET_STATE" == REVISION_2 &&
+              "$HELM_RELEASE_STATE" == PRE_ROLLOUT_REVISION_2 &&
+              "$CILIUM_CONFIG_STATE" == DESIRED &&
+              "$CILIUM_OPERATOR_ROLLOUT_STATE" == LEGACY ) ) ]]; then
     CLUSTER_STATE=UPGRADE_REQUIRED
   elif [[ ( "$GATEWAY_STATE" == MISSING || "$GATEWAY_STATE" == COMPLIANT ) &&
           "$HELM_SECRET_STATE" == MISSING && "$CILIUM_WORKLOAD_STATE" == MISSING &&
+          "$CILIUM_OPERATOR_ROLLOUT_STATE" == MISSING &&
           "$ENVOY_DAEMONSET_STATE" == MISSING && "$ENVOY_PODS_STATE" == MISSING &&
           "$CILIUM_CONFIG_STATE" == MISSING &&
           "$HELM_RELEASE_STATE" == MISSING ]]; then
@@ -411,4 +442,5 @@ log_evidence CILIUM_VERSION=1.20.0
 log_evidence KUBE_PROXY_OBJECTS=absent
 log_evidence CILIUM_DAEMONSET_READY=true
 log_evidence CILIUM_OPERATOR_READY=true
+log_evidence CILIUM_OPERATOR_CONFIG_ROLLOUT=true
 complete PASS_CILIUM_INSTALLED cilium-ready 0 'stages/90-verify/run.sh --check'
