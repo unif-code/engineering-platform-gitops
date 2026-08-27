@@ -4405,7 +4405,10 @@ class FluxPhaseAStageTest(BootstrapTestCase):
             #!/bin/sh
             printf 'flux %s\n' "$*" >>"$FAKE_COMMAND_LOG"
             case "$*" in
-              'version --client') printf 'flux version 2.9.3\n' ;;
+              'version --client')
+                printf '%s\n' "${FAKE_FLUX_VERSION_OUTPUT:-flux: v2.9.3}"
+                exit "${FAKE_FLUX_VERSION_EXIT_CODE:-0}"
+                ;;
               check\ --pre\ --kubeconfig=*) printf 'pre-install checks passed\n' ;;
               check\ --kubeconfig=*\ --components=source-controller,kustomize-controller,helm-controller,notification-controller)
                 printf 'all checks passed\n'
@@ -5103,6 +5106,48 @@ class FluxPhaseAStageTest(BootstrapTestCase):
         commands = command_log.read_text(encoding='utf-8').splitlines()
         self.assertTrue(any('tar -xOf ' in line for line in commands), commands)
         self.assertFalse(any('tar -xzf ' in line for line in commands), commands)
+
+    def test_apply_accepts_official_flux_cli_version_output(self) -> None:
+        environment, _, _ = self.make_environment()
+        environment['FAKE_FLUX_VERSION_OUTPUT'] = 'flux: v2.9.3'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_INSTALLED', result.stdout)
+
+    def test_apply_rejects_nonzero_flux_cli_version_command_before_mutation(
+        self,
+    ) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_VERSION_OUTPUT'] = 'flux: v2.9.3'
+        environment['FAKE_FLUX_VERSION_EXIT_CODE'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-cli-version-drift', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        for mutation in (
+            ' apply --server-side', ' create --filename=', ' delete pod ',
+        ):
+            self.assertNotIn(mutation, commands)
+
+    def test_apply_rejects_flux_cli_version_drift_before_server_mutation(
+        self,
+    ) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_VERSION_OUTPUT'] = 'flux: v2.9.4'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 20, result.stdout + result.stderr)
+        self.assertIn('REASON=flux-cli-version-drift', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        for mutation in (
+            ' apply --server-side', ' create --filename=', ' delete pod ',
+        ):
+            self.assertNotIn(mutation, commands)
 
     def test_apply_reconciles_existing_approved_drift_without_namespace_apply(
         self,

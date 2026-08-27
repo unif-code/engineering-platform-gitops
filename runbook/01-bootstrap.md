@@ -593,7 +593,7 @@ test "$(stat -c '%U:%G %a' flux)" = 'root:root 755'
 ./flux check --pre --kubeconfig=/etc/kubernetes/admin.conf
 ```
 
-期望：archive SHA-256 为 `OK`，CLI 为 `v2.9.3`，pre-install check 通过。任何下载、
+期望：archive SHA-256 为 `OK`，CLI 精确输出 `flux: v2.9.3`，pre-install check 通过。任何下载、
 TLS、摘要或兼容性失败都必须停止，不允许改用浮动 URL、tag 或未登记镜像。
 
 ### 渲染与 client dry-run
