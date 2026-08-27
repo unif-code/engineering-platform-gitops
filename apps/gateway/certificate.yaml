@@ -8,6 +8,7 @@ metadata:
   name: platform-gateway-tls
   namespace: platform
 spec:
+  commonName: platform.dev.local
   dnsNames:
     - platform.dev.local
   duration: 720h
