@@ -470,7 +470,11 @@ chmod 755 "$flux_binary" ||
 if [[ ! -x "$flux_binary" ]] || ! safe_file "$flux_binary" 755; then
   complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-binary-unsafe "$EXIT_SUPPLY_CHAIN" NONE
 fi
-[[ "$("$flux_binary" version --client 2>/dev/null)" == 'flux version 2.9.3' ]] ||
+flux_version_output=
+if ! flux_version_output=$("$flux_binary" version --client 2>/dev/null); then
+  complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-version-drift "$EXIT_SUPPLY_CHAIN" NONE
+fi
+[[ "$flux_version_output" == "flux: v${FLUX_VERSION}" ]] ||
   complete STOP_SUPPLY_CHAIN_MISMATCH flux-cli-version-drift "$EXIT_SUPPLY_CHAIN" NONE
 printf '%s' "$ADMIN_CONF_CONTENT" >"$kubeconfig_file" ||
   complete STOP_APPLY_FAILED flux-kubeconfig-create-failed "$EXIT_APPLY_FAILED" NONE
