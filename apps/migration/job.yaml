@@ -4,11 +4,11 @@ metadata:
   annotations:
     platform.unif.internal/backend-image: sha256:f32c5f67f26f1794022698b4692de5390b81374adf6c82de8e8a748fe1fca857
     platform.unif.internal/backend-source: 4aaf721fa91abd729b33765e4e329b02aa2ece02
-    platform.unif.internal/migration-generation: '1'
+    platform.unif.internal/migration-generation: '2'
   labels:
     app.kubernetes.io/name: platform-migration
     app.kubernetes.io/part-of: engineering-platform
-  name: platform-migrate-4aaf721
+  name: platform-migrate-4aaf721-g2
   namespace: platform
 spec:
   activeDeadlineSeconds: 600

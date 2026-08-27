@@ -185,7 +185,7 @@ Gateway 的 `ingress` identity 访问 frontend/backend。
 | 110 | `PASS_FLUX_SYNC_CHECK` | `PASS_FLUX_SYNC_ENABLED` | 持久化 Namespace/RBAC、公共 GitRepository、根 Kustomization 与 Git FQDN egress，并等待 Git source/root sync Ready |
 | 120 | `PASS_PLATFORM_CORE_CHECK` | `PASS_PLATFORM_CORE_READY` | 等待 foundation、cert-manager 与 CNPG Operator Ready |
 | 130 | `PASS_PLATFORM_DATABASE_CHECK` | `PASS_PLATFORM_DATABASE_READY` | 创建 13 个不覆盖的 Secret，等待单实例 PostgreSQL，生成 file-only runtime config |
-| 140 | `PASS_PLATFORM_MIGRATION_CHECK` | `PASS_PLATFORM_MIGRATION_COMPLETE` | 等待不可变 Job `platform-migrate-4aaf721` 完成并验证 migration heads |
+| 140 | `PASS_PLATFORM_MIGRATION_CHECK` | `PASS_PLATFORM_MIGRATION_COMPLETE` | 等待不可变 Job `platform-migrate-4aaf721-g2` 完成并验证 migration heads |
 | 150 | `PASS_PLATFORM_APPS_CHECK` | `PASS_PLATFORM_APPS_READY` | 等待 workload/TLS/Gateway 并执行 HTTPS `/`、`/healthz`、`/readyz`、未认证 `/api/v1/me` smoke |
 | 160 | `PASS_BUSINESS_READY_EVIDENCE_CHECK` | `PASS_BUSINESS_READY` | 重放 smoke，写入 mode `0600` evidence 与 SHA-256 sidecar |
 
@@ -194,6 +194,10 @@ Gateway 的 `ingress` identity 访问 frontend/backend。
 受限 ServiceAccount 时，该阶段保证 namespaced Role 先于依赖它的 RoleBinding 持久化，
 避免 server-side dry-run 的同批次依赖失败；禁止改为授予 `bind`、`escalate` 或
 `cluster-admin`。
+
+迁移 Job 失败时保留失败代际作为审计证据，禁止在现场就地删除或重跑；重试必须通过受审
+Git 变更同时递增 `platform.unif.internal/migration-generation` 与 Job 名称，再重新通过
+`validation-gate` 和 `run-approved.sh`。
 
 重复运行时，已精确合规的 stage 返回 `ALREADY_COMPLIANT`；任何 partial、extra、Secret 语义漂移、
 供应链漂移、readiness 或 smoke 未知状态都 fail closed。Stage 160 证据路径固定为

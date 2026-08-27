@@ -6095,6 +6095,33 @@ class BusinessReadyStageTest(BootstrapTestCase):
             self.source,
         )
 
+    def test_migration_retry_uses_a_new_immutable_generation(self) -> None:
+        migration = (
+            ROOT / 'apps/migration/job.yaml'
+        ).read_text(encoding='utf-8')
+        runbook = (ROOT / 'runbook/01-bootstrap.md').read_text(
+            encoding='utf-8'
+        )
+        self.assertIn(
+            'readonly BUSINESS_MIGRATION_JOB=platform-migrate-4aaf721-g2',
+            self.source,
+        )
+        self.assertIn('name: platform-migrate-4aaf721-g2', migration)
+        self.assertIn(
+            "platform.unif.internal/migration-generation: '2'",
+            migration,
+        )
+        self.assertIn(
+            'log_evidence "MIGRATION=${BUSINESS_MIGRATION_JOB}-complete"',
+            self.source,
+        )
+        self.assertIn('`platform-migrate-4aaf721-g2`', runbook)
+        self.assertIn('保留失败代际', runbook)
+        self.assertNotIn(
+            'kubectl_run --namespace=platform delete',
+            self.source,
+        )
+
     def test_https_smoke_uses_gateway_status_and_the_issued_certificate(self) -> None:
         for required in (
             'business_gateway_address',

@@ -3,6 +3,10 @@
 Waits for the immutable backend migration generation and requires its one-shot Job to
 complete. The Job validates the owner and six runtime roles before Alembic runs.
 
+Failed generations are retained as audit evidence. A reviewed Git change must advance
+both `platform.unif.internal/migration-generation` and the Job name before a retry; the
+bootstrap never deletes or reruns a failed immutable generation in place.
+
 ## 停止原因
 
 - `admin-conf-content-or-structure-drift`

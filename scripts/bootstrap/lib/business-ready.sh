@@ -23,7 +23,7 @@ source "${business_lib_dir}/kubectl.sh"
 readonly BUSINESS_REPO_ROOT=$business_repo_root
 readonly BUSINESS_FIELD_MANAGER=engineering-platform-business-ready
 readonly BUSINESS_SECRET_COUNT=13
-readonly BUSINESS_MIGRATION_JOB=platform-migrate-4aaf721
+readonly BUSINESS_MIGRATION_JOB=platform-migrate-4aaf721-g2
 readonly -a BUSINESS_NAMESPACES=(cert-manager cnpg-system local-path-storage platform)
 readonly -a BUSINESS_ROOT_KUSTOMIZATIONS=(
   infrastructure-foundation cert-manager-controller cert-manager-config
@@ -888,7 +888,7 @@ business_stage_160_apply() {
   log_evidence 'CNPG_OPERATOR=READY'
   log_evidence 'POSTGRES_INSTANCES=1'
   log_evidence 'POSTGRES_BACKUP=NOT_EXECUTED'
-  log_evidence 'MIGRATION=platform-migrate-4aaf721-complete'
+  log_evidence "MIGRATION=${BUSINESS_MIGRATION_JOB}-complete"
   log_evidence 'FRONTEND=READY'
   log_evidence 'BACKEND=READY'
   log_evidence 'HTTPS_SMOKE=PASS'
