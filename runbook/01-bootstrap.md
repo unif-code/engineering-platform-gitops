@@ -51,7 +51,8 @@ Chrome 堡垒机 root 会话于 `2026-08-24 12:16:47Z` 完成 Flux Phase A 四 C
 编排器汇总：`RESULT=PASS_BOOTSTRAP_ALL`、`REASON=bootstrap-complete`、`NEXT_STAGE=NONE`、`EXIT_CODE=0`。
 
 集群构成：kubeadm 单节点控制面（`clusterName=engineering-platform-dev`）、containerd 2.3.1 + runc、
-Kubernetes 1.36.3 四包 hold、Cilium 1.20.0（kube-proxy replacement、Gateway API v1.6.1 standard、Envoy DaemonSet）。
+Kubernetes 1.36.3 四包 hold、Cilium 1.20.0（kube-proxy replacement、Gateway API v1.6.1
+standard、host-network Gateway、Envoy DaemonSet）。
 
 ### 2026-08-21 历史 bootstrap 观测
 
@@ -236,7 +237,7 @@ probe，因此仍属于必须先展示完整命令的运维动作。
 | 10 | `stages/30-install-containerd/run.sh` | `--check` 后批准 `--apply` | `PASS_CONTAINERD_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/10-containerd-*.txt` |
 | 11 | `stages/40-install-kubernetes/run.sh` | `--check` 后批准 `--apply` | `PASS_KUBERNETES_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/11-kubernetes-*.txt` |
 | 12 | `stages/50-kubeadm-init/run.sh` | `--check` 后批准 `--apply` | `PASS_KUBEADM_INITIALIZED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/12-kubeadm-*.txt` |
-| 13 | `stages/60-install-cilium/run.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/13-cilium-*.txt` |
+| 13 | `stages/60-install-cilium/run.sh` | `--check` 后批准 `--apply` | `PASS_CILIUM_INSTALLED` 或 `ALREADY_COMPLIANT` | 安装当前合同，或仅把精确旧 rev1 升级到当前 rev2；`/root/dev-infra-evidence/13-cilium-*.txt` |
 | 14 | `stages/90-verify/run.sh` | 仅 `--check` | `PASS_BOOTSTRAP_VERIFIED` | `/root/dev-infra-evidence/14-verify-*.txt` |
 | 15 | `stages/100-flux-phase-a/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_PHASE_A_INSTALLED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/15-flux-phase-a-*.txt` 及同名 `.sha256` |
 | 16 | `stages/110-flux-sync/run.sh` | `--check` 后批准 `--apply` | `PASS_FLUX_SYNC_ENABLED` 或 `ALREADY_COMPLIANT` | 终端回执 |
@@ -311,21 +312,27 @@ HELM_SECRET_STATE=UNKNOWN      ← 阻塞点
 CILIUM_WORKLOAD_STATE=COMPLIANT
 ENVOY_DAEMONSET_STATE=COMPLIANT
 ENVOY_PODS_STATE=COMPLIANT
-CILIUM_CONFIG_STATE=COMPLIANT
-HELM_RELEASE_STATE=COMPLIANT
+CILIUM_CONFIG_STATE=DESIRED
+HELM_RELEASE_STATE=DESIRED_REVISION_1
 ```
 
-取值只有 `COMPLIANT`/`MISSING`/`UNKNOWN` 三种。注意 `KUBE_PROXY_STATE` 非 COMPLIANT 时
-其余分量**根本没被查询**，会统一显示 `UNKNOWN`——那是「没查」不是「查了不对」，
-先解决 kube-proxy 残留再重跑。
+大部分分量取值为 `COMPLIANT`/`MISSING`/`UNKNOWN`；Helm Secret、release 和 Cilium Config
+使用固定的 revision/`DESIRED`/`LEGACY` 状态名，以便精确区分唯一允许的旧 rev1 迁移。
+注意 `KUBE_PROXY_STATE` 非 COMPLIANT 时其余分量**根本没被查询**，会统一显示 `UNKNOWN`——
+那是「没查」不是「查了不对」，先解决 kube-proxy 残留再重跑。
 
 > 2026-08-21 之前这八个分量在停止时一个都不打印，定位只能靠额外跑一轮只读普查。
 
 **外来 Helm release 不再判死。** Stage 60/90 的 helm 判定作用域已收窄为「我们的 cilium
 release 对不对」，集群里其他运维装的 release（例如 gitlab-runner）会被服务端
-`--selector owner=helm,name=cilium` 直接滤掉，不影响判定。仍然会被抓的是这三种：
-cilium 被 `helm upgrade` 过（留下 revision 2）、cilium 装在非 `kube-system`、
-存在同名的影子 release。
+`--selector owner=helm,name=cilium` 直接滤掉，不影响判定。当前只接受两种终态：全新安装的
+精确 rev1，或 Stage 60 从已知旧 rev1 执行一次受控 upgrade 后得到的精确 rev2。任意 rev3、
+错误 superseded/deployed 历史、非 `kube-system`、同名影子 release 或 values 漂移仍会停止。
+
+**Gateway 不再等待外部地址。** 单节点 DEV 没有 LoadBalancer 地址提供者；若保持 Cilium
+默认 Service 模式，Gateway 会停在 `Programmed=False / AddressNotAssigned`。固定 values
+启用 `gatewayAPI.hostNetwork.enabled=true`，它会关闭 Gateway 的 LoadBalancer Service 模式，
+让 Envoy 直接监听主机网络；HTTPS 443 所需的 `NET_BIND_SERVICE` 与默认能力一起锁死。
 
 各 stage 能发出的**完整** STOP 原因清单见 `scripts/bootstrap/stages/<NN-name>/README.md`
 ——那些文件由源码生成并有 `StageReadmeTest` 防漂移。本表只收录实际遇到过、且处置方式

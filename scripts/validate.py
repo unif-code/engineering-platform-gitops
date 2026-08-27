@@ -977,6 +977,18 @@ cgroup:
 
 gatewayAPI:
   enabled: true
+  hostNetwork:
+    enabled: true
+
+envoy:
+  enabled: true
+  securityContext:
+    capabilities:
+      keepCapNetBindService: true
+      envoy:
+        - NET_ADMIN
+        - SYS_ADMIN
+        - NET_BIND_SERVICE
 
 hubble:
   enabled: false
@@ -1107,7 +1119,7 @@ def validate_host_cilium(path: Path, host: dict[str, str]) -> None:
     expect_contract(
         f'{label} 顶层键集', set(cilium),
         {'kubeProxyReplacement', 'k8sServiceHost', 'k8sServicePort', 'cgroup',
-         'gatewayAPI', 'hubble', 'image', 'ipam', 'operator'},
+         'gatewayAPI', 'envoy', 'hubble', 'image', 'ipam', 'operator'},
     )
     contracts = (
         (('kubeProxyReplacement',), True, 'kube-proxy replacement'),
@@ -1115,6 +1127,12 @@ def validate_host_cilium(path: Path, host: dict[str, str]) -> None:
         (('k8sServicePort',), 6443, 'Cilium API port'),
         (('ipam', 'mode'), 'kubernetes', 'Cilium IPAM'),
         (('gatewayAPI', 'enabled'), True, 'Cilium Gateway API'),
+        (('gatewayAPI', 'hostNetwork', 'enabled'), True, 'Cilium Gateway API host network'),
+        (('envoy', 'enabled'), True, 'Cilium standalone Envoy'),
+        (('envoy', 'securityContext', 'capabilities', 'keepCapNetBindService'), True,
+         'Cilium Envoy keep NET_BIND_SERVICE'),
+        (('envoy', 'securityContext', 'capabilities', 'envoy'),
+         ['NET_ADMIN', 'SYS_ADMIN', 'NET_BIND_SERVICE'], 'Cilium Envoy capabilities'),
         (('cgroup', 'autoMount', 'enabled'), False, 'Cilium cgroup automount'),
         (('cgroup', 'hostRoot'), '/sys/fs/cgroup', 'Cilium cgroup root'),
         (('operator', 'replicas'), 1, 'Cilium operator replicas'),

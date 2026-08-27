@@ -76,12 +76,12 @@ helm_kubeconfig_residue_exists() (
   exit 1
 )
 
-helm_values_json_is_exact() {
+helm_values_json_state() {
   python_isolated -c '
 import json
 import sys
 
-expected = {
+desired = {
     "kubeProxyReplacement": True,
     "k8sServiceHost": sys.argv[1],
     "k8sServicePort": 6443,
@@ -89,7 +89,16 @@ expected = {
         "autoMount": {"enabled": False},
         "hostRoot": "/sys/fs/cgroup",
     },
-    "gatewayAPI": {"enabled": True},
+    "gatewayAPI": {"enabled": True, "hostNetwork": {"enabled": True}},
+    "envoy": {
+        "enabled": True,
+        "securityContext": {
+            "capabilities": {
+                "keepCapNetBindService": True,
+                "envoy": ["NET_ADMIN", "SYS_ADMIN", "NET_BIND_SERVICE"],
+            },
+        },
+    },
     "hubble": {"enabled": False},
     "image": {
         "digest": "sha256:383968cd5e8873f7976fa76aa6196045643558f4cc9518a207b9335cb24a0e93",
@@ -104,6 +113,9 @@ expected = {
         "replicas": 1,
     },
 }
+legacy = dict(desired)
+legacy["gatewayAPI"] = {"enabled": True}
+del legacy["envoy"]
 
 def unique_object(pairs):
     result = {}
@@ -136,9 +148,23 @@ try:
         parse_constant=reject_constant,
     )
 except (TypeError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(0 if exactly_equal(actual, expected) else 1)
-' "$HOST_NODE_IP" >/dev/null 2>&1
+    print("UNKNOWN")
+    raise SystemExit(0)
+if exactly_equal(actual, desired):
+    print("DESIRED")
+elif exactly_equal(actual, legacy):
+    print("LEGACY")
+else:
+    print("UNKNOWN")
+' "$HOST_NODE_IP" 2>/dev/null
+}
+
+helm_values_json_is_exact() {
+  [[ "$(helm_values_json_state)" == DESIRED ]]
+}
+
+helm_values_json_is_legacy() {
+  [[ "$(helm_values_json_state)" == LEGACY ]]
 }
 
 helm_archive_is_safe() {

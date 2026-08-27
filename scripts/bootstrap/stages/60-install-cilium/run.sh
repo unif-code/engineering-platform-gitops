@@ -125,7 +125,7 @@ readonly -a GATEWAY_OBJECTS=(
 # shellcheck disable=SC2329
 
 # 复合判定的分量。停止时逐条报告，运维才不必再跑一轮人工普查去猜是哪一个。
-# 取值域封闭在 COMPLIANT/MISSING/UNKNOWN，不含任何来自集群的自由文本。
+# 取值域只含脚本声明的固定状态，不含任何来自集群的自由文本。
 report_cluster_state() {
   log_evidence "CLUSTER_STATE=${CLUSTER_STATE}"
   log_evidence "KUBE_PROXY_STATE=${KUBE_PROXY_STATE}"
@@ -168,11 +168,21 @@ load_cluster_state() {
     HELM_RELEASE_STATE=MISSING
   fi
   if [[ "$GATEWAY_STATE" == COMPLIANT && "$helm_state" == COMPLIANT &&
-        "$HELM_SECRET_STATE" == COMPLIANT && "$CILIUM_WORKLOAD_STATE" == COMPLIANT &&
+        ( ( "$HELM_SECRET_STATE" == REVISION_1 &&
+            "$HELM_RELEASE_STATE" == DESIRED_REVISION_1 ) ||
+          ( "$HELM_SECRET_STATE" == REVISION_2 &&
+            "$HELM_RELEASE_STATE" == DESIRED_REVISION_2 ) ) &&
+        "$CILIUM_WORKLOAD_STATE" == COMPLIANT &&
         "$ENVOY_DAEMONSET_STATE" == COMPLIANT && "$ENVOY_PODS_STATE" == COMPLIANT &&
-        "$CILIUM_CONFIG_STATE" == COMPLIANT &&
-        "$HELM_RELEASE_STATE" == COMPLIANT ]]; then
+        "$CILIUM_CONFIG_STATE" == DESIRED ]]; then
     CLUSTER_STATE=COMPLIANT
+  elif [[ "$GATEWAY_STATE" == COMPLIANT && "$helm_state" == COMPLIANT &&
+          "$HELM_SECRET_STATE" == REVISION_1 &&
+          "$HELM_RELEASE_STATE" == LEGACY_REVISION_1 &&
+          "$CILIUM_WORKLOAD_STATE" == COMPLIANT &&
+          "$ENVOY_DAEMONSET_STATE" == COMPLIANT && "$ENVOY_PODS_STATE" == COMPLIANT &&
+          "$CILIUM_CONFIG_STATE" == LEGACY ]]; then
+    CLUSTER_STATE=UPGRADE_REQUIRED
   elif [[ ( "$GATEWAY_STATE" == MISSING || "$GATEWAY_STATE" == COMPLIANT ) &&
           "$HELM_SECRET_STATE" == MISSING && "$CILIUM_WORKLOAD_STATE" == MISSING &&
           "$ENVOY_DAEMONSET_STATE" == MISSING && "$ENVOY_PODS_STATE" == MISSING &&
@@ -269,6 +279,9 @@ fi
 # MODE 由公共 parse_mode helper 赋值。
 # shellcheck disable=SC2153
 if [[ "$MODE" == CHECK ]]; then
+  if [[ "$CLUSTER_STATE" == UPGRADE_REQUIRED ]]; then
+    complete PASS_CILIUM_CHECK cilium-upgrade-required 0 'stages/60-install-cilium/run.sh --apply'
+  fi
   complete PASS_CILIUM_CHECK apply-required 0 'stages/60-install-cilium/run.sh --apply'
 fi
 
@@ -298,7 +311,7 @@ managed_kubectl_gate || complete STOP_UNKNOWN_STATE kubectl-provenance-raced "$E
 admin_conf_is_safe || complete STOP_UNKNOWN_STATE admin-conf-metadata-raced "$EXIT_UNKNOWN_STATE" NONE
 api_endpoint_is_exact || complete STOP_UNKNOWN_STATE api-endpoint-raced "$EXIT_UNKNOWN_STATE" NONE
 load_cluster_state "$helm_state"
-[[ "$CLUSTER_STATE" == APPLY_REQUIRED ]] || {
+[[ "$CLUSTER_STATE" == APPLY_REQUIRED || "$CLUSTER_STATE" == UPGRADE_REQUIRED ]] || {
   report_cluster_state "$helm_state"
   complete STOP_UNKNOWN_STATE pre-gateway-cluster-state-raced "$EXIT_UNKNOWN_STATE" NONE
 }
@@ -336,7 +349,8 @@ kube_proxy_absent || complete STOP_UNKNOWN_STATE kube-proxy-state-raced "$EXIT_U
 helm_state=$(helm_binary_state)
 [[ "$helm_state" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE helm-binary-raced-before-install "$EXIT_UNKNOWN_STATE" NONE
 load_cluster_state "$helm_state"
-[[ "$CLUSTER_STATE" == APPLY_REQUIRED && "$GATEWAY_STATE" == COMPLIANT ]] || {
+[[ ( "$CLUSTER_STATE" == APPLY_REQUIRED || "$CLUSTER_STATE" == UPGRADE_REQUIRED ) &&
+    "$GATEWAY_STATE" == COMPLIANT ]] || {
   report_cluster_state "$helm_state"
   complete STOP_UNKNOWN_STATE pre-helm-cluster-state-raced "$EXIT_UNKNOWN_STATE" NONE
 }
@@ -345,12 +359,22 @@ apply_snapshot_gate || complete STOP_SUPPLY_CHAIN_MISMATCH apply-input-snapshot-
 helm_state=$(helm_binary_state)
 [[ "$helm_state" == COMPLIANT ]] || complete STOP_UNKNOWN_STATE helm-binary-raced-at-install "$EXIT_UNKNOWN_STATE" NONE
 apply_snapshot_gate || complete STOP_SUPPLY_CHAIN_MISMATCH apply-input-snapshot-raced-at-consumer "$EXIT_SUPPLY_CHAIN" NONE
-if ! helm_cluster_run install cilium "$cilium_chart_input" \
-  --namespace kube-system \
-  --values "$values_input" \
-  --atomic \
-  --timeout 10m0s >/dev/null 2>&1; then
-  complete STOP_APPLY_FAILED cilium-helm-install-failed "$EXIT_APPLY_FAILED" NONE
+if [[ "$CLUSTER_STATE" == APPLY_REQUIRED ]]; then
+  if ! helm_cluster_run install cilium "$cilium_chart_input" \
+    --namespace kube-system \
+    --values "$values_input" \
+    --atomic \
+    --timeout 10m0s >/dev/null 2>&1; then
+    complete STOP_APPLY_FAILED cilium-helm-install-failed "$EXIT_APPLY_FAILED" NONE
+  fi
+else
+  if ! helm_cluster_run upgrade cilium "$cilium_chart_input" \
+    --namespace kube-system \
+    --values "$values_input" \
+    --atomic \
+    --timeout 10m0s >/dev/null 2>&1; then
+    complete STOP_APPLY_FAILED cilium-helm-upgrade-failed "$EXIT_APPLY_FAILED" NONE
+  fi
 fi
 
 staged_inputs_gate || complete STOP_SUPPLY_CHAIN_MISMATCH staged-input-raced-after-helm "$EXIT_SUPPLY_CHAIN" NONE

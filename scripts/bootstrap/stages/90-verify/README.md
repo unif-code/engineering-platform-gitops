@@ -1,6 +1,8 @@
 # 90-verify
 
-只读整机验收：包、运行时、控制面、CNI、网关与证书的逐项核对。
+只读整机验收：包、运行时、控制面、CNI、网关与证书的逐项核对。Cilium Helm
+合同只接受使用当前 host-network values 的全新 rev1，或由 Stage 60 从已知旧合同升级出的
+精确 rev2；其他 revision、Secret 历史或 values 组合全部 fail-closed。
 
 | 项 | 值 |
 | --- | --- |
