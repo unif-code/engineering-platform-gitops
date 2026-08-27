@@ -699,10 +699,19 @@ with open(sys.argv[3], "w", encoding="utf-8") as stream:
 }
 
 business_stage_140_check() {
-  business_condition_true flux-system kustomization.kustomize.toolkit.fluxcd.io \
-    platform-migration Ready &&
-    business_condition_true platform job.batch "$BUSINESS_MIGRATION_JOB" Complete &&
-    complete ALREADY_COMPLIANT platform-migration-complete 0 NONE
+  if business_condition_true platform job.batch \
+    "$BUSINESS_MIGRATION_JOB" Complete; then
+    if business_condition_true flux-system \
+      kustomization.kustomize.toolkit.fluxcd.io platform-migration Ready ||
+      {
+        business_wait_current_ready flux-system \
+          kustomization.kustomize.toolkit.fluxcd.io platform-migration 1m &&
+          business_condition_true platform job.batch \
+            "$BUSINESS_MIGRATION_JOB" Complete
+      }; then
+      complete ALREADY_COMPLIANT platform-migration-complete 0 NONE
+    fi
+  fi
   complete PASS_PLATFORM_MIGRATION_CHECK migration-wait-required 0 \
     'stages/140-platform-migration/run.sh --apply'
 }

@@ -6003,6 +6003,87 @@ class BusinessReadyStageTest(BootstrapTestCase):
             result.stdout,
         )
 
+    def test_migration_check_absorbs_current_revision_reconcile_window(
+        self,
+    ) -> None:
+        program = (
+            'set -Eeuo pipefail\n'
+            'source "$1"\n'
+            'WAIT_STATUS=$2\n'
+            'JOB_RECHECK_STATUS=$3\n'
+            'waited=0\n'
+            'job_checks=0\n'
+            'business_condition_true() {\n'
+            '  case "$2:$3:$4" in\n'
+            '    job.batch:platform-migrate-4aaf721-g2:Complete)\n'
+            '      job_checks=$((job_checks + 1))\n'
+            '      if [[ "$job_checks" -eq 2 ]]; then\n'
+            '        return "$JOB_RECHECK_STATUS"\n'
+            '      fi\n'
+            '      return 0\n'
+            '      ;;\n'
+            '    kustomization.kustomize.toolkit.fluxcd.io:'
+            'platform-migration:Ready) return 1 ;;\n'
+            '    *) return 2 ;;\n'
+            '  esac\n'
+            '}\n'
+            'business_wait_current_ready() {\n'
+            '  [[ "$*" == "flux-system '
+            'kustomization.kustomize.toolkit.fluxcd.io '
+            'platform-migration 1m" ]] || return 2\n'
+            '  waited=1\n'
+            '  return "$WAIT_STATUS"\n'
+            '}\n'
+            'complete() {\n'
+            '  if [[ "$1" == ALREADY_COMPLIANT && '
+            '( "$waited" -ne 1 || "$job_checks" -ne 2 ) ]]; then\n'
+            '    printf "RESULT=UNSAFE_KUSTOMIZATION_BYPASS\\n"\n'
+            '    exit 99\n'
+            '  fi\n'
+            '  printf "RESULT=%s\\nREASON=%s\\n" "$1" "$2"\n'
+            '  exit "$3"\n'
+            '}\n'
+            'business_stage_140_check\n'
+        )
+        result = self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                program,
+                'test-migration-reconcile-window',
+                str(self.library),
+                '0',
+                '0',
+            ],
+            env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', result.stdout)
+        self.assertIn('REASON=platform-migration-complete', result.stdout)
+        self.assertNotIn('RESULT=PASS_PLATFORM_MIGRATION_CHECK', result.stdout)
+
+        for wait_status, recheck_status in (('1', '0'), ('0', '1')):
+            with self.subTest(
+                wait_status=wait_status,
+                recheck_status=recheck_status,
+            ):
+                blocked = self.run_command(
+                    [
+                        '/bin/bash',
+                        '-c',
+                        program,
+                        'test-migration-reconcile-window',
+                        str(self.library),
+                        wait_status,
+                        recheck_status,
+                    ],
+                    env=self.sanitized_environment(PATH='/usr/bin:/bin'),
+                )
+                self.assertEqual(blocked.returncode, 0, blocked.stderr)
+                self.assertIn('RESULT=PASS_PLATFORM_MIGRATION_CHECK', blocked.stdout)
+                self.assertIn('REASON=migration-wait-required', blocked.stdout)
+
     def test_sync_apply_waits_for_git_source_then_root_kustomization(
         self,
     ) -> None:
