@@ -21,3 +21,14 @@ spec:
       ports:
         - port: 5432
           protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+              app.kubernetes.io/instance: cloudnative-pg
+      ports:
+        - port: 8000
+          protocol: TCP

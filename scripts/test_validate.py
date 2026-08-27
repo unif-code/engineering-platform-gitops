@@ -2405,6 +2405,109 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
         self.assertEqual(default_deny_namespaces, self.APPROVED_NAMESPACES)
         self.assertEqual(dns_namespaces, self.APPROVED_NAMESPACES)
 
+    def test_cnpg_operator_can_read_instance_status_only_on_tcp_8000(
+        self,
+    ) -> None:
+        ingress_policy = self.find(
+            'networking.k8s.io/v1',
+            'NetworkPolicy',
+            'platform',
+            'platform-postgres-ingress',
+        )
+        self.assertEqual(
+            ingress_policy.get('spec'),
+            {
+                'podSelector': {
+                    'matchLabels': {'cnpg.io/cluster': 'platform'}
+                },
+                'policyTypes': ['Ingress'],
+                'ingress': [
+                    {
+                        'from': [
+                            {
+                                'podSelector': {
+                                    'matchExpressions': [
+                                        {
+                                            'key': 'app.kubernetes.io/name',
+                                            'operator': 'In',
+                                            'values': [
+                                                'backend',
+                                                'platform-migration',
+                                            ],
+                                        }
+                                    ]
+                                }
+                            }
+                        ],
+                        'ports': [{'port': 5432, 'protocol': 'TCP'}],
+                    },
+                    {
+                        'from': [
+                            {
+                                'namespaceSelector': {
+                                    'matchLabels': {
+                                        'kubernetes.io/metadata.name': (
+                                            'cnpg-system'
+                                        )
+                                    }
+                                },
+                                'podSelector': {
+                                    'matchLabels': {
+                                        'app.kubernetes.io/name': (
+                                            'cloudnative-pg'
+                                        ),
+                                        'app.kubernetes.io/instance': (
+                                            'cloudnative-pg'
+                                        ),
+                                    }
+                                },
+                            }
+                        ],
+                        'ports': [{'port': 8000, 'protocol': 'TCP'}],
+                    },
+                ],
+            },
+        )
+        egress_policy = self.find(
+            'networking.k8s.io/v1',
+            'NetworkPolicy',
+            'cnpg-system',
+            'allow-instance-status-egress',
+        )
+        self.assertEqual(
+            egress_policy.get('spec'),
+            {
+                'podSelector': {
+                    'matchLabels': {
+                        'app.kubernetes.io/name': 'cloudnative-pg',
+                        'app.kubernetes.io/instance': 'cloudnative-pg',
+                    }
+                },
+                'policyTypes': ['Egress'],
+                'egress': [
+                    {
+                        'to': [
+                            {
+                                'namespaceSelector': {
+                                    'matchLabels': {
+                                        'kubernetes.io/metadata.name': (
+                                            'platform'
+                                        )
+                                    }
+                                },
+                                'podSelector': {
+                                    'matchLabels': {
+                                        'cnpg.io/cluster': 'platform'
+                                    }
+                                },
+                            }
+                        ],
+                        'ports': [{'port': 8000, 'protocol': 'TCP'}],
+                    }
+                ],
+            },
+        )
+
     def test_gateway_and_control_plane_exceptions_use_cilium_entities(self) -> None:
         expected = {
             ('cert-manager', 'allow-kube-apiserver-egress'),
