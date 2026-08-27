@@ -157,7 +157,8 @@ base64 或 DSN。
 - 两个 Deployment 均 non-root、drop ALL、禁止 privilege escalation、只读根文件系统、
   RuntimeDefault seccomp；需要写入的临时目录使用 `emptyDir`。
 - HTTPRoute 同源分流：`/api`、`/healthz`、`/readyz` 到 backend，其余路径到 frontend。
-  只存在 Gateway HTTPS 北向入口，不创建 NodePort、LoadBalancer 或额外 Ingress。
+  只存在 Gateway HTTPS 北向入口；Cilium Gateway 固定为 host-network 模式，不生成
+  LoadBalancer Service，也不创建 NodePort 或额外 Ingress。
 - app Kustomization `dependsOn` migration，migration 未成功时 frontend/backend 不激活。
 
 ## Stage 编排

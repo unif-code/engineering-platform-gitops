@@ -12903,6 +12903,18 @@ cgroup:
 
 gatewayAPI:
   enabled: true
+  hostNetwork:
+    enabled: true
+
+envoy:
+  enabled: true
+  securityContext:
+    capabilities:
+      keepCapNetBindService: true
+      envoy:
+        - NET_ADMIN
+        - SYS_ADMIN
+        - NET_BIND_SERVICE
 
 hubble:
   enabled: false
@@ -12928,7 +12940,19 @@ operator:
             'autoMount': {'enabled': False},
             'hostRoot': '/sys/fs/cgroup',
         },
-        'gatewayAPI': {'enabled': True},
+        'gatewayAPI': {
+            'enabled': True,
+            'hostNetwork': {'enabled': True},
+        },
+        'envoy': {
+            'enabled': True,
+            'securityContext': {
+                'capabilities': {
+                    'keepCapNetBindService': True,
+                    'envoy': ['NET_ADMIN', 'SYS_ADMIN', 'NET_BIND_SERVICE'],
+                },
+            },
+        },
         'hubble': {'enabled': False},
         'image': {
             'digest': (
@@ -12949,6 +12973,9 @@ operator:
             'replicas': 1,
         },
     }
+    legacy_values_object = json.loads(json.dumps(desired_values_object))
+    legacy_values_object['gatewayAPI'] = {'enabled': True}
+    del legacy_values_object['envoy']
     gateway_names = (
         'backendtlspolicies.gateway.networking.k8s.io',
         'gatewayclasses.gateway.networking.k8s.io',
@@ -13027,10 +13054,15 @@ operator:
                     if state == 'missing':
                         print('[]')
                     elif state == 'exact':
+                        revision = (
+                            '2'
+                            if Path(os.environ['FAKE_UPGRADE_MARKER']).exists()
+                            else '1'
+                        )
                         print(json.dumps([{
                             'name': 'cilium',
                             'namespace': 'kube-system',
-                            'revision': '1',
+                            'revision': revision,
                             'updated': '2026-08-10 00:00:00.000000000 +0000 UTC',
                             'status': 'deployed',
                             'chart': 'cilium-1.20.0',
@@ -13045,13 +13077,27 @@ operator:
                         }]))
                     raise SystemExit(0)
 
-                if args == prefix + [
+                values_prefix = prefix + [
                     'get', 'values', 'cilium', '--namespace', 'kube-system',
-                    '--revision', '1', '--output', 'json',
-                ]:
+                    '--revision',
+                ]
+                if (
+                    len(args) == len(values_prefix) + 3
+                    and args[:len(values_prefix)] == values_prefix
+                    and args[-2:] == ['--output', 'json']
+                    and args[len(values_prefix)] in {'1', '2'}
+                ):
                     if os.environ.get('FAKE_HELM_VALUES_FAIL', '0') == '1':
                         raise SystemExit(1)
-                    sys.stdout.write(os.environ['FAKE_HELM_VALUES_JSON'])
+                    revision = args[len(values_prefix)]
+                    if revision == '2':
+                        if not Path(os.environ['FAKE_UPGRADE_MARKER']).exists():
+                            raise SystemExit(1)
+                        sys.stdout.write(os.environ['FAKE_HELM_VALUES_JSON'])
+                    elif os.environ.get('FAKE_LEGACY_RELEASE', '0') == '1':
+                        sys.stdout.write(os.environ['FAKE_HELM_LEGACY_VALUES_JSON'])
+                    else:
+                        sys.stdout.write(os.environ['FAKE_HELM_VALUES_JSON'])
                     raise SystemExit(0)
 
                 if len(args) >= 3 and args[:3] == prefix + ['install']:
@@ -13082,6 +13128,17 @@ operator:
                         raise SystemExit(1)
                     Path(os.environ['FAKE_RELEASE_MARKER']).touch()
                     Path(os.environ['FAKE_CILIUM_MARKER']).touch()
+                    print(os.environ['FAKE_CANARY'])
+                    raise SystemExit(0)
+                if len(args) >= 3 and args[:3] == prefix + ['upgrade']:
+                    if os.environ.get('FAKE_HELM_UPGRADE_FAIL', '0') == '1':
+                        raise SystemExit(1)
+                    if (
+                        os.environ.get('FAKE_LEGACY_RELEASE', '0') != '1'
+                        or not Path(os.environ['FAKE_RELEASE_MARKER']).exists()
+                    ):
+                        raise SystemExit(64)
+                    Path(os.environ['FAKE_UPGRADE_MARKER']).touch()
                     print(os.environ['FAKE_CANARY'])
                     raise SystemExit(0)
                 raise SystemExit(64)
@@ -13335,7 +13392,15 @@ operator:
         )
 
     @staticmethod
-    def cilium_config_json() -> str:
+    def cilium_config_json(*, legacy: bool = False) -> str:
+        data = {
+            'kube-proxy-replacement': 'true',
+            'enable-gateway-api': 'true',
+            'ipam': 'kubernetes',
+            'cgroup-root': '/sys/fs/cgroup',
+        }
+        if not legacy:
+            data['gateway-api-hostnetwork-enabled'] = 'true'
         return json.dumps(
             {
                 'apiVersion': 'v1',
@@ -13344,12 +13409,7 @@ operator:
                     'name': 'cilium-config',
                     'namespace': 'kube-system',
                 },
-                'data': {
-                    'kube-proxy-replacement': 'true',
-                    'enable-gateway-api': 'true',
-                    'ipam': 'kubernetes',
-                    'cgroup-root': '/sys/fs/cgroup',
-                },
+                'data': data,
             }
         )
 
@@ -13396,8 +13456,8 @@ operator:
                 }
             )
         if upgraded:
-            # helm upgrade 会留下第二个 revision，它同样带 name=cilium 标签，
-            # 因此服务端 selector 选得到；判定必须据此判 UNKNOWN。
+            # 受控 upgrade：旧 revision 精确为 superseded，新 revision 精确为 deployed。
+            items[0]['metadata']['labels']['status'] = 'superseded'  # type: ignore[index]
             items.append(
                 {
                     'apiVersion': 'v1',
@@ -13461,12 +13521,14 @@ operator:
 
         gateway_marker = directory / 'gateway-exact'
         release_marker = directory / 'release-exact'
+        upgrade_marker = directory / 'release-upgraded'
         cilium_marker = directory / 'cilium-exact'
         gateway_exact = directory / 'gateway-exact.json'
         gateway_partial = directory / 'gateway-partial.json'
         cilium_exact = directory / 'cilium-exact.json'
         cilium_partial = directory / 'cilium-partial.json'
         secret_exact = directory / 'helm-secret-exact.json'
+        secret_upgraded = directory / 'helm-secret-upgraded.json'
         secret_extra = directory / 'helm-secret-extra.json'
         gateway_exact.write_text(self.gateway_bundle_json(), encoding='utf-8')
         gateway_partial.write_text(
@@ -13477,6 +13539,9 @@ operator:
             self.cilium_workload_json(partial=True), encoding='utf-8'
         )
         secret_exact.write_text(self.helm_secret_json(), encoding='utf-8')
+        secret_upgraded.write_text(
+            self.helm_secret_json(upgraded=True), encoding='utf-8'
+        )
         secret_extra.write_text(self.helm_secret_json(extra=True), encoding='utf-8')
 
         self.write_executable(fake_bin / 'id', '#!/bin/sh\nprintf "0\\n"\n')
@@ -13507,7 +13572,7 @@ operator:
                 ;;
               values.yaml)
                 key=values
-                digest=105ca75fdefc07a32a1b944ad749baf0e66b2b2437dbe0ab995c323f71cdd887
+                digest=dfbdf19d791b473a742559febdec4927ae6bae012bd89898a7ddb614cfd4028d
                 ;;
               *) exec /usr/bin/shasum -a 256 "$path" ;;
             esac
@@ -13751,7 +13816,11 @@ operator:
                 if state == 'extra':
                     path = os.environ['FAKE_SECRET_EXTRA_JSON']
                 elif Path(os.environ['FAKE_RELEASE_MARKER']).exists():
-                    path = os.environ['FAKE_SECRET_EXACT_JSON']
+                    path = (
+                        os.environ['FAKE_SECRET_UPGRADED_JSON']
+                        if Path(os.environ['FAKE_UPGRADE_MARKER']).exists()
+                        else os.environ['FAKE_SECRET_EXACT_JSON']
+                    )
                 else:
                     print('{"apiVersion":"v1","kind":"List","items":[]}')
                     raise SystemExit(0)
@@ -13912,7 +13981,14 @@ operator:
                     if command[3] == 'pods':
                         print('{"apiVersion":"v1","kind":"List","items":[]}')
                     raise SystemExit(0)
-                sys.stdout.write(os.environ[managed_cilium_objects[tuple(command)]])
+                variable = managed_cilium_objects[tuple(command)]
+                if (
+                    variable == 'FAKE_CILIUM_CONFIG_JSON'
+                    and os.environ.get('FAKE_LEGACY_RELEASE', '0') == '1'
+                    and not Path(os.environ['FAKE_UPGRADE_MARKER']).exists()
+                ):
+                    variable = 'FAKE_CILIUM_LEGACY_CONFIG_JSON'
+                sys.stdout.write(os.environ[variable])
                 raise SystemExit(0)
             raise SystemExit(64)
             ''',
@@ -13932,6 +14008,9 @@ operator:
                 'FAKE_HELM_VALUES_JSON': json.dumps(
                     self.desired_values_object
                 ),
+                'FAKE_HELM_LEGACY_VALUES_JSON': json.dumps(
+                    self.legacy_values_object
+                ),
                 'FAKE_ADMIN_CONF': str(admin_conf),
                 'FAKE_ADMIN_CONF_CONTENT': self.canary + '\n',
                 'FAKE_ADMIN_VIEW_JSON': json.dumps(self.admin_config_object()),
@@ -13940,6 +14019,7 @@ operator:
                 'FAKE_VALUES_FILE': str(values),
                 'FAKE_GATEWAY_MARKER': str(gateway_marker),
                 'FAKE_RELEASE_MARKER': str(release_marker),
+                'FAKE_UPGRADE_MARKER': str(upgrade_marker),
                 'FAKE_CILIUM_MARKER': str(cilium_marker),
                 'FAKE_CILIUM_QUERY_COUNTER': str(directory / 'cilium-query-count'),
                 'FAKE_KUBE_PROXY_MARKER': str(directory / 'kube-proxy-present'),
@@ -13954,7 +14034,11 @@ operator:
                 'FAKE_ENVOY_DAEMONSET_JSON': self.envoy_daemonset_json(),
                 'FAKE_ENVOY_PODS_JSON': self.envoy_pods_json(),
                 'FAKE_CILIUM_CONFIG_JSON': self.cilium_config_json(),
+                'FAKE_CILIUM_LEGACY_CONFIG_JSON': self.cilium_config_json(
+                    legacy=True
+                ),
                 'FAKE_SECRET_EXACT_JSON': str(secret_exact),
+                'FAKE_SECRET_UPGRADED_JSON': str(secret_upgraded),
                 'FAKE_SECRET_EXTRA_JSON': str(secret_extra),
             }
         )
@@ -14025,6 +14109,61 @@ operator:
         Path(environment['FAKE_GATEWAY_MARKER']).touch()
         Path(environment['FAKE_RELEASE_MARKER']).touch()
         Path(environment['FAKE_CILIUM_MARKER']).touch()
+
+    def install_legacy_cluster_contract(
+        self, environment: dict[str, str], host: Path
+    ) -> None:
+        self.install_full_cluster_contract(environment, host)
+        environment['FAKE_LEGACY_RELEASE'] = '1'
+
+    def test_exact_legacy_revision_one_is_upgraded_once(self) -> None:
+        environment, host, command_log, _ = self.make_environment()
+        self.install_legacy_cluster_contract(environment, host)
+
+        check = self.run_stage(environment)
+
+        self.assertEqual(
+            check.returncode,
+            0,
+            f'stdout:\n{check.stdout}\nstderr:\n{check.stderr}',
+        )
+        self.assertIn('RESULT=PASS_CILIUM_CHECK', check.stdout)
+        self.assertIn('REASON=cilium-upgrade-required', check.stdout)
+
+        applied = self.run_stage(environment, '--apply')
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertIn('RESULT=PASS_CILIUM_INSTALLED', applied.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(' upgrade cilium ', commands)
+        self.assertNotIn(' install cilium ', commands)
+
+        readback = self.run_stage(environment)
+        self.assertEqual(readback.returncode, 0, readback.stderr)
+        self.assertIn('RESULT=ALREADY_COMPLIANT', readback.stdout)
+        self.assertIn(
+            ' get values cilium --namespace kube-system --revision 2 '
+            '--output json\n',
+            command_log.read_text(encoding='utf-8'),
+        )
+
+    def test_controlled_upgrade_failure_stops_without_install(self) -> None:
+        environment, host, command_log, _ = self.make_environment()
+        self.install_legacy_cluster_contract(environment, host)
+        environment['FAKE_HELM_UPGRADE_FAIL'] = '1'
+
+        result = self.run_stage(environment, '--apply')
+
+        self.assertEqual(result.returncode, 40, result.stderr)
+        self.assertIn('RESULT=STOP_APPLY_FAILED', result.stdout)
+        self.assertIn('REASON=cilium-helm-upgrade-failed', result.stdout)
+        commands = command_log.read_text(encoding='utf-8')
+        self.assertIn(' upgrade cilium ', commands)
+        self.assertNotIn(' install cilium ', commands)
+        self.assertEqual(
+            list((host / 'root/dev-infra-evidence').glob('13-cilium-*.txt')),
+            [],
+        )
 
     # "零写入" = 运行结束后无残留；CHECK 期间允许 helm 的私有 kubeconfig 临时目录短暂存在。
     def test_check_is_zero_write_for_clean_apply_required_state(self) -> None:
@@ -14272,19 +14411,25 @@ operator:
     def test_narrowed_helm_scope_still_rejects_cilium_drift(self) -> None:
         """收窄的反面：作用域变小，但对 cilium 自身的检测能力一点不能少。
 
-        其中 second-revision 是本设计的核心风险用例——若把过滤写成按对象名匹配
+        其中 malformed-second-revision 是本设计的核心风险用例——若把过滤写成按对象名匹配
         `sh.helm.release.v1.cilium.v1`，upgrade 留下的 v2 就完全不可见，本用例
         会变绿；它变红才说明收窄没有打开升级盲区。
         """
-        cases = ('second-revision', 'wrong-namespace', 'list-revision-drift')
+        cases = (
+            'malformed-second-revision',
+            'wrong-namespace',
+            'list-revision-drift',
+        )
         for case in cases:
             with self.subTest(case=case):
                 environment, host, command_log, _ = self.make_environment()
                 self.install_full_cluster_contract(environment, host)
                 secret = Path(environment['FAKE_SECRET_EXACT_JSON'])
-                if case == 'second-revision':
+                if case == 'malformed-second-revision':
+                    payload = json.loads(self.helm_secret_json(upgraded=True))
+                    payload['items'][0]['metadata']['labels']['status'] = 'deployed'
                     secret.write_text(
-                        self.helm_secret_json(upgraded=True), encoding='utf-8'
+                        json.dumps(payload), encoding='utf-8'
                     )
                 elif case == 'wrong-namespace':
                     secret.write_text(
@@ -14293,7 +14438,7 @@ operator:
                     )
                 else:
                     environment['FAKE_HELM_LIST_JSON'] = (
-                        self.helm_list_entries(foreign=True, revision='2')
+                        self.helm_list_entries(foreign=True, revision='3')
                     )
 
                 result = self.run_stage(environment)
@@ -14314,8 +14459,10 @@ operator:
         """
         environment, host, _, _ = self.make_environment()
         self.install_full_cluster_contract(environment, host)
+        payload = json.loads(self.helm_secret_json(upgraded=True))
+        payload['items'][0]['metadata']['labels']['status'] = 'deployed'
         Path(environment['FAKE_SECRET_EXACT_JSON']).write_text(
-            self.helm_secret_json(upgraded=True), encoding='utf-8'
+            json.dumps(payload), encoding='utf-8'
         )
 
         result = self.run_stage(environment)
@@ -14331,9 +14478,11 @@ operator:
         for component in (
             'KUBE_PROXY_STATE', 'HELM_BINARY_STATE', 'GATEWAY_STATE',
             'CILIUM_WORKLOAD_STATE', 'ENVOY_DAEMONSET_STATE',
-            'ENVOY_PODS_STATE', 'CILIUM_CONFIG_STATE', 'HELM_RELEASE_STATE',
+            'ENVOY_PODS_STATE',
         ):
             self.assertIn(f'{component}=COMPLIANT', result.stdout)
+        self.assertIn('CILIUM_CONFIG_STATE=DESIRED', result.stdout)
+        self.assertIn('HELM_RELEASE_STATE=DESIRED_REVISION_1', result.stdout)
         self.assertNotIn(self.canary, result.stdout + result.stderr)
 
     def test_early_return_reports_components_as_unqueried(self) -> None:
@@ -14851,7 +15000,7 @@ operator:
                 retail_pins = (hosts_root / 'retail-test-workflow/pins.sha256').read_text(encoding='utf-8')
                 if case == 'pin':
                     pins = hosts_root / 'retail-test-workflow/pins.sha256'
-                    pins.write_text(retail_pins.replace('105ca75f', '00000000', 1), encoding='utf-8')
+                    pins.write_text(retail_pins.replace('dfbdf19d', '00000000', 1), encoding='utf-8')
                     expected_code, expected_reason = 20, 'staged-input-contract-drift'
                 elif case == 'semantics':
                     # host.env 说 IP 是 .99，但 values 文件与 pins 仍是 retail 的：
@@ -15395,12 +15544,18 @@ class FinalVerifyTest(BootstrapTestCase):
                     raise SystemExit(1)
                 print(os.environ['FAKE_HELM_LIST_JSON'])
                 raise SystemExit(0)
-            values = [
+            values_prefix = [
                 '--kubeconfig', args[1],
                 'get', 'values', 'cilium', '--namespace', 'kube-system',
-                '--revision', '1', '--output', 'json',
+                '--revision',
             ]
-            if args == values:
+            if (
+                len(args) == len(values_prefix) + 3
+                and args[:len(values_prefix)] == values_prefix
+                and args[-2:] == ['--output', 'json']
+                and args[len(values_prefix)]
+                == os.environ.get('FAKE_HELM_REVISION', '1')
+            ):
                 if os.environ.get('FAKE_HELM_VALUES_FAIL', '0') == '1':
                     raise SystemExit(1)
                 sys.stdout.write(os.environ['FAKE_HELM_VALUES_JSON'])
@@ -15547,6 +15702,7 @@ class FinalVerifyTest(BootstrapTestCase):
             )
         if upgraded:
             # upgrade 留下的第二个 revision 同样带 name=cilium，selector 选得到。
+            items[0]['metadata']['labels']['status'] = 'superseded'  # type: ignore[index]
             items.append(
                 {
                     'apiVersion': 'v1',
@@ -17275,23 +17431,47 @@ class FinalVerifyTest(BootstrapTestCase):
         self.assertIn('--selector owner=helm,name=cilium', commands)
         self.assertNotIn('--selector owner=helm --output=json', commands)
 
+    def test_verify_accepts_controlled_cilium_revision_two(self) -> None:
+        environment, host, command_log = self.make_environment()
+        environment['FAKE_RELEASE_JSON'] = self.release_json(upgraded=True)
+        environment['FAKE_HELM_LIST_JSON'] = self.helm_list_json(revision='2')
+        environment['FAKE_HELM_REVISION'] = '2'
+
+        result = self.run_stage(environment)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}',
+        )
+        self.assertIn('RESULT=PASS_BOOTSTRAP_VERIFIED', result.stdout)
+        self.assertIn(
+            ' get values cilium --namespace kube-system --revision 2 '
+            '--output json\n',
+            command_log.read_text(encoding='utf-8'),
+        )
+
     def test_narrowed_helm_scope_still_rejects_cilium_drift(self) -> None:
         """收窄的反面：与 Stage 60 同构的三条边界，检测能力一点不能少。"""
-        cases = ('second-revision', 'wrong-namespace', 'list-revision-drift')
+        cases = (
+            'malformed-second-revision',
+            'wrong-namespace',
+            'list-revision-drift',
+        )
         for case in cases:
             with self.subTest(case=case):
                 environment, host, _ = self.make_environment()
-                if case == 'second-revision':
-                    environment['FAKE_RELEASE_JSON'] = self.release_json(
-                        upgraded=True
-                    )
+                if case == 'malformed-second-revision':
+                    payload = json.loads(self.release_json(upgraded=True))
+                    payload['items'][0]['metadata']['labels']['status'] = 'deployed'
+                    environment['FAKE_RELEASE_JSON'] = json.dumps(payload)
                 elif case == 'wrong-namespace':
                     environment['FAKE_RELEASE_JSON'] = self.release_json(
                         namespace='default'
                     )
                 else:
                     environment['FAKE_HELM_LIST_JSON'] = self.helm_list_json(
-                        foreign=True, revision='2'
+                        foreign=True, revision='3'
                     )
 
                 result = self.run_stage(environment)

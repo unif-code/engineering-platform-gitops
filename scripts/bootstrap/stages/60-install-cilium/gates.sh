@@ -34,6 +34,18 @@ cgroup:
 
 gatewayAPI:
   enabled: true
+  hostNetwork:
+    enabled: true
+
+envoy:
+  enabled: true
+  securityContext:
+    capabilities:
+      keepCapNetBindService: true
+      envoy:
+        - NET_ADMIN
+        - SYS_ADMIN
+        - NET_BIND_SERVICE
 
 hubble:
   enabled: false
@@ -404,27 +416,41 @@ if not isinstance(items, list):
     print("UNKNOWN")
 elif not items:
     print("MISSING")
-elif len(items) == 1:
-    item = items[0]
-    metadata = item.get("metadata", {}) if isinstance(item, dict) else {}
-    labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
-    required = {"owner": "helm", "name": "cilium", "status": "deployed", "version": "1"}
-    dynamic_ok = (
-        isinstance(labels, dict) and set(labels) == set(required) | {"modifiedAt"} and
-        all(labels.get(key) == value for key, value in required.items()) and
-        isinstance(labels.get("modifiedAt"), str) and
-        labels["modifiedAt"].isdigit() and int(labels["modifiedAt"]) > 0
-    )
-    exact = (
-        item.get("kind") == "Secret" and item.get("type") == "helm.sh/release.v1" and
-        metadata.get("name") == "sh.helm.release.v1.cilium.v1" and
-        metadata.get("namespace") == "kube-system" and
-        dynamic_ok and isinstance(item.get("data"), dict) and
-        isinstance(item["data"].get("release"), str) and bool(item["data"]["release"])
-    )
-    print("COMPLIANT" if exact else "UNKNOWN")
 else:
-    print("UNKNOWN")
+    def valid(item, revision, status):
+        metadata = item.get("metadata", {}) if isinstance(item, dict) else {}
+        labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        required = {
+            "owner": "helm", "name": "cilium", "status": status,
+            "version": str(revision),
+        }
+        dynamic_ok = (
+            isinstance(labels, dict) and set(labels) == set(required) | {"modifiedAt"} and
+            all(labels.get(key) == value for key, value in required.items()) and
+            isinstance(labels.get("modifiedAt"), str) and labels["modifiedAt"].isdigit() and
+            int(labels["modifiedAt"]) > 0
+        )
+        return (
+            item.get("kind") == "Secret" and item.get("type") == "helm.sh/release.v1" and
+            metadata.get("name") == f"sh.helm.release.v1.cilium.v{revision}" and
+            metadata.get("namespace") == "kube-system" and dynamic_ok and
+            isinstance(item.get("data"), dict) and
+            isinstance(item["data"].get("release"), str) and bool(item["data"]["release"])
+        )
+    by_name = {
+        item.get("metadata", {}).get("name"): item
+        for item in items if isinstance(item, dict)
+    }
+    if len(items) == 1 and valid(
+        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "deployed"
+    ):
+        print("REVISION_1")
+    elif len(items) == 2 and valid(
+        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "superseded"
+    ) and valid(by_name.get("sh.helm.release.v1.cilium.v2", {}), 2, "deployed"):
+        print("REVISION_2")
+    else:
+        print("UNKNOWN")
 ' 2>/dev/null
 }
 
@@ -677,7 +703,14 @@ try:
     )
 except (TypeError, ValueError):
     valid = False
-print("COMPLIANT" if valid else "UNKNOWN")
+if not valid:
+    print("UNKNOWN")
+elif data.get("gateway-api-hostnetwork-enabled") == "true":
+    print("DESIRED")
+elif "gateway-api-hostnetwork-enabled" not in data:
+    print("LEGACY")
+else:
+    print("UNKNOWN")
 ' 2>/dev/null
 }
 
@@ -709,8 +742,7 @@ if not isinstance(items, list):
     print("UNKNOWN")
     raise SystemExit(0)
 # 只判定我们自己的 release；同集群可能有其他运维装的 release，与本 stage 无关。
-# 过滤依据是 helm 的 name 字段而非对象名——upgrade 产生的 revision 2 同样带
-# name=cilium，因此仍会被选中，再由下面的 revision 断言判成 UNKNOWN。
+# 过滤依据是 helm 的 name 字段；只接受受控状态中的 revision 1 或 2。
 mine = [item for item in items if isinstance(item, dict) and item.get("name") == "cilium"]
 if not mine:
     print("MISSING")
@@ -720,12 +752,12 @@ elif len(mine) == 1:
     exact = (
         set(item) == expected_keys and
         item.get("name") == "cilium" and item.get("namespace") == "kube-system" and
-        isinstance(item.get("revision"), str) and item["revision"] == "1" and
+        isinstance(item.get("revision"), str) and item["revision"] in {"1", "2"} and
         isinstance(item.get("updated"), str) and bool(item["updated"].strip()) and
         item.get("status") == "deployed" and
         item.get("chart") == "cilium-1.20.0" and item.get("app_version") == "1.20.0"
     )
-    print("COMPLIANT" if exact else "UNKNOWN")
+    print("REVISION_{}".format(item["revision"]) if exact else "UNKNOWN")
 else:
     print("UNKNOWN")
 ' 2>/dev/null
@@ -755,20 +787,24 @@ helm_release_state() {
     return
   }
   parsed=$(printf '%s' "$output" | helm_list_json_state) || parsed=UNKNOWN
-  [[ "$parsed" == COMPLIANT ]] || {
+  [[ "$parsed" == REVISION_1 || "$parsed" == REVISION_2 ]] || {
     printf '%s\n' "$parsed"
     return
   }
+  local revision=${parsed#REVISION_}
   values_output=$(helm_cluster_run get values cilium \
-    --namespace kube-system --revision 1 --output json 2>/dev/null) || {
+    --namespace kube-system --revision "$revision" --output json 2>/dev/null) || {
     printf 'UNKNOWN\n'
     return
   }
-  printf '%s' "$values_output" | helm_values_json_is_exact || {
+  if printf '%s' "$values_output" | helm_values_json_is_exact; then
+    printf 'DESIRED_%s\n' "$parsed"
+  elif [[ "$parsed" == REVISION_1 ]] &&
+       printf '%s' "$values_output" | helm_values_json_is_legacy; then
+    printf 'LEGACY_REVISION_1\n'
+  else
     printf 'UNKNOWN\n'
-    return
-  }
-  printf '%s\n' "$parsed"
+  fi
 }
 
 # 判定移入 gates.sh 后，这个常量只被它消费；source 路径含变量，shellcheck

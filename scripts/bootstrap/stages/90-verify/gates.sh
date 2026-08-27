@@ -160,38 +160,55 @@ kube_proxy_is_absent() {
 }
 
 helm_release_is_exact() {
-  local output values_output version
+  local listed_revision output revision values_output version
   output=$(kubectl_run get secrets,configmaps --all-namespaces \
     --selector owner=helm,name=cilium --output=json 2>/dev/null) || return 1
-  printf '%s' "$output" | python_isolated -c '
+  revision=$(printf '%s' "$output" | python_isolated -c '
 import json
 import sys
 try:
     document = json.load(sys.stdin)
     items = document.get("items") if isinstance(document, dict) else None
-    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+    if not isinstance(items, list):
         raise ValueError
-    item = items[0]
-    metadata = item.get("metadata")
-    labels = metadata.get("labels") if isinstance(metadata, dict) else None
-    required = {"owner": "helm", "name": "cilium", "status": "deployed", "version": "1"}
-    labels_ok = (
-        isinstance(labels, dict) and set(labels) == set(required) | {"modifiedAt"} and
-        all(labels.get(key) == value for key, value in required.items()) and
-        isinstance(labels.get("modifiedAt"), str) and
-        labels["modifiedAt"].isdigit() and int(labels["modifiedAt"]) > 0
-    )
-    valid = (
-        item.get("kind") == "Secret" and item.get("type") == "helm.sh/release.v1" and
-        metadata.get("name") == "sh.helm.release.v1.cilium.v1" and
-        metadata.get("namespace") == "kube-system" and
-        labels_ok and isinstance(item.get("data"), dict) and
-        isinstance(item["data"].get("release"), str) and bool(item["data"]["release"])
-    )
+    def valid(item, revision, status):
+        metadata = item.get("metadata", {}) if isinstance(item, dict) else {}
+        labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        required = {
+            "owner": "helm", "name": "cilium", "status": status,
+            "version": str(revision),
+        }
+        labels_ok = (
+            isinstance(labels, dict) and set(labels) == set(required) | {"modifiedAt"} and
+            all(labels.get(key) == value for key, value in required.items()) and
+            isinstance(labels.get("modifiedAt"), str) and labels["modifiedAt"].isdigit() and
+            int(labels["modifiedAt"]) > 0
+        )
+        return (
+            item.get("kind") == "Secret" and item.get("type") == "helm.sh/release.v1" and
+            metadata.get("name") == f"sh.helm.release.v1.cilium.v{revision}" and
+            metadata.get("namespace") == "kube-system" and labels_ok and
+            isinstance(item.get("data"), dict) and
+            isinstance(item["data"].get("release"), str) and bool(item["data"]["release"])
+        )
+    by_name = {
+        item.get("metadata", {}).get("name"): item
+        for item in items if isinstance(item, dict)
+    }
+    if len(items) == 1 and valid(
+        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "deployed"
+    ):
+        print("1")
+    elif len(items) == 2 and valid(
+        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "superseded"
+    ) and valid(by_name.get("sh.helm.release.v1.cilium.v2", {}), 2, "deployed"):
+        print("2")
+    else:
+        raise ValueError
 except (TypeError, ValueError):
-    valid = False
-raise SystemExit(0 if valid else 1)
-' >/dev/null 2>&1 || return 1
+    raise SystemExit(1)
+' 2>/dev/null) || return 1
+  [[ "$revision" == 1 || "$revision" == 2 ]] || return 1
 
   helm_binary_is_exact || return 1
   version=$(helm_run version --short 2>/dev/null) || return 1
@@ -200,7 +217,7 @@ raise SystemExit(0 if valid else 1)
   output=$(helm_cluster_run list \
     --all-namespaces --all --output json 2>/dev/null) || return 1
   helm_binary_is_exact || return 1
-  printf '%s' "$output" | python_isolated -c '
+  listed_revision=$(printf '%s' "$output" | python_isolated -c '
 import json
 import sys
 expected_keys = {"name", "namespace", "revision", "updated", "status", "chart", "app_version"}
@@ -209,8 +226,7 @@ try:
     if not isinstance(items, list):
         raise ValueError
     # 只判定我们自己的 release；同集群可能有其他运维装的 release，与本 stage 无关。
-    # 过滤依据是 helm 的 name 字段而非对象名——upgrade 产生的 revision 2 同样带
-    # name=cilium，因此仍会被选中，再由下面的 revision 断言判成不合规。
+    # 过滤依据是 helm 的 name 字段；只接受受控状态中的 revision 1 或 2。
     mine = [i for i in items if isinstance(i, dict) and i.get("name") == "cilium"]
     if len(mine) != 1:
         raise ValueError
@@ -218,19 +234,22 @@ try:
     valid = (
         set(item) == expected_keys and item.get("name") == "cilium" and
         item.get("namespace") == "kube-system" and
-        isinstance(item.get("revision"), str) and item["revision"] == "1" and
+        isinstance(item.get("revision"), str) and item["revision"] in {"1", "2"} and
         isinstance(item.get("updated"), str) and bool(item["updated"].strip()) and
         item.get("status") == "deployed" and item.get("chart") == "cilium-1.20.0" and
         item.get("app_version") == "1.20.0"
     )
 except (TypeError, ValueError):
     valid = False
-raise SystemExit(0 if valid else 1)
-' >/dev/null 2>&1 || return 1
+if not valid:
+    raise SystemExit(1)
+print(item["revision"])
+' 2>/dev/null) || return 1
+  [[ "$listed_revision" == "$revision" ]] || return 1
 
   helm_binary_is_exact || return 1
   values_output=$(helm_cluster_run get values cilium \
-    --namespace kube-system --revision 1 --output json 2>/dev/null) || return 1
+    --namespace kube-system --revision "$revision" --output json 2>/dev/null) || return 1
   helm_binary_is_exact || return 1
   printf '%s' "$values_output" | helm_values_json_is_exact
 }
@@ -495,6 +514,7 @@ try:
     expected = {
         "kube-proxy-replacement": "true",
         "enable-gateway-api": "true",
+        "gateway-api-hostnetwork-enabled": "true",
         "ipam": "kubernetes",
         "cgroup-root": "/sys/fs/cgroup",
     }

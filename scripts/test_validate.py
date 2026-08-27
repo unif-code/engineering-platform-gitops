@@ -4372,6 +4372,23 @@ class BootstrapContractTest(unittest.TestCase):
 
         self.assert_contract_fails(root)
 
+    def test_cilium_gateway_contract_uses_host_network(self) -> None:
+        """DEV 没有 LoadBalancer 地址提供者，Gateway 必须直接监听主机网络。"""
+        values = yaml.safe_load(
+            (
+                validator.ROOT
+                / 'bootstrap/hosts/retail-test-workflow/cilium-values.yaml'
+            ).read_text(encoding='utf-8')
+        )
+
+        self.assertIs(values['gatewayAPI']['hostNetwork']['enabled'], True)
+        capabilities = values['envoy']['securityContext']['capabilities']
+        self.assertIs(capabilities['keepCapNetBindService'], True)
+        self.assertEqual(
+            capabilities['envoy'],
+            ['NET_ADMIN', 'SYS_ADMIN', 'NET_BIND_SERVICE'],
+        )
+
     HOST_DIR = Path('bootstrap/hosts/retail-test-workflow')
 
     def rewrite_host_env(self, root: Path, old: str, new: str) -> None:

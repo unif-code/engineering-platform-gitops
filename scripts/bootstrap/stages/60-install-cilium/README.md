@@ -1,6 +1,8 @@
 # 60-install-cilium
 
-用 helm 安装 Cilium 与 Gateway API，装完后有界轮询直到集群状态 COMPLIANT。
+用 Helm 安装 Cilium 与 Gateway API，或把唯一允许的旧 rev1 合同受控升级到 rev2；
+完成后有界轮询直到集群状态 `COMPLIANT`。Gateway 使用 Cilium host-network 模式，
+Envoy 保留默认能力并增加 `NET_BIND_SERVICE`，不依赖 LoadBalancer 地址提供者。
 
 | 项 | 值 |
 | --- | --- |
@@ -14,7 +16,7 @@
 一律 fail-closed，退出码固定：10 前置条件 / 20 供应链 / 30 未知或漂移 /
 40 apply 失败 / 50 verify 失败，不降级为告警。
 
-下列 62 个字面量 REASON 由 `StageReadmeTest` 与 `run.sh` 逐项比对，
+下列 63 个字面量 REASON 由 `StageReadmeTest` 与 `run.sh` 逐项比对，
 文档漂移会判红。模板化的 REASON（如 `missing-command-${cmd}`）不在此列。
 
 - `admin-conf-content-or-structure-drift`
@@ -41,6 +43,7 @@
 - `apply-input-snapshot-unsafe`
 - `apply-temporary-cleanup-unsafe`
 - `cilium-helm-install-failed`
+- `cilium-helm-upgrade-failed`
 - `cilium-post-install-state-invalid`
 - `evidence-open-failed`
 - `gateway-cilium-cluster-state-unknown`
