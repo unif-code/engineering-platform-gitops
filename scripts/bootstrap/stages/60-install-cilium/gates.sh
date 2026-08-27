@@ -707,7 +707,10 @@ if not valid:
     print("UNKNOWN")
 elif data.get("gateway-api-hostnetwork-enabled") == "true":
     print("DESIRED")
-elif "gateway-api-hostnetwork-enabled" not in data:
+elif (
+    "gateway-api-hostnetwork-enabled" not in data or
+    data.get("gateway-api-hostnetwork-enabled") == "false"
+):
     print("LEGACY")
 else:
     print("UNKNOWN")
