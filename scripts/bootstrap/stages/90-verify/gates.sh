@@ -69,6 +69,12 @@ staged_inputs_are_exact() {
   safe_file "$helm_archive" 600 || return 1
   digest=$(sha256_file "$helm_archive") || return 1
   [[ "$digest" == "$HELM_ARCHIVE_SHA256" ]] || return 1
+  safe_file "$cilium_chart" 600 || return 1
+  digest=$(sha256_file "$cilium_chart") || return 1
+  [[ "$digest" == "$CILIUM_CHART_SHA256" ]] || return 1
+  safe_file "$VALUES_FILE" 644 || return 1
+  digest=$(sha256_file "$VALUES_FILE") || return 1
+  [[ "$digest" == "$VALUES_SHA256" ]] || return 1
   safe_file "$gateway_manifest" 600 || return 1
   digest=$(sha256_file "$gateway_manifest") || return 1
   [[ "$digest" == "$GATEWAY_MANIFEST_SHA256" ]]
@@ -160,7 +166,7 @@ kube_proxy_is_absent() {
 }
 
 helm_release_is_exact() {
-  local listed_revision output revision values_output version
+  local lineage listed_revision output revision version
   output=$(kubectl_run get secrets,configmaps --all-namespaces \
     --selector owner=helm,name=cilium --output=json 2>/dev/null) || return 1
   revision=$(printf '%s' "$output" | python_isolated -c '
@@ -195,20 +201,22 @@ try:
         item.get("metadata", {}).get("name"): item
         for item in items if isinstance(item, dict)
     }
-    if len(items) == 1 and valid(
-        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "deployed"
-    ):
-        print("1")
-    elif len(items) == 2 and valid(
-        by_name.get("sh.helm.release.v1.cilium.v1", {}), 1, "superseded"
-    ) and valid(by_name.get("sh.helm.release.v1.cilium.v2", {}), 2, "deployed"):
-        print("2")
-    else:
+    revision = len(items)
+    history_ok = revision in {1, 2, 3} and all(
+        valid(
+            by_name.get(f"sh.helm.release.v1.cilium.v{number}", {}),
+            number,
+            "deployed" if number == revision else "superseded",
+        )
+        for number in range(1, revision + 1)
+    )
+    if not history_ok:
         raise ValueError
+    print(revision)
 except (TypeError, ValueError):
     raise SystemExit(1)
 ' 2>/dev/null) || return 1
-  [[ "$revision" == 1 || "$revision" == 2 ]] || return 1
+  [[ "$revision" == 1 || "$revision" == 2 || "$revision" == 3 ]] || return 1
 
   helm_binary_is_exact || return 1
   version=$(helm_run version --short 2>/dev/null) || return 1
@@ -226,7 +234,7 @@ try:
     if not isinstance(items, list):
         raise ValueError
     # 只判定我们自己的 release；同集群可能有其他运维装的 release，与本 stage 无关。
-    # 过滤依据是 helm 的 name 字段；只接受受控状态中的 revision 1 或 2。
+    # 过滤依据是 helm 的 name 字段；只接受受控状态中的 revision 1、2 或 3。
     mine = [i for i in items if isinstance(i, dict) and i.get("name") == "cilium"]
     if len(mine) != 1:
         raise ValueError
@@ -234,7 +242,7 @@ try:
     valid = (
         set(item) == expected_keys and item.get("name") == "cilium" and
         item.get("namespace") == "kube-system" and
-        isinstance(item.get("revision"), str) and item["revision"] in {"1", "2"} and
+        isinstance(item.get("revision"), str) and item["revision"] in {"1", "2", "3"} and
         isinstance(item.get("updated"), str) and bool(item["updated"].strip()) and
         item.get("status") == "deployed" and item.get("chart") == "cilium-1.20.0" and
         item.get("app_version") == "1.20.0"
@@ -248,10 +256,9 @@ print(item["revision"])
   [[ "$listed_revision" == "$revision" ]] || return 1
 
   helm_binary_is_exact || return 1
-  values_output=$(helm_cluster_run get values cilium \
-    --namespace kube-system --revision "$revision" --output json 2>/dev/null) || return 1
+  lineage=$(helm_cilium_values_lineage_state "$revision") || return 1
   helm_binary_is_exact || return 1
-  printf '%s' "$values_output" | helm_values_json_is_exact
+  [[ "$lineage" == "DESIRED_REVISION_${revision}" ]]
 }
 
 gateway_bundle_is_exact() {
@@ -329,11 +336,13 @@ raise SystemExit(0 if valid else 1)
 }
 
 workload_object_is_ready() {
-  local kind=$1
+  local expected_checksum=${2:-} kind=$1
   python_isolated -c '
 import json
+import re
 import sys
 kind = sys.argv[1]
+expected_checksum = sys.argv[2] if len(sys.argv) > 2 else ""
 try:
     item = json.load(sys.stdin)
     metadata = item.get("metadata") if isinstance(item, dict) else None
@@ -396,6 +405,16 @@ try:
             "app.kubernetes.io/part-of": "cilium",
             "helm.sh/chart": "cilium-1.20.0",
         }
+        template_metadata = item["spec"]["template"].get("metadata")
+        annotations = (
+            template_metadata.get("annotations")
+            if isinstance(template_metadata, dict) else None
+        )
+        generation = metadata.get("generation")
+        checksum = (
+            annotations.get("cilium.io/cilium-configmap-checksum")
+            if isinstance(annotations, dict) else None
+        )
         valid = (
             item.get("kind") == "Deployment" and metadata.get("name") == "cilium-operator" and
             all(labels.get(key) == value for key, value in required_labels.items()) and
@@ -408,6 +427,10 @@ try:
             item["spec"]["template"]["spec"]["containers"][0].get("name") == "cilium-operator" and
             item["spec"]["template"]["spec"]["containers"][0].get("image") ==
                 "quay.io/cilium/operator-generic:v1.20.0@sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3" and
+            isinstance(generation, int) and not isinstance(generation, bool) and generation > 0 and
+            isinstance(checksum, str) and checksum == expected_checksum and
+            re.fullmatch(r"[0-9a-f]{64}", expected_checksum) and
+            status.get("observedGeneration") == generation and
             item.get("spec", {}).get("replicas") == 1 and status.get("replicas") == 1 and
             status.get("updatedReplicas") == 1 and status.get("readyReplicas") == 1 and
             status.get("availableReplicas") == 1 and status.get("unavailableReplicas", 0) == 0
@@ -415,7 +438,7 @@ try:
 except (TypeError, ValueError):
     valid = False
 raise SystemExit(0 if valid else 1)
-' "$kind" >/dev/null 2>&1
+' "$kind" "$expected_checksum" >/dev/null 2>&1
 }
 
 pod_list_is_ready() {
@@ -496,7 +519,7 @@ cilium_is_ready() {
   kubectl_run --namespace kube-system get pods --selector k8s-app=cilium --output=json 2>/dev/null |
     pod_list_is_ready cilium || return 1
   kubectl_run --namespace kube-system get deployment/cilium-operator --output=json 2>/dev/null |
-    workload_object_is_ready Deployment || return 1
+    workload_object_is_ready Deployment "$EXPECTED_CILIUM_OPERATOR_CHECKSUM" || return 1
   kubectl_run --namespace kube-system get pods --selector name=cilium-operator --output=json 2>/dev/null |
     pod_list_is_ready operator || return 1
   kubectl_run --namespace kube-system get daemonset/cilium-envoy --output=json 2>/dev/null |

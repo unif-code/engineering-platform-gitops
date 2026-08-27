@@ -106,6 +106,7 @@ desired = {
     },
     "ipam": {"mode": "kubernetes"},
     "operator": {
+        "rollOutPods": True,
         "image": {
             "genericDigest": "sha256:80744a8cc7c91c2f9e6347629406844eb35d79b30a732c6d41c15b17232a74f3",
             "useDigest": True,
@@ -113,7 +114,10 @@ desired = {
         "replicas": 1,
     },
 }
-legacy = dict(desired)
+pre_rollout = dict(desired)
+pre_rollout["operator"] = dict(desired["operator"])
+del pre_rollout["operator"]["rollOutPods"]
+legacy = dict(pre_rollout)
 legacy["gatewayAPI"] = {"enabled": True}
 del legacy["envoy"]
 
@@ -152,6 +156,8 @@ except (TypeError, ValueError):
     raise SystemExit(0)
 if exactly_equal(actual, desired):
     print("DESIRED")
+elif exactly_equal(actual, pre_rollout):
+    print("PRE_ROLLOUT")
 elif exactly_equal(actual, legacy):
     print("LEGACY")
 else:
@@ -165,6 +171,96 @@ helm_values_json_is_exact() {
 
 helm_values_json_is_legacy() {
   [[ "$(helm_values_json_state)" == LEGACY ]]
+}
+
+helm_values_json_is_pre_rollout() {
+  [[ "$(helm_values_json_state)" == PRE_ROLLOUT ]]
+}
+
+helm_cilium_revision_values_state() {
+  local output revision=$1 state
+  [[ "$revision" == 1 || "$revision" == 2 || "$revision" == 3 ]] || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  output=$(helm_cluster_run get values cilium \
+    --namespace kube-system --revision "$revision" --output json 2>/dev/null) || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  state=$(printf '%s' "$output" | helm_values_json_state) || state=UNKNOWN
+  printf '%s\n' "$state"
+}
+
+# 只接受仓库曾明确交付过的 Cilium values 血统；Secret 标签只能证明 revision
+# 号码，不能证明各 revision 实际使用了哪组 values。
+helm_cilium_values_lineage_state() {
+  local current=$1 revision_one revision_two revision_three
+  [[ "$current" == 1 || "$current" == 2 || "$current" == 3 ]] || {
+    printf 'UNKNOWN\n'
+    return
+  }
+  revision_one=$(helm_cilium_revision_values_state 1)
+  case "$current" in
+    1)
+      case "$revision_one" in
+        DESIRED) printf 'DESIRED_REVISION_1\n' ;;
+        LEGACY) printf 'LEGACY_REVISION_1\n' ;;
+        *) printf 'UNKNOWN\n' ;;
+      esac
+      ;;
+    2)
+      revision_two=$(helm_cilium_revision_values_state 2)
+      if [[ "$revision_one" == LEGACY && "$revision_two" == DESIRED ]]; then
+        printf 'DESIRED_REVISION_2\n'
+      elif [[ "$revision_one" == LEGACY && "$revision_two" == PRE_ROLLOUT ]]; then
+        printf 'PRE_ROLLOUT_REVISION_2\n'
+      else
+        printf 'UNKNOWN\n'
+      fi
+      ;;
+    3)
+      revision_two=$(helm_cilium_revision_values_state 2)
+      revision_three=$(helm_cilium_revision_values_state 3)
+      if [[ "$revision_one" == LEGACY && "$revision_two" == PRE_ROLLOUT &&
+            "$revision_three" == DESIRED ]]; then
+        printf 'DESIRED_REVISION_3\n'
+      else
+        printf 'UNKNOWN\n'
+      fi
+      ;;
+  esac
+}
+
+# Cilium 1.20.0 的 operator.rollOutPods 注解是 cilium-configmap.yaml 渲染结果
+# 的 SHA-256。用已钉死的本地 Chart 与 values 离线重放同一模板，并显式固定
+# Kubernetes capability；只接受唯一、带双引号的 64 位小写摘要。
+helm_rendered_cilium_operator_checksum() {
+  local chart=$1 output values=$2
+  output=$(helm_run template cilium "$chart" \
+    --namespace kube-system \
+    --values "$values" \
+    --kube-version v1.36.3 \
+    --show-only templates/cilium-operator/deployment.yaml 2>/dev/null) || return 1
+  printf '%s' "$output" | python_isolated -c '
+import re
+import sys
+document = sys.stdin.read()
+matches = re.findall(
+    r"^[ \t]*cilium\.io/cilium-configmap-checksum:[ \t]*\"([0-9a-f]{64})\"[ \t]*$",
+    document,
+    flags=re.MULTILINE,
+)
+identity = (
+    len(re.findall(r"^apiVersion:[ \t]*apps/v1[ \t]*$", document, re.MULTILINE)) == 1 and
+    len(re.findall(r"^kind:[ \t]*Deployment[ \t]*$", document, re.MULTILINE)) == 1 and
+    len(re.findall(r"^[ ]{2}name:[ \t]*cilium-operator[ \t]*$", document, re.MULTILINE)) == 1 and
+    len(re.findall(r"^[ ]{2}namespace:[ \t]*kube-system[ \t]*$", document, re.MULTILINE)) == 1
+)
+if len(matches) != 1 or not identity:
+    raise SystemExit(1)
+print(matches[0])
+' 2>/dev/null
 }
 
 helm_archive_is_safe() {
