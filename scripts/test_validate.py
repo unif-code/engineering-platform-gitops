@@ -1865,7 +1865,7 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
         '21248f11379841f12e27d330ffaa8f2be73b92bcbf3628a1855c41b697a10a5c'
     )
     POSTGRES_IMAGE = (
-        'ghcr.io/cloudnative-pg/postgresql@sha256:'
+        'ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:'
         'ae0ec6943c3c24b0de87f93b73ac531a8e546a4cc895655f793547eed2fdbef1'
     )
     RUNTIME_ROLES = {
@@ -2284,6 +2284,20 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
                 document.get('kind') in {'ObjectStore', 'ScheduledBackup'}
                 for document in self.RENDERED
             )
+        )
+
+        restore_documents = yaml.safe_load_all(
+            (validator.ROOT / 'runbook/examples/postgres-restore.yaml').read_text(
+                encoding='utf-8'
+            )
+        )
+        restore_cluster = next(
+            document
+            for document in restore_documents
+            if document.get('kind') == 'Cluster'
+        )
+        self.assertEqual(
+            restore_cluster['spec'].get('imageName'), self.POSTGRES_IMAGE
         )
 
     def test_migration_and_apps_are_immutable_and_ordered(self) -> None:
