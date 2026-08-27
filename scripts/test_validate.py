@@ -2301,7 +2301,18 @@ class BusinessReadyGitOpsContractTest(unittest.TestCase):
         )
 
     def test_migration_and_apps_are_immutable_and_ordered(self) -> None:
-        migration = self.find('batch/v1', 'Job', 'platform', 'platform-migrate-4aaf721')
+        migration = self.find(
+            'batch/v1',
+            'Job',
+            'platform',
+            'platform-migrate-4aaf721-g2',
+        )
+        self.assertEqual(
+            migration['metadata']['annotations'].get(
+                'platform.unif.internal/migration-generation'
+            ),
+            '2',
+        )
         migration_container = migration['spec']['template']['spec']['containers'][0]
         self.assertEqual(migration_container.get('image'), self.BACKEND_IMAGE)
         self.assertEqual(migration['spec'].get('backoffLimit'), 0)
