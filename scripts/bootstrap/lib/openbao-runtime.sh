@@ -325,9 +325,29 @@ openbao_pod_image_id_is_exact() {
     --output=json 2>/dev/null) || return 1
   printf '%s' "$document" | "$PYTHON_BINARY" -I -B -c '
 import json
+import re
 import sys
 
 expected_image, expected_digest = sys.argv[1:]
+pinned_name, separator, pinned_digest = expected_image.rpartition("@")
+repository, tag_separator, tag = pinned_name.rpartition(":")
+if (
+    separator != "@"
+    or expected_image.count("@") != 1
+    or pinned_digest != expected_digest
+    or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None
+    or tag_separator != ":"
+    or not repository
+    or repository.startswith("/")
+    or repository.endswith("/")
+    or "//" in repository
+    or "@" in repository
+    or any(character.isspace() for character in repository)
+    or ":" in repository.rsplit("/", 1)[-1]
+    or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", tag) is None
+):
+    raise SystemExit(1)
+expected_image_id = f"{repository}@{expected_digest}"
 items = json.load(sys.stdin).get("items", [])
 if len(items) != 1:
     raise SystemExit(1)
@@ -338,9 +358,12 @@ statuses = pod.get("status", {}).get("containerStatuses", [])
 if len(statuses) != 1:
     raise SystemExit(1)
 status = statuses[0]
-if not status.get("ready") or status.get("image") != expected_image:
+if (
+    not status.get("ready")
+    or re.fullmatch(r"sha256:[0-9a-f]{64}", str(status.get("image", ""))) is None
+):
     raise SystemExit(1)
-if expected_digest not in str(status.get("imageID", "")):
+if str(status.get("imageID", "")) != expected_image_id:
     raise SystemExit(1)
 ' "$expected_image" "$expected_digest"
 }

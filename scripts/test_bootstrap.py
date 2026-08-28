@@ -6575,6 +6575,53 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
         )
 
+    def pod_image_status_gate(
+        self,
+        expected_image: str,
+        status_image: str,
+        image_id: str,
+    ) -> subprocess.CompletedProcess[str]:
+        digest = (
+            'sha256:'
+            '15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0'
+        )
+        document = {
+            'items': [{
+                'status': {
+                    'phase': 'Running',
+                    'containerStatuses': [{
+                        'ready': True,
+                        'image': status_image,
+                        'imageID': image_id,
+                    }],
+                },
+            }],
+        }
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    fixture=$1
+                    expected_image=$2
+                    expected_digest=$3
+                    PYTHON_BINARY=/usr/bin/python3
+                    kubectl_run() { printf '%s\n' "$fixture"; }
+                    openbao_pod_image_id_is_exact selector \
+                      "$expected_image" "$expected_digest"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                json.dumps(document, separators=(',', ':')),
+                expected_image,
+                digest,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
     def pod_delegation_gate(
         self,
         function: str,
@@ -7045,6 +7092,65 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     'absent', 'absent', errexit
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_pod_status_accepts_only_exact_containerd_readback(self) -> None:
+        digest = (
+            'sha256:'
+            '15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0'
+        )
+        config_id = f'sha256:{"a" * 64}'
+        expected_image = f'quay.io/openbao/openbao:2.6.1@{digest}'
+        canonical = f'quay.io/openbao/openbao@{digest}'
+        accepted = self.pod_image_status_gate(
+            expected_image,
+            config_id,
+            canonical,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for status_image, image_id in (
+            (f'quay.io/openbao/openbao:2.6.1@{digest}', canonical),
+            (canonical, canonical),
+            ('quay.io/openbao/openbao@sha256:wrong', canonical),
+            (f'{config_id}-suffix', canonical),
+            (config_id, f'quay.io/another/openbao@{digest}'),
+            (config_id, f'{canonical}-suffix'),
+            (config_id, f'docker-pullable://{canonical}'),
+            (config_id, 'quay.io/openbao/openbao@sha256:wrong'),
+        ):
+            with self.subTest(
+                status_image=status_image,
+                image_id=image_id,
+            ):
+                rejected = self.pod_image_status_gate(
+                    expected_image,
+                    status_image,
+                    image_id,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        port_image = f'registry.example:5000/ns/openbao:2.6.1@{digest}'
+        port_image_id = f'registry.example:5000/ns/openbao@{digest}'
+        accepted_port = self.pod_image_status_gate(
+            port_image,
+            config_id,
+            port_image_id,
+        )
+        self.assertEqual(accepted_port.returncode, 0, accepted_port.stderr)
+
+        for malformed_image in (
+            f'registry.example:5000/ns/openbao@{digest}',
+            f'registry.example:5000/ns/openbao:2.6.1:extra@{digest}',
+            f':2.6.1@{digest}',
+            f'quay.io/openbao/openbao:2.6.1@extra@{digest}',
+        ):
+            with self.subTest(malformed_image=malformed_image):
+                rejected = self.pod_image_status_gate(
+                    malformed_image,
+                    config_id,
+                    canonical,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
 
     def test_present_recovery_rechecks_exact_failure_before_mutation(self) -> None:
         allowed = self.present_recovery_apply(True)
