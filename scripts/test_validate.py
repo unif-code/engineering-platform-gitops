@@ -455,6 +455,64 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, rendered_text)
 
+    def test_runtime_runbook_and_acceptance_contract_are_explicit(self) -> None:
+        runtime = (
+            validator.ROOT / 'runbook/11-openbao-runtime.md'
+        ).read_text(encoding='utf-8')
+        bootstrap = (
+            validator.ROOT / 'runbook/01-bootstrap.md'
+        ).read_text(encoding='utf-8')
+        secrets = (
+            validator.ROOT / 'runbook/02-secrets.md'
+        ).read_text(encoding='utf-8')
+        acceptance = (
+            validator.ROOT / 'runbook/09-acceptance.md'
+        ).read_text(encoding='utf-8')
+        index = (
+            validator.ROOT / 'runbook/README.md'
+        ).read_text(encoding='utf-8')
+        candidate = (
+            validator.ROOT / 'pcs/candidate-3.md'
+        ).read_text(encoding='utf-8')
+
+        for operation in ('initialize', 'configure', 'accept'):
+            self.assertIn(
+                f'--apply --stage=180 --operation={operation}',
+                runtime,
+            )
+        for expected in (
+            '--check --stage=180',
+            '17-openbao-runtime-<UTC>.txt',
+            '17-openbao-runtime-<UTC>.txt.sha256',
+            'Shamir 5/3',
+            'ClusterIP',
+            'NON_HA',
+            'PVC',
+            'cloud',
+            'STOP_',
+            'MINIO=NOT_EXECUTED',
+            'BACKUP=NOT_EXECUTED',
+            'APP_SECRET_MIGRATION=NOT_EXECUTED',
+        ):
+            self.assertIn(expected, runtime)
+        for forbidden in (
+            'kubectl delete pvc',
+            'kubectl delete namespace openbao',
+            'bao operator init -key-shares=1',
+        ):
+            self.assertNotIn(forbidden, runtime.lower())
+
+        self.assertIn('runbook/11-openbao-runtime.md', bootstrap)
+        self.assertIn('Stage 180', bootstrap)
+        self.assertIn('OpenBao recovery', secrets)
+        self.assertIn('not Kubernetes Secret', secrets)
+        self.assertIn('OpenBao Runtime-Only', acceptance)
+        self.assertIn('不等于 Backup/Restore 或 Release Gate', acceptance)
+        self.assertIn('11-openbao-runtime.md', index)
+        self.assertIn('DEV-005', index)
+        self.assertIn('Stage 170 / Stage 180', candidate)
+        self.assertIn('GATE_READY', candidate)
+
 
 class RepositoryProfileContractTest(unittest.TestCase):
     def assert_documentation_contract(

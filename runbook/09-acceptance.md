@@ -40,6 +40,19 @@ PCS Candidate：`pcs/candidate-2.md`
 | NEXT_STAGE | `PHASE_B_REQUIRES_SEPARATE_APPROVAL` |
 | EXIT_CODE | `0` |
 
+## OpenBao Runtime-Only 独立验收
+
+OpenBao Runtime-Only 由 `runbook/11-openbao-runtime.md` 和
+`pcs/candidate-3.md` 单独验收；在
+`/root/dev-infra-evidence/17-openbao-runtime-<UTC>.txt` 及其 SHA-256 sidecar 生成前，
+状态保持 `NOT_EXECUTED`。运行验收必须证明单 Raft peer、Server/Injector、TLS
+ClusterIP、Data/Audit PVC、Kubernetes Auth、最小 Policy、双 Audit、临时 token 吊销、
+初始 root token 吊销、业务 smoke 不回归及应用 Secret fingerprint 无变化。
+
+该通过只代表 OpenBao runtime 可用，**不等于 Backup/Restore 或 Release Gate** 通过。
+MinIO、Snapshot、Backup、Restore 和应用 Secret 迁移继续保持 `NOT_EXECUTED`，V0.1 六条
+总验收结论仍由下表的独立 Gate 决定。
+
 | # | 验收标准 | 证据 | 状态 |
 | --- | --- | --- | --- |
 | 1 | main 受保护、Flux 单向 Reconcile，带外扩容被纠正 | PR/branch protection、Flux 输出、扩容前后输出 | BLOCKED（候选已形成；Git sync、运行 Reconcile 与漂移演示尚未验收） |
