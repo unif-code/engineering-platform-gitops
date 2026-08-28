@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import hashlib
 import io
 import os
 import re
@@ -90,6 +91,58 @@ class ProfileValidationTest(unittest.TestCase):
             )
 
             self.assertEqual(cpu, '100m')
+
+
+class OpenBaoGitOpsContractTest(unittest.TestCase):
+    DOCS_COMMIT = '0039d697237eb3f3a4a6238f47d4b971974a031e'
+    BASELINE_ID = '2026-08-28.2'
+
+    def test_supply_chain_is_immutable(self) -> None:
+        self.assertEqual(
+            validator.OPENBAO_DOCS_ARCHITECTURE_COMMIT,
+            self.DOCS_COMMIT,
+        )
+        self.assertEqual(validator.OPENBAO_CHART_VERSION, '0.28.6')
+        self.assertEqual(validator.OPENBAO_APP_VERSION, '2.6.1')
+
+        chart_root = validator.ROOT / 'vendor/charts/openbao'
+        chart = yaml.safe_load(
+            (chart_root / 'Chart.yaml').read_text(encoding='utf-8')
+        )
+        self.assertEqual(chart['name'], 'openbao')
+        self.assertEqual(chart['version'], validator.OPENBAO_CHART_VERSION)
+        self.assertEqual(
+            str(chart['appVersion']).lstrip('v'),
+            validator.OPENBAO_APP_VERSION,
+        )
+
+        digest_names = (
+            'OPENBAO_CHART_PACKAGE_SHA256',
+            'OPENBAO_CHART_REGISTRY_DIGEST',
+            'OPENBAO_SERVER_AMD64_DIGEST',
+            'OPENBAO_INJECTOR_AMD64_DIGEST',
+            'OPENBAO_AGENT_AMD64_DIGEST',
+        )
+        candidate = (
+            validator.ROOT / 'pcs/candidate-3.md'
+        ).read_text(encoding='utf-8')
+        chart_readme = (
+            validator.ROOT / 'vendor/charts/README.md'
+        ).read_text(encoding='utf-8')
+        for name in digest_names:
+            digest = getattr(validator, name)
+            self.assertRegex(digest, r'^sha256:[0-9a-f]{64}$')
+            self.assertIn(digest, candidate)
+            self.assertIn(digest, chart_readme)
+
+        package = validator.ROOT / 'vendor/charts/openbao-0.28.6.tgz'
+        self.assertTrue(package.is_file())
+        self.assertEqual(
+            'sha256:' + hashlib.sha256(package.read_bytes()).hexdigest(),
+            validator.OPENBAO_CHART_PACKAGE_SHA256,
+        )
+        self.assertIn(self.DOCS_COMMIT, candidate)
+        self.assertIn(self.BASELINE_ID, candidate)
 
 
 class RepositoryProfileContractTest(unittest.TestCase):
