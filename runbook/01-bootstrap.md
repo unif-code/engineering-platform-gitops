@@ -229,6 +229,18 @@ probe，因此仍属于必须先展示完整命令的运维动作。
 受控交互命令并取得数据库写入批准；临时密码只允许当前 TTY 一次显示，不进入 Job log、证据、
 聊天或文件。
 
+### OpenBao Runtime-Only 阶段 170/180
+
+OpenBao 候选在 Stage 170 增加最后一个自动 bootstrap stage，但 Desired State 保持 dormant：
+`clusters/dev/kustomization.yaml` 不引用 OpenBao。Stage 170 只安装 TLS、Raft、Audit PVC、
+Server 与 Injector，并以 `initialized=false,sealed=true` 结束。Stage 180 是显式、交互式
+恢复仪式，不进入 `bootstrap-all.sh` 的无人值守链。
+
+所有操作、完整命令、影响范围、hidden prompt、ciphertext cloud boundary、STOP 分类、
+PVC-preserving 恢复边界和 `17-openbao-runtime` evidence 合同见
+`runbook/11-openbao-runtime.md`。MinIO、Snapshot、Backup、Restore 和应用 Secret 迁移
+仍为 `NOT_EXECUTED`。
+
 ### 单阶段诊断和人工应急入口
 
 下表保留为诊断和人工应急入口，不是正常 bootstrap 路径。使用任一单独 stage 时仍须每次
@@ -251,6 +263,8 @@ probe，因此仍属于必须先展示完整命令的运维动作。
 | 19 | `stages/140-platform-migration/run.sh` | `--check` 后批准 `--apply` | `PASS_PLATFORM_MIGRATION_COMPLETE` 或 `ALREADY_COMPLIANT` | 终端回执 |
 | 20 | `stages/150-platform-apps/run.sh` | `--check` 后批准 `--apply` | `PASS_PLATFORM_APPS_READY` 或 `ALREADY_COMPLIANT` | 非敏感 HTTPS smoke 回执 |
 | 21 | `stages/160-business-ready-evidence/run.sh` | `--check` 后批准 `--apply` | `PASS_BUSINESS_READY` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/16-business-ready-*.txt` 及同名 `.sha256` |
+| 22 | `stages/170-openbao-runtime/run.sh` | 统一入口 `--check` 后批准 `--apply` | `PASS_OPENBAO_RUNTIME_INSTALLED` 或 `ALREADY_COMPLIANT` | 终端 runtime/readback 回执 |
+| 23 | `stages/180-openbao-initialize/run.sh` | 只经 `run-approved.sh --stage=180` 显式选择 check/initialize/configure/accept | `PASS_OPENBAO_RUNTIME_ACCEPTED` 或 `ALREADY_COMPLIANT` | `/root/dev-infra-evidence/17-openbao-runtime-*.txt` 及同名 `.sha256` |
 
 固定退出码：`0` 表示当前阶段按输出判定完成或需要获批 APPLY；`10` 为前置条件失败，
 `20` 为供应链不匹配，`30` 为未知/漂移状态，`40` 为 APPLY 失败，`50` 为部署后

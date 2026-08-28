@@ -40,7 +40,7 @@ MinIO、Snapshot、Backup、Restore 与应用 Secret 迁移继续为 `NOT_EXECUT
 
 | 能力 | 状态 |
 | --- | --- |
-| Desired State / validators / Stage 170 / Stage 180 | `IN_PROGRESS` |
+| Desired State / validators / Stage 170 / Stage 180 | `GATE_READY` |
 | Runtime deployment | `NOT_EXECUTED` |
 | Initialization / unseal / Auth / Policy / Audit | `NOT_EXECUTED` |
 | MinIO / Snapshot / Backup / Restore | `NOT_EXECUTED` |

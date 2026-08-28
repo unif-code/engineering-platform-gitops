@@ -20,6 +20,17 @@ GitOps commit / PR：
 
 CNPG 在 `platform` Cluster 初始化后生成 `platform-app` 与 `platform-superuser`；只登记存在性、ownerReference 和 Secret type，不导出内容。
 
+## OpenBao recovery material
+
+OpenBao recovery material is **not Kubernetes Secret**。Stage 180 只在服务器
+`/root/openbao-recovery` 保存 mode `0600` 的 OpenPGP ciphertext bundle 和 SHA-256；
+专用私钥及 passphrase 只留在 Windows。服务器上的
+`openbao-recovery-public-key.b64` 与 fingerprint 是公开材料，但仍按 root-owned mode
+`0600` 管理，防止初始化时被替换。
+
+5 个 share 和初始 root token 永不登记值。配置成功后初始 root token 必须吊销；已有
+`platform` 应用 Secret 不迁入 OpenBao，fingerprint 在 Stage 180 前后必须一致。
+
 ```text
 待运维回填 kubectl get secret 的 metadata-only 输出。
 ```
