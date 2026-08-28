@@ -16,8 +16,9 @@
 - OpenBao、MinIO、OpenBao Snapshot、备份任务与恢复任务均未部署；
 - 现有应用继续从 Kubernetes Secret 读取材料，OpenBao Runtime 故障不得影响现有应用；
 - engineering-platform-docs 的治理候选提交
-  `eafe5e82f8629cc82ebc57fd442892e63702b99a` 已登记 DEV-005，并把架构基线刷新为
-  `2026-08-28.1`。DEV-005 必须先进入 docs `main`，GitOps 实现才可引用并交付。
+  `a2de7c12b7f119baf4e9af75d8ea87aefb60e368` 已登记 DEV-005、修正多审计设备的
+  Fail Closed 语义，并把架构基线刷新为 `2026-08-28.2`。DEV-005 必须先进入 docs
+  `main`，GitOps 实现才可引用并交付。
 
 Canonical Contract 仍由 engineering-platform-docs 的
 `architecture/08-security-audit-governance.md`、
