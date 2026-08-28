@@ -5769,8 +5769,10 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         # 出现的「测试恒绿、生产必停」形态（账本 R5）。改从表枚举并钉住数量；
         # 表本身与编排器 stage_path() 的一致性由
         # CommonLibraryTest.test_stage_paths_come_from_one_table 交叉校验。
-        stage_scripts = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stage_scripts), 16, [str(s) for s in stage_scripts])
+        stage_scripts = sorted(
+            [*(ROOT / path for path in STAGE_SCRIPTS.values()), OPENBAO_INITIALIZE]
+        )
+        self.assertEqual(len(stage_scripts), 17, [str(s) for s in stage_scripts])
         for script in stage_scripts:
             self.assertTrue(script.is_file(), script)
         sourced: set[str] = set()
