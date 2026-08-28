@@ -5,7 +5,7 @@ openbao_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 source "${openbao_lib_dir}/business-ready.sh"
 
 readonly OPENBAO_FIELD_MANAGER=engineering-platform-openbao-runtime
-readonly OPENBAO_BOOTSTRAP_SHA256=8c08ccf99e742b71c7f1b589491815f649e8caef998796edfba7d8bdba35b4fb
+readonly OPENBAO_BOOTSTRAP_SHA256=52890177117a1bf16b4b340472643adef4718616a02f8aec2a331bf950283a20
 readonly OPENBAO_RUNTIME_SHA256=c5bfd003cabb8a3350942cc4cb17025228f79300b1acda5c434c3003aab6720a
 readonly OPENBAO_CHART_PACKAGE_SHA256=175c5cea2d36b68d348eca872044656bd8740c4dbe26b7dc8eb7c7438474a8b3
 readonly OPENBAO_RENDERED_RAW_SHA256=ca5826e453916abdf3dc1c6942dfd9e94e3a11facda8cd762c9a040a72226890
