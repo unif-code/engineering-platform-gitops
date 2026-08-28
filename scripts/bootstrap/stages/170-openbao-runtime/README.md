@@ -19,9 +19,12 @@ reviewed Namespace, bootstrap bundle, and standalone Flux Kustomization.
 A third recovery checkpoint is limited to a fully present runtime that is still uninitialized and
 sealed, has exact workloads, image digests, PVCs, private Services, certificates, and Secret inventory,
 and whose HelmRelease reports only the reviewed `openbao-discovery-role` anti-escalation failure while
-the Helm service account has none of the standard pods resource verbs. This checkpoint is rechecked
-after the Flux source wait and may only replay the same three reviewed manifests. Successful compliance
-requires exactly `get/list/watch/update/patch` on pods and still forbids `create/delete/deletecollection`.
+the Helm service account either has none of the standard pods resource verbs or already has exactly
+`get/list/watch/update/patch` while `create/delete/deletecollection` remain forbidden. The second form
+recovers only the failed revision that raced with the authorization cache; it does not admit any other
+Helm failure or permission set. This checkpoint is rechecked after the Flux source wait and may only
+replay the same three reviewed manifests. After the bootstrap RBAC replay, Stage 170 waits up to 60
+seconds for that exact allowed-and-denied permission set before activating the runtime Kustomization.
 Every other present-but-drifted runtime remains fail-closed.
 
 Stage 180 is intentionally not part of `bootstrap-all.sh`; initialization needs the operator to be
@@ -54,6 +57,7 @@ Secret fingerprint drift stops fail-closed.
 - `namespace-apply-failed`
 - `openbao-asset-drift`
 - `openbao-apply-checkpoint-raced`
+- `openbao-rbac-delegation-not-effective`
 - `openbao-runtime-drift`
 - `openbao-runtime-not-ready`
 - `openbao-runtime-readback-failed`

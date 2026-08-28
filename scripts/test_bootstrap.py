@@ -6382,6 +6382,10 @@ class BusinessReadyStageTest(BootstrapTestCase):
 
 
 class OpenBaoRuntimeStageTest(BootstrapTestCase):
+    HELM_MISSING_ROLLBACK_MESSAGE = (
+        'Failed to perform remediation: missing target release for rollback: '
+        'cannot remediate failed release'
+    )
     INVENTORY_IDENTITIES = (
         '|namespace|openbao',
         'flux-system|kustomization.kustomize.toolkit.fluxcd.io|openbao-runtime',
@@ -6413,6 +6417,42 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         return OPENBAO_RUNTIME.read_text(encoding='utf-8') + (
             OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
         )
+
+    @classmethod
+    def helm_rbac_document(
+        cls,
+        message: str,
+        generation: int = 7,
+    ) -> dict[str, object]:
+        return {
+            'metadata': {'generation': generation},
+            'status': {
+                'observedGeneration': generation,
+                'conditions': [
+                    {
+                        'type': 'Stalled',
+                        'status': 'True',
+                        'reason': 'MissingRollbackTarget',
+                        'message': cls.HELM_MISSING_ROLLBACK_MESSAGE,
+                        'observedGeneration': generation,
+                    },
+                    {
+                        'type': 'Ready',
+                        'status': 'False',
+                        'reason': 'UpgradeFailed',
+                        'message': message,
+                        'observedGeneration': generation,
+                    },
+                    {
+                        'type': 'Released',
+                        'status': 'False',
+                        'reason': 'UpgradeFailed',
+                        'message': message,
+                        'observedGeneration': generation,
+                    },
+                ],
+            },
+        }
 
     def inventory_state(
         self,
@@ -6524,6 +6564,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         self,
         document: dict[str, object],
         permissions: str = 'absent',
+        gate: str = 'upgrade_failure',
     ) -> subprocess.CompletedProcess[str]:
         return self.run_command(
             [
@@ -6535,12 +6576,56 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     source "$0"
                     fixture=$1
                     permissions=$2
+                    gate=$3
                     PYTHON_BINARY=/usr/bin/python3
                     business_resource_json() { printf '%s\n' "$fixture"; }
                     kubectl_run() {
                       if [[ "$*" == *'auth can-i'* ]]; then
-                        verb=$4
+                        args=("$@")
+                        verb=
+                        for ((index = 0; index < ${#args[@]} - 1; index++)); do
+                          if [[ "${args[index]}" == can-i ]]; then
+                            verb=${args[index + 1]}
+                            break
+                          fi
+                        done
+                        [[ " ${args[*]} " == *' --request-timeout=5s '* ]] ||
+                          return 2
                         case "$permissions" in
+                          missing-*)
+                            missing=${permissions#missing-}
+                            case "$verb" in
+                              get|list|watch|update|patch)
+                                if [[ "$verb" == "$missing" ]]; then
+                                  printf 'no\n'
+                                  return 1
+                                fi
+                                printf 'yes\n'
+                                return 0
+                                ;;
+                              *)
+                                printf 'no\n'
+                                return 1
+                                ;;
+                            esac
+                            ;;
+                          extra-*)
+                            extra=${permissions#extra-}
+                            case "$verb" in
+                              get|list|watch|update|patch)
+                                printf 'yes\n'
+                                return 0
+                                ;;
+                              *)
+                                if [[ "$verb" == "$extra" ]]; then
+                                  printf 'yes\n'
+                                  return 0
+                                fi
+                                printf 'no\n'
+                                return 1
+                                ;;
+                            esac
+                            ;;
                           absent)
                             printf 'no\n'
                             return 1
@@ -6560,17 +6645,30 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                             printf 'yes\n'
                             return 0
                             ;;
+                          exact)
+                            case "$verb" in
+                              get|list|watch|update|patch)
+                                printf 'yes\n'
+                                return 0
+                                ;;
+                              *)
+                                printf 'no\n'
+                                return 1
+                                ;;
+                            esac
+                            ;;
                         esac
                         return 2
                       fi
                       return 2
                     }
-                    openbao_helm_rbac_upgrade_failure_is_exact
+                    "openbao_helm_rbac_${gate}_is_exact"
                     '''
                 ).strip(),
                 str(OPENBAO_RUNTIME_LIB),
                 json.dumps(document, separators=(',', ':')),
                 permissions,
+                gate,
             ],
             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
         )
@@ -6640,8 +6738,51 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     permissions=$2
                     errexit=$3
                     kubectl_run() {
-                      verb=$4
+                      args=("$@")
+                      verb=
+                      for ((index = 0; index < ${#args[@]} - 1; index++)); do
+                        if [[ "${args[index]}" == can-i ]]; then
+                          verb=${args[index + 1]}
+                          break
+                        fi
+                      done
+                      [[ " ${args[*]} " == *' --request-timeout=5s '* ]] ||
+                        return 2
                       case "$permissions" in
+                        missing-*)
+                          missing=${permissions#missing-}
+                          case "$verb" in
+                            get|list|watch|update|patch)
+                              if [[ "$verb" == "$missing" ]]; then
+                                printf 'no\n'
+                                return 1
+                              fi
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        extra-*)
+                          extra=${permissions#extra-}
+                          case "$verb" in
+                            get|list|watch|update|patch)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              if [[ "$verb" == "$extra" ]]; then
+                                printf 'yes\n'
+                                return 0
+                              fi
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
                         absent)
                           printf 'no\n'
                           return 1
@@ -6678,18 +6819,6 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                           printf 'no\n'
                           return 1
                           ;;
-                        missing-patch)
-                          case "$verb" in
-                            get|list|watch|update)
-                              printf 'yes\n'
-                              return 0
-                              ;;
-                            *)
-                              printf 'no\n'
-                              return 1
-                              ;;
-                          esac
-                          ;;
                         error)
                           return 2
                           ;;
@@ -6716,6 +6845,36 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                 function,
                 permissions,
                 errexit,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def pod_delegation_wait(
+        self,
+        ready_after: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    ready_after=$1
+                    checks=0
+                    openbao_helm_pod_delegation_is_exact() {
+                      checks=$((checks + 1))
+                      (( checks >= ready_after ))
+                    }
+                    openbao_wait_helm_pod_delegation
+                    rc=$?
+                    printf 'CHECKS=%s\n' "$checks"
+                    exit "$rc"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                str(ready_after),
             ],
             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
         )
@@ -6761,6 +6920,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
     def present_recovery_apply(
         self,
         safe_after_wait: bool,
+        delegation_ready: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         return self.run_command(
             [
@@ -6771,6 +6931,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     set -u
                     source "$0"
                     safe_after_wait=$1
+                    delegation_ready=$2
                     after_wait=0
                     openbao_verify_assets() { :; }
                     openbao_client_dry_run() { :; }
@@ -6785,6 +6946,23 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     openbao_wait_flux_source() { after_wait=1; }
                     openbao_apply_namespace() { printf 'MUTATION=namespace\n'; }
                     openbao_apply_bootstrap() { printf 'MUTATION=bootstrap\n'; }
+                    openbao_helm_pod_permission_is() {
+                      expected=$1
+                      verb=$2
+                      request_timeout=$3
+                      [[ "$request_timeout" == 1s ]] || return 2
+                      if [[ "$delegation_ready" != 1 ]]; then
+                        SECONDS=$((SECONDS + 61))
+                        return 1
+                      fi
+                      case "${expected}:${verb}" in
+                        yes:get|yes:list|yes:watch|yes:update|yes:patch|\
+                        no:create|no:delete|no:deletecollection)
+                          return 0
+                          ;;
+                      esac
+                      return 1
+                    }
                     openbao_apply_runtime() { printf 'MUTATION=runtime\n'; }
                     openbao_wait_runtime() { :; }
                     openbao_runtime_is_compliant() { :; }
@@ -6799,6 +6977,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                 ).strip(),
                 str(OPENBAO_RUNTIME_LIB),
                 '1' if safe_after_wait else '0',
+                '1' if delegation_ready else '0',
             ],
             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
         )
@@ -6938,7 +7117,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         self.assertIn('openbao-runtime-rbac-recovery-required', check)
         self.assertIn('openbao_present_recovery_checkpoint_is_safe', apply)
         for required in (
-            'openbao_helm_rbac_upgrade_failure_is_exact',
+            'openbao_helm_rbac_recovery_checkpoint_is_exact',
             'openbao_workload_is_ready',
             'openbao_pod_image_id_is_exact',
             'openbao_pvcs_are_exact',
@@ -6981,19 +7160,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         )
 
         def document(message: str = exact_message) -> dict[str, object]:
-            return {
-                'metadata': {'generation': 7},
-                'status': {
-                    'observedGeneration': 7,
-                    'conditions': [{
-                        'type': 'Ready',
-                        'status': 'False',
-                        'reason': 'UpgradeFailed',
-                        'message': message,
-                        'observedGeneration': 7,
-                    }],
-                },
-            }
+            return self.helm_rbac_document(message)
 
         accepted = self.helm_rbac_failure_gate(document())
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
@@ -7024,19 +7191,28 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                 self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
 
         generation_variants = []
-        for field in ('status', 'condition'):
+        missing_status_generation = document()
+        del missing_status_generation['status']['observedGeneration']
+        generation_variants.append(missing_status_generation)
+        stale_status_generation = document()
+        stale_status_generation['status']['observedGeneration'] = 6
+        generation_variants.append(stale_status_generation)
+
+        for condition_type in ('Ready', 'Released', 'Stalled'):
             missing = document()
-            if field == 'status':
-                del missing['status']['observedGeneration']
-            else:
-                del missing['status']['conditions'][0]['observedGeneration']
+            condition = next(
+                item for item in missing['status']['conditions']
+                if item['type'] == condition_type
+            )
+            del condition['observedGeneration']
             generation_variants.append(missing)
 
             stale = document()
-            if field == 'status':
-                stale['status']['observedGeneration'] = 6
-            else:
-                stale['status']['conditions'][0]['observedGeneration'] = 6
+            condition = next(
+                item for item in stale['status']['conditions']
+                if item['type'] == condition_type
+            )
+            condition['observedGeneration'] = 6
             generation_variants.append(stale)
 
         invalid_generation = document()
@@ -7051,10 +7227,104 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                 rejected = self.helm_rbac_failure_gate(changed)
                 self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
 
+        condition_variants = []
+        for condition_type in ('Ready', 'Released', 'Stalled'):
+            missing = document()
+            missing['status']['conditions'] = [
+                item for item in missing['status']['conditions']
+                if item['type'] != condition_type
+            ]
+            condition_variants.append(missing)
+
+        duplicate = document()
+        duplicate['status']['conditions'].append(
+            dict(duplicate['status']['conditions'][0])
+        )
+        condition_variants.append(duplicate)
+        extra = document()
+        extra['status']['conditions'].append({
+            'type': 'Reconciling',
+            'status': 'True',
+            'reason': 'Progressing',
+            'message': 'another failure',
+            'observedGeneration': 7,
+        })
+        condition_variants.append(extra)
+
+        for condition_type, field, value in (
+            ('Ready', 'status', 'True'),
+            ('Ready', 'reason', 'InstallFailed'),
+            ('Released', 'status', 'True'),
+            ('Released', 'reason', 'InstallFailed'),
+            ('Released', 'message', 'another failure'),
+            ('Stalled', 'status', 'False'),
+            ('Stalled', 'reason', 'RetriesExceeded'),
+            ('Stalled', 'message', 'another failure'),
+        ):
+            changed = document()
+            condition = next(
+                item for item in changed['status']['conditions']
+                if item['type'] == condition_type
+            )
+            condition[field] = value
+            condition_variants.append(changed)
+
+        for changed in condition_variants:
+            with self.subTest(conditions=changed):
+                rejected = self.helm_rbac_failure_gate(changed)
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
         for permissions in ('create-only', 'granted', 'error'):
             with self.subTest(permissions=permissions):
                 rejected = self.helm_rbac_failure_gate(
                     document(), permissions
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+    def test_rbac_recovery_accepts_only_absent_or_exact_delegation(self) -> None:
+        message = (
+            'Helm upgrade failed for release openbao/openbao with chart '
+            'openbao@0.28.6+ebd8bd7b6c01: failed to create resource: '
+            'server-side apply failed for object '
+            'openbao/openbao-discovery-role '
+            'rbac.authorization.k8s.io/v1, Kind=Role: '
+            'roles.rbac.authorization.k8s.io '
+            '"openbao-discovery-role" is forbidden: user '
+            '"system:serviceaccount:flux-system:helm-openbao-reconciler" '
+            '(groups=["system:serviceaccounts" '
+            '"system:serviceaccounts:flux-system" '
+            '"system:authenticated"]) '
+            'is attempting to grant RBAC permissions not currently held:'
+            '\n{APIGroups:[""], Resources:["pods"], '
+            'Verbs:["get" "watch" "list" "update" "patch"]'
+            '}'
+        )
+        document = self.helm_rbac_document(message, 8)
+
+        for permissions in ('absent', 'exact'):
+            with self.subTest(permissions=permissions):
+                accepted = self.helm_rbac_failure_gate(
+                    document,
+                    permissions,
+                    'recovery_checkpoint',
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        invalid_permissions = ['create-only', 'granted', 'error']
+        invalid_permissions.extend(
+            f'missing-{verb}'
+            for verb in ('get', 'list', 'watch', 'update', 'patch')
+        )
+        invalid_permissions.extend(
+            f'extra-{verb}'
+            for verb in ('create', 'delete', 'deletecollection')
+        )
+        for permissions in invalid_permissions:
+            with self.subTest(permissions=permissions):
+                rejected = self.helm_rbac_failure_gate(
+                    document,
+                    permissions,
+                    'recovery_checkpoint',
                 )
                 self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
 
@@ -7067,14 +7337,21 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                 accepted = self.pod_delegation_gate(function, permissions)
                 self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
-        for function, permissions in (
+        rejected_delegations = [
             ('absent', 'create-only'),
             ('absent', 'error'),
             ('exact', 'absent'),
-            ('exact', 'extra'),
-            ('exact', 'missing-patch'),
             ('exact', 'error'),
-        ):
+        ]
+        rejected_delegations.extend(
+            ('exact', f'missing-{verb}')
+            for verb in ('get', 'list', 'watch', 'update', 'patch')
+        )
+        rejected_delegations.extend(
+            ('exact', f'extra-{verb}')
+            for verb in ('create', 'delete', 'deletecollection')
+        )
+        for function, permissions in rejected_delegations:
             with self.subTest(function=function, permissions=permissions):
                 rejected = self.pod_delegation_gate(function, permissions)
                 self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
@@ -7092,6 +7369,30 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     'absent', 'absent', errexit
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+        permission = self.implementation().split(
+            'openbao_helm_pod_permission_is() {', 1
+        )[1].split('openbao_helm_pod_delegation_is_absent() {', 1)[0]
+        self.assertIn('request_timeout=${3:-5s}', permission)
+        self.assertIn('--request-timeout="$request_timeout"', permission)
+
+    def test_pod_delegation_wait_is_bounded_and_retries(self) -> None:
+        body = self.implementation()
+        wait = body.split(
+            'openbao_wait_helm_pod_delegation() {', 1
+        )[1].split('openbao_helm_rbac_upgrade_failure_is_exact() {', 1)[0]
+        self.assertIn('local deadline=$((SECONDS + 60))', wait)
+        self.assertIn('while :; do', wait)
+        self.assertIn(
+            'openbao_helm_pod_delegation_is_exact "$deadline" && return 0',
+            wait,
+        )
+        self.assertIn('(( SECONDS < deadline )) || return 1', wait)
+        self.assertIn('/bin/sleep 1', wait)
+
+        delayed = self.pod_delegation_wait(2)
+        self.assertEqual(delayed.returncode, 0, delayed.stderr)
+        self.assertIn('CHECKS=2', delayed.stdout)
 
     def test_pod_status_accepts_only_exact_containerd_readback(self) -> None:
         digest = (
@@ -7162,6 +7463,13 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         self.assertEqual(raced.returncode, 30, raced.stderr)
         self.assertIn('REASON=openbao-apply-checkpoint-raced', raced.stdout)
         self.assertNotIn('MUTATION=', raced.stdout)
+
+    def test_stage_170_waits_for_exact_delegation_before_runtime(self) -> None:
+        blocked = self.present_recovery_apply(True, False)
+        self.assertEqual(blocked.returncode, 50, blocked.stderr)
+        self.assertIn('REASON=openbao-rbac-delegation-not-effective', blocked.stdout)
+        self.assertIn('MUTATION=bootstrap', blocked.stdout)
+        self.assertNotIn('MUTATION=runtime', blocked.stdout)
 
     def test_stage_170_is_the_final_automatic_stage(self) -> None:
         orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
@@ -7249,9 +7557,11 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         apply = body.split('openbao_stage_170_apply() {', 1)[1]
         namespace_apply = apply.index('openbao_apply_namespace')
         bootstrap_apply = apply.index('openbao_apply_bootstrap')
+        delegation_wait = apply.index('openbao_wait_helm_pod_delegation')
         runtime_apply = apply.index('openbao_apply_runtime')
         self.assertLess(namespace_apply, bootstrap_apply)
-        self.assertLess(bootstrap_apply, runtime_apply)
+        self.assertLess(bootstrap_apply, delegation_wait)
+        self.assertLess(delegation_wait, runtime_apply)
         self.assertIn('kubectl_run apply --server-side', body)
         self.assertIn('clusters/dev/openbao-bootstrap.yaml', body)
         self.assertIn('clusters/dev/openbao-runtime.yaml', body)
