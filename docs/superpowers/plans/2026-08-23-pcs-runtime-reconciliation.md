@@ -1,5 +1,7 @@
 # PCS Candidate 2 And Runtime Evidence Reconciliation Implementation Plan（已执行）
 
+> **Roadmap Reclassification（2026-08-28）**：本计划保留为当时 PCS/bootstrap 事实校正记录，现归 V0.14 Environment & Deployment Foundation。下文 `V0.1 BLOCKED` 是 2026-08-23 旧路线图下的历史部署结论，不再表示 V0.1 Application Release 状态；原 `V0.5 Production Candidate` 截止点改归 V0.19。
+
 > **执行状态：`EXECUTED`。** 本计划已完成；以下步骤均为已执行记录，而非待办。当前发布、Runtime 与 Gate 事实以本节的最终 reconciliation 结果、PCS Candidate 2 和 runbook 为准。
 
 **Goal:** 建立自洽的 PCS Candidate 2，并让 GitOps validator、bootstrap/app runbook 与 V0.1 acceptance 共同表达“bootstrap 已验证，Flux/基础设施/应用未激活，V0.1 仍为 BLOCKED”。
@@ -275,7 +277,7 @@ git commit -m "docs(runbook): 对齐制品与 DEV Runtime 事实" -m "以最后�
 DEV-001 状态：`ACTIVE`
 DEV-002 状态：`ACTIVE`
 关闭负责人：尚未登记（事实缺口）
-截止 Gate：`V0.5 Production Candidate` 前
+截止 Gate：`V0.19 Production Candidate` 前
 ```
 
 - [x] **Step 3: 运行 focused tests**

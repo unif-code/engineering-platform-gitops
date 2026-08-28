@@ -1,5 +1,7 @@
 # Flux Phase A Four-Controller Activation Implementation Plan
 
+> **Roadmap Reclassification（2026-08-28）**：本计划的 Flux/bootstrap 实施证据现归 V0.14 Environment & Deployment Foundation。下文 `V0.1 BLOCKED` 只记录 2026-08-24 旧路线图下的部署状态，不再阻塞或定义 V0.1～V0.13 Application Release。
+
 > **执行状态：`COMPLETED`。** 本计划只激活 Flux Controller 基础层，不创建 Git Credential、`GitRepository`、Flux `Kustomization`、`HelmRelease`，也不激活 infrastructure、apps、MinIO、OpenBao 或任何应用工作负载。
 
 **Goal:** 在 DEV 安装并验证 Flux v2.9.3 的 `source-controller`、`kustomize-controller`、`helm-controller`、`notification-controller`，同时保持 Git sync 与所有下游 Desired State fail-closed。

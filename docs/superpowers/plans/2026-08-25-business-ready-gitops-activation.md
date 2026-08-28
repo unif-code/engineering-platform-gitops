@@ -1,5 +1,7 @@
 # DEV Business-Ready GitOps Activation Implementation Plan
 
+> **Roadmap Reclassification（2026-08-28）**：本计划归 V0.14 Environment & Deployment Foundation。OpenBao、Observability 与 Backup/Restore 分别进入 V0.15～V0.17；其缺失不再阻塞 V0.1～V0.13，但本计划也不能单独宣称 V0.14、部署现场或任何 Release 已验收。
+
 > For agentic workers: REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan. Use superpowers:test-driven-development for every behavior change and superpowers:verification-before-completion before any completion claim.
 
 **Goal:** Extend the approved DEV bootstrap from Flux Phase A to a resumable, one-command business-ready deployment of public gated Git sync, no-backup core infrastructure, PostgreSQL, migrations, frontend/backend and HTTPS routing, while keeping OpenBao, MinIO, backups, restore and observability inactive.
@@ -256,7 +258,7 @@ git commit -m "feat(bootstrap): add business-ready stages 110 through 160"
 
 1. Document that `run-approved.sh <sha> --check|--apply` now resumes through Stage 160 but still requires command-first mutation approval.
 2. Record the exact active DAG, exclusions, supply-chain inputs, Secret metadata-only evidence, migration generation, smoke expectations and `/root/dev-infra-evidence/16-business-ready-<UTC>.txt` contract.
-3. Keep business deployment, migration and account initialization as `NOT_EXECUTED` until runtime evidence exists; keep V0.1 backup/restore/observability acceptance `BLOCKED`.
+3. Keep business deployment, migration and account initialization as `NOT_EXECUTED` until runtime evidence exists; keep V0.15～V0.17 OpenBao/observability/backup scopes unactivated without blocking Application Releases.
 4. Add the separate interactive admin bootstrap command template without a password, employee number or display name; state that one-time output must not enter evidence/chat/files.
 
 Run:

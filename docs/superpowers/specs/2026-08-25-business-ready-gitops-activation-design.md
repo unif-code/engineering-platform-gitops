@@ -1,5 +1,7 @@
 # DEV Business-Ready GitOps Activation Design
 
+> **路线图重分类（2026-08-28）**：本设计归 V0.14 Environment & Deployment Foundation，不再是 V0.1 Release Gate。OpenBao/Trust 属于 V0.15，Observability 属于 V0.16，Backup/Restore/DR 属于 V0.17；它们保持未执行不会阻塞 V0.1～V0.13 Application Release，也不会单独阻塞 V0.14 的部署范围验收。
+
 ## 目的
 
 在已经验收的 Flux Phase A 四 Controller 基础上，把当前单用户 DEV 推进到可通过
@@ -7,8 +9,7 @@
 sync、最小必要平台基础设施、无备份 PostgreSQL、DEV-003 Secret 文件供给、Alembic
 migration、应用工作负载、Gateway 路由和运行验收。
 
-本设计不把“业务可用”冒充完整 V0.1 验收。OpenBao、MinIO、Barman、etcd/PG 备份、
-restore drill、observability 和整机重启验收继续保持 `BLOCKED`/`NOT_EXECUTED`。
+本设计只形成 V0.14 的 DEV 可重复部署与 readback 输入，不把“业务可用”冒充 Application Release Acceptance 或 Production Ready。OpenBao、MinIO、Barman、etcd/PG 备份、restore drill、observability 和整机重启验收继续为后续版本的 `NOT_EXECUTED`。
 
 ## 批准范围
 
@@ -212,7 +213,7 @@ HTTPS probe。`--apply` 对每个 stage 先 check，只执行缺失部分。Phas
 
 最终保存 `/root/dev-infra-evidence/16-business-ready-<UTC>.txt` 和同名 `.sha256`，权限 `600`。
 证据明确记录 `OPENBAO=NOT_EXECUTED`、`MINIO=NOT_EXECUTED`、`BACKUPS=NOT_EXECUTED`、
-`RESTORE=NOT_EXECUTED`，并保持对应 V0.1 条目 `BLOCKED`。
+`RESTORE=NOT_EXECUTED`，并保持 V0.15～V0.17 对应能力未激活；不得因此把 V0.14 或任一 Application Release 伪报为恢复就绪。
 
 ## 失败与回退
 
@@ -229,5 +230,5 @@ HTTPS probe。`--apply` 对每个 stage 先 check，只执行缺失部分。Phas
 - OpenBao Runtime、Agent Injector、Secret 迁移或 OpenBao Backup/Restore；
 - MinIO、Object Lock、Barman、ScheduledBackup、etcd backup、任何 restore drill；
 - Prometheus/Grafana/Metrics Server 与容量/整机重启验收；
-- V0.1 `ACCEPTED` 或 V0.2 Release Gate 通过声明；
+- V0.14 `ACCEPTED`、任一 Application Release Acceptance 或后续 V0.15～V0.17 Gate 通过声明；
 - 修改 frontend/backend 业务源码或重新解释已核验的业务 API 契约。

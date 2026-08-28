@@ -1,5 +1,7 @@
 # OpenBao Runtime 激活实施差异设计
 
+> **路线图重分类（2026-08-28）**：本设计的 OpenBao/PKI/Secret Runtime 归 V0.15。OpenBao 自身的 Cluster 外 Snapshot 与真实 Restore 也是 V0.15 激活 Gate 的必要子批次；平台其余数据、对象与 GitOps Backup/Restore/DR 归 V0.17。V0.15 未完成不阻塞 V0.1～V0.14。
+
 ## 目的
 
 本文不是新的 OpenBao 目标架构。OpenBao、Agent Injector、Secret、数据库凭据、
@@ -11,13 +13,12 @@ architecture/appendix-parameters.md 拥有。
 本文只固定当前单用户 DEV 的实施边界：
 
 - OpenBao 本体继续部署，作为 DEV 的实际 Secret Provider；
-- 当前 DEV 选择 Launch Profile：单 OpenBao Server、单 Agent Injector，明确标记
+- 当前 DEV 选择运维过渡 Profile：单 OpenBao Server、单 Agent Injector，明确标记
   NON_HA；
 - DEV、后续 TEST/PROD 使用相同 Chart、Kustomize Base、配置结构、Secret 文件接口和
   验证脚本，环境 overlay 只调整规模与环境绑定值；
-- OpenBao Backup/Restore 作为后续独立批次交付；
-- Backup/Restore 未完成前可以形成 OpenBao Runtime 证据，但 V0.1 Release Gate 保持
-  BLOCKED。
+- OpenBao Backup/Restore 作为同一 V0.15 的独立子批次交付；
+- Backup/Restore 未完成前只能形成代码与配置证据，不激活正式 OpenBao Capability，也不评估 V0.15 Release Gate；这不阻塞 V0.1～V0.14。
 
 ## 当前事实基线
 
@@ -41,7 +42,7 @@ architecture/appendix-parameters.md 拥有。
 
 ## 已锁定决策
 
-### 1. DEV Launch Profile
+### 1. DEV 运维过渡 Profile
 
 DEV 使用：
 
@@ -116,29 +117,23 @@ GitOps 主仓已是 Public。后续只读 GitRepository 可以使用 HTTPS 公�
 边界、ServiceAccount impersonation 和下游依赖图仍须单独设计、测试、CI 和 Runtime
 批准。Flux Phase A 只安装四个 Controller，不激活 OpenBao 或其他基础设施。
 
-## OpenBao Backup 后置
+## OpenBao Backup 激活前置子批次
 
-本批次不实现 OpenBao Snapshot、Cluster 外保存或 Restore Drill。后置不等于已经具备
-恢复能力：
+本设计文件本身不实现 OpenBao Snapshot、Cluster 外保存或 Restore Drill；对应实现必须作为 V0.15 的另一子批次，在正式 Runtime 激活前完成。缺失时明确不具备恢复能力：
 
 - Node、Raft PVC 或 Cluster 丢失可能导致 DEV Secret 无法恢复；
 - DEV 密码、TOTP 与数据库凭据可能需要重置；
 - PVC 存活、空 Snapshot 清单或未执行的 Runbook 不能替代真实 Restore 证据；
-- OpenBao 已部署不等于 V0.1 已验收。
+- OpenBao 代码或 Deployment 已存在不等于 V0.15 已验收，也不推导任何 Application Release 状态。
 
-Canonical 架构把 OpenBao Backup/Restore 定义为 Security Floor。因此在没有恢复能力
-的情况下激活 OpenBao 前，必须先在 engineering-platform-docs 的
-architecture/deviations.md 登记明确、限时、仅 DEV 的治理偏差；GitOps 仓不得自行
-铸造 DEV 编号。
+Canonical 架构把 OpenBao Backup/Restore 定义为 Security Floor。因此正式激活 OpenBao 前，必须在同一 V0.15 子批次完成恢复能力；不得以 DEV 或单用户为由放宽为无恢复模式。原设计提出的 Backup 后置 deviation 不再需要，GitOps 仓仍不得自行铸造 DEV 编号。
 
-该偏差至少必须固定：
+V0.15 恢复子 Gate 至少必须固定：
 
-- 仅限单用户、无生产数据和真实生产凭据的 DEV，PROD 永不适用；
 - Shamir 分片与初始 Root Token 的离线 OpenPGP 保管不后置；
 - NON_HA、PVC/Seal/Audit/容量告警、Root Token 回收、TLS、NetworkPolicy 与最小权限
   仍必须在激活时完成；
-- Release/Acceptance 保持 BLOCKED；
-- 关闭条件是应用一致性 Raft Snapshot、Cluster 外保存、Manifest、真实 Restore，
+- 应用一致性 Raft Snapshot、Cluster 外保存、Manifest、真实 Restore，
   以及恢复后的登录、TOTP 和数据库访问验证。
 
 ## Secret 与应用接入边界
@@ -165,13 +160,13 @@ HTTPRoute、Smoke 与 Telemetry 属于 OpenBao Runtime 之后的纵向闭环。
 每一步失败都停止，不得跳过：
 
 1. 完成 Flux Phase A 服务器 Runtime 验证并保存证据；
-2. 在 docs 登记 Backup 后置偏差，完成 OpenBao PCS、Desired State、Runbook 与测试；
+2. 完成 OpenBao PCS、Desired State、Runbook、Cluster 外 Snapshot/Restore 子批次与测试；
 3. GitOps 公共 CI 全绿并由 origin/validated 发布精确提交；
 4. 单独完成 Flux Phase B/C 的只读同步、Prune 和权限边界；
-5. 激活 foundation、cert-manager 与 OpenBao Runtime；
+5. 恢复子 Gate 通过后再激活 foundation、cert-manager 与 OpenBao Runtime；
 6. 初始化、解封并验证 TLS、Audit、Kubernetes Auth、Policy 与 Injector；
 7. 迁移 Secret，执行数据库迁移与应用工作负载闭环；
-8. 保持 Backup Gate BLOCKED，后续独立完成 Snapshot 与 Restore Drill。
+8. V0.15 内完成 Snapshot 与 Restore Drill；平台其余组件恢复在 V0.17 独立推进。
 
 ## 错误处理与回退
 
@@ -193,7 +188,7 @@ HTTPRoute、Smoke 与 Telemetry 属于 OpenBao Runtime 之后的纵向闭环。
 - 环境 overlay 只改变获准的环境绑定值；
 - GitRepository 公共只读且无 Git Credential，Phase A 不包含 sync CR；
 - Backend Secret 值只能来自文件，迁移与运行身份不能交叉读取；
-- Backup/Restore 缺失时强制 Release Gate 保持 BLOCKED。
+- OpenBao Backup/Restore 缺失时强制 V0.15 Capability 保持未激活、Release Gate 不通过。
 
 Runtime 验收至少覆盖：
 
@@ -209,6 +204,6 @@ Runtime 验收至少覆盖：
 
 - MinIO、OSS、Barman、etcd、OpenBao 或其他组件的 Backup/Restore 实现；
 - 多节点 DEV 伪 HA、动态数据库凭据、自动轮换与连接热重建；
-- V0.1 ACCEPTED 或 V0.2 Release Gate 收口；
-- V0.3 Requirement、V0.4 Agent Runtime 或模型/Agent Framework 选型；
+- 任一 V0.1～V0.13 Application Release Acceptance 收口；
+- V0.3～V0.12 Requirement、交付、模型或 Agent/Sandbox Capability 实现；
 - 任何绕过 Git Review、CI、origin/validated、堡垒机或当前运维授权的服务器修改。
