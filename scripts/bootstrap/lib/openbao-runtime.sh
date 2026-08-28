@@ -702,11 +702,10 @@ openbao_stage_main() {
     complete STOP_PRECONDITION untrusted-environment-override \
       "$EXIT_PRECONDITION" NONE
   business_initialize "$@"
-  for required in df helm; do
-    require_command "$required" ||
-      complete STOP_PRECONDITION "missing-command-${required}" \
-        "$EXIT_PRECONDITION" NONE
-  done
+  required='df'
+  require_command "$required" ||
+    complete STOP_PRECONDITION "missing-command-${required}" \
+      "$EXIT_PRECONDITION" NONE
   openbao_initialize_paths
   case "$MODE" in
     CHECK) openbao_stage_170_check ;;
