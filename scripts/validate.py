@@ -316,10 +316,10 @@ FLUX_PHASE_A_COMPONENTS_SHA256 = (
     'c6e84495c3b611978d053adc40aca1e2a12af38f6e239c44a6b6c1224e01cab7'
 )
 FLUX_PHASE_A_CANONICAL_RENDERED_SHA256 = (
-    'c048e900c7b516d63fa74a3e8b585807023d8a5a571dc1acff7ad46100384175'
+    'bb63c76f698c52d92869a4ddb524fb5c97b6934855059d903fdd3395b53559dd'
 )
 FLUX_PHASE_A_RAW_RENDERED_SHA256 = (
-    '7d27a43f17ba425def1b454ca31dbdecfd2370d1e13207be0c28700c8f73d69a'
+    'e94f6dc99ff9ed9cee4f2b6458fd9d99e05f314daa1026fb98303009175840de'
 )
 FLUX_PHASE_A_ROLLOUT_STRATEGY = {
     'rollingUpdate': {'maxSurge': 1, 'maxUnavailable': 0},
@@ -696,7 +696,20 @@ FLUX_PHASE_A_ROLE_RULES = {
         },
         {
             'apiGroups': ['source.toolkit.fluxcd.io'],
-            'resources': ['helmcharts', 'ocirepositories'],
+            'resources': ['helmcharts'],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': ['ocirepositories'],
             'verbs': ['get', 'list', 'watch'],
         },
         {

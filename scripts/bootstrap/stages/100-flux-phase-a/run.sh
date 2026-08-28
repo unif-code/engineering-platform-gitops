@@ -65,7 +65,7 @@ if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
 fi
 readonly TAR_BINARY
 readonly DESIRED_ROOT="${repo_root}/clusters/dev/flux-system/phase-a"
-readonly RAW_RENDERED_SHA256=7d27a43f17ba425def1b454ca31dbdecfd2370d1e13207be0c28700c8f73d69a
+readonly RAW_RENDERED_SHA256=e94f6dc99ff9ed9cee4f2b6458fd9d99e05f314daa1026fb98303009175840de
 readonly FIELD_MANAGER=engineering-platform-flux-phase-a
 readonly FLUX_VERSION=2.9.3
 readonly FLUX_ARCHIVE_SHA256=eae4e8608c0ade2bf4e8dec1669dbb6b0c28b5822b252d97feccfb4fb1181fd2

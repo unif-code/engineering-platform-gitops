@@ -4404,7 +4404,7 @@ class FluxPhaseAContractTest(_FluxPhaseAContractBase, unittest.TestCase):
         mutations = (
             ('source-controller', 'cross-controller-api-group'),
             ('kustomize-controller', 'configmap-write'),
-            ('helm-controller', 'cross-controller-write'),
+            ('helm-controller', 'unowned-source-write'),
             ('notification-controller', 'lease-broadening'),
         )
         for controller, mutation in mutations:
@@ -4426,13 +4426,13 @@ class FluxPhaseAContractTest(_FluxPhaseAContractBase, unittest.TestCase):
                         if 'configmaps' in rule.get('resources', [])
                     )
                     core['verbs'].append('update')
-                elif mutation == 'cross-controller-write':
+                elif mutation == 'unowned-source-write':
                     source_read = next(
                         rule
                         for rule in role['rules']
                         if rule.get('apiGroups')
                         == ['source.toolkit.fluxcd.io']
-                        and 'helmcharts' in rule.get('resources', [])
+                        and 'ocirepositories' in rule.get('resources', [])
                         and 'list' in rule.get('verbs', [])
                     )
                     source_read['verbs'].append('patch')
@@ -4448,6 +4448,21 @@ class FluxPhaseAContractTest(_FluxPhaseAContractBase, unittest.TestCase):
                     rendered_documents,
                     'Role|RBAC|namespaced|Lease|跨 Controller|权限',
                 )
+
+    def test_helm_controller_can_reconcile_derived_helmcharts(self) -> None:
+        _root, rendered_documents = self.make_root()
+        role = self.resource(rendered_documents, 'Role', 'helm-controller')
+        helmchart_rule = next(
+            rule
+            for rule in role['rules']
+            if 'helmcharts' in rule.get('resources', [])
+            and 'list' in rule.get('verbs', [])
+        )
+
+        self.assertEqual(
+            ['create', 'delete', 'get', 'list', 'patch', 'update', 'watch'],
+            helmchart_rule['verbs'],
+        )
 
     def test_rejects_api_health_cluster_role_expansion(self) -> None:
         mutations = (
