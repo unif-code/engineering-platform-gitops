@@ -127,8 +127,12 @@ OpenBao 运行在独立 `openbao` Namespace：
 
 交付采用“仓库内 dormant desired state + 获批后显式安装独立 Flux Kustomization”：
 
-- OpenBao HelmRepository/HelmRelease、配置、RBAC、TLS、NetworkPolicy、Quota 与 PVC 契约
-  全部进入仓库并通过 CI；
+- OpenBao HelmRelease、配置、RBAC、TLS、NetworkPolicy、Quota 与 PVC 契约全部进入仓库并
+  通过 CI；不新增 HelmRepository，HelmRelease 直接读取现有 GitRepository 中的 vendored
+  Chart；
+- 由于现有 Controller 启用了 `--no-cross-namespace-refs=true`，HelmRelease 与 values
+  ConfigMap 位于 `flux-system`，Chart 的 `targetNamespace` 固定为 `openbao`；实际 OpenBao
+  工作负载、TLS、PVC 与 NetworkPolicy 仍全部位于 `openbao`；
 - 一个独立的 OpenBao Flux Kustomization 清单也进入仓库，但不被当前
   `clusters/dev/kustomization.yaml` 引用；
 - `origin/validated` 发布候选 SHA 不会自动创建 OpenBao Namespace 或资源；
@@ -151,7 +155,8 @@ Stage 170 加入 `bootstrap-all.sh`，但必须具有独立的停机语义：
 - 已完全合规时返回 `ALREADY_COMPLIANT`；
 - 部分安装、未知所有者、digest 漂移、容量不足、已有 Secret、外部暴露或备份资源出现时
   返回明确 `STOP_*`，不得吸收未知状态；
-- `--apply` 只激活 OpenBao Runtime，不初始化、不 unseal、不配置 Auth/Policy/Audit，
+- `--apply` 只激活 OpenBao Runtime，不初始化、不 unseal、不配置 Auth/Policy；两个 Audit
+  device 已以非敏感 declarative server config 固定，但只在 OpenBao 初始化后生效，
   不部署 MinIO/Backup，不修改应用；
 - apply 后必须等待 HelmRelease、Server、Injector、PVC、Service、TLS 与 NetworkPolicy
   readback；OpenBao 处于未初始化/sealed 状态是 Stage 170 的预期终态；
@@ -166,7 +171,8 @@ OpenPGP 与隐藏输入步骤：
 - `--check` 验证 Stage 170 已合规、OpenBao 未初始化或已知幂等状态、公钥可用、输出目录
   权限安全、现有应用健康且 OpenBao 未承载应用 Secret；
 - 首次 `--apply` 生成只含密文的恢复包，随后停在用户解密和隐藏输入门；
-- unseal 后配置 TLS 验证、Audit、Kubernetes Auth、验证 Role 与最小 Policy；
+- unseal 后验证 declarative Audit，并配置 TLS 验证、Kubernetes Auth、验证 Role 与最小
+  Policy；禁止再用 root token 通过 API 创建 Audit device；
 - 重跑不得再次初始化、覆盖恢复包、轮换 share、生成第二个 root token 或扩大 Policy；
 - 最终 readback 验证 initialized、unsealed、单 Raft peer、Server/Injector Ready、Auth、
   Policy、Audit、TLS、无外部入口、现有应用仍健康且旧 Kubernetes Secret 未变化；

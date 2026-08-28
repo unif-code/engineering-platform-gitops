@@ -30,8 +30,9 @@ MinIO、Snapshot、Backup、Restore 与应用 Secret 迁移继续为 `NOT_EXECUT
 - Audit PVC `5 GiB`；
 - TLS ClusterIP-only，无 Ingress/Gateway/HTTPRoute/NodePort/LoadBalancer；
 - Shamir `5/3`，只允许 OpenPGP 加密 share 与初始 root token；
-- Audit file + stdout，默认 HMAC、`log_raw=false`；所有已配置审计设备都无法写入时
-  OpenBao 才按官方语义 Fail Closed；
+- Audit file + stdout，默认 HMAC、`log_raw=false`；非 blocking device 至少一个可写时请求
+  可继续，所有可用 device 都无法写入时 Fail Closed，任一 blocking device 失败还可能令
+  请求挂起；
 - Kubernetes Auth 与验证 Policy 只用于专用 probe，不读取现有应用 Secret；
 - Runtime 激活不改变现有应用 Kubernetes Secret。
 

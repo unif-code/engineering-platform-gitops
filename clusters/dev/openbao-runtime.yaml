@@ -1,0 +1,19 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: openbao-runtime
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: cert-manager-config
+    - name: infrastructure-foundation
+  interval: 10m
+  path: ./infrastructure/openbao
+  prune: true
+  retryInterval: 1m
+  serviceAccountName: flux-openbao-reconciler
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  timeout: 20m
+  wait: true

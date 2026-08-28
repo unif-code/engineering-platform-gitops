@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  labels:
+    app.kubernetes.io/part-of: engineering-platform
+    platform.unif.internal/environment: dev
+  name: openbao-runtime
+  namespace: openbao
+spec:
+  hard:
+    configmaps: '10'
+    limits.cpu: '1'
+    limits.memory: 1Gi
+    persistentvolumeclaims: '2'
+    pods: '4'
+    requests.cpu: 500m
+    requests.memory: 512Mi
+    requests.storage: 15Gi
+    secrets: '10'
+    services: '8'
