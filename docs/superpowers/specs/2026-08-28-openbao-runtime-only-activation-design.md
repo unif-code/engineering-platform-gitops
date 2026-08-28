@@ -15,10 +15,11 @@
   Gateway 已完成运行验收；
 - OpenBao、MinIO、OpenBao Snapshot、备份任务与恢复任务均未部署；
 - 现有应用继续从 Kubernetes Secret 读取材料，OpenBao Runtime 故障不得影响现有应用；
-- engineering-platform-docs 的治理候选提交
-  `a2de7c12b7f119baf4e9af75d8ea87aefb60e368` 已登记 DEV-005、修正多审计设备的
-  Fail Closed 语义，并把架构基线刷新为 `2026-08-28.2`。DEV-005 必须先进入 docs
-  `main`，GitOps 实现才可引用并交付。
+- engineering-platform-docs `main` 提交
+  `0039d697237eb3f3a4a6238f47d4b971974a031e` 已登记 DEV-005、修正多审计设备的
+  Fail Closed 语义，并把架构基线刷新为 `2026-08-28.2`；该仓因 GitHub Actions
+  Billing 无法启动 runner，经用户明确决定以本地 `baseline:check` 与 `git diff --check`
+  作为本批次治理门禁后合并。
 
 Canonical Contract 仍由 engineering-platform-docs 的
 `architecture/08-security-audit-governance.md`、

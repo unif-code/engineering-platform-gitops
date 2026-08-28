@@ -1,9 +1,9 @@
 # DEV OpenBao Runtime-Only Activation Implementation Plan
 
-> **Status:** BLOCKED before implementation by engineering-platform-docs PR #3 CI. GitHub did not
-> start the runner because account payments failed or the Actions spending limit must be increased.
-> Do not merge docs or begin GitOps implementation until the docs `baseline` job and the post-merge
-> `main` run both succeed.
+> **Status:** READY. engineering-platform-docs PR #3 was merged as
+> `0039d697237eb3f3a4a6238f47d4b971974a031e` after the user explicitly selected the local
+> `baseline:check` and `git diff --check` gate because the private repository's GitHub Actions runner
+> could not start due to Billing. GitOps remains subject to its public PR and post-merge CI gates.
 
 **Goal:** Deploy and accept a single-node DEV OpenBao 2.6.1 runtime with TLS, Raft, dual audit,
 Kubernetes Auth and Agent Injector while keeping MinIO, every backup/restore path, and application
@@ -29,24 +29,25 @@ cert-manager, Bash, Python 3 `unittest`/PyYAML, GnuPG/Gpg4win.
 - Verify: `engineering-platform-docs/architecture/deviations.md`
 - Verify: `engineering-platform-docs/architecture/baseline-manifest.json`
 
-1. Restore GitHub Actions billing/spending capacity outside this repository.
-2. Confirm docs PR #3 head is `a2de7c12b7f119baf4e9af75d8ea87aefb60e368`.
-3. Wait for `baseline` to pass; do not use local success as a substitute.
-4. Rebase-merge PR #3 into docs `main` to preserve linear history.
-5. Wait for the separate `main` push CI and record its exact run URL and merged SHA.
-6. Sync local docs `main`, delete `codex/openbao-backup-deviation` locally/remotely, and remove its
+1. Confirm docs PR #3 head is `a2de7c12b7f119baf4e9af75d8ea87aefb60e368`.
+2. Run `npm run baseline:check` and `git diff --check` locally; record that the private-repo Actions
+   job did not start because of Billing rather than a test assertion.
+3. Rebase-merge PR #3 into docs `main` as explicitly authorized by the user.
+4. Record merged SHA `0039d697237eb3f3a4a6238f47d4b971974a031e` and baseline
+   `2026-08-28.2`.
+5. Sync local docs `main`, delete `codex/openbao-backup-deviation` locally/remotely, and remove its
    worktree only after the merged tree is verified equivalent and clean.
 
 Commands:
 
 ```bash
-gh pr checks 3 --repo unif-code/engineering-platform-docs --watch
+npm run baseline:check
+git diff --check
 gh pr merge 3 --repo unif-code/engineering-platform-docs --rebase --delete-branch
-gh run list --repo unif-code/engineering-platform-docs --branch main --limit 3
 ```
 
-Expected: DEV-005 exists on docs `main`, baseline `2026-08-28.2` is consistent, and PR plus main CI
-are both green.
+Expected: DEV-005 exists on docs `main`, baseline `2026-08-28.2` is locally consistent, and the
+GitHub Billing exception is recorded without being misreported as a passing CI run.
 
 ## Task 2: Lock the OpenBao supply chain
 
@@ -339,4 +340,3 @@ rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
 9. After read-only output is reviewed, show the exact Stage 170 mutation command, affected resource
    inventory and expected readback, then wait for explicit approval. Do the same separately for each
    Stage 180 operation.
-
