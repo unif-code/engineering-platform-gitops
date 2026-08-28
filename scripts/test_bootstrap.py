@@ -59,6 +59,11 @@ BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
 OPENBAO_RUNTIME = ROOT / STAGE_SCRIPTS['170']
 OPENBAO_RUNTIME_LIB = ROOT / 'scripts/bootstrap/lib/openbao-runtime.sh'
+OPENBAO_INITIALIZE = (
+    ROOT / 'scripts/bootstrap/stages/180-openbao-initialize/run.sh'
+)
+OPENBAO_INITIALIZE_LIB = ROOT / 'scripts/bootstrap/lib/openbao-initialize.sh'
+OPENBAO_RECOVERY_WIZARD = ROOT / 'scripts/openbao/recovery-ceremony-wizard.sh'
 
 # 命令位置的完整枚举：行首、分隔符之后、复合命令关键字之后，再加上 `!`/`command`/
 # `builtin` 这类可叠加的命令前缀。少一种写法就等于失败开放——那条 source 既不会被
@@ -1889,6 +1894,10 @@ class StageReadmeTest(BootstrapTestCase):
     def actual_stop_reasons(self, directory: Path) -> list[str]:
         if int(directory.name.split('-', 1)[0]) < 110:
             source = (directory / 'run.sh').read_text(encoding='utf-8')
+            return sorted(set(self.REASON.findall(source)))
+
+        if directory.name.startswith('170-'):
+            source = OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
             return sorted(set(self.REASON.findall(source)))
 
         source = (
@@ -6373,6 +6382,155 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
             'sealed',
         ):
             self.assertIn(expected, readme)
+
+
+class OpenBaoInitializationStageTest(BootstrapTestCase):
+    @staticmethod
+    def implementation() -> str:
+        return OPENBAO_INITIALIZE.read_text(encoding='utf-8') + (
+            OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        )
+
+    def test_stage_180_is_interactive_and_never_orchestrated(self) -> None:
+        self.assertTrue(OPENBAO_INITIALIZE.is_file())
+        self.assertTrue(OPENBAO_INITIALIZE_LIB.is_file())
+        body = self.implementation()
+        orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        for operation in ('--check', '--initialize', '--configure', '--accept'):
+            self.assertIn(operation, body)
+        self.assertNotIn('--apply', body)
+        self.assertNotIn('180-openbao', orchestrator)
+
+    def test_public_key_and_recovery_targets_fail_closed(self) -> None:
+        body = self.implementation()
+        for expected in (
+            'openbao-recovery-public-key.b64',
+            'openbao-recovery-public-key.fingerprint',
+            'safe_file "$OPENBAO_PUBLIC_KEY" 600',
+            'safe_file "$OPENBAO_PUBLIC_KEY_FINGERPRINT" 600',
+            'safe_owned_directory "$OPENBAO_RECOVERY_ROOT" 0',
+            'set -o noclobber',
+            'chmod 600',
+            'sha256_file',
+        ):
+            self.assertIn(expected, body)
+
+    def test_initialize_uses_exact_pgp_shamir_contract(self) -> None:
+        body = self.implementation()
+        initialize = body.split('openbao_stage_180_initialize() {', 1)[1].split(
+            'openbao_stage_180_configure() {', 1
+        )[0]
+        for expected in (
+            'operator init',
+            '-format=json',
+            '-key-shares=5',
+            '-key-threshold=3',
+            '-pgp-keys=',
+            '-root-token-pgp-key=',
+            'unseal_keys_b64',
+            'root_token',
+            'openbao_recovery_bundle_is_valid',
+        ):
+            self.assertIn(expected, body)
+        self.assertIn('openbao_operator_initialize', initialize)
+        self.assertRegex(
+            body,
+            r"pgp_keys=\$\(printf .*%s,%s,%s,%s,%s.*"
+            r'\"\$key\" \"\$key\" \"\$key\" \"\$key\" \"\$key\"\)',
+        )
+        self.assertNotIn('operator init', body.split('openbao_stage_180_check() {', 1)[1].split(
+            'openbao_stage_180_initialize() {', 1
+        )[0])
+
+    def test_unseal_and_root_token_are_stdin_only(self) -> None:
+        body = self.implementation()
+        for expected in (
+            'read -r -s -p',
+            'bao operator unseal -format=json',
+            'login -no-print',
+            'unset OPENBAO_SECRET_INPUT',
+        ):
+            self.assertIn(expected, body)
+        for forbidden in (
+            'BAO_TOKEN=',
+            'VAULT_TOKEN=',
+            'bao operator unseal "$OPENBAO_SECRET_INPUT"',
+            'bao login "$OPENBAO_SECRET_INPUT"',
+            'log_evidence "$OPENBAO_SECRET_INPUT"',
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_configuration_and_probe_contract_are_exact(self) -> None:
+        body = self.implementation()
+        for expected in (
+            'openbao-runtime-probe',
+            'openbao-probe',
+            '"audience":"openbao"',
+            'sys/storage/raft/configuration',
+            'to-file/',
+            'to-stdout/',
+            'kubectl_run --namespace=openbao create token',
+            'bao kv delete openbao-probe/runtime-check',
+            'bao read sys/auth',
+            'bao token revoke -self',
+        ):
+            self.assertIn(expected, body)
+
+    def test_acceptance_evidence_is_secret_free_and_scope_exact(self) -> None:
+        body = self.implementation()
+        accept = body.split('openbao_stage_180_accept() {', 1)[1]
+        for expected in (
+            '17-openbao-runtime',
+            'OPENBAO_INITIALIZED=true',
+            'OPENBAO_SEALED=false',
+            'OPENBAO_RAFT_PEERS=1',
+            'OPENBAO_HA_CLASS=NON_HA',
+            'KUBERNETES_AUTH=PASS',
+            'MINIO=NOT_EXECUTED',
+            'SNAPSHOT=NOT_EXECUTED',
+            'BACKUP=NOT_EXECUTED',
+            'RESTORE=NOT_EXECUTED',
+            'APP_SECRET_MIGRATION=NOT_EXECUTED',
+            'openbao_platform_secret_fingerprint',
+            'openbao_evidence_is_secret_free',
+        ):
+            self.assertIn(expected, body)
+        self.assertIn('openbao_write_acceptance_payload', accept)
+        self.assertIn('openbao_evidence_is_secret_free', accept)
+        self.assertNotIn('unseal_keys_b64', accept)
+        self.assertNotIn('root_token', accept)
+
+    def test_recovery_wizard_has_exactly_five_human_stages(self) -> None:
+        self.assertTrue(OPENBAO_RECOVERY_WIZARD.is_file())
+        wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
+        stages = re.findall(r'^stage "', wizard, re.MULTILINE)
+        self.assertEqual(len(stages), 5)
+        self.assertIn('TOTAL_STAGES=5', wizard)
+        for expected in (
+            'Gpg4win',
+            'gpg --full-generate-key',
+            'openbao-recovery-public-key.b64',
+            'Set-Clipboard',
+            'three unseal shares',
+            'cloud',
+            'Clear-Clipboard',
+        ):
+            self.assertIn(expected, wizard)
+        for forbidden in ('write_env ', 'set_secret ', 'set_var '):
+            stages_source = wizard.split('# STAGES', 1)[1]
+            self.assertNotIn(forbidden, stages_source)
+
+    def test_manual_stage_readme_stop_reasons_match_implementation(self) -> None:
+        reasons = sorted(set(StageReadmeTest.REASON.findall(
+            OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        )))
+        listed = sorted(re.findall(
+            r'^- `([a-z0-9-]+)`$',
+            OPENBAO_INITIALIZE.with_name('README.md').read_text(encoding='utf-8'),
+            re.MULTILINE,
+        ))
+        self.assertTrue(reasons)
+        self.assertEqual(listed, reasons)
 
 
 class ArtifactStageTest(BootstrapTestCase):
