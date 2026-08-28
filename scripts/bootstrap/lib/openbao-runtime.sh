@@ -604,8 +604,9 @@ openbao_resume_checkpoint_is_safe() {
 }
 
 openbao_helm_pod_permission_is() {
-  local expected=$1 verb=$2 output rc
-  if output=$(kubectl_run --namespace=openbao auth can-i "$verb" pods \
+  local expected=$1 verb=$2 request_timeout=${3:-5s} output rc
+  if output=$(kubectl_run --request-timeout="$request_timeout" \
+    --namespace=openbao auth can-i "$verb" pods \
     --as=system:serviceaccount:flux-system:helm-openbao-reconciler \
     2>/dev/null); then
     rc=0
@@ -627,16 +628,28 @@ openbao_helm_pod_delegation_is_absent() {
 }
 
 openbao_helm_pod_delegation_is_exact() {
-  local verb
+  local deadline=${1:-} request_timeout=5s verb
+  [[ -z "$deadline" ]] || request_timeout=1s
   for verb in get list watch update patch; do
-    openbao_helm_pod_permission_is yes "$verb" || return 1
+    [[ -z "$deadline" ]] || (( SECONDS < deadline )) || return 1
+    openbao_helm_pod_permission_is yes "$verb" "$request_timeout" || return 1
   done
   for verb in create delete deletecollection; do
-    openbao_helm_pod_permission_is no "$verb" || return 1
+    [[ -z "$deadline" ]] || (( SECONDS < deadline )) || return 1
+    openbao_helm_pod_permission_is no "$verb" "$request_timeout" || return 1
   done
 }
 
-openbao_helm_rbac_upgrade_failure_is_exact() {
+openbao_wait_helm_pod_delegation() {
+  local deadline=$((SECONDS + 60))
+  while :; do
+    openbao_helm_pod_delegation_is_exact "$deadline" && return 0
+    (( SECONDS < deadline )) || return 1
+    /bin/sleep 1
+  done
+}
+
+openbao_helm_rbac_upgrade_failure_status_is_exact() {
   local document
   document=$(business_resource_json flux-system \
     helmrelease.helm.toolkit.fluxcd.io openbao) || return 1
@@ -655,20 +668,40 @@ if type(generation) is not int or generation < 1:
     raise SystemExit(1)
 if status.get("observedGeneration") != generation:
     raise SystemExit(1)
-conditions = [
-    item for item in status.get("conditions", [])
-    if item.get("type") == "Ready"
-]
-if len(conditions) != 1:
+conditions = status.get("conditions", [])
+if type(conditions) is not list or len(conditions) != 3:
     raise SystemExit(1)
-condition = conditions[0]
-if condition.get("status") != "False":
+by_type = {}
+for condition in conditions:
+    if type(condition) is not dict:
+        raise SystemExit(1)
+    condition_type = condition.get("type")
+    if condition_type in by_type:
+        raise SystemExit(1)
+    by_type[condition_type] = condition
+expected_conditions = {
+    "Ready": ("False", "UpgradeFailed"),
+    "Released": ("False", "UpgradeFailed"),
+    "Stalled": ("True", "MissingRollbackTarget"),
+}
+if set(by_type) != set(expected_conditions):
     raise SystemExit(1)
-if condition.get("reason") != "UpgradeFailed":
+for condition_type, (expected_status, expected_reason) in expected_conditions.items():
+    condition = by_type[condition_type]
+    if condition.get("status") != expected_status:
+        raise SystemExit(1)
+    if condition.get("reason") != expected_reason:
+        raise SystemExit(1)
+    if condition.get("observedGeneration") != generation:
+        raise SystemExit(1)
+ready_message = str(by_type["Ready"].get("message", ""))
+if str(by_type["Released"].get("message", "")) != ready_message:
     raise SystemExit(1)
-if condition.get("observedGeneration") != generation:
+if str(by_type["Stalled"].get("message", "")) != (
+    "Failed to perform remediation: missing target release for rollback: "
+    "cannot remediate failed release"
+):
     raise SystemExit(1)
-message = str(condition.get("message", ""))
 pattern = re.compile(
     r"Helm upgrade failed for release openbao/openbao with chart "
     r"openbao@0\.28\.6\+[0-9a-f]{12}: failed to create resource: "
@@ -684,7 +717,7 @@ pattern = re.compile(
     r"Resources:\[(?P<resources>[^]]*)\], "
     r"Verbs:\[(?P<verbs>[^]]*)\]\}"
 )
-match = pattern.fullmatch(message)
+match = pattern.fullmatch(ready_message)
 if match is None:
     raise SystemExit(1)
 
@@ -699,15 +732,29 @@ def exact_list(fragment, expected):
 exact_list(match.group("api_groups"), {""})
 exact_list(match.group("resources"), {"pods"})
 exact_list(match.group("verbs"), {"get", "list", "watch", "update", "patch"})
-' || return 1
-  openbao_helm_pod_delegation_is_absent
+  '
+}
+
+openbao_helm_rbac_upgrade_failure_is_exact() {
+  openbao_helm_rbac_upgrade_failure_status_is_exact &&
+    openbao_helm_pod_delegation_is_absent
+}
+
+openbao_helm_rbac_retry_failure_is_exact() {
+  openbao_helm_rbac_upgrade_failure_status_is_exact &&
+    openbao_helm_pod_delegation_is_exact
+}
+
+openbao_helm_rbac_recovery_checkpoint_is_exact() {
+  openbao_helm_rbac_upgrade_failure_is_exact ||
+    openbao_helm_rbac_retry_failure_is_exact
 }
 
 openbao_present_recovery_checkpoint_is_safe() {
   local expected_injector expected_server
   expected_server="quay.io/openbao/openbao:2.6.1@${OPENBAO_SERVER_DIGEST}"
   expected_injector="docker.io/hashicorp/vault-k8s:1.7.2@${OPENBAO_INJECTOR_DIGEST}"
-  openbao_helm_rbac_upgrade_failure_is_exact &&
+  openbao_helm_rbac_recovery_checkpoint_is_exact &&
     business_condition_true openbao certificate.cert-manager.io \
       openbao-transport-ca Ready &&
     business_condition_true openbao certificate.cert-manager.io \
@@ -896,6 +943,9 @@ openbao_stage_170_apply() {
     complete STOP_APPLY_FAILED namespace-apply-failed "$EXIT_APPLY_FAILED" NONE
   openbao_apply_bootstrap ||
     complete STOP_APPLY_FAILED bootstrap-apply-failed "$EXIT_APPLY_FAILED" NONE
+  openbao_wait_helm_pod_delegation ||
+    complete STOP_VERIFY_FAILED openbao-rbac-delegation-not-effective \
+      "$EXIT_VERIFY_FAILED" NONE
   openbao_apply_runtime ||
     complete STOP_APPLY_FAILED runtime-activation-failed \
       "$EXIT_APPLY_FAILED" NONE
