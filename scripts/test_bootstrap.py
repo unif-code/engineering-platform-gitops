@@ -5025,6 +5025,67 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                     command_log.read_text(encoding='utf-8'),
                 )
 
+    def test_check_accepts_openbao_runtime_checkpoint_for_phase_a_upgrade(
+        self,
+    ) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DESIRED_DRIFT'] = '1'
+        environment['FAKE_DOWNSTREAM_INVENTORY'] = (
+            'namespace/platform\n'
+            'namespace/openbao\n'
+            'namespace/cert-manager\n'
+            'namespace/cnpg-system\n'
+            'namespace/local-path-storage\n'
+        )
+        environment['FAKE_SYNC_INVENTORY'] = (
+            'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'helmchart.source.toolkit.fluxcd.io/flux-system/flux-system-openbao\n'
+            'helmrelease.helm.toolkit.fluxcd.io/flux-system/openbao\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/cert-manager-config\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/cert-manager-controller\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/cnpg-controller\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/infrastructure-foundation\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/openbao-runtime\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/platform-apps\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/platform-database\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/platform-migration\n'
+        )
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
+        self.assertIn('REASON=upgrade-apply-required', result.stdout)
+        self.assertNotIn(
+            ' apply --server-side', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_readme_names_the_exact_openbao_runtime_checkpoint_boundary(
+        self,
+    ) -> None:
+        readme = FLUX_PHASE_A.with_name('README.md').read_text(encoding='utf-8')
+
+        self.assertIn('Stage `110`～`170`', readme)
+        for identity in (
+            '`namespace/openbao`',
+            '`flux-system/openbao-runtime` Kustomization',
+            '`flux-system/openbao` HelmRelease',
+            '`flux-system/flux-system-openbao` HelmChart',
+        ):
+            self.assertIn(identity, readme)
+        for excluded in ('MinIO', '监控', 'Backup/Snapshot/Restore'):
+            self.assertIn(excluded, readme)
+
     def test_check_rejects_unapproved_downstream_checkpoint_inventory(
         self,
     ) -> None:
