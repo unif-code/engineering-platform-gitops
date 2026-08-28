@@ -116,6 +116,16 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
             str(metadata.get('name', '')),
         )
 
+    @staticmethod
+    def permissions(document: dict[str, object]) -> set[tuple[str, str, str]]:
+        return {
+            (api_group, resource, verb)
+            for rule in document.get('rules', [])
+            for api_group in rule.get('apiGroups', [])
+            for resource in rule.get('resources', [])
+            for verb in rule.get('verbs', [])
+        }
+
     def test_supply_chain_is_immutable(self) -> None:
         self.assertEqual(
             validator.OPENBAO_DOCS_ARCHITECTURE_COMMIT,
@@ -267,6 +277,35 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
         self.assertGreaterEqual(config.count('log_raw = "false"'), 2)
         self.assertGreaterEqual(config.count('hmac_accessor = "true"'), 2)
         self.assertNotIn('auto_unseal', config.lower())
+
+    def test_helm_reconciler_delegates_exact_discovery_permissions(self) -> None:
+        bootstrap = self.documents(
+            validator.ROOT / 'clusters/dev/openbao-bootstrap.yaml'
+        )
+        helm_role = next(
+            document
+            for document in bootstrap
+            if self.identity(document)
+            == ('Role', 'openbao', 'helm-openbao-reconciler')
+        )
+        rendered = self.documents(
+            validator.ROOT / 'infrastructure/openbao/rendered.yaml'
+        )
+        discovery_role = next(
+            document
+            for document in rendered
+            if self.identity(document)
+            == ('Role', 'openbao', 'openbao-discovery-role')
+        )
+        helm_pod_permissions = {
+            permission
+            for permission in self.permissions(helm_role)
+            if permission[:2] == ('', 'pods')
+        }
+        self.assertEqual(
+            helm_pod_permissions,
+            self.permissions(discovery_role),
+        )
 
     def test_runtime_resources_are_private_and_backup_free(self) -> None:
         result = subprocess.run(

@@ -6410,7 +6410,7 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
     def test_runtime_stage_pins_inputs_and_preserves_dormancy(self) -> None:
         body = self.implementation()
         for expected in (
-            '8c08ccf99e742b71c7f1b589491815f649e8caef998796edfba7d8bdba35b4fb',
+            '52890177117a1bf16b4b340472643adef4718616a02f8aec2a331bf950283a20',
             'c5bfd003cabb8a3350942cc4cb17025228f79300b1acda5c434c3003aab6720a',
             '175c5cea2d36b68d348eca872044656bd8740c4dbe26b7dc8eb7c7438474a8b3',
             'ee07429197a8ca7644343d0d66b52e3dc7941a8a608fc6db00da3b4184dcc180',
