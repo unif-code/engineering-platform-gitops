@@ -6520,6 +6520,242 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
         )
 
+    def helm_rbac_failure_gate(
+        self,
+        document: dict[str, object],
+        permissions: str = 'absent',
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    fixture=$1
+                    permissions=$2
+                    PYTHON_BINARY=/usr/bin/python3
+                    business_resource_json() { printf '%s\n' "$fixture"; }
+                    kubectl_run() {
+                      if [[ "$*" == *'auth can-i'* ]]; then
+                        verb=$4
+                        case "$permissions" in
+                          absent)
+                            printf 'no\n'
+                            return 1
+                            ;;
+                          create-only)
+                            if [[ "$verb" == create ]]; then
+                              printf 'yes\n'
+                              return 0
+                            fi
+                            printf 'no\n'
+                            return 1
+                            ;;
+                          error)
+                            return 2
+                            ;;
+                          granted)
+                            printf 'yes\n'
+                            return 0
+                            ;;
+                        esac
+                        return 2
+                      fi
+                      return 2
+                    }
+                    openbao_helm_rbac_upgrade_failure_is_exact
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                json.dumps(document, separators=(',', ':')),
+                permissions,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def pod_delegation_gate(
+        self,
+        function: str,
+        permissions: str,
+        errexit: str = 'off',
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    function=$1
+                    permissions=$2
+                    errexit=$3
+                    kubectl_run() {
+                      verb=$4
+                      case "$permissions" in
+                        absent)
+                          printf 'no\n'
+                          return 1
+                          ;;
+                        exact)
+                          case "$verb" in
+                            get|list|watch|update|patch)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        extra)
+                          case "$verb" in
+                            get|list|watch|create|update|patch)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        create-only)
+                          if [[ "$verb" == create ]]; then
+                            printf 'yes\n'
+                            return 0
+                          fi
+                          printf 'no\n'
+                          return 1
+                          ;;
+                        missing-patch)
+                          case "$verb" in
+                            get|list|watch|update)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        error)
+                          return 2
+                          ;;
+                      esac
+                      return 2
+                    }
+                    if [[ "$errexit" == on ]]; then
+                      set -e
+                    else
+                      set +e
+                    fi
+                    before=$-
+                    if "openbao_helm_pod_delegation_is_${function}"; then
+                      rc=0
+                    else
+                      rc=$?
+                    fi
+                    after=$-
+                    [[ "$before" == "$after" ]] || exit 90
+                    exit "$rc"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                function,
+                permissions,
+                errexit,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def present_recovery_check(
+        self,
+        safe: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    safe=$1
+                    openbao_verify_assets() { :; }
+                    openbao_client_dry_run() { :; }
+                    openbao_capacity_is_safe() { :; }
+                    business_apps_ready() { :; }
+                    business_https_smoke() { :; }
+                    openbao_flux_source_matches_head() { :; }
+                    openbao_inventory_state() { printf 'PRESENT\n'; }
+                    openbao_runtime_is_compliant() { return 1; }
+                    openbao_present_recovery_checkpoint_is_safe() {
+                      [[ "$safe" == 1 ]]
+                    }
+                    complete() {
+                      printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\n' \
+                        "$1" "$2" "$3"
+                      exit "$3"
+                    }
+                    openbao_stage_170_check
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                '1' if safe else '0',
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def present_recovery_apply(
+        self,
+        safe_after_wait: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    safe_after_wait=$1
+                    after_wait=0
+                    openbao_verify_assets() { :; }
+                    openbao_client_dry_run() { :; }
+                    openbao_capacity_is_safe() { :; }
+                    openbao_inventory_state() { printf 'PRESENT\n'; }
+                    openbao_present_recovery_checkpoint_is_safe() {
+                      (( after_wait == 0 )) || [[ "$safe_after_wait" == 1 ]]
+                    }
+                    business_apps_ready() { :; }
+                    business_https_smoke() { :; }
+                    openbao_platform_secret_fingerprint() { printf 'stable\n'; }
+                    openbao_wait_flux_source() { after_wait=1; }
+                    openbao_apply_namespace() { printf 'MUTATION=namespace\n'; }
+                    openbao_apply_bootstrap() { printf 'MUTATION=bootstrap\n'; }
+                    openbao_apply_runtime() { printf 'MUTATION=runtime\n'; }
+                    openbao_wait_runtime() { :; }
+                    openbao_runtime_is_compliant() { :; }
+                    openbao_state_is_known() { :; }
+                    complete() {
+                      printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\n' \
+                        "$1" "$2" "$3"
+                      exit "$3"
+                    }
+                    openbao_stage_170_apply
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                '1' if safe_after_wait else '0',
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
     def test_inventory_classifier_whitelists_only_exact_resume_states(
         self,
     ) -> None:
@@ -6638,6 +6874,188 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
                     result.stdout,
                 )
                 self.assertNotIn('MUTATION=', result.stdout)
+
+    def test_present_drift_only_allows_exact_rbac_recovery_checkpoint(
+        self,
+    ) -> None:
+        body = self.implementation()
+        check = body.split('openbao_stage_170_check() {', 1)[1].split(
+            'openbao_stage_170_apply() {', 1
+        )[0]
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        guard = body.split(
+            'openbao_present_recovery_checkpoint_is_safe() {', 1
+        )[1].split('openbao_apply_checkpoint_is_unchanged() {', 1)[0]
+
+        self.assertIn('openbao_present_recovery_checkpoint_is_safe', check)
+        self.assertIn('openbao-runtime-rbac-recovery-required', check)
+        self.assertIn('openbao_present_recovery_checkpoint_is_safe', apply)
+        for required in (
+            'openbao_helm_rbac_upgrade_failure_is_exact',
+            'openbao_workload_is_ready',
+            'openbao_pod_image_id_is_exact',
+            'openbao_pvcs_are_exact',
+            'openbao_services_are_private',
+            'openbao_secret_inventory_is_safe',
+            'openbao_state_is_known fresh',
+            'openbao_full_server_validation',
+        ):
+            self.assertIn(required, guard)
+
+        allowed = self.present_recovery_check(True)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn('RESULT=PASS_OPENBAO_RUNTIME_CHECK', allowed.stdout)
+        self.assertIn(
+            'REASON=openbao-runtime-rbac-recovery-required',
+            allowed.stdout,
+        )
+
+        rejected = self.present_recovery_check(False)
+        self.assertEqual(rejected.returncode, 30, rejected.stderr)
+        self.assertIn('REASON=openbao-runtime-drift', rejected.stdout)
+
+    def test_known_helm_rbac_failure_gate_is_exact(self) -> None:
+        exact_message = (
+            'Helm upgrade failed for release openbao/openbao with chart '
+            'openbao@0.28.6+476e15855aec: failed to create resource: '
+            'server-side apply failed for object '
+            'openbao/openbao-discovery-role '
+            'rbac.authorization.k8s.io/v1, Kind=Role: '
+            'roles.rbac.authorization.k8s.io '
+            '"openbao-discovery-role" is forbidden: user '
+            '"system:serviceaccount:flux-system:helm-openbao-reconciler" '
+            '(groups=["system:serviceaccounts" '
+            '"system:serviceaccounts:flux-system" '
+            '"system:authenticated"]) '
+            'is attempting to grant RBAC permissions not currently held:'
+            '\n{APIGroups:[""], Resources:["pods"], '
+            'Verbs:["get" "watch" "list" "update" "patch"]'
+            '}'
+        )
+
+        def document(message: str = exact_message) -> dict[str, object]:
+            return {
+                'metadata': {'generation': 7},
+                'status': {
+                    'observedGeneration': 7,
+                    'conditions': [{
+                        'type': 'Ready',
+                        'status': 'False',
+                        'reason': 'UpgradeFailed',
+                        'message': message,
+                        'observedGeneration': 7,
+                    }],
+                },
+            }
+
+        accepted = self.helm_rbac_failure_gate(document())
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for changed in (
+            exact_message.replace('openbao-discovery-role', 'another-role'),
+            exact_message.replace('helm-openbao-reconciler', 'another-sa'),
+            exact_message.replace('"patch"]', '"patch" "delete"]'),
+            exact_message.replace('"patch"]', '"patch" "patch"]'),
+            exact_message.replace('Resources:["pods"]', 'Resources:["secrets"]'),
+            exact_message.replace(
+                '"openbao-discovery-role"',
+                '"openbao-discovery-role-copy"',
+            ),
+            exact_message.replace(
+                'helm-openbao-reconciler"',
+                'helm-openbao-reconciler-copy"',
+            ),
+            exact_message + (
+                ', APIGroups:[""], Resources:["secrets"], Verbs:["get"]'
+            ),
+            exact_message + (
+                '; secrets "another" is forbidden: user "another"'
+            ),
+        ):
+            with self.subTest(changed=changed):
+                rejected = self.helm_rbac_failure_gate(document(changed))
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        generation_variants = []
+        for field in ('status', 'condition'):
+            missing = document()
+            if field == 'status':
+                del missing['status']['observedGeneration']
+            else:
+                del missing['status']['conditions'][0]['observedGeneration']
+            generation_variants.append(missing)
+
+            stale = document()
+            if field == 'status':
+                stale['status']['observedGeneration'] = 6
+            else:
+                stale['status']['conditions'][0]['observedGeneration'] = 6
+            generation_variants.append(stale)
+
+        invalid_generation = document()
+        invalid_generation['metadata']['generation'] = 0
+        generation_variants.append(invalid_generation)
+        deleting = document()
+        deleting['metadata']['deletionTimestamp'] = '2026-08-28T00:00:00Z'
+        generation_variants.append(deleting)
+
+        for changed in generation_variants:
+            with self.subTest(generation=changed):
+                rejected = self.helm_rbac_failure_gate(changed)
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        for permissions in ('create-only', 'granted', 'error'):
+            with self.subTest(permissions=permissions):
+                rejected = self.helm_rbac_failure_gate(
+                    document(), permissions
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+    def test_pod_delegation_requires_exact_effective_permissions(self) -> None:
+        for function, permissions in (
+            ('absent', 'absent'),
+            ('exact', 'exact'),
+        ):
+            with self.subTest(function=function, permissions=permissions):
+                accepted = self.pod_delegation_gate(function, permissions)
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for function, permissions in (
+            ('absent', 'create-only'),
+            ('absent', 'error'),
+            ('exact', 'absent'),
+            ('exact', 'extra'),
+            ('exact', 'missing-patch'),
+            ('exact', 'error'),
+        ):
+            with self.subTest(function=function, permissions=permissions):
+                rejected = self.pod_delegation_gate(function, permissions)
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        body = self.implementation()
+        compliant = body.split('openbao_runtime_is_compliant() {', 1)[1].split(
+            'openbao_full_server_validation() {', 1
+        )[0]
+        self.assertIn('openbao_helm_pod_delegation_is_exact', compliant)
+
+    def test_pod_delegation_permission_probe_preserves_errexit(self) -> None:
+        for errexit in ('off', 'on'):
+            with self.subTest(errexit=errexit):
+                result = self.pod_delegation_gate(
+                    'absent', 'absent', errexit
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_present_recovery_rechecks_exact_failure_before_mutation(self) -> None:
+        allowed = self.present_recovery_apply(True)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn('RESULT=PASS_OPENBAO_RUNTIME_INSTALLED', allowed.stdout)
+        self.assertIn('MUTATION=bootstrap', allowed.stdout)
+
+        raced = self.present_recovery_apply(False)
+        self.assertEqual(raced.returncode, 30, raced.stderr)
+        self.assertIn('REASON=openbao-apply-checkpoint-raced', raced.stdout)
+        self.assertNotIn('MUTATION=', raced.stdout)
 
     def test_stage_170_is_the_final_automatic_stage(self) -> None:
         orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')

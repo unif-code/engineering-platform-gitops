@@ -533,6 +533,7 @@ openbao_runtime_is_compliant() {
     openbao_pvcs_are_exact &&
     openbao_services_are_private &&
     openbao_secret_inventory_is_safe &&
+    openbao_helm_pod_delegation_is_exact &&
     openbao_state_is_known any &&
     business_apps_ready && business_https_smoke
 }
@@ -579,6 +580,134 @@ openbao_resume_checkpoint_is_safe() {
     openbao_full_server_validation
 }
 
+openbao_helm_pod_permission_is() {
+  local expected=$1 verb=$2 output rc
+  if output=$(kubectl_run --namespace=openbao auth can-i "$verb" pods \
+    --as=system:serviceaccount:flux-system:helm-openbao-reconciler \
+    2>/dev/null); then
+    rc=0
+  else
+    rc=$?
+  fi
+  case "$expected" in
+    yes) (( rc == 0 )) && [[ "$output" == yes ]] ;;
+    no) (( rc == 1 )) && [[ "$output" == no ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+openbao_helm_pod_delegation_is_absent() {
+  local verb
+  for verb in get list watch create update patch delete deletecollection; do
+    openbao_helm_pod_permission_is no "$verb" || return 1
+  done
+}
+
+openbao_helm_pod_delegation_is_exact() {
+  local verb
+  for verb in get list watch update patch; do
+    openbao_helm_pod_permission_is yes "$verb" || return 1
+  done
+  for verb in create delete deletecollection; do
+    openbao_helm_pod_permission_is no "$verb" || return 1
+  done
+}
+
+openbao_helm_rbac_upgrade_failure_is_exact() {
+  local document
+  document=$(business_resource_json flux-system \
+    helmrelease.helm.toolkit.fluxcd.io openbao) || return 1
+  printf '%s' "$document" | "$PYTHON_BINARY" -I -B -c '
+import json
+import re
+import sys
+
+document = json.load(sys.stdin)
+metadata = document.get("metadata", {})
+status = document.get("status", {})
+generation = metadata.get("generation")
+if metadata.get("deletionTimestamp") is not None:
+    raise SystemExit(1)
+if type(generation) is not int or generation < 1:
+    raise SystemExit(1)
+if status.get("observedGeneration") != generation:
+    raise SystemExit(1)
+conditions = [
+    item for item in status.get("conditions", [])
+    if item.get("type") == "Ready"
+]
+if len(conditions) != 1:
+    raise SystemExit(1)
+condition = conditions[0]
+if condition.get("status") != "False":
+    raise SystemExit(1)
+if condition.get("reason") != "UpgradeFailed":
+    raise SystemExit(1)
+if condition.get("observedGeneration") != generation:
+    raise SystemExit(1)
+message = str(condition.get("message", ""))
+pattern = re.compile(
+    r"Helm upgrade failed for release openbao/openbao with chart "
+    r"openbao@0\.28\.6\+[0-9a-f]{12}: failed to create resource: "
+    r"server-side apply failed for object openbao/openbao-discovery-role "
+    r"rbac\.authorization\.k8s\.io/v1, Kind=Role: "
+    r"roles\.rbac\.authorization\.k8s\.io \"openbao-discovery-role\" "
+    r"is forbidden: user \"system:serviceaccount:flux-system:"
+    r"helm-openbao-reconciler\" \(groups=\[\"system:serviceaccounts\" "
+    r"\"system:serviceaccounts:flux-system\" "
+    r"\"system:authenticated\"\]\) is attempting to grant RBAC "
+    r"permissions not currently held:\n"
+    r"\{APIGroups:\[(?P<api_groups>[^]]*)\], "
+    r"Resources:\[(?P<resources>[^]]*)\], "
+    r"Verbs:\[(?P<verbs>[^]]*)\]\}"
+)
+match = pattern.fullmatch(message)
+if match is None:
+    raise SystemExit(1)
+
+def exact_list(fragment, expected):
+    values = re.findall(r"\"([^\"]*)\"", fragment)
+    if len(values) != len(expected) or set(values) != expected:
+        raise SystemExit(1)
+    residue = re.sub(r"\"[^\"]*\"", "", fragment)
+    if residue.strip(" ,\t\r\n"):
+        raise SystemExit(1)
+
+exact_list(match.group("api_groups"), {""})
+exact_list(match.group("resources"), {"pods"})
+exact_list(match.group("verbs"), {"get", "list", "watch", "update", "patch"})
+' || return 1
+  openbao_helm_pod_delegation_is_absent
+}
+
+openbao_present_recovery_checkpoint_is_safe() {
+  local expected_injector expected_server
+  expected_server="quay.io/openbao/openbao:2.6.1@${OPENBAO_SERVER_DIGEST}"
+  expected_injector="docker.io/hashicorp/vault-k8s:1.7.2@${OPENBAO_INJECTOR_DIGEST}"
+  openbao_helm_rbac_upgrade_failure_is_exact &&
+    business_condition_true openbao certificate.cert-manager.io \
+      openbao-transport-ca Ready &&
+    business_condition_true openbao certificate.cert-manager.io \
+      openbao-server-tls Ready &&
+    business_condition_true openbao certificate.cert-manager.io \
+      openbao-injector-tls Ready &&
+    openbao_workload_is_ready openbao statefulset.apps openbao \
+      "$expected_server" &&
+    openbao_workload_is_ready openbao deployment.apps \
+      openbao-agent-injector "$expected_injector" &&
+    openbao_pod_image_id_is_exact \
+      'app.kubernetes.io/name=openbao,component=server' \
+      "$expected_server" "$OPENBAO_SERVER_DIGEST" &&
+    openbao_pod_image_id_is_exact \
+      'app.kubernetes.io/name=openbao-agent-injector,component=webhook' \
+      "$expected_injector" "$OPENBAO_INJECTOR_DIGEST" &&
+    openbao_pvcs_are_exact &&
+    openbao_services_are_private &&
+    openbao_secret_inventory_is_safe &&
+    openbao_state_is_known fresh &&
+    openbao_full_server_validation
+}
+
 openbao_apply_checkpoint_is_unchanged() {
   local expected=$1 observed
   observed=$(openbao_inventory_state) || return 1
@@ -587,6 +716,9 @@ openbao_apply_checkpoint_is_unchanged() {
     MISSING) return 0 ;;
     RESUMABLE_BOOTSTRAP|RESUMABLE_RETAINED_PVCS)
       openbao_resume_checkpoint_is_safe "$observed"
+      ;;
+    PRESENT)
+      openbao_present_recovery_checkpoint_is_safe
       ;;
     *) return 1 ;;
   esac
@@ -669,13 +801,18 @@ openbao_stage_170_check() {
         'stages/170-openbao-runtime/run.sh --apply'
       ;;
     PRESENT)
-      openbao_runtime_is_compliant ||
+      if openbao_runtime_is_compliant; then
+        openbao_full_server_validation ||
+          complete STOP_VERIFY_FAILED full-server-validation-failed \
+            "$EXIT_VERIFY_FAILED" NONE
+        complete ALREADY_COMPLIANT openbao-runtime-ready 0 NONE
+      fi
+      openbao_present_recovery_checkpoint_is_safe ||
         complete STOP_UNKNOWN_STATE openbao-runtime-drift \
           "$EXIT_UNKNOWN_STATE" NONE
-      openbao_full_server_validation ||
-        complete STOP_VERIFY_FAILED full-server-validation-failed \
-          "$EXIT_VERIFY_FAILED" NONE
-      complete ALREADY_COMPLIANT openbao-runtime-ready 0 NONE
+      complete PASS_OPENBAO_RUNTIME_CHECK \
+        openbao-runtime-rbac-recovery-required 0 \
+        'stages/170-openbao-runtime/run.sh --apply'
       ;;
     PARTIAL|UNKNOWN)
       complete STOP_UNKNOWN_STATE partial-or-unknown-openbao-inventory \
@@ -708,6 +845,11 @@ openbao_stage_170_apply() {
       openbao_resume_checkpoint_is_safe "$inventory" ||
         complete STOP_VERIFY_FAILED unsafe-openbao-resume-checkpoint \
           "$EXIT_VERIFY_FAILED" NONE
+      ;;
+    PRESENT)
+      openbao_present_recovery_checkpoint_is_safe ||
+        complete STOP_UNKNOWN_STATE openbao-runtime-drift \
+          "$EXIT_UNKNOWN_STATE" NONE
       ;;
     *)
       complete STOP_UNKNOWN_STATE apply-requires-empty-or-approved-checkpoint \
