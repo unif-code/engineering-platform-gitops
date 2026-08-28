@@ -25,6 +25,7 @@ spec:
   interval: 30m
   releaseName: openbao
   serviceAccountName: helm-openbao-reconciler
+  storageNamespace: openbao
   targetNamespace: openbao
   timeout: 15m
   upgrade:

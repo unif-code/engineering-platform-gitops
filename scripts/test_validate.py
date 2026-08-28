@@ -307,6 +307,7 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
             == ('HelmRelease', 'flux-system', 'openbao')
         )
         self.assertEqual(helm_release['spec']['targetNamespace'], 'openbao')
+        self.assertEqual(helm_release['spec']['storageNamespace'], 'openbao')
         self.assertEqual(
             helm_release['spec']['chart']['spec']['sourceRef'],
             {
