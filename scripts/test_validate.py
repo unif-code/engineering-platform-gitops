@@ -2111,7 +2111,7 @@ class _FluxPhaseAContractBase:
             validator.ROOT / 'scripts/bootstrap/bootstrap-all.sh'
         ).read_text(encoding='utf-8')
         self.assertIn(
-            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160)',
+            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160 170)',
             orchestrator,
         )
         self.assertIn('100:PASS_FLUX_PHASE_A_INSTALLED', orchestrator)
