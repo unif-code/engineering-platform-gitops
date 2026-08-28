@@ -16,6 +16,14 @@ partial inventory. After waiting for the approved Flux source and immediately be
 `--apply` must observe the same checkpoint and repeat its safety gate. It then replays only the exact
 reviewed Namespace, bootstrap bundle, and standalone Flux Kustomization.
 
+A third recovery checkpoint is limited to a fully present runtime that is still uninitialized and
+sealed, has exact workloads, image digests, PVCs, private Services, certificates, and Secret inventory,
+and whose HelmRelease reports only the reviewed `openbao-discovery-role` anti-escalation failure while
+the Helm service account has none of the standard pods resource verbs. This checkpoint is rechecked
+after the Flux source wait and may only replay the same three reviewed manifests. Successful compliance
+requires exactly `get/list/watch/update/patch` on pods and still forbids `create/delete/deletecollection`.
+Every other present-but-drifted runtime remains fail-closed.
+
 Stage 180 is intentionally not part of `bootstrap-all.sh`; initialization needs the operator to be
 present for hidden input and the encrypted recovery ceremony.
 
