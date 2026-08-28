@@ -44,6 +44,7 @@ STAGE_SCRIPTS = {
     '140': 'scripts/bootstrap/stages/140-platform-migration/run.sh',
     '150': 'scripts/bootstrap/stages/150-platform-apps/run.sh',
     '160': 'scripts/bootstrap/stages/160-business-ready-evidence/run.sh',
+    '170': 'scripts/bootstrap/stages/170-openbao-runtime/run.sh',
 }
 PREFLIGHT = ROOT / STAGE_SCRIPTS['00']
 STAGE_ARTIFACTS = ROOT / STAGE_SCRIPTS['10']
@@ -56,6 +57,8 @@ FINAL_VERIFY = ROOT / STAGE_SCRIPTS['90']
 FLUX_PHASE_A = ROOT / STAGE_SCRIPTS['100']
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
+OPENBAO_RUNTIME = ROOT / STAGE_SCRIPTS['170']
+OPENBAO_RUNTIME_LIB = ROOT / 'scripts/bootstrap/lib/openbao-runtime.sh'
 
 # 命令位置的完整枚举：行首、分隔符之后、复合命令关键字之后，再加上 `!`/`command`/
 # `builtin` 这类可叠加的命令前缀。少一种写法就等于失败开放——那条 source 既不会被
@@ -648,7 +651,7 @@ class CommonLibraryTest(BootstrapTestCase):
             sorted(STAGE_SCRIPTS, key=int),
             [
                 '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                '110', '120', '130', '140', '150', '160',
+                '110', '120', '130', '140', '150', '160', '170',
             ],
         )
         for number in STAGE_SCRIPTS:
@@ -707,16 +710,19 @@ class CommonLibraryTest(BootstrapTestCase):
 
         # 走表而非通配：迁移后 `[0-9]*.sh` 只剩尚未迁移的那几个，枚举会静默变少。
         stages = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stages), 15, [str(s) for s in stages])
+        self.assertEqual(len(stages), 16, [str(s) for s in stages])
         for stage in stages:
             with self.subTest(stage=stage.name):
                 body = stage.read_text(encoding='utf-8')
                 for declaration in ('host_path()', 'complete()'):
                     self.assertNotIn(declaration + ' {', body, declaration)
-                expected_library = (
-                    'business-ready.sh' if int(stage.parent.name.split('-', 1)[0]) >= 110
-                    else 'common.sh'
-                )
+                stage_number = int(stage.parent.name.split('-', 1)[0])
+                if stage_number == 170:
+                    expected_library = 'openbao-runtime.sh'
+                elif stage_number >= 110:
+                    expected_library = 'business-ready.sh'
+                else:
+                    expected_library = 'common.sh'
                 self.assertRegex(
                     body, self.library_source_pattern(expected_library)
                 )
@@ -3681,6 +3687,10 @@ class BootstrapOrchestratorMixin:
                 check_result=PASS_BUSINESS_READY_EVIDENCE_CHECK
                 apply_result=PASS_BUSINESS_READY
                 ;;
+              170)
+                check_result=PASS_OPENBAO_RUNTIME_CHECK
+                apply_result=PASS_OPENBAO_RUNTIME_INSTALLED
+                ;;
               *) exit 30 ;;
             esac
 
@@ -3894,6 +3904,8 @@ class BootstrapOrchestratorMixin:
             (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150'),
              'PASS_BOOTSTRAP_CHECK', '160'),
             (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150', '160'),
+             'PASS_BOOTSTRAP_CHECK', '170'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150', '160', '170'),
              'PASS_BOOTSTRAP_ALL_CHECK', 'NONE'),
         )
         for completed, expected_result, expected_next in cases:
@@ -3909,7 +3921,7 @@ class BootstrapOrchestratorMixin:
                 self.assertIn(f'NEXT_STAGE={expected_next}', result.stdout)
                 expected_checks = [
                     '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                    '110', '120', '130', '140', '150', '160',
+                    '110', '120', '130', '140', '150', '160', '170',
                 ]
                 if expected_next != 'NONE':
                     expected_checks = expected_checks[
@@ -3923,7 +3935,7 @@ class BootstrapOrchestratorMixin:
     def test_apply_on_fully_complete_state_performs_no_stage_apply(self) -> None:
         for stage in (
             '10', '20', '30', '40', '50', '60', '100',
-            '110', '120', '130', '140', '150', '160',
+            '110', '120', '130', '140', '150', '160', '170',
         ):
             (self.state_dir / stage).touch()
 
@@ -3939,7 +3951,7 @@ class BootstrapOrchestratorMixin:
                 f'{stage} --check'
                 for stage in (
                     '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                    '110', '120', '130', '140', '150', '160',
+                    '110', '120', '130', '140', '150', '160', '170',
                 )
             ],
         )
@@ -4024,20 +4036,20 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in (
-            '[1/15] stage 00 check ...',
-            '[1/15] stage 00 check -> PASS_PREFLIGHT',
-            '[5/15] stage 40 check -> PASS_KUBERNETES_CHECK',
-            '[5/15] stage 40 apply ...',
-            '[5/15] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
-            '[5/15] stage 40 postcheck -> ALREADY_COMPLIANT',
-            '[8/15] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
-            '[9/15] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
-            '[15/15] stage 160 check -> PASS_BUSINESS_READY_EVIDENCE_CHECK',
+            '[1/16] stage 00 check ...',
+            '[1/16] stage 00 check -> PASS_PREFLIGHT',
+            '[5/16] stage 40 check -> PASS_KUBERNETES_CHECK',
+            '[5/16] stage 40 apply ...',
+            '[5/16] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
+            '[5/16] stage 40 postcheck -> ALREADY_COMPLIANT',
+            '[8/16] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
+            '[9/16] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
+            '[16/16] stage 170 check -> PASS_OPENBAO_RUNTIME_CHECK',
         ):
             self.assertIn(line, result.stderr)
         # 进度行一旦漏进 stdout，下游解析与既有逐字段断言都会被打乱。
-        for index in range(1, 16):
-            self.assertNotIn(f'[{index}/15]', result.stdout)
+        for index in range(1, 17):
+            self.assertNotIn(f'[{index}/16]', result.stdout)
         # 进度行只回显编排器自己掌握的事实，不含 stage 自由文本与终端控制序列。
         self.assertNotIn(self.canary, result.stdout + result.stderr)
         self.assertNotIn('\x1b', result.stdout + result.stderr)
@@ -4055,18 +4067,18 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(
-            result.stderr, r'\[5/15\] stage 40 check \.\.\. \d+s elapsed'
+            result.stderr, r'\[5/16\] stage 40 check \.\.\. \d+s elapsed'
         )
         # 结束行带累计耗时，事后也能看出哪个 stage 慢。
         self.assertRegex(
             result.stderr,
-            r'\[5/15\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
+            r'\[5/16\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
         )
         # 心跳必须随 stage 结束而停。没被 kill 掉的话它会变成孤儿，一路刷进
         # 后续 stage——行数会远超该 stage 的实际时长。这条才是真正的区分点：
         # 「有心跳」很容易，「心跳能停」才是并发代码的难处。
         beats = re.findall(
-            r'\[5/15\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/16\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertTrue(beats)
         self.assertLessEqual(len(beats), 6, result.stderr)
@@ -4089,7 +4101,7 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         beats = re.findall(
-            r'\[5/15\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/16\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertEqual(beats, ['5'], result.stderr)
 
@@ -4215,7 +4227,7 @@ class BootstrapOrchestratorMixin:
     def test_check_all_complete_reaches_final_verify(self) -> None:
         for stage in (
             '10', '20', '30', '40', '50', '60', '100', '110', '120',
-            '130', '140', '150', '160',
+            '130', '140', '150', '160', '170',
         ):
             (self.state_dir / stage).touch()
 
@@ -4230,7 +4242,7 @@ class BootstrapOrchestratorMixin:
                 f'{stage} --check'
                 for stage in (
                     '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                    '110', '120', '130', '140', '150', '160',
+                    '110', '120', '130', '140', '150', '160', '170',
                 )
             ],
         )
@@ -5704,7 +5716,7 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         # 表本身与编排器 stage_path() 的一致性由
         # CommonLibraryTest.test_stage_paths_come_from_one_table 交叉校验。
         stage_scripts = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stage_scripts), 15, [str(s) for s in stage_scripts])
+        self.assertEqual(len(stage_scripts), 16, [str(s) for s in stage_scripts])
         for script in stage_scripts:
             self.assertTrue(script.is_file(), script)
         sourced: set[str] = set()
@@ -5747,7 +5759,7 @@ class BusinessReadyStageTest(BootstrapTestCase):
     def test_orchestrator_has_exact_business_ready_order_and_results(self) -> None:
         orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
         self.assertIn(
-            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160)',
+            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160 170)',
             orchestrator,
         )
         contracts = {
@@ -6250,6 +6262,117 @@ class BusinessReadyStageTest(BootstrapTestCase):
             '16-business-ready-*.txt',
         ):
             self.assertIn(required, self.source)
+
+
+class OpenBaoRuntimeStageTest(BootstrapTestCase):
+    @staticmethod
+    def implementation() -> str:
+        return OPENBAO_RUNTIME.read_text(encoding='utf-8') + (
+            OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
+        )
+
+    def test_stage_170_is_the_final_automatic_stage(self) -> None:
+        orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        self.assertRegex(
+            orchestrator,
+            r'readonly -a STAGES=\([^)]*160 170\)',
+        )
+        self.assertRegex(
+            orchestrator,
+            r'readonly -a MUTATING_STAGES=\([^)]*160 170\)',
+        )
+        self.assertIn(
+            "170) printf '%s/stages/170-openbao-runtime/run.sh\\n'",
+            orchestrator,
+        )
+        self.assertIn('170:PASS_OPENBAO_RUNTIME_CHECK', orchestrator)
+        self.assertIn('170:PASS_OPENBAO_RUNTIME_INSTALLED', orchestrator)
+        self.assertIn('170:ALREADY_COMPLIANT', orchestrator)
+        self.assertNotIn('180-openbao', orchestrator)
+
+    def test_runtime_stage_pins_inputs_and_preserves_dormancy(self) -> None:
+        body = self.implementation()
+        for expected in (
+            '8c08ccf99e742b71c7f1b589491815f649e8caef998796edfba7d8bdba35b4fb',
+            'c5bfd003cabb8a3350942cc4cb17025228f79300b1acda5c434c3003aab6720a',
+            '175c5cea2d36b68d348eca872044656bd8740c4dbe26b7dc8eb7c7438474a8b3',
+            'ee07429197a8ca7644343d0d66b52e3dc7941a8a608fc6db00da3b4184dcc180',
+            'e84bcc197c160ce6f1547444f0910a240c6fac221b58be378fa212de88b4ffc7',
+            '15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0',
+            '3dd30a9ac5909d17555480f51be734dfb719a323409f06cffe8b48cdaf6237d2',
+        ):
+            self.assertIn(expected, body)
+        self.assertIn('clusters/dev/kustomization.yaml', body)
+        self.assertIn('openbao-bootstrap.yaml', body)
+        self.assertIn('openbao-runtime.yaml', body)
+        self.assertIn('infrastructure/openbao/rendered.yaml', body)
+        self.assertIn('vendor/charts/openbao-0.28.6.tgz', body)
+        self.assertIn('--no-cross-namespace-refs=true', body)
+
+    def test_check_is_read_only_and_server_validation_is_dependency_aware(
+        self,
+    ) -> None:
+        body = self.implementation()
+        check = body.split('openbao_stage_170_check() {', 1)[1].split(
+            'openbao_stage_170_apply() {', 1
+        )[0]
+        self.assertNotRegex(check, r'kubectl_run\s+apply')
+        self.assertNotIn('open_evidence', check)
+        self.assertIn('openbao_client_dry_run', check)
+        self.assertIn('openbao_server_validate_safe_subset', check)
+        self.assertIn('PASS_OPENBAO_RUNTIME_CHECK', check)
+        self.assertIn('namespace-dependent-server-validation-deferred', check)
+        self.assertNotIn('--force-conflicts', body)
+        self.assertNotRegex(body, r'kubectl_run\s+create\s+namespace')
+
+    def test_apply_uses_exact_manifests_and_never_initializes(self) -> None:
+        body = self.implementation()
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        namespace_apply = apply.index('openbao_apply_namespace')
+        bootstrap_apply = apply.index('openbao_apply_bootstrap')
+        runtime_apply = apply.index('openbao_apply_runtime')
+        self.assertLess(namespace_apply, bootstrap_apply)
+        self.assertLess(bootstrap_apply, runtime_apply)
+        self.assertIn('kubectl_run apply --server-side', body)
+        self.assertIn('clusters/dev/openbao-bootstrap.yaml', body)
+        self.assertIn('clusters/dev/openbao-runtime.yaml', body)
+        self.assertIn('statefulset/openbao', body)
+        self.assertIn('deployment/openbao-agent-injector', body)
+        self.assertIn('initialized', body)
+        self.assertIn('sealed', body)
+        for forbidden in (
+            'operator init',
+            'operator unseal',
+            '/v1/sys/unseal',
+            'bao audit enable',
+            'kubectl_run delete persistentvolumeclaim',
+            'kubectl_run delete pvc',
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_status_readback_uses_a_certificate_dns_name(self) -> None:
+        body = self.implementation()
+        status = body.split('openbao_status_json() {', 1)[1].split(
+            'openbao_state_is_known() {', 1
+        )[0]
+        self.assertIn('BAO_ADDR=https://openbao.openbao.svc:8200', status)
+        self.assertNotIn('BAO_ADDR=https://127.0.0.1:8200', status)
+
+    def test_runtime_readme_names_the_deferred_capabilities(self) -> None:
+        readme = OPENBAO_RUNTIME.with_name('README.md').read_text(
+            encoding='utf-8'
+        )
+        for expected in (
+            'MinIO',
+            'Snapshot',
+            'Backup',
+            'Restore',
+            'Secret migration',
+            'Stage 180',
+            'uninitialized',
+            'sealed',
+        ):
+            self.assertIn(expected, readme)
 
 
 class ArtifactStageTest(BootstrapTestCase):

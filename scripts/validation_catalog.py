@@ -37,6 +37,7 @@ SHARDS = {
         'test_bootstrap.BootstrapOrchestratorTest',
         'test_bootstrap.FluxPhaseAStageTest',
         'test_bootstrap.BusinessReadyStageTest',
+        'test_bootstrap.OpenBaoRuntimeStageTest',
         'test_bootstrap.RunApprovedTest',
     ),
     'artifacts': ('test_bootstrap.ArtifactStageTest',),
@@ -83,6 +84,7 @@ FAST_SELECTORS = (
     'test_bootstrap.BootstrapOrchestratorTest.test_gnu_stat_fallback_discards_failed_probe_stdout',
     'test_bootstrap.FluxPhaseAStageTest',
     'test_bootstrap.BusinessReadyStageTest',
+    'test_bootstrap.OpenBaoRuntimeStageTest',
     'test_bootstrap.RunApprovedTest',
 )
 
