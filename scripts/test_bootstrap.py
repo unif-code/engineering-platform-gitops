@@ -6365,6 +6365,33 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
         self.assertIn('vendor/charts/openbao-0.28.6.tgz', body)
         self.assertIn('--no-cross-namespace-refs=true', body)
 
+    def test_helm_uses_gated_absolute_path_not_restricted_path_lookup(self) -> None:
+        library = OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
+        stage_main = library.split('openbao_stage_main() {', 1)[1]
+
+        self.assertIn(
+            'OPENBAO_HELM_BINARY=$(host_path /usr/local/bin/helm)',
+            library,
+        )
+        self.assertNotRegex(
+            stage_main,
+            r'for required in [^;]*\bhelm\b',
+            '生产 PATH 刻意排除 /usr/local/bin；Helm 必须走绝对路径门禁',
+        )
+        self.assertNotRegex(
+            stage_main,
+            r'require_command ["\']?helm\b',
+            'Helm 可用性必须由受门禁保护的绝对路径决定',
+        )
+        self.assertIn(
+            'safe_file "$OPENBAO_HELM_BINARY" 755',
+            library,
+        )
+        self.assertIn(
+            '"$OPENBAO_HELM_BINARY" template openbao',
+            library,
+        )
+
     def test_check_is_read_only_and_server_validation_is_dependency_aware(
         self,
     ) -> None:
