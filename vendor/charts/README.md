@@ -1,9 +1,10 @@
 # Vendored controller charts
 
-These charts are retained as reviewed supply-chain inputs. The active GitOps paths use
-committed `helm template` output plus Kustomize digest transforms; the cluster does not
-create `HelmRelease`, `HelmRepository`, Helm release-storage Secret, or chart-network
-dependency for these two controllers.
+These charts are retained as reviewed supply-chain inputs. cert-manager and CloudNativePG use
+committed `helm template` output plus Kustomize digest transforms. OpenBao is the deliberate
+exception: its dormant runtime path creates one `HelmRelease` only after Stage 170 approval, reads
+the vendored Chart from the existing GitRepository artifact, and has no HelmRepository or runtime
+chart-network dependency.
 
 | Chart | Official source | Version | Package SHA-256 | Registry digest |
 | --- | --- | --- | --- | --- |
@@ -38,3 +39,7 @@ injector controller; that linux/amd64 manifest is pinned to
 The reviewed package is retained as `openbao-0.28.6.tgz`; its extracted tree is
 `vendor/charts/openbao` and contained 60 regular files/directories with no
 absolute path, parent traversal, symlink, hardlink or special-file entry.
+The committed 16-document reference render is `infrastructure/openbao/rendered.yaml`; its
+canonical JSON SHA-256 is
+`ee07429197a8ca7644343d0d66b52e3dc7941a8a608fc6db00da3b4184dcc180` after
+trailing-whitespace normalization.

@@ -1,0 +1,112 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/part-of: engineering-platform
+    platform.unif.internal/environment: dev
+  name: openbao-transport-ca
+  namespace: openbao
+spec:
+  commonName: openbao-transport-ca
+  duration: 87600h
+  isCA: true
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: dev-selfsigned
+  privateKey:
+    algorithm: ECDSA
+    rotationPolicy: Always
+    size: 256
+  renewBefore: 8760h
+  secretName: openbao-transport-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/part-of: engineering-platform
+    platform.unif.internal/environment: dev
+  name: openbao-transport-ca
+  namespace: openbao
+spec:
+  ca:
+    secretName: openbao-transport-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/part-of: engineering-platform
+    platform.unif.internal/environment: dev
+  name: openbao-server-tls
+  namespace: openbao
+spec:
+  commonName: openbao.openbao.svc
+  dnsNames:
+    - openbao
+    - openbao.openbao
+    - openbao.openbao.svc
+    - openbao.openbao.svc.cluster.local
+    - openbao-active
+    - openbao-active.openbao
+    - openbao-active.openbao.svc
+    - openbao-active.openbao.svc.cluster.local
+    - openbao-internal
+    - openbao-internal.openbao
+    - openbao-internal.openbao.svc
+    - openbao-internal.openbao.svc.cluster.local
+    - openbao-standby
+    - openbao-standby.openbao
+    - openbao-standby.openbao.svc
+    - openbao-standby.openbao.svc.cluster.local
+    - openbao-0.openbao-internal
+    - openbao-0.openbao-internal.openbao
+    - openbao-0.openbao-internal.openbao.svc
+    - openbao-0.openbao-internal.openbao.svc.cluster.local
+  duration: 8760h
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: openbao-transport-ca
+  privateKey:
+    algorithm: ECDSA
+    rotationPolicy: Always
+    size: 256
+  renewBefore: 720h
+  secretName: openbao-server-tls
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/part-of: engineering-platform
+    platform.unif.internal/environment: dev
+  name: openbao-injector-tls
+  namespace: openbao
+spec:
+  commonName: openbao-agent-injector-svc.openbao.svc
+  dnsNames:
+    - openbao-agent-injector-svc
+    - openbao-agent-injector-svc.openbao
+    - openbao-agent-injector-svc.openbao.svc
+    - openbao-agent-injector-svc.openbao.svc.cluster.local
+  duration: 8760h
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: openbao-transport-ca
+  privateKey:
+    algorithm: ECDSA
+    rotationPolicy: Always
+    size: 256
+  renewBefore: 720h
+  secretName: openbao-injector-tls
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth

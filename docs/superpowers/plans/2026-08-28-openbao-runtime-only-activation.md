@@ -113,7 +113,6 @@ Run the class and confirm RED for missing desired state before implementation.
 **Files:**
 
 - Create: `infrastructure/openbao/kustomization.yaml`
-- Create: `infrastructure/openbao/namespace.yaml`
 - Create: `infrastructure/openbao/resourcequota.yaml`
 - Create: `infrastructure/openbao/certificate.yaml`
 - Create: `infrastructure/openbao/rbac.yaml`
@@ -129,13 +128,16 @@ Implementation constraints:
 
 - the OpenBao Flux Kustomization and bootstrap RBAC are committed but not referenced by the active
   root;
-- HelmRelease reads the vendored Chart from the already approved GitRepository artifact and uses
-  only digest-pinned images; no runtime chart network dependency;
+- HelmRelease and its values ConfigMap live in `flux-system` so the existing
+  `--no-cross-namespace-refs=true` controller policy is preserved; the release targets `openbao`,
+  reads the vendored Chart from the already approved GitRepository artifact and uses only
+  digest-pinned images; no runtime chart network dependency;
 - TLS config uses the cert-manager Secret only as transport material; it contains no OpenBao
   recovery material;
 - Raft and audit data use separate PVCs, and no rollback object can delete them;
-- audit devices are configured after init; OpenBao serves when at least one configured device can
-  write and fails closed only if all configured devices are blocked;
+- file-PVC and stdout audit devices are declared in server HCL with `log_raw=false` and accessor
+  HMAC, become active after initialization without root-token API creation, and preserve OpenBao's
+  documented audit availability semantics;
 - rendered resources remain compatible with Kubernetes 1.36 restricted PSS.
 
 Generate and commit a deterministic render/digest contract. Then run:

@@ -4,6 +4,7 @@ import copy
 import contextlib
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -97,6 +98,24 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
     DOCS_COMMIT = '0039d697237eb3f3a4a6238f47d4b971974a031e'
     BASELINE_ID = '2026-08-28.2'
 
+    @staticmethod
+    def documents(path: Path) -> list[dict[str, object]]:
+        return [
+            document
+            for document in yaml.safe_load_all(path.read_text(encoding='utf-8'))
+            if isinstance(document, dict)
+        ]
+
+    @staticmethod
+    def identity(document: dict[str, object]) -> tuple[str, str, str]:
+        metadata = document.get('metadata', {})
+        assert isinstance(metadata, dict)
+        return (
+            str(document.get('kind', '')),
+            str(metadata.get('namespace', '')),
+            str(metadata.get('name', '')),
+        )
+
     def test_supply_chain_is_immutable(self) -> None:
         self.assertEqual(
             validator.OPENBAO_DOCS_ARCHITECTURE_COMMIT,
@@ -143,6 +162,298 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
         )
         self.assertIn(self.DOCS_COMMIT, candidate)
         self.assertIn(self.BASELINE_ID, candidate)
+
+    def test_activation_is_dormant_and_repository_owned(self) -> None:
+        active_root = yaml.safe_load(
+            (validator.ROOT / 'clusters/dev/kustomization.yaml').read_text(
+                encoding='utf-8'
+            )
+        )
+        self.assertNotIn('openbao-bootstrap.yaml', active_root['resources'])
+        self.assertNotIn('openbao-runtime.yaml', active_root['resources'])
+
+        bootstrap = self.documents(
+            validator.ROOT / 'clusters/dev/openbao-bootstrap.yaml'
+        )
+        identities = {self.identity(document) for document in bootstrap}
+        self.assertIn(('Namespace', '', 'openbao'), identities)
+        self.assertIn(
+            ('ServiceAccount', 'flux-system', 'flux-openbao-reconciler'),
+            identities,
+        )
+        self.assertIn(
+            ('ServiceAccount', 'flux-system', 'helm-openbao-reconciler'),
+            identities,
+        )
+
+        activation = self.documents(
+            validator.ROOT / 'clusters/dev/openbao-runtime.yaml'
+        )
+        self.assertEqual(len(activation), 1)
+        kustomization = activation[0]
+        self.assertEqual(
+            self.identity(kustomization),
+            ('Kustomization', 'flux-system', 'openbao-runtime'),
+        )
+        spec = kustomization['spec']
+        self.assertEqual(spec['path'], './infrastructure/openbao')
+        self.assertTrue(spec['prune'])
+        self.assertTrue(spec['wait'])
+        self.assertEqual(
+            spec['serviceAccountName'], 'flux-openbao-reconciler'
+        )
+        self.assertEqual(
+            spec['sourceRef'],
+            {'kind': 'GitRepository', 'name': 'flux-system'},
+        )
+
+        desired_state = yaml.safe_load(
+            (validator.ROOT / 'infrastructure/openbao/kustomization.yaml')
+            .read_text(encoding='utf-8')
+        )
+        self.assertNotIn('namespace.yaml', desired_state['resources'])
+        self.assertNotIn('rendered.yaml', desired_state['resources'])
+
+    def test_values_lock_non_ha_tls_raft_and_persistent_audit(self) -> None:
+        values = yaml.safe_load(
+            (validator.ROOT / 'infrastructure/openbao/values.yaml').read_text(
+                encoding='utf-8'
+            )
+        )
+        self.assertFalse(values['global']['tlsDisable'])
+        self.assertTrue(values['injector']['enabled'])
+        self.assertEqual(values['injector']['replicas'], 1)
+        self.assertEqual(values['injector']['webhook']['failurePolicy'], 'Fail')
+        self.assertEqual(
+            values['injector']['image']['tag'],
+            '1.7.2@' + validator.OPENBAO_INJECTOR_AMD64_DIGEST,
+        )
+        self.assertEqual(
+            values['injector']['agentImage']['tag'],
+            '2.6.1@' + validator.OPENBAO_AGENT_AMD64_DIGEST,
+        )
+        self.assertEqual(
+            values['server']['image']['tag'],
+            '2.6.1@' + validator.OPENBAO_SERVER_AMD64_DIGEST,
+        )
+        self.assertFalse(values['server']['dev']['enabled'])
+        self.assertFalse(values['server']['standalone']['enabled'])
+        self.assertTrue(values['server']['ha']['enabled'])
+        self.assertEqual(values['server']['ha']['replicas'], 1)
+        self.assertTrue(values['server']['ha']['raft']['enabled'])
+        self.assertTrue(values['server']['ha']['raft']['setNodeId'])
+        self.assertEqual(values['server']['dataStorage']['size'], '10Gi')
+        self.assertEqual(values['server']['auditStorage']['size'], '5Gi')
+        self.assertEqual(
+            values['server']['persistentVolumeClaimRetentionPolicy'],
+            {'whenDeleted': 'Retain', 'whenScaled': 'Retain'},
+        )
+        self.assertFalse(values['server']['ingress']['enabled'])
+        self.assertFalse(values['server']['gateway']['tlsRoute']['enabled'])
+        self.assertFalse(values['server']['gateway']['httpRoute']['enabled'])
+        self.assertFalse(values['server']['route']['enabled'])
+        self.assertFalse(values['ui']['enabled'])
+        self.assertFalse(values['csi']['enabled'])
+        self.assertFalse(values['snapshotAgent']['enabled'])
+        config = values['server']['ha']['raft']['config']
+        self.assertIn('storage "raft"', config)
+        self.assertIn('tls_disable = 0', config)
+        self.assertIn('tls_cert_file', config)
+        self.assertIn('tls_key_file', config)
+        self.assertIn('audit "file" "to-file"', config)
+        self.assertIn('file_path = "/openbao/audit/openbao-audit.log"', config)
+        self.assertIn('audit "file" "to-stdout"', config)
+        self.assertIn('file_path = "stdout"', config)
+        self.assertGreaterEqual(config.count('log_raw = "false"'), 2)
+        self.assertGreaterEqual(config.count('hmac_accessor = "true"'), 2)
+        self.assertNotIn('auto_unseal', config.lower())
+
+    def test_runtime_resources_are_private_and_backup_free(self) -> None:
+        result = subprocess.run(
+            [
+                'kubectl',
+                'kustomize',
+                str(validator.ROOT / 'infrastructure/openbao'),
+            ],
+            cwd=validator.ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError(result.stderr or result.stdout)
+        documents = [
+            document
+            for document in yaml.safe_load_all(result.stdout)
+            if isinstance(document, dict)
+        ]
+        identities = {self.identity(document) for document in documents}
+        required = {
+            ('ResourceQuota', 'openbao', 'openbao-runtime'),
+            ('Certificate', 'openbao', 'openbao-server-tls'),
+            ('HelmRelease', 'flux-system', 'openbao'),
+            ('NetworkPolicy', 'openbao', 'default-deny'),
+            ('ServiceAccount', 'openbao', 'openbao-runtime-probe'),
+        }
+        self.assertTrue(required.issubset(identities))
+        self.assertIn(
+            ('ConfigMap', 'flux-system', 'openbao-helm-values'),
+            identities,
+        )
+        helm_release = next(
+            document
+            for document in documents
+            if self.identity(document)
+            == ('HelmRelease', 'flux-system', 'openbao')
+        )
+        self.assertEqual(helm_release['spec']['targetNamespace'], 'openbao')
+        self.assertEqual(
+            helm_release['spec']['chart']['spec']['sourceRef'],
+            {
+                'kind': 'GitRepository',
+                'name': 'flux-system',
+                'namespace': 'flux-system',
+            },
+        )
+        forbidden_kinds = {
+            'Ingress', 'Gateway', 'HTTPRoute', 'TLSRoute', 'CronJob',
+            'ScheduledBackup', 'Backup', 'VolumeSnapshot',
+        }
+        self.assertTrue(
+            forbidden_kinds.isdisjoint(
+                {str(document.get('kind', '')) for document in documents}
+            )
+        )
+        identity_text = '\n'.join(
+            '/'.join(self.identity(document)).lower() for document in documents
+        )
+        for forbidden in (
+            'minio', 'snapshot', 'objectstore', 'scheduledbackup',
+            'backup', 'restore',
+        ):
+            self.assertNotIn(forbidden, identity_text)
+        serialized = yaml.safe_dump_all(documents, sort_keys=True).lower()
+        for forbidden in ('platform-secret', 'secretstore', 'externalsecret'):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_rendered_chart_contract_is_digest_locked(self) -> None:
+        rendered_path = validator.ROOT / 'infrastructure/openbao/rendered.yaml'
+        documents = self.documents(rendered_path)
+        canonical_documents = sorted(
+            documents,
+            key=lambda document: (
+                str(document.get('apiVersion', '')),
+                *self.identity(document),
+            ),
+        )
+        canonical = json.dumps(
+            canonical_documents,
+            ensure_ascii=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        ).encode('utf-8')
+        self.assertEqual(
+            hashlib.sha256(canonical).hexdigest(),
+            validator.OPENBAO_RENDERED_CANONICAL_SHA256,
+        )
+        expected_identities = {
+            ('ClusterRole', '', 'openbao-agent-injector-clusterrole'),
+            ('ClusterRoleBinding', '', 'openbao-agent-injector-binding'),
+            ('ClusterRoleBinding', '', 'openbao-server-binding'),
+            ('ConfigMap', 'openbao', 'openbao-config'),
+            ('Deployment', 'openbao', 'openbao-agent-injector'),
+            (
+                'MutatingWebhookConfiguration',
+                '',
+                'openbao-agent-injector-cfg',
+            ),
+            ('Pod', 'openbao', 'openbao-server-test'),
+            ('Role', 'openbao', 'openbao-discovery-role'),
+            ('RoleBinding', 'openbao', 'openbao-discovery-rolebinding'),
+            ('Service', 'openbao', 'openbao'),
+            ('Service', 'openbao', 'openbao-active'),
+            ('Service', 'openbao', 'openbao-agent-injector-svc'),
+            ('Service', 'openbao', 'openbao-internal'),
+            ('ServiceAccount', 'openbao', 'openbao'),
+            ('ServiceAccount', 'openbao', 'openbao-agent-injector'),
+            ('StatefulSet', 'openbao', 'openbao'),
+        }
+        self.assertEqual(
+            {self.identity(document) for document in documents},
+            expected_identities,
+        )
+
+        by_identity = {
+            self.identity(document): document for document in documents
+        }
+        injector = by_identity[
+            ('Deployment', 'openbao', 'openbao-agent-injector')
+        ]
+        server = by_identity[('StatefulSet', 'openbao', 'openbao')]
+        self.assertEqual(injector['spec']['replicas'], 1)
+        self.assertEqual(server['spec']['replicas'], 1)
+        self.assertEqual(
+            server['spec']['persistentVolumeClaimRetentionPolicy'],
+            {'whenDeleted': 'Retain', 'whenScaled': 'Retain'},
+        )
+        claims = {
+            claim['metadata']['name']: claim['spec']['resources']['requests'][
+                'storage'
+            ]
+            for claim in server['spec']['volumeClaimTemplates']
+        }
+        self.assertEqual(claims, {'audit': '5Gi', 'data': '10Gi'})
+
+        expected_images = {
+            'docker.io/hashicorp/vault-k8s:1.7.2@'
+            + validator.OPENBAO_INJECTOR_AMD64_DIGEST,
+            'quay.io/openbao/openbao:2.6.1@'
+            + validator.OPENBAO_SERVER_AMD64_DIGEST,
+        }
+        actual_images: set[str] = set()
+        for document in documents:
+            spec = document.get('spec', {})
+            if not isinstance(spec, dict):
+                continue
+            pod_spec = spec.get('template', {}).get('spec', spec)
+            if not isinstance(pod_spec, dict):
+                continue
+            for container_key in ('containers', 'initContainers'):
+                for container in pod_spec.get(container_key, []):
+                    image = container.get('image')
+                    if image:
+                        actual_images.add(str(image))
+        self.assertEqual(actual_images, expected_images)
+
+        for workload in (injector, server):
+            pod_spec = workload['spec']['template']['spec']
+            self.assertTrue(pod_spec['securityContext']['runAsNonRoot'])
+            self.assertEqual(
+                pod_spec['securityContext']['seccompProfile']['type'],
+                'RuntimeDefault',
+            )
+            for container in pod_spec['containers']:
+                security = container['securityContext']
+                self.assertFalse(security['allowPrivilegeEscalation'])
+                self.assertEqual(security['capabilities']['drop'], ['ALL'])
+
+        for document in documents:
+            if document.get('kind') != 'Service':
+                continue
+            self.assertIn(
+                document.get('spec', {}).get('type', 'ClusterIP'),
+                ('ClusterIP',),
+            )
+        rendered_text = rendered_path.read_text(encoding='utf-8').lower()
+        for forbidden in (
+            'kind: ingress',
+            'kind: httproute',
+            'kind: tlsroute',
+            'kind: cronjob',
+            'kind: volumesnapshot',
+            'image: minio',
+        ):
+            self.assertNotIn(forbidden, rendered_text)
 
 
 class RepositoryProfileContractTest(unittest.TestCase):
