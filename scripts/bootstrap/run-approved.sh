@@ -1,6 +1,10 @@
 #!/bin/bash
-# 运维一行入口：校验已批准的提交与仓库状态后，在干净环境中执行 bootstrap-all。
+# 运维一行入口：校验已批准的提交与仓库状态后，在干净环境中执行 bootstrap-all
+# 或显式的 Stage 180 OpenBao 人工仪式入口。
 # 用法：scripts/bootstrap/run-approved.sh [<approved-sha>] --check|--apply
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --check --stage=180
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
+#         --operation=initialize|configure|accept
 # 不带 SHA 时使用 CI 在 validation-gate 全绿后发布的 origin/validated；它必须仍在
 # origin/main 历史上，否则 fail-closed，杜绝部署未经门禁或已被回滚的提交。
 # 门禁与既往人工粘贴的脚本一致（SHA、origin、main、干净树、ff-only、helm 残留、
@@ -12,21 +16,49 @@ umask 022
 
 usage() {
   printf 'usage: %s [<approved-sha>] --check|--apply\n' "${0##*/}" >&2
+  printf '       %s [<approved-sha>] --check --stage=180\n' "${0##*/}" >&2
+  printf '       %s [<approved-sha>] --apply --stage=180 ' "${0##*/}" >&2
+  printf '%s\n' '--operation=initialize|configure|accept' >&2
   printf '  省略 SHA 时使用 CI 发布的 origin/validated\n' >&2
   exit 2
 }
 
 approved_sha=
-case $# in
-  1) mode=$1 ;;
-  2)
-    approved_sha=$1
-    mode=$2
-    ;;
-  *) usage ;;
-esac
+if (( $# > 0 )) && [[ "$1" != --* ]]; then
+  approved_sha=$1
+  shift
+fi
+(( $# > 0 )) || usage
+mode=$1
+shift
 case "$mode" in
   --check|--apply) ;;
+  *) usage ;;
+esac
+target=bootstrap
+target_argument=$mode
+case $# in
+  0) ;;
+  1)
+    if [[ "$mode" == --check && "$1" == --stage=180 ]]; then
+      target=openbao-initialize
+      target_argument=--check
+    else
+      usage
+    fi
+    ;;
+  2)
+    if [[ "$mode" != --apply || "$1" != --stage=180 ]]; then
+      usage
+    fi
+    target=openbao-initialize
+    case "$2" in
+      --operation=initialize) target_argument=--initialize ;;
+      --operation=configure) target_argument=--configure ;;
+      --operation=accept) target_argument=--accept ;;
+      *) usage ;;
+    esac
+    ;;
   *) usage ;;
 esac
 if [[ -n "$approved_sha" && ! "$approved_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -110,9 +142,19 @@ if [[ "$EUID" -eq 0 ]]; then
   done
 fi
 
+case "$target" in
+  bootstrap) target_script="$repo/scripts/bootstrap/bootstrap-all.sh" ;;
+  openbao-initialize)
+    target_script="$repo/scripts/bootstrap/stages/180-openbao-initialize/run.sh"
+    ;;
+  *)
+    echo 'STOP: invalid approved target'
+    exit 101
+    ;;
+esac
 set +e
 /usr/bin/env -i HOME="${HOME:-/root}" PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-  /bin/bash -p "$repo/scripts/bootstrap/bootstrap-all.sh" "$mode"
+  /bin/bash -p "$target_script" "$target_argument"
 rc=$?
 set -e
 printf 'COMMAND_EXIT_CODE=%s\n' "$rc"

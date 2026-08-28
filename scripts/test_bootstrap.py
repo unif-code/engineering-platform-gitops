@@ -3381,6 +3381,13 @@ class RunApprovedTest(BootstrapTestCase):
             'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
             'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
         )
+        self.write_executable(
+            scripts / 'stages/180-openbao-initialize/run.sh',
+            '#!/bin/bash\n'
+            'printf \'FAKE_OPENBAO_OPERATION=%s\\n\' "$1"\n'
+            'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
+            'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
+        )
         self.git('add', '-A', cwd=seed)
         self.git('commit', '-q', '-m', 'seed', cwd=seed)
         self.git('remote', 'add', 'origin', str(bare), cwd=seed)
@@ -3447,6 +3454,44 @@ class RunApprovedTest(BootstrapTestCase):
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         self.assertEqual(head, approved)
+
+    def test_routes_stage_180_check_through_the_same_gates(self) -> None:
+        clone, approved, _ = self.make_gated_repo()
+
+        result = self.run_wrapper(
+            clone, approved, '--check', '--stage=180',
+            extra_env={'KUBECACHEDIR': '/dev/null', 'PYTHONDONTWRITEBYTECODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAKE_OPENBAO_OPERATION=--check', result.stdout)
+        self.assertNotIn('FAKE_MODE=', result.stdout)
+        self.assertIn('KUBECACHEDIR_SEEN=ABSENT', result.stdout)
+        self.assertIn('PYTHON_SEEN=ABSENT', result.stdout)
+        self.assertIn('COMMAND_EXIT_CODE=0', result.stdout)
+
+    def test_stage_180_mutations_are_explicit_and_root_gated(self) -> None:
+        clone, approved, _ = self.make_gated_repo()
+        for operation in ('initialize', 'configure', 'accept'):
+            with self.subTest(operation=operation):
+                result = self.run_wrapper(
+                    clone, approved, '--apply', '--stage=180',
+                    f'--operation={operation}',
+                )
+                self.assertEqual(result.returncode, 91, result.stdout + result.stderr)
+                self.assertIn('STOP: --apply must run as root', result.stdout)
+                self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
+
+        for arguments in (
+            (approved, '--apply', '--stage=180'),
+            (approved, '--check', '--stage=180', '--operation=initialize'),
+            (approved, '--apply', '--stage=180', '--operation=check'),
+            (approved, '--check', '--stage=170'),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_wrapper(clone, *arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
 
     def test_defaults_to_ci_published_validated_ref(self) -> None:
         """不带 SHA 时使用 CI 发布的 origin/validated，运维无需手工转述 40 位字符。"""
