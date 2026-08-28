@@ -24,3 +24,28 @@ The following remain deferred and absent after Stage 170:
 The stage never deletes PVCs. Partial or unknown OpenBao inventory, external exposure, source
 revision drift, image drift, insufficient capacity, business health regression, or application
 Secret fingerprint drift stops fail-closed.
+
+## 停止原因
+
+- `applications-not-ready`
+- `apply-requires-empty-inventory`
+- `bootstrap-apply-failed`
+- `client-dry-run-failed`
+- `flux-source-revision-drift`
+- `full-server-validation-failed`
+- `insufficient-openbao-capacity`
+- `invalid-openbao-inventory-state`
+- `invalid-openbao-mode`
+- `inventory-query-failed`
+- `namespace-apply-failed`
+- `openbao-asset-drift`
+- `openbao-runtime-drift`
+- `openbao-runtime-not-ready`
+- `openbao-runtime-readback-failed`
+- `partial-or-unknown-openbao-inventory`
+- `platform-secret-drift`
+- `platform-secret-fingerprint-failed`
+- `runtime-activation-failed`
+- `safe-server-validation-failed`
+- `unexpected-initialization-state`
+- `untrusted-environment-override`

@@ -38,6 +38,7 @@ SHARDS = {
         'test_bootstrap.FluxPhaseAStageTest',
         'test_bootstrap.BusinessReadyStageTest',
         'test_bootstrap.OpenBaoRuntimeStageTest',
+        'test_bootstrap.OpenBaoInitializationStageTest',
         'test_bootstrap.RunApprovedTest',
     ),
     'artifacts': ('test_bootstrap.ArtifactStageTest',),
@@ -85,6 +86,7 @@ FAST_SELECTORS = (
     'test_bootstrap.FluxPhaseAStageTest',
     'test_bootstrap.BusinessReadyStageTest',
     'test_bootstrap.OpenBaoRuntimeStageTest',
+    'test_bootstrap.OpenBaoInitializationStageTest',
     'test_bootstrap.RunApprovedTest',
 )
 
