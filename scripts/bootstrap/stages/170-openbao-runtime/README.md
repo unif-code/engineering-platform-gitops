@@ -6,9 +6,15 @@ finish `uninitialized=true` and `sealed=true`; Stage 170 never initializes or un
 
 `--check` is read-only. When the `openbao` Namespace is absent, Kubernetes cannot server-validate
 objects in that Namespace, so the stage validates the Namespace and existing-scope bootstrap objects
-separately and reports the namespace-dependent part as deferred. `--apply` first persists the exact
-reviewed Namespace, then server-validates and applies the complete bootstrap bundle before activating
-the standalone Flux Kustomization.
+separately and reports the namespace-dependent part as deferred. An interrupted install may resume
+only from one of two exact inventory fingerprints: the reviewed bootstrap checkpoint, or that same
+checkpoint plus the chart-retained `10Gi` data and `5Gi` audit PVCs. The retained-PVC checkpoint must
+also prove both claims are `Bound`, use `stateful-rwo-lowlatency`, and have the exact requested sizes.
+Both resume checkpoints require a safe Secret inventory, no Service or external exposure, no
+Snapshot/Backup resources, and full server validation. Any one-object deviation remains an unknown
+partial inventory. After waiting for the approved Flux source and immediately before its first write,
+`--apply` must observe the same checkpoint and repeat its safety gate. It then replays only the exact
+reviewed Namespace, bootstrap bundle, and standalone Flux Kustomization.
 
 Stage 180 is intentionally not part of `bootstrap-all.sh`; initialization needs the operator to be
 present for hidden input and the encrypted recovery ceremony.
@@ -28,7 +34,7 @@ Secret fingerprint drift stops fail-closed.
 ## 停止原因
 
 - `applications-not-ready`
-- `apply-requires-empty-inventory`
+- `apply-requires-empty-or-approved-checkpoint`
 - `bootstrap-apply-failed`
 - `client-dry-run-failed`
 - `flux-source-revision-drift`
@@ -39,6 +45,7 @@ Secret fingerprint drift stops fail-closed.
 - `inventory-query-failed`
 - `namespace-apply-failed`
 - `openbao-asset-drift`
+- `openbao-apply-checkpoint-raced`
 - `openbao-runtime-drift`
 - `openbao-runtime-not-ready`
 - `openbao-runtime-readback-failed`
@@ -48,4 +55,5 @@ Secret fingerprint drift stops fail-closed.
 - `runtime-activation-failed`
 - `safe-server-validation-failed`
 - `unexpected-initialization-state`
+- `unsafe-openbao-resume-checkpoint`
 - `untrusted-environment-override`

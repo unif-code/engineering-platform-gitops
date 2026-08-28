@@ -6382,11 +6382,262 @@ class BusinessReadyStageTest(BootstrapTestCase):
 
 
 class OpenBaoRuntimeStageTest(BootstrapTestCase):
+    INVENTORY_IDENTITIES = (
+        '|namespace|openbao',
+        'flux-system|kustomization.kustomize.toolkit.fluxcd.io|openbao-runtime',
+        'flux-system|helmrelease.helm.toolkit.fluxcd.io|openbao',
+        'flux-system|serviceaccount|flux-openbao-reconciler',
+        'flux-system|serviceaccount|helm-openbao-reconciler',
+        'flux-system|role.rbac.authorization.k8s.io|flux-openbao-control-plane',
+        'openbao|statefulset.apps|openbao',
+        'openbao|deployment.apps|openbao-agent-injector',
+        'openbao|persistentvolumeclaim|data-openbao-0',
+        'openbao|persistentvolumeclaim|audit-openbao-0',
+        'openbao|certificate.cert-manager.io|openbao-server-tls',
+        'openbao|certificate.cert-manager.io|openbao-injector-tls',
+        'openbao|certificate.cert-manager.io|openbao-transport-ca',
+        'openbao|secret|openbao-server-tls',
+        'openbao|secret|openbao-injector-tls',
+        'openbao|secret|openbao-transport-ca',
+        'openbao|service|openbao',
+        'openbao|serviceaccount|openbao-runtime-probe',
+        'openbao|networkpolicy.networking.k8s.io|default-deny',
+        '|clusterrole.rbac.authorization.k8s.io|openbao-agent-injector-clusterrole',
+        '|clusterrole.rbac.authorization.k8s.io|helm-openbao-reconciler',
+        '|clusterrolebinding.rbac.authorization.k8s.io|helm-openbao-reconciler',
+        '|mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg',
+    )
+
     @staticmethod
     def implementation() -> str:
         return OPENBAO_RUNTIME.read_text(encoding='utf-8') + (
             OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
         )
+
+    def inventory_state(
+        self,
+        present: tuple[str, ...],
+        *,
+        failed_identity: str = '',
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the real classifier against semantic identity membership."""
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    present=$1
+                    failed_identity=$2
+                    openbao_query_exists() {
+                      local identity="${1}|${2}|${3}"
+                      [[ "$identity" != "$failed_identity" ]] || return 2
+                      grep -Fxq -- "$identity" <<<"$present"
+                    }
+                    openbao_inventory_state
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                '\n'.join(present),
+                failed_identity,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def resume_surface_gate(self, failed: str) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    failed=$1
+                    kubectl_query_is_empty() {
+                      [[ -z "$failed" || "$*" != *"$failed"* ]]
+                    }
+                    openbao_optional_resource_is_empty() {
+                      [[ -z "$failed" || "$2" != "$failed" ]]
+                    }
+                    openbao_resume_surface_is_safe
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                failed,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def apply_inventory_race(
+        self,
+        observed: str,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    observed=$1
+                    after_wait=0
+                    openbao_verify_assets() { :; }
+                    openbao_client_dry_run() { :; }
+                    openbao_capacity_is_safe() { :; }
+                    openbao_inventory_state() {
+                      if (( after_wait == 0 )); then
+                        printf 'RESUMABLE_RETAINED_PVCS\n'
+                      else
+                        printf '%s\n' "$observed"
+                      fi
+                    }
+                    openbao_resume_checkpoint_is_safe() { :; }
+                    business_apps_ready() { :; }
+                    business_https_smoke() { :; }
+                    openbao_platform_secret_fingerprint() { printf 'stable\n'; }
+                    openbao_wait_flux_source() { after_wait=1; }
+                    openbao_apply_namespace() { printf 'MUTATION=namespace\n'; }
+                    openbao_apply_bootstrap() { printf 'MUTATION=bootstrap\n'; }
+                    openbao_apply_runtime() { printf 'MUTATION=runtime\n'; }
+                    openbao_wait_runtime() { :; }
+                    openbao_runtime_is_compliant() { :; }
+                    openbao_state_is_known() { :; }
+                    complete() {
+                      printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\n' \
+                        "$1" "$2" "$3"
+                      exit "$3"
+                    }
+                    openbao_stage_170_apply
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                observed,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def test_inventory_classifier_whitelists_only_exact_resume_states(
+        self,
+    ) -> None:
+        pvc_identities = {
+            'openbao|persistentvolumeclaim|data-openbao-0',
+            'openbao|persistentvolumeclaim|audit-openbao-0',
+        }
+        runtime_identities = {
+            'openbao|statefulset.apps|openbao',
+            'openbao|deployment.apps|openbao-agent-injector',
+            *pvc_identities,
+            'openbao|service|openbao',
+            '|clusterrole.rbac.authorization.k8s.io|openbao-agent-injector-clusterrole',
+            '|mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg',
+        }
+        bootstrap = tuple(
+            identity for identity in self.INVENTORY_IDENTITIES
+            if identity not in runtime_identities
+        )
+        retained_pvcs = tuple(
+            identity for identity in self.INVENTORY_IDENTITIES
+            if identity not in runtime_identities - pvc_identities
+        )
+        cases = (
+            ((), '', 'MISSING'),
+            (self.INVENTORY_IDENTITIES, '', 'PRESENT'),
+            (bootstrap, '', 'RESUMABLE_BOOTSTRAP'),
+            (retained_pvcs, '', 'RESUMABLE_RETAINED_PVCS'),
+            (retained_pvcs + ('openbao|service|openbao',), '', 'PARTIAL'),
+            (
+                retained_pvcs + (
+                    '|mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg',
+                ),
+                '',
+                'PARTIAL',
+            ),
+            (
+                retained_pvcs,
+                '|clusterrole.rbac.authorization.k8s.io|helm-openbao-reconciler',
+                'UNKNOWN',
+            ),
+        )
+        for present, failed_identity, expected in cases:
+            with self.subTest(expected=expected, present=present):
+                result = self.inventory_state(
+                    present,
+                    failed_identity=failed_identity,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_resume_states_are_safety_gated_in_check_and_apply(self) -> None:
+        body = self.implementation()
+        check = body.split('openbao_stage_170_check() {', 1)[1].split(
+            'openbao_stage_170_apply() {', 1
+        )[0]
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        guard = body.split('openbao_resume_checkpoint_is_safe() {', 1)[1].split(
+            'openbao_stage_170_check() {', 1
+        )[0]
+
+        for state in ('RESUMABLE_BOOTSTRAP', 'RESUMABLE_RETAINED_PVCS'):
+            self.assertIn(state, check)
+            self.assertIn(state, apply)
+        self.assertIn('openbao_resume_checkpoint_is_safe "$inventory"', check)
+        self.assertIn('openbao_resume_checkpoint_is_safe "$inventory"', apply)
+        self.assertIn('openbao_pvcs_are_exact', guard)
+        self.assertIn('openbao_secret_inventory_is_safe', guard)
+        self.assertIn('openbao_resume_surface_is_safe', guard)
+        self.assertIn('openbao_full_server_validation', guard)
+
+    def test_resume_surface_rejects_external_and_backup_resources(self) -> None:
+        self.assertEqual(self.resume_surface_gate('').returncode, 0)
+        for forbidden in (
+            'service',
+            'ingress,cronjob',
+            'gateways',
+            'httproutes',
+            'tlsroutes',
+            'volumesnapshots',
+            'backups',
+            'scheduledbackups',
+        ):
+            with self.subTest(forbidden=forbidden):
+                result = self.resume_surface_gate(forbidden)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+
+    def test_apply_rechecks_checkpoint_after_flux_wait_before_first_write(
+        self,
+    ) -> None:
+        body = self.implementation()
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        wait = apply.index('openbao_wait_flux_source')
+        recheck = apply.index(
+            'openbao_apply_checkpoint_is_unchanged "$inventory"'
+        )
+        first_write = apply.index('openbao_apply_namespace')
+        guard = body.split(
+            'openbao_apply_checkpoint_is_unchanged() {', 1
+        )[1].split('openbao_stage_170_check() {', 1)[0]
+
+        self.assertLess(wait, recheck)
+        self.assertLess(recheck, first_write)
+        self.assertIn('observed=$(openbao_inventory_state)', guard)
+        self.assertIn('[[ "$observed" == "$expected" ]]', guard)
+        self.assertIn('openbao_resume_checkpoint_is_safe "$observed"', guard)
+
+    def test_apply_inventory_race_stops_without_mutation(self) -> None:
+        for observed in ('PRESENT', 'UNKNOWN', 'PARTIAL'):
+            with self.subTest(observed=observed):
+                result = self.apply_inventory_race(observed)
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertIn(
+                    'REASON=openbao-apply-checkpoint-raced',
+                    result.stdout,
+                )
+                self.assertNotIn('MUTATION=', result.stdout)
 
     def test_stage_170_is_the_final_automatic_stage(self) -> None:
         orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')

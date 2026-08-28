@@ -15,6 +15,12 @@ readonly OPENBAO_SERVER_DIGEST=sha256:15e90b578c970ae57b596ed51295380cd54f93860f
 readonly OPENBAO_INJECTOR_DIGEST=sha256:3dd30a9ac5909d17555480f51be734dfb719a323409f06cffe8b48cdaf6237d2
 readonly OPENBAO_HELM_VERSION=v3.21.0
 readonly OPENBAO_MIN_AVAILABLE_KIB=20971520
+# Ordered bits match openbao_inventory_state's identity list. Only these two
+# failed-install checkpoints may resume; every other mixed inventory is PARTIAL.
+readonly OPENBAO_INVENTORY_MISSING=00000000000000000000000
+readonly OPENBAO_INVENTORY_PRESENT=11111111111111111111111
+readonly OPENBAO_INVENTORY_RESUMABLE_BOOTSTRAP=11111100001111110110110
+readonly OPENBAO_INVENTORY_RESUMABLE_RETAINED_PVCS=11111100111111110110110
 
 OPENBAO_REPO_ROOT=
 OPENBAO_BOOTSTRAP_MANIFEST=
@@ -225,7 +231,7 @@ openbao_query_exists() {
 }
 
 openbao_inventory_state() {
-  local present=0 missing=0 result namespace resource name
+  local fingerprint='' result namespace resource name
   while IFS='|' read -r namespace resource name; do
     [[ -n "$resource" ]] || continue
     set +e
@@ -233,8 +239,8 @@ openbao_inventory_state() {
     result=$?
     set -e
     case "$result" in
-      0) present=$((present + 1)) ;;
-      1) missing=$((missing + 1)) ;;
+      0) fingerprint+=1 ;;
+      1) fingerprint+=0 ;;
       *) printf 'UNKNOWN\n'; return 0 ;;
     esac
   done <<'EOF'
@@ -262,13 +268,17 @@ openbao|networkpolicy.networking.k8s.io|default-deny
 |clusterrolebinding.rbac.authorization.k8s.io|helm-openbao-reconciler
 |mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg
 EOF
-  if (( present == 0 )); then
-    printf 'MISSING\n'
-  elif (( missing == 0 )); then
-    printf 'PRESENT\n'
-  else
-    printf 'PARTIAL\n'
-  fi
+  case "$fingerprint" in
+    "$OPENBAO_INVENTORY_MISSING") printf 'MISSING\n' ;;
+    "$OPENBAO_INVENTORY_PRESENT") printf 'PRESENT\n' ;;
+    "$OPENBAO_INVENTORY_RESUMABLE_BOOTSTRAP")
+      printf 'RESUMABLE_BOOTSTRAP\n'
+      ;;
+    "$OPENBAO_INVENTORY_RESUMABLE_RETAINED_PVCS")
+      printf 'RESUMABLE_RETAINED_PVCS\n'
+      ;;
+    *) printf 'PARTIAL\n' ;;
+  esac
 }
 
 openbao_flux_source_matches_head() {
@@ -383,14 +393,7 @@ for item in items:
     if spec.get("externalIPs") or spec.get("loadBalancerIP"):
         raise SystemExit(1)
 ' || return 1
-  kubectl_query_is_empty --namespace=openbao get ingress,cronjob \
-    --ignore-not-found --output=name &&
-    openbao_optional_resource_is_empty gateway.networking.k8s.io gateways &&
-    openbao_optional_resource_is_empty gateway.networking.k8s.io httproutes &&
-    openbao_optional_resource_is_empty gateway.networking.k8s.io tlsroutes &&
-    openbao_optional_resource_is_empty snapshot.storage.k8s.io volumesnapshots &&
-    openbao_optional_resource_is_empty postgresql.cnpg.io backups &&
-    openbao_optional_resource_is_empty postgresql.cnpg.io scheduledbackups
+  openbao_forbidden_resources_are_absent
 }
 
 openbao_optional_resource_is_empty() {
@@ -402,6 +405,23 @@ openbao_optional_resource_is_empty() {
   fi
   kubectl_query_is_empty --namespace=openbao get \
     "${resource}.${api_group}" --ignore-not-found --output=name
+}
+
+openbao_forbidden_resources_are_absent() {
+  kubectl_query_is_empty --namespace=openbao get ingress,cronjob \
+    --ignore-not-found --output=name &&
+    openbao_optional_resource_is_empty gateway.networking.k8s.io gateways &&
+    openbao_optional_resource_is_empty gateway.networking.k8s.io httproutes &&
+    openbao_optional_resource_is_empty gateway.networking.k8s.io tlsroutes &&
+    openbao_optional_resource_is_empty snapshot.storage.k8s.io volumesnapshots &&
+    openbao_optional_resource_is_empty postgresql.cnpg.io backups &&
+    openbao_optional_resource_is_empty postgresql.cnpg.io scheduledbackups
+}
+
+openbao_resume_surface_is_safe() {
+  kubectl_query_is_empty --namespace=openbao get service \
+    --ignore-not-found --output=name &&
+    openbao_forbidden_resources_are_absent
 }
 
 openbao_secret_inventory_is_safe() {
@@ -545,6 +565,33 @@ openbao_full_server_validation() {
   (( diff_rc == 0 || diff_rc == 1 ))
 }
 
+openbao_resume_checkpoint_is_safe() {
+  local inventory=$1
+  case "$inventory" in
+    RESUMABLE_BOOTSTRAP) ;;
+    RESUMABLE_RETAINED_PVCS)
+      openbao_pvcs_are_exact || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  openbao_secret_inventory_is_safe &&
+    openbao_resume_surface_is_safe &&
+    openbao_full_server_validation
+}
+
+openbao_apply_checkpoint_is_unchanged() {
+  local expected=$1 observed
+  observed=$(openbao_inventory_state) || return 1
+  [[ "$observed" == "$expected" ]] || return 1
+  case "$observed" in
+    MISSING) return 0 ;;
+    RESUMABLE_BOOTSTRAP|RESUMABLE_RETAINED_PVCS)
+      openbao_resume_checkpoint_is_safe "$observed"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 openbao_apply_namespace() {
   openbao_bootstrap_subset namespace |
     kubectl_run apply --server-side --field-manager="$OPENBAO_FIELD_MANAGER" \
@@ -614,6 +661,13 @@ openbao_stage_170_check() {
       complete PASS_OPENBAO_RUNTIME_CHECK openbao-runtime-activation-required 0 \
         'stages/170-openbao-runtime/run.sh --apply'
       ;;
+    RESUMABLE_BOOTSTRAP|RESUMABLE_RETAINED_PVCS)
+      openbao_resume_checkpoint_is_safe "$inventory" ||
+        complete STOP_VERIFY_FAILED unsafe-openbao-resume-checkpoint \
+          "$EXIT_VERIFY_FAILED" NONE
+      complete PASS_OPENBAO_RUNTIME_CHECK openbao-runtime-resume-required 0 \
+        'stages/170-openbao-runtime/run.sh --apply'
+      ;;
     PRESENT)
       openbao_runtime_is_compliant ||
         complete STOP_UNKNOWN_STATE openbao-runtime-drift \
@@ -648,9 +702,18 @@ openbao_stage_170_apply() {
   inventory=$(openbao_inventory_state) ||
     complete STOP_UNKNOWN_STATE inventory-query-failed \
       "$EXIT_UNKNOWN_STATE" NONE
-  [[ "$inventory" == MISSING ]] ||
-    complete STOP_UNKNOWN_STATE apply-requires-empty-inventory \
-      "$EXIT_UNKNOWN_STATE" NONE
+  case "$inventory" in
+    MISSING) ;;
+    RESUMABLE_BOOTSTRAP|RESUMABLE_RETAINED_PVCS)
+      openbao_resume_checkpoint_is_safe "$inventory" ||
+        complete STOP_VERIFY_FAILED unsafe-openbao-resume-checkpoint \
+          "$EXIT_VERIFY_FAILED" NONE
+      ;;
+    *)
+      complete STOP_UNKNOWN_STATE apply-requires-empty-or-approved-checkpoint \
+        "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+  esac
   if ! business_apps_ready || ! business_https_smoke; then
     complete STOP_PRECONDITION applications-not-ready \
       "$EXIT_PRECONDITION" NONE
@@ -660,6 +723,9 @@ openbao_stage_170_apply() {
       "$EXIT_UNKNOWN_STATE" NONE
   openbao_wait_flux_source ||
     complete STOP_UNKNOWN_STATE flux-source-revision-drift \
+      "$EXIT_UNKNOWN_STATE" NONE
+  openbao_apply_checkpoint_is_unchanged "$inventory" ||
+    complete STOP_UNKNOWN_STATE openbao-apply-checkpoint-raced \
       "$EXIT_UNKNOWN_STATE" NONE
   openbao_apply_namespace ||
     complete STOP_APPLY_FAILED namespace-apply-failed "$EXIT_APPLY_FAILED" NONE
