@@ -7849,6 +7849,11 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
 
 class OpenBaoInitializationStageTest(BootstrapTestCase):
     SOURCE_SHA = '1' * 40
+    CURRENT_SHA = '2' * 40
+    SOURCE_BUNDLE_SHA256 = 'c' * 64
+    CLUSTER_ID = '12345678-1234-4abc-8def-1234567890ab'
+    CLUSTER_NAME = 'openbao-cluster-dev'
+    VERIFICATION_NONCE = 'verification-nonce-1234'
     DOCS_COMMIT = '0039d697237eb3f3a4a6238f47d4b971974a031e'
     DOCS_BASELINE = '2026-08-28.2'
     DEVIATION = 'DEV-005'
@@ -8268,6 +8273,142 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             self.PLATFORM_SECRET_FINGERPRINT,
         ])
 
+    def run_artifact_helper(
+        self, operation: str, *arguments: object
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command([
+            sys.executable,
+            '-I',
+            '-B',
+            str(OPENBAO_RECOVERY_HELPER),
+            operation,
+            *(str(argument) for argument in arguments),
+        ])
+
+    def rotation_response(self) -> dict[str, object]:
+        ciphertexts = [
+            self.synthetic_ciphertext(f'rotated-share-{index}')
+            for index in range(1, 6)
+        ]
+        return {
+            'nonce': 'rotation-nonce-1234',
+            'complete': True,
+            'keys': [base64.b64decode(value).hex() for value in ciphertexts],
+            'keys_base64': ciphertexts,
+            'pgp_fingerprints': [self.PUBLIC_KEY_FINGERPRINT] * 5,
+            'backup': True,
+            'verification_required': True,
+            'verification_nonce': self.VERIFICATION_NONCE,
+        }
+
+    def backup_retrieve_response(self) -> dict[str, object]:
+        direct = self.rotation_response()
+        return {
+            'request_id': '',
+            'lease_id': '',
+            'lease_duration': 0,
+            'renewable': False,
+            'data': {
+                'nonce': direct['nonce'],
+                'keys': {
+                    self.PUBLIC_KEY_FINGERPRINT: direct['keys'],
+                },
+                'keys_base64': {
+                    self.PUBLIC_KEY_FINGERPRINT: direct['keys_base64'],
+                },
+            },
+            'warnings': None,
+        }
+
+    def artifact_public_key_files(self, directory: Path) -> tuple[Path, Path]:
+        public_key = directory / 'openbao-recovery-public-key.b64'
+        fingerprint = directory / 'openbao-recovery-public-key.fingerprint'
+        public_key.write_bytes(self.PUBLIC_KEY_BYTES)
+        fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        public_key.chmod(0o600)
+        fingerprint.chmod(0o600)
+        return public_key, fingerprint
+
+    def write_rotation_response(
+        self, directory: Path, document: dict[str, object]
+    ) -> Path:
+        response = directory / 'rotation-response.json'
+        response.write_text(
+            json.dumps(document, separators=(',', ':'), sort_keys=True) + '\n',
+            encoding='utf-8',
+        )
+        response.chmod(0o600)
+        return response
+
+    def build_candidate_artifact(
+        self,
+        directory: Path,
+        *,
+        response: dict[str, object] | None = None,
+        response_kind: str = 'direct',
+        verification_nonce: str | None = None,
+        key_shares: int = 5,
+        key_threshold: int = 3,
+        raw_response: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+        directory.mkdir(parents=True, exist_ok=True)
+        response_path = self.write_rotation_response(
+            directory,
+            response
+            if response is not None
+            else (
+                self.rotation_response()
+                if response_kind == 'direct'
+                else self.backup_retrieve_response()
+            ),
+        )
+        if raw_response is not None:
+            response_path.write_text(raw_response, encoding='utf-8')
+        public_key, fingerprint = self.artifact_public_key_files(directory)
+        archive = directory / (
+            'openbao-recovery-rotation-candidate-'
+            f'{self.CURRENT_SHA}.tar.gz'
+        )
+        sidecar = archive.with_name(archive.name + '.sha256')
+        arguments: list[object] = [
+            '--response', response_path,
+            '--response-kind', response_kind,
+            '--archive', archive,
+            '--sidecar', sidecar,
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key', public_key,
+            '--public-key-fingerprint-file', fingerprint,
+            '--cluster-id', self.CLUSTER_ID,
+            '--cluster-name', self.CLUSTER_NAME,
+            '--key-shares', key_shares,
+            '--key-threshold', key_threshold,
+        ]
+        if verification_nonce is not None:
+            arguments.extend(('--verification-nonce', verification_nonce))
+        result = self.run_artifact_helper('build-candidate', *arguments)
+        return result, archive, sidecar
+
+    @staticmethod
+    def archive_files(archive: Path) -> dict[str, bytes]:
+        with tarfile.open(archive, 'r:gz') as stream:
+            return {
+                Path(member.name).name: stream.extractfile(member).read()
+                for member in stream.getmembers()
+                if member.isfile()
+            }
+
+    @staticmethod
+    def archive_documents(archive: Path) -> tuple[dict[str, object], dict[str, object]]:
+        files = OpenBaoInitializationStageTest.archive_files(archive)
+        return (
+            json.loads(files['shares.json']),
+            json.loads(files['metadata.json']),
+        )
+
     def make_git_ancestry(self) -> tuple[Path, str, str, str]:
         repository = self.temporary_directory() / 'repository'
         repository.mkdir()
@@ -8577,6 +8718,562 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertNotIn('operator init', body.split('openbao_stage_180_check() {', 1)[1].split(
             'openbao_stage_180_initialize() {', 1
         )[0])
+
+    def test_candidate_and_v2_final_have_exact_safe_contents(self) -> None:
+        temporary = self.temporary_directory() / 'direct'
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            temporary
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertEqual((built.stdout, built.stderr), ('', ''))
+        expected_candidate_root = (
+            'openbao-recovery-rotation-candidate-' + self.CURRENT_SHA
+        )
+        with tarfile.open(candidate, 'r:gz') as stream:
+            members = stream.getmembers()
+            self.assertEqual(
+                [member.name for member in members],
+                [
+                    expected_candidate_root,
+                    f'{expected_candidate_root}/shares.json',
+                    f'{expected_candidate_root}/metadata.json',
+                    f'{expected_candidate_root}/openbao-recovery-public-key.b64',
+                    f'{expected_candidate_root}/openbao-recovery-public-key.fingerprint',
+                ],
+            )
+            self.assertEqual(members[0].mode, 0o700)
+            self.assertTrue(all(member.mode == 0o600 for member in members[1:]))
+            self.assertTrue(all(member.uid == member.gid == 0 for member in members))
+        self.assertEqual(candidate.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(candidate_sidecar.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            (temporary / expected_candidate_root).stat().st_mode & 0o777,
+            0o700,
+        )
+
+        shares, metadata = self.archive_documents(candidate)
+        expected_ciphertexts = self.rotation_response()['keys_base64']
+        self.assertEqual(
+            shares,
+            {
+                'unseal_keys_b64': expected_ciphertexts,
+                'unseal_shares': 5,
+                'unseal_threshold': 3,
+            },
+        )
+        expected_cluster_identity = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        expected_share_digests = {
+            f'share{index}': hashlib.sha256(
+                base64.b64decode(ciphertext)
+            ).hexdigest()
+            for index, ciphertext in enumerate(expected_ciphertexts, start=1)
+        }
+        self.assertEqual(
+            metadata,
+            {
+                'schema': (
+                    'engineering-platform/'
+                    'openbao-recovery-rotation-candidate/v1'
+                ),
+                'git_commit': self.CURRENT_SHA,
+                'source_recovery_sha': self.SOURCE_SHA,
+                'source_bundle_sha256': self.SOURCE_BUNDLE_SHA256,
+                'public_key_sha256': self.PUBLIC_KEY_SHA256,
+                'public_key_fingerprint': self.PUBLIC_KEY_FINGERPRINT,
+                'cluster_identity_sha256': expected_cluster_identity,
+                'key_shares': 5,
+                'key_threshold': 3,
+                'rotation_state': 'pending_verification',
+                'verification_nonce': self.VERIFICATION_NONCE,
+                'share_ciphertext_sha256': expected_share_digests,
+            },
+        )
+        serialized_candidate = candidate.read_bytes()
+        self.assertNotIn(b'root_token', serialized_candidate)
+        self.assertNotIn(b'PRIVATE KEY', serialized_candidate.upper())
+
+        validation_arguments: list[object] = [
+            '--archive', candidate,
+            '--sidecar', candidate_sidecar,
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+            '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+            '--cluster-identity-sha256', expected_cluster_identity,
+        ]
+        validated = self.run_artifact_helper(
+            'validate-candidate', *validation_arguments
+        )
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+        self.assertEqual((validated.stdout, validated.stderr), ('', ''))
+        for mode_path in (candidate, candidate_sidecar):
+            with self.subTest(mode_path=mode_path.name):
+                mode_path.chmod(0o640)
+                mode_rejected = self.run_artifact_helper(
+                    'validate-candidate', *validation_arguments
+                )
+                self.assertNotEqual(mode_rejected.returncode, 0)
+                self.assertEqual(
+                    (mode_rejected.stdout, mode_rejected.stderr), ('', '')
+                )
+                mode_path.chmod(0o600)
+
+        backup_directory = self.temporary_directory() / 'backup'
+        backup_built, backup, _ = self.build_candidate_artifact(
+            backup_directory,
+            response_kind='backup',
+            verification_nonce=self.VERIFICATION_NONCE,
+        )
+        self.assertEqual(backup_built.returncode, 0, backup_built.stderr)
+        self.assertEqual(backup_built.stdout, '')
+        self.assertEqual(
+            self.archive_documents(backup),
+            self.archive_documents(candidate),
+        )
+
+        final = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_sidecar = final.with_name(final.name + '.sha256')
+        verified_at = '2026-08-31T01:02:03Z'
+        final_built = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments[4:],
+            '--verified-at-utc', verified_at,
+        )
+        self.assertEqual(final_built.returncode, 0, final_built.stderr)
+        self.assertEqual((final_built.stdout, final_built.stderr), ('', ''))
+        final_shares, final_metadata = self.archive_documents(final)
+        self.assertEqual(final_shares, shares)
+        self.assertEqual(
+            final_metadata,
+            {
+                **{
+                    key: value
+                    for key, value in metadata.items()
+                    if key not in ('schema', 'rotation_state', 'verification_nonce')
+                },
+                'schema': 'engineering-platform/openbao-recovery/v2',
+                'rotation_state': 'verified',
+                'rotation_verified_at_utc': verified_at,
+                'initial_root_token': 'revoked',
+            },
+        )
+        self.assertNotIn('verification_nonce', final_metadata)
+        self.assertNotIn('root_token', final_shares)
+        final_validated = self.run_artifact_helper(
+            'validate-final',
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments[4:],
+        )
+        self.assertEqual(final_validated.returncode, 0, final_validated.stderr)
+        self.assertEqual((final_validated.stdout, final_validated.stderr), ('', ''))
+
+        before = (
+            hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            hashlib.sha256(final.read_bytes()).hexdigest(),
+        )
+        candidate_rebuild, _, _ = self.build_candidate_artifact(temporary)
+        self.assertNotEqual(candidate_rebuild.returncode, 0)
+        final_rebuild = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments[4:],
+            '--verified-at-utc', verified_at,
+        )
+        self.assertNotEqual(final_rebuild.returncode, 0)
+        self.assertEqual(
+            before,
+            (
+                hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                hashlib.sha256(final.read_bytes()).hexdigest(),
+            ),
+        )
+
+    def test_rotation_response_and_artifact_rejection_matrix(self) -> None:
+        direct = self.rotation_response()
+        cases: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
+        for name in (
+            'incomplete', 'wrong-key-count', 'representation-mismatch',
+            'plaintext-like', 'missing-fingerprint', 'mixed-fingerprint',
+            'backup-disabled', 'verification-disabled', 'unsafe-nonce',
+            'unexpected-field', 'wrong-ciphertext-recipient',
+        ):
+            mutated = json.loads(json.dumps(direct))
+            options: dict[str, object] = {}
+            if name == 'incomplete':
+                mutated['complete'] = False
+            elif name == 'wrong-key-count':
+                mutated['keys_base64'] = mutated['keys_base64'][:4]
+                mutated['keys'] = mutated['keys'][:4]
+                mutated['pgp_fingerprints'] = mutated['pgp_fingerprints'][:4]
+            elif name == 'representation-mismatch':
+                mutated['keys'][0] = '00' * 128
+            elif name == 'plaintext-like':
+                plaintext = self.wrapped_plaintext('rotated-share')
+                mutated['keys_base64'][0] = plaintext
+                mutated['keys'][0] = base64.b64decode(plaintext).hex()
+            elif name == 'missing-fingerprint':
+                mutated['pgp_fingerprints'] = mutated['pgp_fingerprints'][:4]
+            elif name == 'mixed-fingerprint':
+                mutated['pgp_fingerprints'][4] = 'A' * 40
+            elif name == 'backup-disabled':
+                mutated['backup'] = False
+            elif name == 'verification-disabled':
+                mutated['verification_required'] = False
+            elif name == 'unsafe-nonce':
+                mutated['verification_nonce'] = 'bad nonce\n'
+            elif name == 'unexpected-field':
+                mutated['raw_rotation_response'] = mutated['keys_base64'][0]
+            elif name == 'wrong-ciphertext-recipient':
+                ciphertext = self.synthetic_ciphertext(
+                    'rotated-wrong-recipient', recipient_key_id=b'\x99' * 8
+                )
+                mutated['keys_base64'][0] = ciphertext
+                mutated['keys'][0] = base64.b64decode(ciphertext).hex()
+            cases[name] = (mutated, options)
+        cases['wrong-threshold'] = (direct, {'key_threshold': 2})
+
+        for name, (response, options) in cases.items():
+            with self.subTest(case=name):
+                result, archive, sidecar = self.build_candidate_artifact(
+                    self.temporary_directory() / name,
+                    response=response,
+                    **options,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertFalse(archive.exists())
+                self.assertFalse(sidecar.exists())
+
+        serialized = json.dumps(direct, separators=(',', ':'), sort_keys=True)
+        duplicate_field = serialized.replace(
+            '"complete":true', '"complete":true,"complete":true', 1
+        ) + '\n'
+        duplicate, _, _ = self.build_candidate_artifact(
+            self.temporary_directory() / 'duplicate-json-field',
+            raw_response=duplicate_field,
+        )
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertEqual(duplicate.stdout, '')
+
+        for name, nonce in (
+            ('missing-live-nonce', None),
+            ('unsafe-live-nonce', 'bad live nonce'),
+        ):
+            with self.subTest(case=name):
+                rejected, _, _ = self.build_candidate_artifact(
+                    self.temporary_directory() / name,
+                    response_kind='backup',
+                    verification_nonce=nonce,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, '')
+
+        backup = self.backup_retrieve_response()
+        backup['data']['unexpected'] = 'value'
+        rejected_backup, _, _ = self.build_candidate_artifact(
+            self.temporary_directory() / 'backup-unexpected-field',
+            response=backup,
+            response_kind='backup',
+            verification_nonce=self.VERIFICATION_NONCE,
+        )
+        self.assertNotEqual(rejected_backup.returncode, 0)
+        self.assertEqual(rejected_backup.stdout, '')
+
+        wrong_map = self.backup_retrieve_response()
+        wrong_map['data']['keys']['A' * 40] = wrong_map['data']['keys'].pop(
+            self.PUBLIC_KEY_FINGERPRINT
+        )
+        wrong_map['data']['keys_base64']['A' * 40] = wrong_map['data'][
+            'keys_base64'
+        ].pop(self.PUBLIC_KEY_FINGERPRINT)
+        rejected_map, _, _ = self.build_candidate_artifact(
+            self.temporary_directory() / 'backup-wrong-fingerprint-map',
+            response=wrong_map,
+            response_kind='backup',
+            verification_nonce=self.VERIFICATION_NONCE,
+        )
+        self.assertNotEqual(rejected_map.returncode, 0)
+        self.assertEqual(rejected_map.stdout, '')
+
+        valid_directory = self.temporary_directory() / 'archive-matrix'
+        built, archive, sidecar = self.build_candidate_artifact(valid_directory)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        original = archive.read_bytes()
+        digest = sidecar.read_text(encoding='ascii').split()[0]
+        sidecar.write_text(
+            f'{"0" * 64}  {archive.name}\n', encoding='ascii'
+        )
+        checksum_drift = self.run_artifact_helper(
+            'emit-item', '--archive', archive, '--sidecar', sidecar,
+            '--item', 'share1',
+        )
+        self.assertNotEqual(checksum_drift.returncode, 0)
+        self.assertEqual(checksum_drift.stdout, '')
+        sidecar.write_text(f'{digest}  {archive.name}\n', encoding='ascii')
+        self.assertEqual(hashlib.sha256(original).hexdigest(), digest)
+
+        with tarfile.open(archive, 'r:gz') as stream:
+            original_members = [
+                (
+                    member,
+                    stream.extractfile(member).read() if member.isfile() else None,
+                )
+                for member in stream.getmembers()
+            ]
+        for case in (
+            'extra-member', 'symlink', 'member-mode', 'mixed-schema',
+            'duplicate-json-field', 'root-token-field',
+        ):
+            with self.subTest(archive_case=case):
+                case_directory = self.temporary_directory() / case
+                case_directory.mkdir()
+                mutated_archive = case_directory / archive.name
+                with tarfile.open(mutated_archive, 'w:gz') as output:
+                    for original_member, original_payload in original_members:
+                        member = tarfile.TarInfo(original_member.name)
+                        member.type = original_member.type
+                        member.mode = original_member.mode
+                        member.uid = original_member.uid
+                        member.gid = original_member.gid
+                        member.size = original_member.size
+                        payload = original_payload
+                        if case == 'member-mode' and member.name.endswith(
+                            '/shares.json'
+                        ):
+                            member.mode = 0o640
+                        if case in (
+                            'mixed-schema', 'duplicate-json-field'
+                        ) and member.name.endswith('/metadata.json'):
+                            if case == 'mixed-schema':
+                                document = json.loads(payload)
+                                document['schema'] = (
+                                    'engineering-platform/openbao-recovery/v2'
+                                )
+                                payload = json.dumps(
+                                    document,
+                                    separators=(',', ':'),
+                                    sort_keys=True,
+                                ).encode('utf-8') + b'\n'
+                            else:
+                                payload = payload.replace(
+                                    b'"key_shares":5',
+                                    b'"key_shares":5,"key_shares":5',
+                                    1,
+                                )
+                            member.size = len(payload)
+                        if case == 'root-token-field' and member.name.endswith(
+                            '/shares.json'
+                        ):
+                            document = json.loads(payload)
+                            document['root_token'] = self.synthetic_ciphertext(
+                                'forbidden-rotated-root'
+                            )
+                            payload = json.dumps(
+                                document,
+                                separators=(',', ':'),
+                                sort_keys=True,
+                            ).encode('utf-8') + b'\n'
+                            member.size = len(payload)
+                        output.addfile(
+                            member,
+                            None if payload is None else io.BytesIO(payload),
+                        )
+                    if case in ('extra-member', 'symlink'):
+                        root = (
+                            'openbao-recovery-rotation-candidate-'
+                            + self.CURRENT_SHA
+                        )
+                        hostile = tarfile.TarInfo(f'{root}/hostile')
+                        hostile.mode = 0o600
+                        hostile.uid = hostile.gid = 0
+                        if case == 'symlink':
+                            hostile.type = tarfile.SYMTYPE
+                            hostile.linkname = 'shares.json'
+                            output.addfile(hostile)
+                        else:
+                            hostile.size = 1
+                            output.addfile(hostile, io.BytesIO(b'x'))
+                mutated_archive.chmod(0o600)
+                mutated_sidecar = mutated_archive.with_name(
+                    mutated_archive.name + '.sha256'
+                )
+                mutated_digest = hashlib.sha256(
+                    mutated_archive.read_bytes()
+                ).hexdigest()
+                mutated_sidecar.write_text(
+                    f'{mutated_digest}  {mutated_archive.name}\n',
+                    encoding='ascii',
+                )
+                mutated_sidecar.chmod(0o600)
+                rejected = self.run_artifact_helper(
+                    'emit-item', '--archive', mutated_archive,
+                    '--sidecar', mutated_sidecar, '--item', 'share1',
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual((rejected.stdout, rejected.stderr), ('', ''))
+
+        symlink_directory = self.temporary_directory() / 'symlink-output'
+        symlink_directory.mkdir()
+        sentinel = self.temporary_directory() / 'sentinel'
+        sentinel.mkdir()
+        candidate_root = symlink_directory / (
+            'openbao-recovery-rotation-candidate-' + self.CURRENT_SHA
+        )
+        candidate_root.symlink_to(sentinel, target_is_directory=True)
+        symlink_rejected, _, _ = self.build_candidate_artifact(
+            symlink_directory
+        )
+        self.assertNotEqual(symlink_rejected.returncode, 0)
+        self.assertEqual(symlink_rejected.stdout, '')
+        self.assertEqual(list(sentinel.iterdir()), [])
+
+    def test_wizard_item_permissions_follow_bundle_schema(self) -> None:
+        source_archive, source_sidecar = self.make_source_bundle()
+        v1_shares = [
+            self.synthetic_ciphertext(f'share-{index}') for index in range(5)
+        ]
+        v1_root = self.synthetic_ciphertext('root-token')
+        for item, expected in (
+            ('share1', v1_shares[0]),
+            ('share5', v1_shares[4]),
+            ('root', v1_root),
+        ):
+            with self.subTest(schema='v1', item=item):
+                emitted = self.run_artifact_helper(
+                    'emit-item', '--archive', source_archive,
+                    '--sidecar', source_sidecar, '--item', item,
+                )
+                self.assertEqual(emitted.returncode, 0, emitted.stderr)
+                self.assertEqual(emitted.stdout, expected)
+                self.assertEqual(emitted.stderr, '')
+
+        temporary = self.temporary_directory() / 'rotated'
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            temporary
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        cluster_digest = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        validation_arguments: list[object] = [
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+            '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+            '--cluster-identity-sha256', cluster_digest,
+        ]
+        final = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_sidecar = final.with_name(final.name + '.sha256')
+        final_built = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments,
+            '--verified-at-utc', '2026-08-31T01:02:03Z',
+        )
+        self.assertEqual(final_built.returncode, 0, final_built.stderr)
+        expected_shares = self.rotation_response()['keys_base64']
+        for schema, archive, sidecar in (
+            ('candidate', candidate, candidate_sidecar),
+            ('v2', final, final_sidecar),
+        ):
+            for item, expected in (
+                ('share1', expected_shares[0]),
+                ('share5', expected_shares[4]),
+            ):
+                with self.subTest(schema=schema, item=item):
+                    emitted = self.run_artifact_helper(
+                        'emit-item', '--archive', archive,
+                        '--sidecar', sidecar, '--item', item,
+                    )
+                    self.assertEqual(emitted.returncode, 0, emitted.stderr)
+                    self.assertEqual(emitted.stdout, expected)
+                    self.assertEqual(emitted.stderr, '')
+            rejected_root = self.run_artifact_helper(
+                'emit-item', '--archive', archive, '--sidecar', sidecar,
+                '--item', 'root',
+            )
+            self.assertNotEqual(rejected_root.returncode, 0)
+            self.assertEqual((rejected_root.stdout, rejected_root.stderr), ('', ''))
+
+        for item in ('share0', 'share6', 'metadata', '../share1'):
+            with self.subTest(item=item):
+                rejected = self.run_artifact_helper(
+                    'emit-item', '--archive', candidate,
+                    '--sidecar', candidate_sidecar, '--item', item,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual((rejected.stdout, rejected.stderr), ('', ''))
+
+    def test_rotated_artifact_paths_and_marker_only_state_fail_closed(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        marker = temporary / f'openbao-rotation-{self.CURRENT_SHA}.verified.json'
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            openbao_rotation_artifact_paths
+            printf 'CANDIDATE=%s\nFINAL=%s\nMARKER=%s\nSTATE=%s\n' \
+              "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+              "$OPENBAO_RECOVERY_ARCHIVE" \
+              "$OPENBAO_ROTATION_VERIFIED_MARKER" \
+              "$(openbao_rotation_artifact_presence_state)"
+            '''
+        )
+        marker.write_text('{}\n', encoding='utf-8')
+        marker.chmod(0o600)
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'rotated-paths',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                self.CURRENT_SHA, self.SOURCE_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'CANDIDATE='
+            f'{temporary}/openbao-recovery-rotation-candidate-'
+            f'{self.CURRENT_SHA}.tar.gz\n'
+            f'FINAL={temporary}/openbao-recovery-{self.CURRENT_SHA}.tar.gz\n'
+            f'MARKER={marker}\nSTATE=UNSAFE\n',
+        )
+        marker.unlink()
+        partial_directory = temporary / (
+            'openbao-recovery-rotation-candidate-' + self.CURRENT_SHA
+        )
+        partial_directory.mkdir(mode=0o700)
+        partial = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'rotated-partial',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                self.CURRENT_SHA, self.SOURCE_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        self.assertIn('STATE=UNSAFE\n', partial.stdout)
 
     def test_unseal_and_root_login_use_true_tty_without_outer_capture(
         self,

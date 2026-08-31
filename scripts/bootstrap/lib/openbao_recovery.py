@@ -4,24 +4,49 @@
 from __future__ import annotations
 
 import base64
+import argparse
 import dataclasses
+import datetime
 import hashlib
 import hmac
 import json
+import os
 import pathlib
 import re
+import stat
 import sys
 import tarfile
 from typing import Any
 
 
 V1_SCHEMA = 'engineering-platform/openbao-recovery/v1'
+CANDIDATE_SCHEMA = (
+    'engineering-platform/openbao-recovery-rotation-candidate/v1'
+)
+V2_SCHEMA = 'engineering-platform/openbao-recovery/v2'
 MAX_ARCHIVE_BYTES = 1024 * 1024
 MAX_MEMBER_BYTES = 256 * 1024
 SHA256 = re.compile(r'[0-9a-f]{64}')
 GIT_SHA = re.compile(r'[0-9a-f]{40}')
 PUBLIC_FINGERPRINT = re.compile(r'(?:[0-9A-F]{40}|[0-9A-F]{64})')
 TOKEN_SHAPE = re.compile(rb'(?i)(?:hvs|hvb|hvr|s)\.[A-Za-z0-9_-]{8,}')
+SAFE_NONCE = re.compile(r'[A-Za-z0-9_-]{8,128}')
+CLUSTER_ID = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
+    r'[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+)
+CLUSTER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+UTC_TIMESTAMP = re.compile(
+    r'(?:19|20)[0-9]{2}-(?:0[1-9]|1[0-2])-'
+    r'(?:0[1-9]|[12][0-9]|3[01])T'
+    r'(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z'
+)
+ROTATED_FILES = {
+    'shares.json',
+    'metadata.json',
+    'openbao-recovery-public-key.b64',
+    'openbao-recovery-public-key.fingerprint',
+}
 
 
 class RecoveryValidationError(Exception):
@@ -36,6 +61,20 @@ class SourceBundleFacts:
     public_key_sha256: str
     public_key_fingerprint: str
     platform_secret_fingerprint: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RotatedBundleFacts:
+    schema: str
+    archive_sha256: str
+    current_sha: str
+    source_sha: str
+    source_bundle_sha256: str
+    public_key_sha256: str
+    public_key_fingerprint: str
+    cluster_identity_sha256: str
+    ciphertexts: tuple[str, ...]
+    verification_nonce: str | None
 
 
 def _reject(message: str) -> None:
@@ -96,9 +135,20 @@ def read_exact_tar(
             ):
                 _reject('unsafe archive members')
             if member.name == root:
-                if not member.isdir():
+                if (
+                    not member.isdir()
+                    or member.mode != 0o700
+                    or member.uid != 0
+                    or member.gid != 0
+                ):
                     _reject('unsafe archive members')
-            elif member.name not in expected or not member.isfile():
+            elif (
+                member.name not in expected
+                or not member.isfile()
+                or member.mode != 0o600
+                or member.uid != 0
+                or member.gid != 0
+            ):
                 _reject('unsafe archive members')
             elif member.size < 0 or member.size > MAX_MEMBER_BYTES:
                 _reject('unsafe archive member size')
@@ -497,21 +547,901 @@ def validate_source(
     )
 
 
-def main(arguments: list[str]) -> int:
-    if len(arguments) != 10 or arguments[0] != 'validate-source':
-        return 2
+def _artifact_digest(
+    archive: pathlib.Path, sidecar: pathlib.Path, expected_name: str
+) -> str:
+    if archive.name != expected_name or sidecar.name != expected_name + '.sha256':
+        _reject('archive name mismatch')
+    for path in (archive, sidecar):
+        try:
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise RecoveryValidationError('artifact missing') from error
+        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            _reject('unsafe artifact path')
     try:
-        validate_source(
-            pathlib.Path(arguments[1]),
-            pathlib.Path(arguments[2]),
-            source_sha=arguments[3],
-            docs_commit=arguments[4],
-            docs_baseline=arguments[5],
-            deviation=arguments[6],
-            public_key_sha256=arguments[7],
-            public_key_fingerprint=arguments[8],
-            platform_secret_fingerprint=arguments[9],
+        text = sidecar.read_text(encoding='ascii')
+    except (OSError, UnicodeError) as error:
+        raise RecoveryValidationError('invalid sidecar') from error
+    match = re.fullmatch(
+        rf'([0-9a-f]{{64}})  {re.escape(expected_name)}\n', text
+    )
+    if match is None:
+        _reject('invalid sidecar')
+    if archive.stat().st_size > MAX_ARCHIVE_BYTES:
+        _reject('archive too large')
+    digest = hashlib.sha256()
+    with archive.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(64 * 1024), b''):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if not hmac.compare_digest(match.group(1), actual):
+        _reject('archive digest mismatch')
+    return actual
+
+
+def _require_mode_0600(path: pathlib.Path) -> None:
+    mode = path.lstat().st_mode
+    if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+        _reject('artifact mode mismatch')
+
+
+def _public_key_material(
+    public_key: bytes,
+    fingerprint_bytes: bytes,
+    *,
+    expected_sha256: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> tuple[str, str, set[bytes], set[bytes]]:
+    try:
+        encoded_key = public_key.decode('ascii').strip()
+        fingerprint = fingerprint_bytes.decode('ascii').strip()
+    except UnicodeError as error:
+        raise RecoveryValidationError('invalid public key') from error
+    if not encoded_key or any(character.isspace() for character in encoded_key):
+        _reject('invalid public key')
+    try:
+        decoded_key = base64.b64decode(encoded_key, validate=True)
+    except (ValueError, UnicodeError) as error:
+        raise RecoveryValidationError('invalid public key') from error
+    if not 128 <= len(decoded_key) <= 16384:
+        _reject('invalid public key')
+    public_key_sha256 = hashlib.sha256(public_key).hexdigest()
+    if (
+        expected_sha256 is not None
+        and not hmac.compare_digest(public_key_sha256, expected_sha256)
+    ):
+        _reject('public key digest mismatch')
+    if PUBLIC_FINGERPRINT.fullmatch(fingerprint) is None:
+        _reject('public key fingerprint mismatch')
+    if (
+        expected_fingerprint is not None
+        and not hmac.compare_digest(fingerprint, expected_fingerprint)
+    ):
+        _reject('public key fingerprint mismatch')
+    key_ids, fingerprints = _public_key_recipients(decoded_key, fingerprint)
+    return public_key_sha256, fingerprint, key_ids, fingerprints
+
+
+def _safe_nonce(value: Any) -> str:
+    if not isinstance(value, str) or SAFE_NONCE.fullmatch(value) is None:
+        _reject('unsafe rotation nonce')
+    return value
+
+
+def cluster_identity_sha256(cluster_id: str, cluster_name: str) -> str:
+    if (
+        CLUSTER_ID.fullmatch(cluster_id) is None
+        or CLUSTER_NAME.fullmatch(cluster_name) is None
+    ):
+        _reject('invalid cluster identity')
+    canonical = json.dumps(
+        {'cluster_id': cluster_id, 'cluster_name': cluster_name},
+        ensure_ascii=True,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode('ascii')
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _rotation_ciphertexts(
+    keys: Any,
+    keys_base64: Any,
+    key_ids: set[bytes],
+    fingerprints: set[bytes],
+) -> tuple[str, ...]:
+    if (
+        not isinstance(keys, list)
+        or not isinstance(keys_base64, list)
+        or len(keys) != 5
+        or len(keys_base64) != 5
+    ):
+        _reject('rotation key count mismatch')
+    decoded = tuple(
+        _validated_ciphertext(value, key_ids, fingerprints)
+        for value in keys_base64
+    )
+    if len(set(decoded)) != 5:
+        _reject('duplicate share ciphertext')
+    if any(not isinstance(value, str) for value in keys):
+        _reject('ciphertext representations differ')
+    try:
+        decoded_hex = tuple(bytes.fromhex(value) for value in keys)
+    except ValueError as error:
+        raise RecoveryValidationError('ciphertext representations differ') from error
+    if decoded_hex != decoded:
+        _reject('ciphertext representations differ')
+    return tuple(keys_base64)
+
+
+def normalize_rotation_response(
+    payload: bytes,
+    *,
+    response_kind: str,
+    public_key: bytes,
+    fingerprint_bytes: bytes,
+    verification_nonce: str | None,
+    key_shares: int,
+    key_threshold: int,
+) -> tuple[tuple[str, ...], str]:
+    if key_shares != 5 or key_threshold != 3:
+        _reject('invalid share contract')
+    document = _json_document(payload)
+    _, expected_fingerprint, key_ids, fingerprints = _public_key_material(
+        public_key, fingerprint_bytes
+    )
+    if response_kind == 'direct':
+        expected_fields = {
+            'nonce',
+            'complete',
+            'keys',
+            'keys_base64',
+            'pgp_fingerprints',
+            'backup',
+            'verification_required',
+            'verification_nonce',
+        }
+        if set(document) != expected_fields:
+            _reject('unexpected rotation response field')
+        if verification_nonce is not None:
+            _reject('direct response nonce must not be supplied separately')
+        _safe_nonce(document['nonce'])
+        if (
+            document['complete'] is not True
+            or document['backup'] is not True
+            or document['verification_required'] is not True
+        ):
+            _reject('rotation response incomplete')
+        expected_fingerprints = document['pgp_fingerprints']
+        if (
+            not isinstance(expected_fingerprints, list)
+            or len(expected_fingerprints) != 5
+            or any(
+                not isinstance(value, str)
+                or not hmac.compare_digest(value, expected_fingerprint)
+                for value in expected_fingerprints
+            )
+        ):
+            _reject('PGP fingerprint mismatch')
+        candidate_nonce = _safe_nonce(document['verification_nonce'])
+        ciphertexts = _rotation_ciphertexts(
+            document['keys'], document['keys_base64'], key_ids, fingerprints
         )
+    elif response_kind == 'backup':
+        expected_outer = {
+            'request_id',
+            'lease_id',
+            'lease_duration',
+            'renewable',
+            'data',
+            'warnings',
+        }
+        if set(document) != expected_outer:
+            _reject('unexpected backup response field')
+        if (
+            document['request_id'] != ''
+            or document['lease_id'] != ''
+            or type(document['lease_duration']) is not int
+            or document['lease_duration'] != 0
+            or document['renewable'] is not False
+            or document['warnings'] is not None
+        ):
+            _reject('unsafe backup response envelope')
+        data = document['data']
+        if not isinstance(data, dict) or set(data) != {
+            'nonce', 'keys', 'keys_base64'
+        }:
+            _reject('unexpected backup response data')
+        _safe_nonce(data['nonce'])
+        keys = data['keys']
+        keys_base64 = data['keys_base64']
+        if (
+            not isinstance(keys, dict)
+            or not isinstance(keys_base64, dict)
+            or set(keys) != {expected_fingerprint}
+            or set(keys_base64) != {expected_fingerprint}
+        ):
+            _reject('PGP fingerprint mismatch')
+        candidate_nonce = _safe_nonce(verification_nonce)
+        ciphertexts = _rotation_ciphertexts(
+            keys[expected_fingerprint],
+            keys_base64[expected_fingerprint],
+            key_ids,
+            fingerprints,
+        )
+    else:
+        _reject('unknown rotation response kind')
+    if TOKEN_SHAPE.search(payload) or b'PRIVATE KEY' in payload.upper():
+        _reject('plaintext secret shape detected')
+    return ciphertexts, candidate_nonce
+
+
+def _share_document(
+    ciphertexts: tuple[str, ...],
+    key_ids: set[bytes],
+    fingerprints: set[bytes],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    if len(ciphertexts) != 5:
+        _reject('invalid share contract')
+    decoded = tuple(
+        _validated_ciphertext(value, key_ids, fingerprints)
+        for value in ciphertexts
+    )
+    if len(set(decoded)) != 5:
+        _reject('duplicate share ciphertext')
+    return (
+        {
+            'unseal_keys_b64': list(ciphertexts),
+            'unseal_shares': 5,
+            'unseal_threshold': 3,
+        },
+        {
+            f'share{index}': hashlib.sha256(value).hexdigest()
+            for index, value in enumerate(decoded, start=1)
+        },
+    )
+
+
+def _json_bytes(document: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            document,
+            ensure_ascii=True,
+            separators=(',', ':'),
+            sort_keys=True,
+        ).encode('ascii')
+        + b'\n'
+    )
+
+
+def _exclusive_file(path: pathlib.Path, payload: bytes, mode: int = 0o600) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as error:
+        raise RecoveryValidationError('artifact path already exists') from error
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        raise
+    os.chmod(path, mode, follow_symlinks=False)
+
+
+def _write_bundle(
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    *,
+    root: str,
+    files: dict[str, bytes],
+) -> None:
+    if set(files) != ROTATED_FILES:
+        _reject('unexpected artifact files')
+    if archive.parent != sidecar.parent:
+        _reject('artifact parents differ')
+    directory = archive.parent / root
+    for path in (directory, archive, sidecar):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RecoveryValidationError('unsafe artifact path') from error
+        _reject('artifact path already exists')
+    try:
+        os.mkdir(directory, 0o700)
+    except OSError as error:
+        raise RecoveryValidationError('artifact directory create failed') from error
+    os.chmod(directory, 0o700)
+    for name in (
+        'shares.json',
+        'metadata.json',
+        'openbao-recovery-public-key.b64',
+        'openbao-recovery-public-key.fingerprint',
+    ):
+        _exclusive_file(directory / name, files[name])
+    try:
+        descriptor = os.open(
+            archive,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | (os.O_NOFOLLOW if hasattr(os, 'O_NOFOLLOW') else 0),
+            0o600,
+        )
+    except OSError as error:
+        raise RecoveryValidationError('archive create failed') from error
+    with os.fdopen(descriptor, 'wb') as raw:
+        with tarfile.open(fileobj=raw, mode='w:gz') as stream:
+            root_member = tarfile.TarInfo(root)
+            root_member.type = tarfile.DIRTYPE
+            root_member.mode = 0o700
+            root_member.uid = root_member.gid = 0
+            root_member.mtime = 0
+            stream.addfile(root_member)
+            for name in (
+                'shares.json',
+                'metadata.json',
+                'openbao-recovery-public-key.b64',
+                'openbao-recovery-public-key.fingerprint',
+            ):
+                payload = files[name]
+                member = tarfile.TarInfo(f'{root}/{name}')
+                member.mode = 0o600
+                member.uid = member.gid = 0
+                member.mtime = 0
+                member.size = len(payload)
+                import io
+
+                stream.addfile(member, io.BytesIO(payload))
+    os.chmod(archive, 0o600, follow_symlinks=False)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    _exclusive_file(
+        sidecar, f'{digest}  {archive.name}\n'.encode('ascii')
+    )
+
+
+def _rotated_bundle_files(
+    archive: pathlib.Path, root: str
+) -> dict[str, bytes]:
+    names = {f'{root}/{name}' for name in ROTATED_FILES}
+    members = read_exact_tar(archive, names)
+    return {
+        name: members[f'{root}/{name}']
+        for name in ROTATED_FILES
+    }
+
+
+def _validate_utc_timestamp(value: Any) -> str:
+    if not isinstance(value, str) or UTC_TIMESTAMP.fullmatch(value) is None:
+        _reject('invalid verification timestamp')
+    try:
+        datetime.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
+    except ValueError as error:
+        raise RecoveryValidationError('invalid verification timestamp') from error
+    return value
+
+
+def validate_rotated_bundle(
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    *,
+    expected_schema: str,
+    current_sha: str,
+    source_sha: str,
+    source_bundle_sha256: str,
+    public_key_sha256: str,
+    public_key_fingerprint: str,
+    cluster_identity_digest: str,
+    require_file_mode: bool = False,
+) -> RotatedBundleFacts:
+    if (
+        GIT_SHA.fullmatch(current_sha or '') is None
+        or GIT_SHA.fullmatch(source_sha or '') is None
+        or SHA256.fullmatch(source_bundle_sha256 or '') is None
+        or SHA256.fullmatch(public_key_sha256 or '') is None
+        or PUBLIC_FINGERPRINT.fullmatch(public_key_fingerprint or '') is None
+        or SHA256.fullmatch(cluster_identity_digest or '') is None
+    ):
+        _reject('invalid rotated bundle expectations')
+    if expected_schema == CANDIDATE_SCHEMA:
+        root = f'openbao-recovery-rotation-candidate-{current_sha}'
+    elif expected_schema == V2_SCHEMA:
+        root = f'openbao-recovery-{current_sha}'
+    else:
+        _reject('unsupported rotated schema')
+    expected_archive_name = root + '.tar.gz'
+    if require_file_mode:
+        _require_mode_0600(archive)
+        _require_mode_0600(sidecar)
+    archive_sha256 = _artifact_digest(archive, sidecar, expected_archive_name)
+    files = _rotated_bundle_files(archive, root)
+    actual_key_sha, actual_fingerprint, key_ids, fingerprints = (
+        _public_key_material(
+            files['openbao-recovery-public-key.b64'],
+            files['openbao-recovery-public-key.fingerprint'],
+            expected_sha256=public_key_sha256,
+            expected_fingerprint=public_key_fingerprint,
+        )
+    )
+    shares = _json_document(files['shares.json'])
+    if set(shares) != {
+        'unseal_keys_b64', 'unseal_shares', 'unseal_threshold'
+    }:
+        _reject('unexpected shares field')
+    if (
+        type(shares['unseal_shares']) is not int
+        or shares['unseal_shares'] != 5
+        or type(shares['unseal_threshold']) is not int
+        or shares['unseal_threshold'] != 3
+        or not isinstance(shares['unseal_keys_b64'], list)
+    ):
+        _reject('invalid share contract')
+    share_document, share_digests = _share_document(
+        tuple(shares['unseal_keys_b64']), key_ids, fingerprints
+    )
+    if shares != share_document:
+        _reject('invalid shares document')
+    metadata = _json_document(files['metadata.json'])
+    common = {
+        'git_commit': current_sha,
+        'source_recovery_sha': source_sha,
+        'source_bundle_sha256': source_bundle_sha256,
+        'public_key_sha256': actual_key_sha,
+        'public_key_fingerprint': actual_fingerprint,
+        'cluster_identity_sha256': cluster_identity_digest,
+        'key_shares': 5,
+        'key_threshold': 3,
+        'share_ciphertext_sha256': share_digests,
+    }
+    verification_nonce: str | None
+    if expected_schema == CANDIDATE_SCHEMA:
+        verification_nonce = _safe_nonce(metadata.get('verification_nonce'))
+        expected_metadata = {
+            **common,
+            'schema': CANDIDATE_SCHEMA,
+            'rotation_state': 'pending_verification',
+            'verification_nonce': verification_nonce,
+        }
+    else:
+        verification_nonce = None
+        verified_at = _validate_utc_timestamp(
+            metadata.get('rotation_verified_at_utc')
+        )
+        expected_metadata = {
+            **common,
+            'schema': V2_SCHEMA,
+            'rotation_state': 'verified',
+            'rotation_verified_at_utc': verified_at,
+            'initial_root_token': 'revoked',
+        }
+    if metadata != expected_metadata:
+        _reject('rotated metadata mismatch')
+    combined = files['shares.json'] + files['metadata.json']
+    if TOKEN_SHAPE.search(combined) or b'PRIVATE KEY' in combined.upper():
+        _reject('plaintext secret shape detected')
+    return RotatedBundleFacts(
+        schema=expected_schema,
+        archive_sha256=archive_sha256,
+        current_sha=current_sha,
+        source_sha=source_sha,
+        source_bundle_sha256=source_bundle_sha256,
+        public_key_sha256=actual_key_sha,
+        public_key_fingerprint=actual_fingerprint,
+        cluster_identity_sha256=cluster_identity_digest,
+        ciphertexts=tuple(shares['unseal_keys_b64']),
+        verification_nonce=verification_nonce,
+    )
+
+
+def build_candidate(
+    *,
+    response: pathlib.Path,
+    response_kind: str,
+    verification_nonce: str | None,
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    current_sha: str,
+    source_sha: str,
+    source_bundle_sha256: str,
+    public_key_path: pathlib.Path,
+    fingerprint_path: pathlib.Path,
+    cluster_id: str,
+    cluster_name: str,
+    key_shares: int,
+    key_threshold: int,
+) -> RotatedBundleFacts:
+    if (
+        GIT_SHA.fullmatch(current_sha) is None
+        or GIT_SHA.fullmatch(source_sha) is None
+        or SHA256.fullmatch(source_bundle_sha256) is None
+    ):
+        _reject('invalid recovery provenance')
+    public_key = public_key_path.read_bytes()
+    fingerprint_bytes = fingerprint_path.read_bytes()
+    public_key_sha256, fingerprint, key_ids, key_fingerprints = (
+        _public_key_material(public_key, fingerprint_bytes)
+    )
+    payload = response.read_bytes()
+    if len(payload) > MAX_MEMBER_BYTES:
+        _reject('rotation response too large')
+    ciphertexts, candidate_nonce = normalize_rotation_response(
+        payload,
+        response_kind=response_kind,
+        public_key=public_key,
+        fingerprint_bytes=fingerprint_bytes,
+        verification_nonce=verification_nonce,
+        key_shares=key_shares,
+        key_threshold=key_threshold,
+    )
+    shares, share_digests = _share_document(
+        ciphertexts, key_ids, key_fingerprints
+    )
+    cluster_digest = cluster_identity_sha256(cluster_id, cluster_name)
+    metadata = {
+        'schema': CANDIDATE_SCHEMA,
+        'git_commit': current_sha,
+        'source_recovery_sha': source_sha,
+        'source_bundle_sha256': source_bundle_sha256,
+        'public_key_sha256': public_key_sha256,
+        'public_key_fingerprint': fingerprint,
+        'cluster_identity_sha256': cluster_digest,
+        'key_shares': 5,
+        'key_threshold': 3,
+        'rotation_state': 'pending_verification',
+        'verification_nonce': candidate_nonce,
+        'share_ciphertext_sha256': share_digests,
+    }
+    root = f'openbao-recovery-rotation-candidate-{current_sha}'
+    if archive.name != root + '.tar.gz' or sidecar.name != archive.name + '.sha256':
+        _reject('candidate output path mismatch')
+    _write_bundle(
+        archive,
+        sidecar,
+        root=root,
+        files={
+            'shares.json': _json_bytes(shares),
+            'metadata.json': _json_bytes(metadata),
+            'openbao-recovery-public-key.b64': public_key,
+            'openbao-recovery-public-key.fingerprint': fingerprint_bytes,
+        },
+    )
+    return validate_rotated_bundle(
+        archive,
+        sidecar,
+        expected_schema=CANDIDATE_SCHEMA,
+        current_sha=current_sha,
+        source_sha=source_sha,
+        source_bundle_sha256=source_bundle_sha256,
+        public_key_sha256=public_key_sha256,
+        public_key_fingerprint=fingerprint,
+        cluster_identity_digest=cluster_digest,
+        require_file_mode=True,
+    )
+
+
+def build_final(
+    *,
+    candidate_archive: pathlib.Path,
+    candidate_sidecar: pathlib.Path,
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    current_sha: str,
+    source_sha: str,
+    source_bundle_sha256: str,
+    public_key_sha256: str,
+    public_key_fingerprint: str,
+    cluster_identity_digest: str,
+    verified_at_utc: str,
+) -> RotatedBundleFacts:
+    candidate = validate_rotated_bundle(
+        candidate_archive,
+        candidate_sidecar,
+        expected_schema=CANDIDATE_SCHEMA,
+        current_sha=current_sha,
+        source_sha=source_sha,
+        source_bundle_sha256=source_bundle_sha256,
+        public_key_sha256=public_key_sha256,
+        public_key_fingerprint=public_key_fingerprint,
+        cluster_identity_digest=cluster_identity_digest,
+        require_file_mode=True,
+    )
+    verified_at = _validate_utc_timestamp(verified_at_utc)
+    candidate_root = f'openbao-recovery-rotation-candidate-{current_sha}'
+    files = _rotated_bundle_files(candidate_archive, candidate_root)
+    shares = _json_document(files['shares.json'])
+    share_digests = _json_document(files['metadata.json'])[
+        'share_ciphertext_sha256'
+    ]
+    metadata = {
+        'schema': V2_SCHEMA,
+        'git_commit': current_sha,
+        'source_recovery_sha': source_sha,
+        'source_bundle_sha256': source_bundle_sha256,
+        'public_key_sha256': candidate.public_key_sha256,
+        'public_key_fingerprint': candidate.public_key_fingerprint,
+        'cluster_identity_sha256': cluster_identity_digest,
+        'key_shares': 5,
+        'key_threshold': 3,
+        'rotation_state': 'verified',
+        'rotation_verified_at_utc': verified_at,
+        'initial_root_token': 'revoked',
+        'share_ciphertext_sha256': share_digests,
+    }
+    root = f'openbao-recovery-{current_sha}'
+    if archive.name != root + '.tar.gz' or sidecar.name != archive.name + '.sha256':
+        _reject('final output path mismatch')
+    _write_bundle(
+        archive,
+        sidecar,
+        root=root,
+        files={
+            'shares.json': _json_bytes(shares),
+            'metadata.json': _json_bytes(metadata),
+            'openbao-recovery-public-key.b64': files[
+                'openbao-recovery-public-key.b64'
+            ],
+            'openbao-recovery-public-key.fingerprint': files[
+                'openbao-recovery-public-key.fingerprint'
+            ],
+        },
+    )
+    return validate_rotated_bundle(
+        archive,
+        sidecar,
+        expected_schema=V2_SCHEMA,
+        current_sha=current_sha,
+        source_sha=source_sha,
+        source_bundle_sha256=source_bundle_sha256,
+        public_key_sha256=public_key_sha256,
+        public_key_fingerprint=public_key_fingerprint,
+        cluster_identity_digest=cluster_identity_digest,
+        require_file_mode=True,
+    )
+
+
+def _emit_item(
+    archive: pathlib.Path, sidecar: pathlib.Path, item: str
+) -> str:
+    candidate_match = re.fullmatch(
+        r'openbao-recovery-rotation-candidate-([0-9a-f]{40})\.tar\.gz',
+        archive.name,
+    )
+    recovery_match = re.fullmatch(
+        r'openbao-recovery-([0-9a-f]{40})\.tar\.gz', archive.name
+    )
+    if candidate_match is not None:
+        current_sha = candidate_match.group(1)
+        root = f'openbao-recovery-rotation-candidate-{current_sha}'
+        files = _rotated_bundle_files(archive, root)
+        metadata = _json_document(files['metadata.json'])
+        validate_rotated_bundle(
+            archive,
+            sidecar,
+            expected_schema=CANDIDATE_SCHEMA,
+            current_sha=current_sha,
+            source_sha=metadata.get('source_recovery_sha'),
+            source_bundle_sha256=metadata.get('source_bundle_sha256'),
+            public_key_sha256=metadata.get('public_key_sha256'),
+            public_key_fingerprint=metadata.get('public_key_fingerprint'),
+            cluster_identity_digest=metadata.get('cluster_identity_sha256'),
+        )
+        if item == 'root':
+            _reject('root item forbidden for rotated bundle')
+        shares = _json_document(files['shares.json'])['unseal_keys_b64']
+    elif recovery_match is not None:
+        current_sha = recovery_match.group(1)
+        root = f'openbao-recovery-{current_sha}'
+        v1_names = {
+            f'{root}/init.json',
+            f'{root}/metadata.json',
+            f'{root}/openbao-recovery-public-key.b64',
+            f'{root}/openbao-recovery-public-key.fingerprint',
+        }
+        v2_names = {f'{root}/{name}' for name in ROTATED_FILES}
+        _artifact_digest(archive, sidecar, archive.name)
+        try:
+            files = read_exact_tar(archive, v1_names)
+            metadata = _json_document(files[f'{root}/metadata.json'])
+            validate_source(
+                archive,
+                sidecar,
+                source_sha=current_sha,
+                docs_commit=metadata.get('docs_commit'),
+                docs_baseline=metadata.get('docs_baseline'),
+                deviation=metadata.get('deviation'),
+                public_key_sha256=metadata.get('public_key_sha256'),
+                public_key_fingerprint=metadata.get('public_key_fingerprint'),
+                platform_secret_fingerprint=metadata.get(
+                    'platform_secret_fingerprint'
+                ),
+            )
+            init_document = _json_document(files[f'{root}/init.json'])
+            if item == 'root':
+                return init_document['root_token']
+            shares = init_document['unseal_keys_b64']
+        except RecoveryValidationError as v1_error:
+            try:
+                files = read_exact_tar(archive, v2_names)
+                metadata = _json_document(files[f'{root}/metadata.json'])
+                validate_rotated_bundle(
+                    archive,
+                    sidecar,
+                    expected_schema=V2_SCHEMA,
+                    current_sha=current_sha,
+                    source_sha=metadata.get('source_recovery_sha'),
+                    source_bundle_sha256=metadata.get('source_bundle_sha256'),
+                    public_key_sha256=metadata.get('public_key_sha256'),
+                    public_key_fingerprint=metadata.get(
+                        'public_key_fingerprint'
+                    ),
+                    cluster_identity_digest=metadata.get(
+                        'cluster_identity_sha256'
+                    ),
+                )
+            except RecoveryValidationError:
+                raise v1_error
+            if item == 'root':
+                _reject('root item forbidden for rotated bundle')
+            shares = _json_document(files[f'{root}/shares.json'])[
+                'unseal_keys_b64'
+            ]
+    else:
+        _reject('unsupported archive name')
+    match = re.fullmatch(r'share([1-5])', item)
+    if match is None:
+        _reject('unsupported recovery item')
+    return shares[int(match.group(1)) - 1]
+
+
+def _add_validation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument('--current-sha', required=True)
+    parser.add_argument('--source-sha', required=True)
+    parser.add_argument('--source-bundle-sha256', required=True)
+    parser.add_argument('--public-key-sha256', required=True)
+    parser.add_argument('--public-key-fingerprint', required=True)
+    parser.add_argument('--cluster-identity-sha256', required=True)
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    commands = parser.add_subparsers(dest='operation', required=True)
+
+    candidate = commands.add_parser('build-candidate', add_help=False)
+    candidate.add_argument('--response', required=True)
+    candidate.add_argument('--response-kind', required=True)
+    candidate.add_argument('--verification-nonce')
+    candidate.add_argument('--archive', required=True)
+    candidate.add_argument('--sidecar', required=True)
+    candidate.add_argument('--current-sha', required=True)
+    candidate.add_argument('--source-sha', required=True)
+    candidate.add_argument('--source-bundle-sha256', required=True)
+    candidate.add_argument('--public-key', required=True)
+    candidate.add_argument('--public-key-fingerprint-file', required=True)
+    candidate.add_argument('--cluster-id', required=True)
+    candidate.add_argument('--cluster-name', required=True)
+    candidate.add_argument('--key-shares', required=True, type=int)
+    candidate.add_argument('--key-threshold', required=True, type=int)
+
+    for operation in ('validate-candidate', 'validate-final'):
+        validate = commands.add_parser(operation, add_help=False)
+        validate.add_argument('--archive', required=True)
+        validate.add_argument('--sidecar', required=True)
+        _add_validation_arguments(validate)
+
+    final = commands.add_parser('build-final', add_help=False)
+    final.add_argument('--candidate-archive', required=True)
+    final.add_argument('--candidate-sidecar', required=True)
+    final.add_argument('--archive', required=True)
+    final.add_argument('--sidecar', required=True)
+    _add_validation_arguments(final)
+    final.add_argument('--verified-at-utc', required=True)
+
+    emit = commands.add_parser('emit-item', add_help=False)
+    emit.add_argument('--archive', required=True)
+    emit.add_argument('--sidecar', required=True)
+    emit.add_argument('--item', required=True)
+
+    cluster = commands.add_parser('cluster-identity-sha256', add_help=False)
+    cluster.add_argument('--cluster-id', required=True)
+    cluster.add_argument('--cluster-name', required=True)
+    return parser
+
+
+def main(arguments: list[str]) -> int:
+    if arguments and arguments[0] == 'validate-source':
+        if len(arguments) != 10:
+            return 2
+        try:
+            validate_source(
+                pathlib.Path(arguments[1]),
+                pathlib.Path(arguments[2]),
+                source_sha=arguments[3],
+                docs_commit=arguments[4],
+                docs_baseline=arguments[5],
+                deviation=arguments[6],
+                public_key_sha256=arguments[7],
+                public_key_fingerprint=arguments[8],
+                platform_secret_fingerprint=arguments[9],
+            )
+        except Exception:
+            return 1
+        return 0
+    try:
+        try:
+            parsed = _argument_parser().parse_args(arguments)
+        except SystemExit:
+            return 2
+        operation = parsed.operation
+        if operation == 'build-candidate':
+            build_candidate(
+                response=pathlib.Path(parsed.response),
+                response_kind=parsed.response_kind,
+                verification_nonce=parsed.verification_nonce,
+                archive=pathlib.Path(parsed.archive),
+                sidecar=pathlib.Path(parsed.sidecar),
+                current_sha=parsed.current_sha,
+                source_sha=parsed.source_sha,
+                source_bundle_sha256=parsed.source_bundle_sha256,
+                public_key_path=pathlib.Path(parsed.public_key),
+                fingerprint_path=pathlib.Path(
+                    parsed.public_key_fingerprint_file
+                ),
+                cluster_id=parsed.cluster_id,
+                cluster_name=parsed.cluster_name,
+                key_shares=parsed.key_shares,
+                key_threshold=parsed.key_threshold,
+            )
+        elif operation in ('validate-candidate', 'validate-final'):
+            validate_rotated_bundle(
+                pathlib.Path(parsed.archive),
+                pathlib.Path(parsed.sidecar),
+                expected_schema=(
+                    CANDIDATE_SCHEMA
+                    if operation == 'validate-candidate'
+                    else V2_SCHEMA
+                ),
+                current_sha=parsed.current_sha,
+                source_sha=parsed.source_sha,
+                source_bundle_sha256=parsed.source_bundle_sha256,
+                public_key_sha256=parsed.public_key_sha256,
+                public_key_fingerprint=parsed.public_key_fingerprint,
+                cluster_identity_digest=parsed.cluster_identity_sha256,
+                require_file_mode=True,
+            )
+        elif operation == 'build-final':
+            build_final(
+                candidate_archive=pathlib.Path(parsed.candidate_archive),
+                candidate_sidecar=pathlib.Path(parsed.candidate_sidecar),
+                archive=pathlib.Path(parsed.archive),
+                sidecar=pathlib.Path(parsed.sidecar),
+                current_sha=parsed.current_sha,
+                source_sha=parsed.source_sha,
+                source_bundle_sha256=parsed.source_bundle_sha256,
+                public_key_sha256=parsed.public_key_sha256,
+                public_key_fingerprint=parsed.public_key_fingerprint,
+                cluster_identity_digest=parsed.cluster_identity_sha256,
+                verified_at_utc=parsed.verified_at_utc,
+            )
+        elif operation == 'emit-item':
+            sys.stdout.write(
+                _emit_item(
+                    pathlib.Path(parsed.archive),
+                    pathlib.Path(parsed.sidecar),
+                    parsed.item,
+                )
+            )
+        elif operation == 'cluster-identity-sha256':
+            sys.stdout.write(
+                cluster_identity_sha256(
+                    parsed.cluster_id, parsed.cluster_name
+                )
+                + '\n'
+            )
+        else:
+            return 2
     except Exception:
         return 1
     return 0
