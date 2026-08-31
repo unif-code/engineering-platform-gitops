@@ -8260,25 +8260,33 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             uncompressed.write(
                 b'\0' * (-uncompressed.tell() % tarfile.RECORDSIZE)
             )
-            archive.write_bytes(gzip.compress(uncompressed.getvalue(), mtime=0))
+            archive.write_bytes(
+                self.canonical_python_gzip(uncompressed.getvalue())
+            )
         else:
             archive_format = (
                 tarfile.GNU_FORMAT
                 if case == 'valid-gnu'
                 else tarfile.PAX_FORMAT
             )
+            compressed = io.BytesIO()
             with tarfile.open(
-                archive, 'w:gz', format=archive_format
+                fileobj=compressed, mode='w:gz', format=archive_format
             ) as stream:
                 for member, payload in members:
                     stream.addfile(
                         member,
                         None if payload is None else io.BytesIO(payload),
                     )
+            archive.write_bytes(
+                self.canonical_python_gzip(
+                    gzip.decompress(compressed.getvalue())
+                )
+            )
         if case == 'nonzero-trailing-data':
             uncompressed = bytearray(gzip.decompress(archive.read_bytes()))
             uncompressed[-1] = ord('x')
-            archive.write_bytes(gzip.compress(uncompressed, mtime=0))
+            archive.write_bytes(self.canonical_python_gzip(uncompressed))
         archive.chmod(0o600)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         if case == 'checksum-drift':
@@ -8586,6 +8594,83 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             json.loads(files['metadata.json']),
         )
 
+    @staticmethod
+    def canonical_ustar_bytes(archive: Path) -> bytes:
+        with tarfile.open(archive, 'r:gz') as source:
+            entries = [
+                (
+                    member,
+                    source.extractfile(member).read()
+                    if member.isfile()
+                    else None,
+                )
+                for member in source.getmembers()
+            ]
+        raw = io.BytesIO()
+        with tarfile.open(
+            fileobj=raw, mode='w:', format=tarfile.USTAR_FORMAT
+        ) as output:
+            for original, payload in entries:
+                member = tarfile.TarInfo(original.name)
+                member.type = original.type
+                member.mode = original.mode
+                member.uid = original.uid
+                member.gid = original.gid
+                member.size = original.size
+                member.mtime = original.mtime
+                output.addfile(
+                    member,
+                    None if payload is None else io.BytesIO(payload),
+                )
+        return raw.getvalue()
+
+    @staticmethod
+    def write_artifact_bytes(
+        directory: Path, archive_name: str, payload: bytes
+    ) -> tuple[Path, Path]:
+        directory.mkdir(parents=True)
+        archive = directory / archive_name
+        archive.write_bytes(payload)
+        archive.chmod(0o600)
+        digest = hashlib.sha256(payload).hexdigest()
+        sidecar = archive.with_name(archive.name + '.sha256')
+        sidecar.write_text(
+            f'{digest}  {archive.name}\n', encoding='ascii'
+        )
+        sidecar.chmod(0o600)
+        return archive, sidecar
+
+    @staticmethod
+    def canonical_python_gzip(payload: bytes) -> bytes:
+        compressed = io.BytesIO()
+        with gzip.GzipFile(
+            filename='', mode='wb', fileobj=compressed, mtime=0
+        ) as stream:
+            stream.write(payload)
+        return compressed.getvalue()
+
+    @staticmethod
+    def recalculate_tar_header_checksum(
+        raw: bytearray, header_offset: int
+    ) -> None:
+        header = bytearray(
+            raw[header_offset:header_offset + tarfile.BLOCKSIZE]
+        )
+        header[148:156] = b'        '
+        checksum = sum(header)
+        header[148:156] = f'{checksum:06o}\0 '.encode('ascii')
+        raw[header_offset:header_offset + tarfile.BLOCKSIZE] = header
+
+    @staticmethod
+    def pax_record(key: str, value: str) -> bytes:
+        body = f'{key}={value}\n'.encode('utf-8')
+        length = len(body) + 2
+        while True:
+            record = f'{length} '.encode('ascii') + body
+            if len(record) == length:
+                return record
+            length = len(record)
+
     def make_git_ancestry(self) -> tuple[Path, str, str, str]:
         repository = self.temporary_directory() / 'repository'
         repository.mkdir()
@@ -8740,6 +8825,61 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             (0, '', ''),
         )
 
+        actual_gnu_root = self.temporary_directory() / 'actual-gnu-v1'
+        staging = actual_gnu_root / 'staging'
+        prefix = f'openbao-recovery-{self.SOURCE_SHA}'
+        with tarfile.open(gnu_archive, 'r:gz') as source:
+            for member in source.getmembers():
+                target = staging / member.name
+                if member.isdir():
+                    target.mkdir(parents=True)
+                    target.chmod(0o700)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    payload = source.extractfile(member)
+                    self.assertIsNotNone(payload)
+                    target.write_bytes(payload.read())
+                    target.chmod(0o600)
+        actual_gnu = subprocess.run(
+            [
+                '/usr/bin/tar', '--format=gnu', '--owner=root',
+                '--group=root', '-C', str(staging), '-czf', '-', prefix,
+            ],
+            env=self.sanitized_environment(),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(actual_gnu.returncode, 0, actual_gnu.stderr)
+        self.assertEqual(
+            actual_gnu.stdout[:10],
+            b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03',
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(actual_gnu.stdout), mode='r:gz'
+        ) as stream:
+            actual_members = stream.getmembers()
+        self.assertTrue(
+            all(
+                member.uid == member.gid == 0
+                and member.uname == member.gname == 'root'
+                for member in actual_members
+            )
+        )
+        actual_archive, actual_sidecar = self.write_artifact_bytes(
+            actual_gnu_root / 'artifact', gnu_archive.name, actual_gnu.stdout
+        )
+        accepted_actual_gnu = self.run_recovery_helper(
+            'validate-source', actual_archive, actual_sidecar
+        )
+        self.assertEqual(
+            (
+                accepted_actual_gnu.returncode,
+                accepted_actual_gnu.stdout,
+                accepted_actual_gnu.stderr,
+            ),
+            (0, '', ''),
+        )
+
         cases = (
             'absolute-path', 'dot-dot', 'symlink', 'hardlink', 'fifo', 'device',
             'duplicate-member', 'extra-member', 'missing-member', 'wrong-schema',
@@ -8777,6 +8917,227 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual((result.stdout, result.stderr), ('', ''))
+
+    def test_raw_recovery_archive_bytes_are_canonical(self) -> None:
+        directory = self.temporary_directory() / 'raw-archive'
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            directory / 'candidate'
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+
+        candidate_raw = self.canonical_ustar_bytes(candidate)
+        candidate_gzip = self.canonical_python_gzip(candidate_raw)
+        self.assertEqual(candidate_gzip[:4], b'\x1f\x8b\x08\x00')
+        legal_archive, legal_sidecar = self.write_artifact_bytes(
+            directory / 'legal-ustar', candidate.name, candidate_gzip
+        )
+        legal = self.run_artifact_helper(
+            'emit-item', '--archive', legal_archive, '--sidecar', legal_sidecar,
+            '--item', 'share1',
+        )
+        self.assertEqual(
+            (legal.returncode, legal.stdout, legal.stderr),
+            (0, self.rotation_response()['keys_base64'][0], ''),
+        )
+
+        with tarfile.open(
+            fileobj=io.BytesIO(candidate_raw), mode='r:'
+        ) as stream:
+            members = stream.getmembers()
+        long_member = next(
+            member
+            for member in members
+            if member.isfile() and len(member.name.encode('utf-8')) > 100
+        )
+        fingerprint_member = next(
+            member
+            for member in members
+            if member.name.endswith(
+                '/openbao-recovery-public-key.fingerprint'
+            )
+        )
+
+        def optional_gzip(flag: int, option: bytes) -> bytes:
+            return (
+                candidate_gzip[:3]
+                + bytes([flag])
+                + candidate_gzip[4:10]
+                + option
+                + candidate_gzip[10:]
+            )
+
+        duplicate_pax_raw = bytearray(candidate_raw)
+        record = self.pax_record('path', long_member.name)
+        pax_payload = record + record
+        pax_member = tarfile.TarInfo('././@PaxHeader')
+        pax_member.type = tarfile.XHDTYPE
+        pax_member.mode = 0o600
+        pax_member.uid = pax_member.gid = 0
+        pax_member.mtime = 0
+        pax_member.size = len(pax_payload)
+        pax_extension = (
+            pax_member.tobuf(format=tarfile.USTAR_FORMAT)
+            + pax_payload
+            + b'\0' * (-len(pax_payload) % tarfile.BLOCKSIZE)
+        )
+        duplicate_pax_raw = (
+            duplicate_pax_raw[:long_member.offset]
+            + pax_extension
+            + duplicate_pax_raw[long_member.offset:]
+        )
+
+        unused_field_raw = bytearray(candidate_raw)
+        link_field = fingerprint_member.offset + 157
+        marker = b'PRIVATE KEY'
+        unused_field_raw[link_field:link_field + 100] = (
+            marker + b'\0' * (100 - len(marker))
+        )
+        self.recalculate_tar_header_checksum(
+            unused_field_raw, fingerprint_member.offset
+        )
+
+        padding_raw = bytearray(candidate_raw)
+        padding_start = fingerprint_member.offset_data + fingerprint_member.size
+        padding_end = (
+            fingerprint_member.offset_data
+            + (fingerprint_member.size + tarfile.BLOCKSIZE - 1)
+            // tarfile.BLOCKSIZE
+            * tarfile.BLOCKSIZE
+        )
+        padding_marker = b's.abcdefgh'
+        self.assertGreaterEqual(padding_end - padding_start, len(padding_marker))
+        padding_raw[padding_start:padding_start + len(padding_marker)] = (
+            padding_marker
+        )
+
+        extra = b'root-token-hidden'
+        unapproved_xfl = bytearray(candidate_gzip)
+        unapproved_xfl[8] = 0
+        unapproved_os = bytearray(candidate_gzip)
+        unapproved_os[9] = 7
+        unapproved_gnu_mtime = bytearray(candidate_gzip)
+        unapproved_gnu_mtime[4:8] = (1).to_bytes(4, 'little')
+        unapproved_gnu_mtime[8] = 0
+        unapproved_gnu_mtime[9] = 3
+        unapproved_python_mtime = bytearray(candidate_gzip)
+        unapproved_python_mtime[4:8] = (1).to_bytes(4, 'little')
+        cases = {
+            'gzip-filename': optional_gzip(0x08, b'root-token-hidden\0'),
+            'gzip-comment': optional_gzip(0x10, b'PRIVATE KEY\0'),
+            'gzip-extra': optional_gzip(
+                0x04, len(extra).to_bytes(2, 'little') + extra
+            ),
+            'concatenated-gzip-member': (
+                candidate_gzip + self.canonical_python_gzip(b'')
+            ),
+            'gzip-unapproved-xfl': bytes(unapproved_xfl),
+            'gzip-unapproved-os': bytes(unapproved_os),
+            'gzip-unapproved-gnu-mtime': bytes(unapproved_gnu_mtime),
+            'gzip-unapproved-python-mtime': bytes(unapproved_python_mtime),
+            'duplicate-pax-record': self.canonical_python_gzip(
+                bytes(duplicate_pax_raw)
+            ),
+            'nonzero-unused-header-field': self.canonical_python_gzip(
+                bytes(unused_field_raw)
+            ),
+            'nonzero-file-padding': self.canonical_python_gzip(
+                bytes(padding_raw)
+            ),
+        }
+        for case, payload in cases.items():
+            with self.subTest(candidate_case=case):
+                archive, sidecar = self.write_artifact_bytes(
+                    directory / case, candidate.name, payload
+                )
+                rejected = self.run_artifact_helper(
+                    'emit-item', '--archive', archive, '--sidecar', sidecar,
+                    '--item', 'share1',
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(
+                    (rejected.stdout, rejected.stderr), ('', '')
+                )
+
+        cluster_digest = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        validation_arguments: list[object] = [
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+            '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+            '--cluster-identity-sha256', cluster_digest,
+        ]
+        final = directory / 'final' / (
+            f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        )
+        final.parent.mkdir()
+        final_sidecar = final.with_name(final.name + '.sha256')
+        final_built = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments,
+            '--verified-at-utc', '2026-08-31T01:02:03Z',
+        )
+        self.assertEqual(final_built.returncode, 0, final_built.stderr)
+
+        final_raw = self.canonical_ustar_bytes(final)
+        with tarfile.open(
+            fileobj=io.BytesIO(final_raw), mode='r:'
+        ) as stream:
+            final_fingerprint = next(
+                member
+                for member in stream.getmembers()
+                if member.name.endswith(
+                    '/openbao-recovery-public-key.fingerprint'
+                )
+            )
+        final_padding = bytearray(final_raw)
+        final_padding_start = final_fingerprint.offset_data + final_fingerprint.size
+        final_padding[
+            final_padding_start:final_padding_start + len(extra)
+        ] = extra
+        hostile_final, hostile_final_sidecar = self.write_artifact_bytes(
+            directory / 'v2-padding', final.name,
+            self.canonical_python_gzip(bytes(final_padding)),
+        )
+        rejected_final = self.run_artifact_helper(
+            'validate-final', '--archive', hostile_final,
+            '--sidecar', hostile_final_sidecar, *validation_arguments,
+        )
+        self.assertNotEqual(rejected_final.returncode, 0)
+        self.assertEqual(
+            (rejected_final.stdout, rejected_final.stderr), ('', '')
+        )
+
+        for label, archive in (('candidate', candidate), ('v2', final)):
+            with self.subTest(writer=label):
+                archive_bytes = archive.read_bytes()
+                self.assertEqual(
+                    archive_bytes[:10],
+                    b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff',
+                )
+                raw = gzip.decompress(archive_bytes)
+                with tarfile.open(
+                    fileobj=io.BytesIO(raw), mode='r:'
+                ) as stream:
+                    written_members = stream.getmembers()
+                self.assertTrue(
+                    all(
+                        not member.pax_headers
+                        and member.offset_data - member.offset
+                        == tarfile.BLOCKSIZE
+                        and raw[
+                            member.offset:member.offset + tarfile.BLOCKSIZE
+                        ] == member.tobuf(format=tarfile.USTAR_FORMAT)
+                        for member in written_members
+                    )
+                )
 
     def test_source_sha_must_resolve_to_ancestor_commit(self) -> None:
         repository, source, current, non_ancestor = self.make_git_ancestry()
