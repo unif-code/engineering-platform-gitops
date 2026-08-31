@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
-import base64
 import argparse
+import base64
 import dataclasses
 import datetime
+import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import pathlib
@@ -25,7 +27,9 @@ CANDIDATE_SCHEMA = (
 )
 V2_SCHEMA = 'engineering-platform/openbao-recovery/v2'
 MAX_ARCHIVE_BYTES = 1024 * 1024
+MAX_UNCOMPRESSED_ARCHIVE_BYTES = 2 * 1024 * 1024
 MAX_MEMBER_BYTES = 256 * 1024
+MAX_SIDECAR_BYTES = 256
 SHA256 = re.compile(r'[0-9a-f]{64}')
 GIT_SHA = re.compile(r'[0-9a-f]{40}')
 PUBLIC_FINGERPRINT = re.compile(r'(?:[0-9A-F]{40}|[0-9A-F]{64})')
@@ -77,6 +81,27 @@ class RotatedBundleFacts:
     verification_nonce: str | None
 
 
+@dataclasses.dataclass(frozen=True)
+class _ArtifactSnapshot:
+    archive_name: str
+    archive_bytes: bytes
+    sidecar_bytes: bytes
+    archive_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _SourceBundleValidation:
+    facts: SourceBundleFacts
+    ciphertexts: tuple[str, ...]
+    root_token: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _RotatedBundleValidation:
+    facts: RotatedBundleFacts
+    files: dict[str, bytes]
+
+
 def _reject(message: str) -> None:
     raise RecoveryValidationError(message)
 
@@ -113,18 +138,145 @@ def _single_archive_root(expected: set[str]) -> str:
     return next(iter(roots))
 
 
+def _read_regular_file_once(
+    path: pathlib.Path, maximum_bytes: int, *, require_mode: bool
+) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, 'O_BINARY'):
+        flags |= os.O_BINARY
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        _reject('unsafe artifact path')
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RecoveryValidationError('artifact missing') from error
+    try:
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or facts.st_size < 0
+            or facts.st_size > maximum_bytes
+        ):
+            _reject('unsafe artifact path')
+        if require_mode and stat.S_IMODE(facts.st_mode) != 0o600:
+            _reject('artifact mode mismatch')
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor, min(64 * 1024, maximum_bytes + 1 - total)
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                _reject('artifact too large')
+        return b''.join(chunks)
+    except OSError as error:
+        raise RecoveryValidationError('artifact read failed') from error
+    finally:
+        os.close(descriptor)
+
+
+def _artifact_snapshot(
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    expected_name: str,
+    *,
+    require_mode: bool = False,
+) -> _ArtifactSnapshot:
+    if archive.name != expected_name or sidecar.name != expected_name + '.sha256':
+        _reject('archive name mismatch')
+    archive_bytes = _read_regular_file_once(
+        archive, MAX_ARCHIVE_BYTES, require_mode=require_mode
+    )
+    sidecar_bytes = _read_regular_file_once(
+        sidecar, MAX_SIDECAR_BYTES, require_mode=require_mode
+    )
+    try:
+        sidecar_text = sidecar_bytes.decode('ascii')
+    except UnicodeError as error:
+        raise RecoveryValidationError('invalid sidecar') from error
+    match = re.fullmatch(
+        rf'([0-9a-f]{{64}})  {re.escape(expected_name)}\n', sidecar_text
+    )
+    if match is None:
+        _reject('invalid sidecar')
+    digest = hashlib.sha256(archive_bytes).hexdigest()
+    if not hmac.compare_digest(match.group(1), digest):
+        _reject('archive digest mismatch')
+    return _ArtifactSnapshot(
+        archive_name=expected_name,
+        archive_bytes=archive_bytes,
+        sidecar_bytes=sidecar_bytes,
+        archive_sha256=digest,
+    )
+
+
+def _bounded_uncompressed_tar(archive_bytes: bytes) -> bytes:
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(archive_bytes), mode='rb') as stream:
+            uncompressed = stream.read(MAX_UNCOMPRESSED_ARCHIVE_BYTES + 1)
+    except (OSError, EOFError) as error:
+        raise RecoveryValidationError('invalid compressed archive') from error
+    if len(uncompressed) > MAX_UNCOMPRESSED_ARCHIVE_BYTES:
+        _reject('uncompressed archive too large')
+    return uncompressed
+
+
+def _validate_member_extensions(member: tarfile.TarInfo) -> None:
+    header_span = member.offset_data - member.offset
+    if member.pax_headers:
+        if (
+            member.pax_headers != {'path': member.name}
+            or len(member.name.encode('utf-8')) <= tarfile.LENGTH_NAME
+            or header_span != 3 * tarfile.BLOCKSIZE
+        ):
+            _reject('noncanonical archive extension')
+    elif header_span != tarfile.BLOCKSIZE:
+        _reject('noncanonical archive extension')
+
+
+def _validate_tar_termination(
+    uncompressed: bytes, members: list[tarfile.TarInfo]
+) -> None:
+    content_end = max(
+        member.offset_data
+        + (
+            (member.size + tarfile.BLOCKSIZE - 1)
+            // tarfile.BLOCKSIZE
+            * tarfile.BLOCKSIZE
+        )
+        for member in members
+    )
+    padding = uncompressed[content_end:]
+    if len(padding) < 2 * tarfile.BLOCKSIZE or any(padding):
+        _reject('noncanonical archive termination')
+
+
 def read_exact_tar(
-    archive: pathlib.Path, expected: set[str]
+    archive_bytes: bytes, expected: set[str]
 ) -> dict[str, bytes]:
-    if archive.stat().st_size > MAX_ARCHIVE_BYTES:
+    if len(archive_bytes) > MAX_ARCHIVE_BYTES:
         _reject('archive too large')
     root = _single_archive_root(expected)
-    with tarfile.open(archive, 'r:gz') as stream:
+    uncompressed = _bounded_uncompressed_tar(archive_bytes)
+    try:
+        stream = tarfile.open(fileobj=io.BytesIO(uncompressed), mode='r:')
+    except tarfile.TarError as error:
+        raise RecoveryValidationError('invalid tar archive') from error
+    with stream:
         members = stream.getmembers()
         names = [member.name for member in members]
         if len(names) != len(set(names)) or set(names) != expected | {root}:
             _reject('unsafe archive members')
         for member in members:
+            _validate_member_extensions(member)
             path = pathlib.PurePosixPath(member.name)
             if (
                 path.is_absolute()
@@ -137,6 +289,7 @@ def read_exact_tar(
             if member.name == root:
                 if (
                     not member.isdir()
+                    or member.size != 0
                     or member.mode != 0o700
                     or member.uid != 0
                     or member.gid != 0
@@ -152,6 +305,7 @@ def read_exact_tar(
                 _reject('unsafe archive members')
             elif member.size < 0 or member.size > MAX_MEMBER_BYTES:
                 _reject('unsafe archive member size')
+        _validate_tar_termination(uncompressed, members)
         files: dict[str, bytes] = {}
         for member in members:
             if not member.isfile():
@@ -164,33 +318,6 @@ def read_exact_tar(
                 _reject('unsafe archive member size')
             files[member.name] = payload
         return files
-
-
-def _sidecar_digest(
-    archive: pathlib.Path, sidecar: pathlib.Path, source_sha: str
-) -> str:
-    expected_name = f'openbao-recovery-{source_sha}.tar.gz'
-    if archive.name != expected_name or sidecar.name != expected_name + '.sha256':
-        _reject('source archive name mismatch')
-    try:
-        text = sidecar.read_text(encoding='ascii')
-    except UnicodeError as error:
-        raise RecoveryValidationError('invalid sidecar') from error
-    match = re.fullmatch(
-        rf'([0-9a-f]{{64}})  {re.escape(expected_name)}\n', text
-    )
-    if match is None:
-        _reject('invalid sidecar')
-    if archive.stat().st_size > MAX_ARCHIVE_BYTES:
-        _reject('archive too large')
-    digest = hashlib.sha256()
-    with archive.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(64 * 1024), b''):
-            digest.update(chunk)
-    actual = digest.hexdigest()
-    if not hmac.compare_digest(match.group(1), actual):
-        _reject('archive digest mismatch')
-    return actual
 
 
 def _openpgp_length(data: bytes, offset: int) -> tuple[int, bool, int]:
@@ -461,9 +588,8 @@ def _validate_metadata(
         _reject('source metadata mismatch')
 
 
-def validate_source(
-    archive: pathlib.Path,
-    sidecar: pathlib.Path,
+def _validate_source_snapshot(
+    snapshot: _ArtifactSnapshot,
     *,
     source_sha: str,
     docs_commit: str,
@@ -472,7 +598,7 @@ def validate_source(
     public_key_sha256: str,
     public_key_fingerprint: str,
     platform_secret_fingerprint: str,
-) -> SourceBundleFacts:
+) -> _SourceBundleValidation:
     if (
         GIT_SHA.fullmatch(source_sha) is None
         or GIT_SHA.fullmatch(docs_commit) is None
@@ -483,15 +609,16 @@ def validate_source(
         or not deviation
     ):
         _reject('invalid expected source facts')
-    archive_sha256 = _sidecar_digest(archive, sidecar, source_sha)
     prefix = f'openbao-recovery-{source_sha}'
+    if snapshot.archive_name != prefix + '.tar.gz':
+        _reject('source archive name mismatch')
     names = {
         f'{prefix}/init.json',
         f'{prefix}/metadata.json',
         f'{prefix}/openbao-recovery-public-key.b64',
         f'{prefix}/openbao-recovery-public-key.fingerprint',
     }
-    files = read_exact_tar(archive, names)
+    files = read_exact_tar(snapshot.archive_bytes, names)
     metadata = _json_document(files[f'{prefix}/metadata.json'])
     init_document = _json_document(files[f'{prefix}/init.json'])
     public_key = files[f'{prefix}/openbao-recovery-public-key.b64']
@@ -537,53 +664,45 @@ def validate_source(
         key_ids,
         key_fingerprints,
     )
-    return SourceBundleFacts(
-        schema=V1_SCHEMA,
-        archive_sha256=archive_sha256,
+    return _SourceBundleValidation(
+        facts=SourceBundleFacts(
+            schema=V1_SCHEMA,
+            archive_sha256=snapshot.archive_sha256,
+            source_sha=source_sha,
+            public_key_sha256=public_key_sha256,
+            public_key_fingerprint=public_key_fingerprint,
+            platform_secret_fingerprint=platform_secret_fingerprint,
+        ),
+        ciphertexts=tuple(init_document['unseal_keys_b64']),
+        root_token=init_document['root_token'],
+    )
+
+
+def validate_source(
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    *,
+    source_sha: str,
+    docs_commit: str,
+    docs_baseline: str,
+    deviation: str,
+    public_key_sha256: str,
+    public_key_fingerprint: str,
+    platform_secret_fingerprint: str,
+) -> SourceBundleFacts:
+    snapshot = _artifact_snapshot(
+        archive, sidecar, f'openbao-recovery-{source_sha}.tar.gz'
+    )
+    return _validate_source_snapshot(
+        snapshot,
         source_sha=source_sha,
+        docs_commit=docs_commit,
+        docs_baseline=docs_baseline,
+        deviation=deviation,
         public_key_sha256=public_key_sha256,
         public_key_fingerprint=public_key_fingerprint,
         platform_secret_fingerprint=platform_secret_fingerprint,
-    )
-
-
-def _artifact_digest(
-    archive: pathlib.Path, sidecar: pathlib.Path, expected_name: str
-) -> str:
-    if archive.name != expected_name or sidecar.name != expected_name + '.sha256':
-        _reject('archive name mismatch')
-    for path in (archive, sidecar):
-        try:
-            mode = path.lstat().st_mode
-        except OSError as error:
-            raise RecoveryValidationError('artifact missing') from error
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-            _reject('unsafe artifact path')
-    try:
-        text = sidecar.read_text(encoding='ascii')
-    except (OSError, UnicodeError) as error:
-        raise RecoveryValidationError('invalid sidecar') from error
-    match = re.fullmatch(
-        rf'([0-9a-f]{{64}})  {re.escape(expected_name)}\n', text
-    )
-    if match is None:
-        _reject('invalid sidecar')
-    if archive.stat().st_size > MAX_ARCHIVE_BYTES:
-        _reject('archive too large')
-    digest = hashlib.sha256()
-    with archive.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(64 * 1024), b''):
-            digest.update(chunk)
-    actual = digest.hexdigest()
-    if not hmac.compare_digest(match.group(1), actual):
-        _reject('archive digest mismatch')
-    return actual
-
-
-def _require_mode_0600(path: pathlib.Path) -> None:
-    mode = path.lstat().st_mode
-    if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
-        _reject('artifact mode mismatch')
+    ).facts
 
 
 def _public_key_material(
@@ -864,50 +983,44 @@ def _write_bundle(
         'openbao-recovery-public-key.fingerprint',
     ):
         _exclusive_file(directory / name, files[name])
-    try:
-        descriptor = os.open(
-            archive,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            | (os.O_NOFOLLOW if hasattr(os, 'O_NOFOLLOW') else 0),
-            0o600,
-        )
-    except OSError as error:
-        raise RecoveryValidationError('archive create failed') from error
-    with os.fdopen(descriptor, 'wb') as raw:
-        with tarfile.open(fileobj=raw, mode='w:gz') as stream:
-            root_member = tarfile.TarInfo(root)
-            root_member.type = tarfile.DIRTYPE
-            root_member.mode = 0o700
-            root_member.uid = root_member.gid = 0
-            root_member.mtime = 0
-            stream.addfile(root_member)
-            for name in (
-                'shares.json',
-                'metadata.json',
-                'openbao-recovery-public-key.b64',
-                'openbao-recovery-public-key.fingerprint',
-            ):
-                payload = files[name]
-                member = tarfile.TarInfo(f'{root}/{name}')
-                member.mode = 0o600
-                member.uid = member.gid = 0
-                member.mtime = 0
-                member.size = len(payload)
-                import io
-
-                stream.addfile(member, io.BytesIO(payload))
-    os.chmod(archive, 0o600, follow_symlinks=False)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    raw = io.BytesIO()
+    with tarfile.open(
+        fileobj=raw, mode='w:gz', format=tarfile.PAX_FORMAT
+    ) as stream:
+        root_member = tarfile.TarInfo(root)
+        root_member.type = tarfile.DIRTYPE
+        root_member.mode = 0o700
+        root_member.uid = root_member.gid = 0
+        root_member.mtime = 0
+        stream.addfile(root_member)
+        for name in (
+            'shares.json',
+            'metadata.json',
+            'openbao-recovery-public-key.b64',
+            'openbao-recovery-public-key.fingerprint',
+        ):
+            payload = files[name]
+            member = tarfile.TarInfo(f'{root}/{name}')
+            member.mode = 0o600
+            member.uid = member.gid = 0
+            member.mtime = 0
+            member.size = len(payload)
+            stream.addfile(member, io.BytesIO(payload))
+    archive_bytes = raw.getvalue()
+    if len(archive_bytes) > MAX_ARCHIVE_BYTES:
+        _reject('archive too large')
+    _exclusive_file(archive, archive_bytes)
+    digest = hashlib.sha256(archive_bytes).hexdigest()
     _exclusive_file(
         sidecar, f'{digest}  {archive.name}\n'.encode('ascii')
     )
 
 
 def _rotated_bundle_files(
-    archive: pathlib.Path, root: str
+    archive_bytes: bytes, root: str
 ) -> dict[str, bytes]:
     names = {f'{root}/{name}' for name in ROTATED_FILES}
-    members = read_exact_tar(archive, names)
+    members = read_exact_tar(archive_bytes, names)
     return {
         name: members[f'{root}/{name}']
         for name in ROTATED_FILES
@@ -924,9 +1037,8 @@ def _validate_utc_timestamp(value: Any) -> str:
     return value
 
 
-def validate_rotated_bundle(
-    archive: pathlib.Path,
-    sidecar: pathlib.Path,
+def _validate_rotated_snapshot(
+    snapshot: _ArtifactSnapshot,
     *,
     expected_schema: str,
     current_sha: str,
@@ -935,8 +1047,7 @@ def validate_rotated_bundle(
     public_key_sha256: str,
     public_key_fingerprint: str,
     cluster_identity_digest: str,
-    require_file_mode: bool = False,
-) -> RotatedBundleFacts:
+) -> _RotatedBundleValidation:
     if (
         GIT_SHA.fullmatch(current_sha or '') is None
         or GIT_SHA.fullmatch(source_sha or '') is None
@@ -953,11 +1064,9 @@ def validate_rotated_bundle(
     else:
         _reject('unsupported rotated schema')
     expected_archive_name = root + '.tar.gz'
-    if require_file_mode:
-        _require_mode_0600(archive)
-        _require_mode_0600(sidecar)
-    archive_sha256 = _artifact_digest(archive, sidecar, expected_archive_name)
-    files = _rotated_bundle_files(archive, root)
+    if snapshot.archive_name != expected_archive_name:
+        _reject('archive name mismatch')
+    files = _rotated_bundle_files(snapshot.archive_bytes, root)
     actual_key_sha, actual_fingerprint, key_ids, fingerprints = (
         _public_key_material(
             files['openbao-recovery-public-key.b64'],
@@ -1022,18 +1131,58 @@ def validate_rotated_bundle(
     combined = files['shares.json'] + files['metadata.json']
     if TOKEN_SHAPE.search(combined) or b'PRIVATE KEY' in combined.upper():
         _reject('plaintext secret shape detected')
-    return RotatedBundleFacts(
-        schema=expected_schema,
-        archive_sha256=archive_sha256,
+    return _RotatedBundleValidation(
+        facts=RotatedBundleFacts(
+            schema=expected_schema,
+            archive_sha256=snapshot.archive_sha256,
+            current_sha=current_sha,
+            source_sha=source_sha,
+            source_bundle_sha256=source_bundle_sha256,
+            public_key_sha256=actual_key_sha,
+            public_key_fingerprint=actual_fingerprint,
+            cluster_identity_sha256=cluster_identity_digest,
+            ciphertexts=tuple(shares['unseal_keys_b64']),
+            verification_nonce=verification_nonce,
+        ),
+        files=files,
+    )
+
+
+def validate_rotated_bundle(
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    *,
+    expected_schema: str,
+    current_sha: str,
+    source_sha: str,
+    source_bundle_sha256: str,
+    public_key_sha256: str,
+    public_key_fingerprint: str,
+    cluster_identity_digest: str,
+    require_file_mode: bool = False,
+) -> RotatedBundleFacts:
+    if expected_schema == CANDIDATE_SCHEMA:
+        root = f'openbao-recovery-rotation-candidate-{current_sha}'
+    elif expected_schema == V2_SCHEMA:
+        root = f'openbao-recovery-{current_sha}'
+    else:
+        _reject('unsupported rotated schema')
+    snapshot = _artifact_snapshot(
+        archive,
+        sidecar,
+        root + '.tar.gz',
+        require_mode=require_file_mode,
+    )
+    return _validate_rotated_snapshot(
+        snapshot,
+        expected_schema=expected_schema,
         current_sha=current_sha,
         source_sha=source_sha,
         source_bundle_sha256=source_bundle_sha256,
-        public_key_sha256=actual_key_sha,
-        public_key_fingerprint=actual_fingerprint,
-        cluster_identity_sha256=cluster_identity_digest,
-        ciphertexts=tuple(shares['unseal_keys_b64']),
-        verification_nonce=verification_nonce,
-    )
+        public_key_sha256=public_key_sha256,
+        public_key_fingerprint=public_key_fingerprint,
+        cluster_identity_digest=cluster_identity_digest,
+    ).facts
 
 
 def build_candidate(
@@ -1136,9 +1285,15 @@ def build_final(
     cluster_identity_digest: str,
     verified_at_utc: str,
 ) -> RotatedBundleFacts:
-    candidate = validate_rotated_bundle(
+    candidate_root = f'openbao-recovery-rotation-candidate-{current_sha}'
+    candidate_snapshot = _artifact_snapshot(
         candidate_archive,
         candidate_sidecar,
+        candidate_root + '.tar.gz',
+        require_mode=True,
+    )
+    candidate_validation = _validate_rotated_snapshot(
+        candidate_snapshot,
         expected_schema=CANDIDATE_SCHEMA,
         current_sha=current_sha,
         source_sha=source_sha,
@@ -1146,11 +1301,10 @@ def build_final(
         public_key_sha256=public_key_sha256,
         public_key_fingerprint=public_key_fingerprint,
         cluster_identity_digest=cluster_identity_digest,
-        require_file_mode=True,
     )
+    candidate = candidate_validation.facts
     verified_at = _validate_utc_timestamp(verified_at_utc)
-    candidate_root = f'openbao-recovery-rotation-candidate-{current_sha}'
-    files = _rotated_bundle_files(candidate_archive, candidate_root)
+    files = candidate_validation.files
     shares = _json_document(files['shares.json'])
     share_digests = _json_document(files['metadata.json'])[
         'share_ciphertext_sha256'
@@ -1212,14 +1366,16 @@ def _emit_item(
     recovery_match = re.fullmatch(
         r'openbao-recovery-([0-9a-f]{40})\.tar\.gz', archive.name
     )
+    if candidate_match is None and recovery_match is None:
+        _reject('unsupported archive name')
+    snapshot = _artifact_snapshot(archive, sidecar, archive.name)
     if candidate_match is not None:
         current_sha = candidate_match.group(1)
         root = f'openbao-recovery-rotation-candidate-{current_sha}'
-        files = _rotated_bundle_files(archive, root)
+        files = _rotated_bundle_files(snapshot.archive_bytes, root)
         metadata = _json_document(files['metadata.json'])
-        validate_rotated_bundle(
-            archive,
-            sidecar,
+        validation = _validate_rotated_snapshot(
+            snapshot,
             expected_schema=CANDIDATE_SCHEMA,
             current_sha=current_sha,
             source_sha=metadata.get('source_recovery_sha'),
@@ -1230,7 +1386,7 @@ def _emit_item(
         )
         if item == 'root':
             _reject('root item forbidden for rotated bundle')
-        shares = _json_document(files['shares.json'])['unseal_keys_b64']
+        ciphertexts = validation.facts.ciphertexts
     elif recovery_match is not None:
         current_sha = recovery_match.group(1)
         root = f'openbao-recovery-{current_sha}'
@@ -1241,13 +1397,11 @@ def _emit_item(
             f'{root}/openbao-recovery-public-key.fingerprint',
         }
         v2_names = {f'{root}/{name}' for name in ROTATED_FILES}
-        _artifact_digest(archive, sidecar, archive.name)
         try:
-            files = read_exact_tar(archive, v1_names)
+            files = read_exact_tar(snapshot.archive_bytes, v1_names)
             metadata = _json_document(files[f'{root}/metadata.json'])
-            validate_source(
-                archive,
-                sidecar,
+            validation_v1 = _validate_source_snapshot(
+                snapshot,
                 source_sha=current_sha,
                 docs_commit=metadata.get('docs_commit'),
                 docs_baseline=metadata.get('docs_baseline'),
@@ -1258,17 +1412,15 @@ def _emit_item(
                     'platform_secret_fingerprint'
                 ),
             )
-            init_document = _json_document(files[f'{root}/init.json'])
             if item == 'root':
-                return init_document['root_token']
-            shares = init_document['unseal_keys_b64']
+                return validation_v1.root_token
+            ciphertexts = validation_v1.ciphertexts
         except RecoveryValidationError as v1_error:
             try:
-                files = read_exact_tar(archive, v2_names)
+                files = read_exact_tar(snapshot.archive_bytes, v2_names)
                 metadata = _json_document(files[f'{root}/metadata.json'])
-                validate_rotated_bundle(
-                    archive,
-                    sidecar,
+                validation_v2 = _validate_rotated_snapshot(
+                    snapshot,
                     expected_schema=V2_SCHEMA,
                     current_sha=current_sha,
                     source_sha=metadata.get('source_recovery_sha'),
@@ -1285,15 +1437,11 @@ def _emit_item(
                 raise v1_error
             if item == 'root':
                 _reject('root item forbidden for rotated bundle')
-            shares = _json_document(files[f'{root}/shares.json'])[
-                'unseal_keys_b64'
-            ]
-    else:
-        _reject('unsupported archive name')
+            ciphertexts = validation_v2.facts.ciphertexts
     match = re.fullmatch(r'share([1-5])', item)
     if match is None:
         _reject('unsupported recovery item')
-    return shares[int(match.group(1)) - 1]
+    return ciphertexts[int(match.group(1)) - 1]
 
 
 def _add_validation_arguments(parser: argparse.ArgumentParser) -> None:
