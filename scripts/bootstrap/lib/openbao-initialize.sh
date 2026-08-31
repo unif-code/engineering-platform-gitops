@@ -31,33 +31,29 @@ safe_owned_directory() {
 openbao_parse_operation() {
   local source_sha
   OPENBAO_SOURCE_RECOVERY_SHA=
-  case "$#:${1:-}:${2:-}" in
-    0::|1:--check:) OPENBAO_OPERATION=CHECK ;;
-    2:--check:--source-recovery-sha=*)
-      source_sha=${2#--source-recovery-sha=}
-      [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return "$EXIT_PRECONDITION"
-      OPENBAO_OPERATION=CHECK
-      # shellcheck disable=SC2034
-      # The checked incident provenance remains available to the stage operation.
-      OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
+  case "$#" in
+    0) OPENBAO_OPERATION=CHECK ;;
+    1)
+      case "$1" in
+        --check) OPENBAO_OPERATION=CHECK ;;
+        --initialize) OPENBAO_OPERATION=INITIALIZE ;;
+        --configure) OPENBAO_OPERATION=CONFIGURE ;;
+        --accept) OPENBAO_OPERATION=ACCEPT ;;
+        *) return "$EXIT_PRECONDITION" ;;
+      esac
       ;;
-    1:--initialize:) OPENBAO_OPERATION=INITIALIZE ;;
-    1:--configure:) OPENBAO_OPERATION=CONFIGURE ;;
-    1:--accept:) OPENBAO_OPERATION=ACCEPT ;;
-    2:--recover-start:--source-recovery-sha=*)
+    2)
+      [[ "$2" == --source-recovery-sha=* ]] || return "$EXIT_PRECONDITION"
       source_sha=${2#--source-recovery-sha=}
       [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return "$EXIT_PRECONDITION"
-      OPENBAO_OPERATION=RECOVER_START
+      case "$1" in
+        --check) OPENBAO_OPERATION=CHECK ;;
+        --recover-start) OPENBAO_OPERATION=RECOVER_START ;;
+        --recover-verify) OPENBAO_OPERATION=RECOVER_VERIFY ;;
+        *) return "$EXIT_PRECONDITION" ;;
+      esac
       # shellcheck disable=SC2034
-      # The following recovery operation consumes this validated provenance value.
-      OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
-      ;;
-    2:--recover-verify:--source-recovery-sha=*)
-      source_sha=${2#--source-recovery-sha=}
-      [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return "$EXIT_PRECONDITION"
-      OPENBAO_OPERATION=RECOVER_VERIFY
-      # shellcheck disable=SC2034
-      # The following recovery operation consumes this validated provenance value.
+      # The checked recovery provenance remains available to the stage operation.
       OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
       ;;
     *) return "$EXIT_PRECONDITION" ;;

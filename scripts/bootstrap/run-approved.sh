@@ -109,6 +109,7 @@ else
 fi
 if [[ "$target" == openbao-initialize ]]; then
   /usr/bin/git -C "$repo" fetch --force origin \
+    'refs/heads/main:refs/remotes/origin/main' \
     'refs/heads/validated:refs/remotes/origin/validated' >/dev/null 2>&1 || {
     echo 'STOP: validated ref unavailable (CI publishes it after validation-gate)'
     exit 99
