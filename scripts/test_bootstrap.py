@@ -12,6 +12,8 @@ import subprocess
 import tarfile
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -3500,6 +3502,9 @@ class RunApprovedTest(BootstrapTestCase):
              '--source-recovery-sha=' + 'A' * 40),
             ('--apply', '--stage=180', '--operation=recover-start',
              f'--source-recovery-sha={source}', '--extra'),
+            ('--apply', '--stage=180',
+             '--operation=recover-start:--source-recovery-sha=junk',
+             f'--source-recovery-sha={source}'),
         )
         expected = (
             ('openbao-initialize', '--check'),
@@ -3546,10 +3551,17 @@ class RunApprovedTest(BootstrapTestCase):
                     ],
                 )
 
-        result = self.run_openbao_operation_parser(
-            '--recover-start', '--source-recovery-sha=' + 'A' * 40,
+        rejected = (
+            ('--recover-start', '--source-recovery-sha=' + 'A' * 40),
+            ('--recover-start:--source-recovery-sha=junk',
+             f'--source-recovery-sha={source}'),
+            ('--check:--source-recovery-sha=junk',
+             f'--source-recovery-sha={source}'),
         )
-        self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+        for arguments in rejected:
+            with self.subTest(arguments=arguments):
+                result = self.run_openbao_operation_parser(*arguments)
+                self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
 
     def test_stage_180_check_forwards_only_the_validated_incident_argv(self) -> None:
         clone, approved, seed = self.make_gated_repo()
@@ -3580,6 +3592,76 @@ class RunApprovedTest(BootstrapTestCase):
             '--source-recovery-sha=' + 'a' * 40,
         )
 
+        self.assertEqual(result.returncode, 102, result.stdout + result.stderr)
+        self.assertIn('STOP: Stage 180 requires main and validated to match', result.stdout)
+        self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
+
+    def test_stage_180_ref_gate_fetches_main_and_validated_as_one_snapshot(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        (seed / 'unvalidated.txt').write_text('later\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'not yet validated', cwd=seed)
+        later = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=seed,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        directory = self.temporary_directory()
+        count_file = directory / 'upload-pack-count'
+        release_file = directory / 'release-second-fetch'
+        upload_pack = directory / 'upload-pack'
+        self.write_executable(
+            upload_pack,
+            '''
+            #!/bin/bash
+            set -eu
+            if [[ -e "$RACE_UPLOAD_PACK_COUNT" ]]; then
+              while [[ ! -e "$RACE_RELEASE_SECOND_FETCH" ]]; do
+                sleep 0.01
+              done
+            fi
+            /usr/bin/git-upload-pack "$@"
+            if [[ ! -e "$RACE_UPLOAD_PACK_COUNT" ]]; then
+              : >"$RACE_UPLOAD_PACK_COUNT"
+            fi
+            ''',
+        )
+        self.git('config', 'remote.origin.uploadpack', str(upload_pack), cwd=clone)
+        errors: list[str] = []
+
+        def advance_main_after_first_fetch() -> None:
+            deadline = time.monotonic() + 5
+            while not count_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not count_file.exists():
+                errors.append('first fetch did not use the configured upload-pack')
+                release_file.touch()
+                return
+            pushed = subprocess.run(
+                ['/usr/bin/git', 'push', '-q', 'origin', f'{later}:refs/heads/main'],
+                cwd=seed, capture_output=True, text=True, check=False,
+            )
+            if pushed.returncode:
+                errors.append(pushed.stderr)
+            release_file.touch()
+
+        updater = threading.Thread(target=advance_main_after_first_fetch)
+        updater.start()
+        try:
+            result = self.run_wrapper(
+                clone, approved, '--check', '--stage=180',
+                '--source-recovery-sha=' + 'a' * 40,
+                extra_env={
+                    'RACE_UPLOAD_PACK_COUNT': str(count_file),
+                    'RACE_RELEASE_SECOND_FETCH': str(release_file),
+                },
+            )
+        finally:
+            release_file.touch()
+            updater.join(timeout=5)
+
+        self.assertFalse(errors, errors)
+        self.assertFalse(updater.is_alive(), 'main advancement watcher did not finish')
         self.assertEqual(result.returncode, 102, result.stdout + result.stderr)
         self.assertIn('STOP: Stage 180 requires main and validated to match', result.stdout)
         self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
