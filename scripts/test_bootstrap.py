@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -9,6 +10,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import textwrap
@@ -66,6 +68,7 @@ OPENBAO_INITIALIZE = (
     ROOT / 'scripts/bootstrap/stages/180-openbao-initialize/run.sh'
 )
 OPENBAO_INITIALIZE_LIB = ROOT / 'scripts/bootstrap/lib/openbao-initialize.sh'
+OPENBAO_RECOVERY_HELPER = ROOT / 'scripts/bootstrap/lib/openbao_recovery.py'
 OPENBAO_RECOVERY_WIZARD = ROOT / 'scripts/openbao/recovery-ceremony-wizard.sh'
 
 # 命令位置的完整枚举：行首、分隔符之后、复合命令关键字之后，再加上 `!`/`command`/
@@ -7842,10 +7845,432 @@ class OpenBaoRuntimeStageTest(BootstrapTestCase):
 
 
 class OpenBaoInitializationStageTest(BootstrapTestCase):
+    SOURCE_SHA = '1' * 40
+    DOCS_COMMIT = '0039d697237eb3f3a4a6238f47d4b971974a031e'
+    DOCS_BASELINE = '2026-08-28.2'
+    DEVIATION = 'DEV-005'
+    PUBLIC_KEY_FINGERPRINT = 'A' * 40
+    PLATFORM_SECRET_FINGERPRINT = 'b' * 64
+    PUBLIC_KEY_BYTES = (
+        base64.b64encode(b'synthetic-openpgp-public-key' * 12) + b'\n'
+    )
+    PUBLIC_KEY_SHA256 = hashlib.sha256(PUBLIC_KEY_BYTES).hexdigest()
+
     @staticmethod
     def implementation() -> str:
         return OPENBAO_INITIALIZE.read_text(encoding='utf-8') + (
             OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        )
+
+    @staticmethod
+    def synthetic_ciphertext(label: str) -> str:
+        return base64.b64encode(
+            (f'synthetic-{label}-ciphertext:'.encode('ascii') + b'x' * 96)
+        ).decode('ascii')
+
+    def make_source_bundle(
+        self,
+        *,
+        case: str = 'valid',
+        directory: Path | None = None,
+        source_sha: str | None = None,
+    ) -> tuple[Path, Path]:
+        directory = directory or self.temporary_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        source_sha = source_sha or self.SOURCE_SHA
+        prefix = f'openbao-recovery-{source_sha}'
+        metadata = {
+            'schema': 'engineering-platform/openbao-recovery/v1',
+            'git_commit': source_sha,
+            'docs_commit': self.DOCS_COMMIT,
+            'docs_baseline': self.DOCS_BASELINE,
+            'deviation': self.DEVIATION,
+            'public_key_sha256': self.PUBLIC_KEY_SHA256,
+            'public_key_fingerprint': self.PUBLIC_KEY_FINGERPRINT,
+            'platform_secret_fingerprint': self.PLATFORM_SECRET_FINGERPRINT,
+            'key_shares': 5,
+            'key_threshold': 3,
+            'plaintext_recovery_material': 'NOT_RECORDED',
+        }
+        encrypted_shares = [
+            self.synthetic_ciphertext(f'share-{index}')
+            for index in range(5)
+        ]
+        init_document = {
+            'unseal_shares': 5,
+            'unseal_threshold': 3,
+            'unseal_keys_b64': encrypted_shares,
+            'unseal_keys_hex': [
+                base64.b64decode(value).hex() for value in encrypted_shares
+            ],
+            'recovery_keys_b64': [],
+            'recovery_keys_hex': [],
+            'recovery_keys_shares': 0,
+            'recovery_keys_threshold': 0,
+            'root_token': self.synthetic_ciphertext('root-token'),
+        }
+        fingerprint = self.PUBLIC_KEY_FINGERPRINT
+        if case == 'wrong-schema':
+            metadata['schema'] = 'engineering-platform/openbao-recovery/v2'
+        elif case == 'wrong-source-sha':
+            metadata['git_commit'] = '2' * 40
+        elif case == 'wrong-docs-baseline':
+            metadata['docs_baseline'] = '2026-08-28.1'
+        elif case == 'wrong-platform-fingerprint':
+            metadata['platform_secret_fingerprint'] = 'c' * 64
+        elif case == 'wrong-public-fingerprint':
+            fingerprint = 'B' * 40
+            metadata['public_key_fingerprint'] = fingerprint
+        elif case == 'wrong-share-count':
+            init_document['unseal_shares'] = 4
+            init_document['unseal_keys_b64'] = init_document[
+                'unseal_keys_b64'
+            ][:4]
+        elif case == 'missing-root-token':
+            del init_document['root_token']
+
+        members: list[tuple[tarfile.TarInfo, bytes | None]] = []
+        root = tarfile.TarInfo(prefix)
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o700
+        root.uid = root.gid = 0
+        members.append((root, None))
+        files = {
+            f'{prefix}/init.json': json.dumps(
+                init_document, separators=(',', ':'), sort_keys=True
+            ).encode('utf-8') + b'\n',
+            f'{prefix}/metadata.json': json.dumps(
+                metadata, separators=(',', ':'), sort_keys=True
+            ).encode('utf-8') + b'\n',
+            f'{prefix}/openbao-recovery-public-key.b64': self.PUBLIC_KEY_BYTES,
+            f'{prefix}/openbao-recovery-public-key.fingerprint': (
+                fingerprint.encode('ascii') + b'\n'
+            ),
+        }
+        if case == 'missing-member':
+            del files[f'{prefix}/init.json']
+        for name, payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.mode = 0o600
+            member.uid = member.gid = 0
+            member.size = len(payload)
+            members.append((member, payload))
+
+        hostile: tarfile.TarInfo | None = None
+        hostile_payload: bytes | None = b'hostile\n'
+        if case == 'absolute-path':
+            hostile = tarfile.TarInfo('/absolute-path')
+        elif case == 'dot-dot':
+            hostile = tarfile.TarInfo(f'{prefix}/../escape')
+        elif case == 'symlink':
+            hostile = tarfile.TarInfo(f'{prefix}/symlink')
+            hostile.type = tarfile.SYMTYPE
+            hostile.linkname = 'metadata.json'
+            hostile_payload = None
+        elif case == 'hardlink':
+            hostile = tarfile.TarInfo(f'{prefix}/hardlink')
+            hostile.type = tarfile.LNKTYPE
+            hostile.linkname = f'{prefix}/metadata.json'
+            hostile_payload = None
+        elif case == 'fifo':
+            hostile = tarfile.TarInfo(f'{prefix}/fifo')
+            hostile.type = tarfile.FIFOTYPE
+            hostile_payload = None
+        elif case == 'extra-member':
+            hostile = tarfile.TarInfo(f'{prefix}/extra.json')
+        if hostile is not None:
+            hostile.mode = 0o600
+            hostile.uid = hostile.gid = 0
+            hostile.size = len(hostile_payload or b'')
+            members.append((hostile, hostile_payload))
+
+        archive = directory / f'{prefix}.tar.gz'
+        with tarfile.open(archive, 'w:gz') as stream:
+            for member, payload in members:
+                stream.addfile(
+                    member,
+                    None if payload is None else io.BytesIO(payload),
+                )
+        archive.chmod(0o600)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if case == 'checksum-drift':
+            digest = '0' * 64
+        sidecar = archive.with_name(archive.name + '.sha256')
+        sidecar.write_text(f'{digest}  {archive.name}\n', encoding='ascii')
+        sidecar.chmod(0o600)
+        return archive, sidecar
+
+    def run_recovery_helper(
+        self, operation: str, archive: Path, sidecar: Path
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command([
+            sys.executable,
+            '-I',
+            '-B',
+            str(OPENBAO_RECOVERY_HELPER),
+            operation,
+            str(archive),
+            str(sidecar),
+            self.SOURCE_SHA,
+            self.DOCS_COMMIT,
+            self.DOCS_BASELINE,
+            self.DEVIATION,
+            self.PUBLIC_KEY_SHA256,
+            self.PUBLIC_KEY_FINGERPRINT,
+            self.PLATFORM_SECRET_FINGERPRINT,
+        ])
+
+    def make_git_ancestry(self) -> tuple[Path, str, str, str]:
+        repository = self.temporary_directory() / 'repository'
+        repository.mkdir()
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ['git', *arguments],
+                cwd=repository,
+                env=self.sanitized_environment(),
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git('init', '-q', '--initial-branch=main')
+        git('config', 'user.name', 'Synthetic Test')
+        git('config', 'user.email', 'synthetic@example.invalid')
+        (repository / 'state.txt').write_text('source\n', encoding='utf-8')
+        git('add', 'state.txt')
+        git('commit', '-q', '-m', 'source')
+        source = git('rev-parse', 'HEAD')
+        git('checkout', '-q', '--orphan', 'non-ancestor')
+        git('rm', '-q', '-f', 'state.txt')
+        (repository / 'other.txt').write_text('other\n', encoding='utf-8')
+        git('add', 'other.txt')
+        git('commit', '-q', '-m', 'non ancestor')
+        non_ancestor = git('rev-parse', 'HEAD')
+        git('checkout', '-q', 'main')
+        (repository / 'state.txt').write_text('current\n', encoding='utf-8')
+        git('commit', '-q', '-am', 'current')
+        current = git('rev-parse', 'HEAD')
+        return repository, source, current, non_ancestor
+
+    def run_source_gate(
+        self,
+        function: str,
+        repository: Path,
+        source_sha: str,
+        current_sha: str,
+        recovery_root: Path,
+        *,
+        owner_drift_path: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        config = recovery_root.parent / 'config'
+        config.mkdir(exist_ok=True)
+        public_key = config / 'openbao-recovery-public-key.b64'
+        public_fingerprint = config / 'openbao-recovery-public-key.fingerprint'
+        public_key.write_bytes(self.PUBLIC_KEY_BYTES)
+        public_fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        public_key.chmod(0o600)
+        public_fingerprint.chmod(0o600)
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_REPO_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ROOT=$5
+            OPENBAO_PUBLIC_KEY=$6
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$7
+            PYTHON_BINARY=/usr/bin/python3
+            EXPECTED_PLATFORM_FINGERPRINT=$8
+            openbao_platform_secret_fingerprint() {
+              printf '%s\\n' "$EXPECTED_PLATFORM_FINGERPRINT"
+            }
+            "$9"
+            '''
+        )
+        environment = self.sanitized_environment(BOOTSTRAP_TEST_MODE='1')
+        if owner_drift_path is not None:
+            environment['BOOTSTRAP_TEST_OWNER_DRIFT_PATH'] = str(
+                owner_drift_path
+            )
+        return self.run_command(
+            [
+                '/bin/bash', '-c', script, 'source-gate',
+                str(OPENBAO_INITIALIZE_LIB), str(repository), current_sha,
+                source_sha, str(recovery_root), str(public_key),
+                str(public_fingerprint), self.PLATFORM_SECRET_FINGERPRINT,
+                function,
+            ],
+            env=environment,
+        )
+
+    def run_source_check(
+        self,
+        repository: Path,
+        current_sha: str,
+        recovery_root: Path,
+        source_sha: str = '',
+    ) -> subprocess.CompletedProcess[str]:
+        config = recovery_root.parent / 'config-check'
+        config.mkdir(exist_ok=True)
+        public_key = config / 'openbao-recovery-public-key.b64'
+        public_fingerprint = config / 'openbao-recovery-public-key.fingerprint'
+        public_key.write_bytes(self.PUBLIC_KEY_BYTES)
+        public_fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        public_key.chmod(0o600)
+        public_fingerprint.chmod(0o600)
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_REPO_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ROOT=$5
+            OPENBAO_PUBLIC_KEY=$6
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$7
+            PYTHON_BINARY=/usr/bin/python3
+            EXPECTED_PLATFORM_FINGERPRINT=$8
+            openbao_stage_180_preflight() { :; }
+            openbao_state_flags() { printf 'true|true\\n'; }
+            openbao_recovery_state() { printf 'MISSING\\n'; }
+            openbao_platform_secret_fingerprint() {
+              printf '%s\\n' "$EXPECTED_PLATFORM_FINGERPRINT"
+            }
+            complete() {
+              printf 'RESULT=%s\\nREASON=%s\\nNEXT=%s\\n' "$1" "$2" "$4"
+              exit "$3"
+            }
+            openbao_stage_180_check
+            '''
+        )
+        return self.run_command(
+            [
+                '/bin/bash', '-c', script, 'source-check',
+                str(OPENBAO_INITIALIZE_LIB), str(repository), current_sha,
+                source_sha, str(recovery_root), str(public_key),
+                str(public_fingerprint), self.PLATFORM_SECRET_FINGERPRINT,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+
+    def test_source_v1_rejects_unsafe_members_and_metadata(self) -> None:
+        archive, sidecar = self.make_source_bundle()
+        accepted = self.run_recovery_helper('validate-source', archive, sidecar)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stdout, '')
+
+        cases = (
+            'absolute-path', 'dot-dot', 'symlink', 'hardlink', 'fifo',
+            'extra-member', 'missing-member', 'wrong-schema', 'wrong-source-sha',
+            'wrong-docs-baseline', 'wrong-platform-fingerprint',
+            'wrong-public-fingerprint', 'wrong-share-count', 'missing-root-token',
+            'checksum-drift',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                archive, sidecar = self.make_source_bundle(case=case)
+                result = self.run_recovery_helper(
+                    'validate-source', archive, sidecar
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_source_sha_must_resolve_to_ancestor_commit(self) -> None:
+        repository, source, current, non_ancestor = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+
+        accepted = self.run_source_gate(
+            'openbao_source_recovery_sha_is_valid',
+            repository, source, current, recovery_root,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for rejected_source in ('f' * 40, non_ancestor):
+            with self.subTest(source=rejected_source):
+                rejected = self.run_source_gate(
+                    'openbao_source_recovery_sha_is_valid',
+                    repository, rejected_source, current, recovery_root,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, '')
+
+    def test_source_bundle_path_is_only_the_requested_sha(self) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        self.make_source_bundle(directory=recovery_root, source_sha=source)
+        requested = current
+
+        rejected = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, requested, current, recovery_root,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, '')
+
+    def test_source_bundle_requires_safe_owner_and_mode(self) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        archive, sidecar = self.make_source_bundle(
+            directory=recovery_root, source_sha=source
+        )
+
+        accepted = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, source, current, recovery_root,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stdout, '')
+
+        archive.chmod(0o640)
+        mode_drift = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, source, current, recovery_root,
+        )
+        self.assertNotEqual(mode_drift.returncode, 0)
+        self.assertEqual(mode_drift.stdout, '')
+        archive.chmod(0o600)
+
+        owner_drift = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, source, current, recovery_root,
+            owner_drift_path=sidecar,
+        )
+        self.assertNotEqual(owner_drift.returncode, 0)
+        self.assertEqual(owner_drift.stdout, '')
+
+    def test_initialized_missing_bundle_requires_or_adopts_exact_source(
+        self,
+    ) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        self.make_source_bundle(directory=recovery_root, source_sha=source)
+
+        missing = self.run_source_check(repository, current, recovery_root)
+        self.assertEqual(missing.returncode, 10, missing.stderr)
+        self.assertIn('RESULT=STOP_PRECONDITION', missing.stdout)
+        self.assertIn('REASON=source-recovery-sha-required', missing.stdout)
+
+        adopted = self.run_source_check(
+            repository, current, recovery_root, source
+        )
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        self.assertIn('RESULT=PASS_OPENBAO_RECOVERY_CHECK', adopted.stdout)
+        self.assertIn('REASON=recover-start-required', adopted.stdout)
+        self.assertIn(
+            'NEXT=stages/180-openbao-initialize/run.sh --recover-start '
+            f'--source-recovery-sha={source}',
+            adopted.stdout,
         )
 
     def test_stage_180_is_interactive_and_never_orchestrated(self) -> None:
