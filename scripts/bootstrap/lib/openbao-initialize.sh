@@ -4,10 +4,14 @@ openbao_initialize_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${openbao_initialize_lib_dir}/openbao-runtime.sh"
 
+readonly OPENBAO_RECOVERY_HELPER=${openbao_initialize_lib_dir}/openbao_recovery.py
 readonly OPENBAO_DOCS_COMMIT=0039d697237eb3f3a4a6238f47d4b971974a031e
 readonly OPENBAO_DOCS_BASELINE=2026-08-28.2
 readonly OPENBAO_DEVIATION=DEV-005
 readonly OPENBAO_PROBE_VALUE=stage180-probe
+readonly OPENBAO_REASON_SOURCE_REQUIRED=source-recovery-sha-required
+readonly OPENBAO_REASON_SOURCE_INVALID=source-recovery-sha-invalid
+readonly OPENBAO_REASON_SOURCE_UNSAFE=source-recovery-bundle-unsafe
 
 OPENBAO_OPERATION=CHECK
 OPENBAO_SOURCE_RECOVERY_SHA=
@@ -19,6 +23,8 @@ OPENBAO_RECOVERY_ID=
 OPENBAO_RECOVERY_DIRECTORY=
 OPENBAO_RECOVERY_ARCHIVE=
 OPENBAO_RECOVERY_SIDECAR=
+OPENBAO_SOURCE_RECOVERY_ARCHIVE=
+OPENBAO_SOURCE_RECOVERY_SIDECAR=
 OPENBAO_SECRET_INPUT=
 OPENBAO_REMOTE_HOME=
 OPENBAO_REMOTE_SESSION_KIND=
@@ -101,6 +107,42 @@ PY
 
 openbao_recovery_root_is_safe() {
   safe_owned_directory "$OPENBAO_RECOVERY_ROOT" 0
+}
+
+openbao_source_recovery_sha_is_valid() {
+  local source=$OPENBAO_SOURCE_RECOVERY_SHA
+  [[ "$source" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git -C "$OPENBAO_REPO_ROOT" cat-file -e "${source}^{commit}" 2>/dev/null ||
+    return 1
+  git -C "$OPENBAO_REPO_ROOT" merge-base --is-ancestor \
+    "$source" "$OPENBAO_RECOVERY_ID" 2>/dev/null
+}
+
+openbao_source_recovery_paths() {
+  local source=$OPENBAO_SOURCE_RECOVERY_SHA
+  [[ "$source" =~ ^[0-9a-f]{40}$ ]] || return 1
+  OPENBAO_SOURCE_RECOVERY_ARCHIVE=${OPENBAO_RECOVERY_ROOT}/openbao-recovery-${source}.tar.gz
+  OPENBAO_SOURCE_RECOVERY_SIDECAR=${OPENBAO_SOURCE_RECOVERY_ARCHIVE}.sha256
+}
+
+openbao_source_recovery_bundle_is_valid() {
+  local fingerprint platform_fingerprint public_key_sha
+  openbao_source_recovery_sha_is_valid || return 1
+  openbao_source_recovery_paths || return 1
+  openbao_recovery_root_is_safe || return 1
+  safe_file "$OPENBAO_RECOVERY_HELPER" 644 || return 1
+  safe_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE" 600 || return 1
+  safe_file "$OPENBAO_SOURCE_RECOVERY_SIDECAR" 600 || return 1
+  safe_file "$OPENBAO_PUBLIC_KEY" 600 || return 1
+  safe_file "$OPENBAO_PUBLIC_KEY_FINGERPRINT" 600 || return 1
+  public_key_sha=$(sha256_file "$OPENBAO_PUBLIC_KEY") || return 1
+  fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
+  platform_fingerprint=$(openbao_platform_secret_fingerprint) || return 1
+  "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" validate-source \
+    "$OPENBAO_SOURCE_RECOVERY_ARCHIVE" "$OPENBAO_SOURCE_RECOVERY_SIDECAR" \
+    "$OPENBAO_SOURCE_RECOVERY_SHA" "$OPENBAO_DOCS_COMMIT" \
+    "$OPENBAO_DOCS_BASELINE" "$OPENBAO_DEVIATION" "$public_key_sha" \
+    "$fingerprint" "$platform_fingerprint"
 }
 
 openbao_state_flags() {
@@ -821,6 +863,19 @@ openbao_stage_180_check() {
     'true|true:DIRECTORY_READY')
       complete PASS_OPENBAO_INITIALIZATION_CHECK recovery-finalization-required 0 \
         'stages/180-openbao-initialize/run.sh --initialize'
+      ;;
+    'true|true:MISSING')
+      [[ -n "$OPENBAO_SOURCE_RECOVERY_SHA" ]] ||
+        complete STOP_PRECONDITION "$OPENBAO_REASON_SOURCE_REQUIRED" \
+          "$EXIT_PRECONDITION" NONE
+      openbao_source_recovery_sha_is_valid ||
+        complete STOP_PRECONDITION "$OPENBAO_REASON_SOURCE_INVALID" \
+          "$EXIT_PRECONDITION" NONE
+      openbao_source_recovery_bundle_is_valid ||
+        complete STOP_UNKNOWN_STATE "$OPENBAO_REASON_SOURCE_UNSAFE" \
+          "$EXIT_UNKNOWN_STATE" NONE
+      complete PASS_OPENBAO_RECOVERY_CHECK recover-start-required 0 \
+        "stages/180-openbao-initialize/run.sh --recover-start --source-recovery-sha=${OPENBAO_SOURCE_RECOVERY_SHA}"
       ;;
     'true|true:COMPLIANT'|'true|false:COMPLIANT')
       if [[ "$state" == 'true|false' ]] && openbao_existing_evidence >/dev/null; then
