@@ -10,6 +10,7 @@ readonly OPENBAO_DEVIATION=DEV-005
 readonly OPENBAO_PROBE_VALUE=stage180-probe
 
 OPENBAO_OPERATION=CHECK
+OPENBAO_SOURCE_RECOVERY_SHA=
 OPENBAO_CONFIG_ROOT=
 OPENBAO_PUBLIC_KEY=
 OPENBAO_PUBLIC_KEY_FINGERPRINT=
@@ -28,11 +29,37 @@ safe_owned_directory() {
 }
 
 openbao_parse_operation() {
-  case "$#:${1:-}" in
-    0:|1:--check) OPENBAO_OPERATION=CHECK ;;
-    1:--initialize) OPENBAO_OPERATION=INITIALIZE ;;
-    1:--configure) OPENBAO_OPERATION=CONFIGURE ;;
-    1:--accept) OPENBAO_OPERATION=ACCEPT ;;
+  local source_sha
+  OPENBAO_SOURCE_RECOVERY_SHA=
+  case "$#:${1:-}:${2:-}" in
+    0::|1:--check:) OPENBAO_OPERATION=CHECK ;;
+    2:--check:--source-recovery-sha=*)
+      source_sha=${2#--source-recovery-sha=}
+      [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return "$EXIT_PRECONDITION"
+      OPENBAO_OPERATION=CHECK
+      # shellcheck disable=SC2034
+      # The checked incident provenance remains available to the stage operation.
+      OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
+      ;;
+    1:--initialize:) OPENBAO_OPERATION=INITIALIZE ;;
+    1:--configure:) OPENBAO_OPERATION=CONFIGURE ;;
+    1:--accept:) OPENBAO_OPERATION=ACCEPT ;;
+    2:--recover-start:--source-recovery-sha=*)
+      source_sha=${2#--source-recovery-sha=}
+      [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return "$EXIT_PRECONDITION"
+      OPENBAO_OPERATION=RECOVER_START
+      # shellcheck disable=SC2034
+      # The following recovery operation consumes this validated provenance value.
+      OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
+      ;;
+    2:--recover-verify:--source-recovery-sha=*)
+      source_sha=${2#--source-recovery-sha=}
+      [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return "$EXIT_PRECONDITION"
+      OPENBAO_OPERATION=RECOVER_VERIFY
+      # shellcheck disable=SC2034
+      # The following recovery operation consumes this validated provenance value.
+      OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
+      ;;
     *) return "$EXIT_PRECONDITION" ;;
   esac
 }
