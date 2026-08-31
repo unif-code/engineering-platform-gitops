@@ -7849,11 +7849,38 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
     DOCS_COMMIT = '0039d697237eb3f3a4a6238f47d4b971974a031e'
     DOCS_BASELINE = '2026-08-28.2'
     DEVIATION = 'DEV-005'
-    PUBLIC_KEY_FINGERPRINT = 'A' * 40
     PLATFORM_SECRET_FINGERPRINT = 'b' * 64
-    PUBLIC_KEY_BYTES = (
-        base64.b64encode(b'synthetic-openpgp-public-key' * 12) + b'\n'
+    _PUBLIC_RSA_MODULUS = b'\x80' + b'\x42' * 127
+    _PUBLIC_KEY_BODY = (
+        b'\x04\x00\x00\x00\x00\x01'
+        + b'\x04\x00'
+        + _PUBLIC_RSA_MODULUS
+        + b'\x00\x11\x01\x00\x01'
     )
+    _PUBLIC_KEY_PACKET = (
+        bytes((0xC0 | 6, len(_PUBLIC_KEY_BODY))) + _PUBLIC_KEY_BODY
+    )
+    _PUBLIC_SUBKEY_BODY = (
+        b'\x04\x00\x00\x00\x01\x01'
+        + b'\x04\x00'
+        + b'\x80'
+        + b'\x24' * 127
+        + b'\x00\x11\x01\x00\x01'
+    )
+    _PUBLIC_SUBKEY_PACKET = (
+        bytes((0xC0 | 14, len(_PUBLIC_SUBKEY_BODY))) + _PUBLIC_SUBKEY_BODY
+    )
+    PUBLIC_KEY_FINGERPRINT = hashlib.sha1(
+        b'\x99' + len(_PUBLIC_KEY_BODY).to_bytes(2, 'big') + _PUBLIC_KEY_BODY
+    ).hexdigest().upper()
+    _PUBLIC_SUBKEY_FINGERPRINT = hashlib.sha1(
+        b'\x99'
+        + len(_PUBLIC_SUBKEY_BODY).to_bytes(2, 'big')
+        + _PUBLIC_SUBKEY_BODY
+    ).hexdigest().upper()
+    PUBLIC_KEY_BYTES = base64.b64encode(
+        _PUBLIC_KEY_PACKET + _PUBLIC_SUBKEY_PACKET
+    ) + b'\n'
     PUBLIC_KEY_SHA256 = hashlib.sha256(PUBLIC_KEY_BYTES).hexdigest()
 
     @staticmethod
@@ -7863,10 +7890,53 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
 
     @staticmethod
-    def synthetic_ciphertext(label: str) -> str:
-        return base64.b64encode(
-            (f'synthetic-{label}-ciphertext:'.encode('ascii') + b'x' * 96)
-        ).decode('ascii')
+    def openpgp_packet(tag: int, body: bytes) -> bytes:
+        if len(body) < 192:
+            header = bytes((0xC0 | tag, len(body)))
+        elif len(body) < 8384:
+            encoded = len(body) - 192
+            header = bytes(
+                (0xC0 | tag, 192 + (encoded >> 8), encoded & 0xFF)
+            )
+        else:
+            header = bytes((0xC0 | tag, 255)) + len(body).to_bytes(4, 'big')
+        return header + body
+
+    @staticmethod
+    def openpgp_stream_packet(tag: int, body: bytes) -> bytes:
+        encoded = bytearray((0xC0 | tag,))
+        offset = 0
+        while offset < len(body):
+            power = (len(body) - offset).bit_length() - 1
+            length = 1 << power
+            encoded.append(224 + power)
+            encoded.extend(body[offset : offset + length])
+            offset += length
+        encoded.append(0)
+        return bytes(encoded)
+
+    @classmethod
+    def synthetic_ciphertext(
+        cls, label: str, *, recipient_key_id: bytes | None = None
+    ) -> str:
+        recipient_key_id = recipient_key_id or bytes.fromhex(
+            cls._PUBLIC_SUBKEY_FINGERPRINT[-16:]
+        )
+        seed = hashlib.sha256(label.encode('ascii')).digest()
+        encrypted_mpi = b'\x80' + (seed * 4)[1:128]
+        pkesk = (
+            b'\x03' + recipient_key_id + b'\x01\x04\x00' + encrypted_mpi
+        )
+        encrypted_payload = b'\x01' + seed * 3
+        message = cls.openpgp_packet(1, pkesk) + cls.openpgp_stream_packet(
+            18, encrypted_payload
+        )
+        return base64.b64encode(message).decode('ascii')
+
+    @staticmethod
+    def wrapped_plaintext(label: str) -> str:
+        payload = (f'synthetic-unencrypted-{label}:'.encode('ascii') + b'x' * 160)
+        return base64.b64encode(payload).decode('ascii')
 
     def make_source_bundle(
         self,
@@ -7917,6 +7987,10 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             metadata['git_commit'] = '2' * 40
         elif case == 'wrong-docs-baseline':
             metadata['docs_baseline'] = '2026-08-28.1'
+        elif case == 'wrong-docs-commit':
+            metadata['docs_commit'] = '4' * 40
+        elif case == 'wrong-deviation':
+            metadata['deviation'] = 'DEV-999'
         elif case == 'wrong-platform-fingerprint':
             metadata['platform_secret_fingerprint'] = 'c' * 64
         elif case == 'wrong-public-fingerprint':
@@ -7924,11 +7998,58 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             metadata['public_key_fingerprint'] = fingerprint
         elif case == 'wrong-share-count':
             init_document['unseal_shares'] = 4
+        elif case == 'wrong-share-array-count':
             init_document['unseal_keys_b64'] = init_document[
                 'unseal_keys_b64'
             ][:4]
         elif case == 'missing-root-token':
             del init_document['root_token']
+        elif case == 'threshold-drift':
+            init_document['unseal_threshold'] = 2
+        elif case == 'metadata-threshold-drift':
+            metadata['key_threshold'] = 2
+        elif case == 'duplicate-share':
+            init_document['unseal_keys_b64'][4] = init_document[
+                'unseal_keys_b64'
+            ][0]
+        elif case == 'base64-hex-mismatch':
+            init_document['unseal_keys_hex'][0] = '00' * 16
+        elif case == 'base64-wrapped-plaintext':
+            plaintext = self.wrapped_plaintext('share')
+            init_document['unseal_keys_b64'][0] = plaintext
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                plaintext
+            ).hex()
+        elif case == 'base64-wrapped-private-key-marker':
+            plaintext = base64.b64encode(
+                b'-----BEGIN PGP PRIVATE KEY BLOCK-----' + b'x' * 160
+            ).decode('ascii')
+            init_document['unseal_keys_b64'][0] = plaintext
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                plaintext
+            ).hex()
+        elif case == 'base64-wrapped-root-token':
+            init_document['root_token'] = self.wrapped_plaintext('root-token')
+        elif case == 'malformed-openpgp':
+            malformed = base64.b64encode(
+                b'\xc1\xff\x00\x00\x01\x00' + b'x' * 256
+            ).decode('ascii')
+            init_document['unseal_keys_b64'][0] = malformed
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                malformed
+            ).hex()
+        elif case == 'wrong-ciphertext-recipient':
+            ciphertext = self.synthetic_ciphertext(
+                'wrong-recipient', recipient_key_id=b'\x99' * 8
+            )
+            init_document['unseal_keys_b64'][0] = ciphertext
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                ciphertext
+            ).hex()
+        elif case == 'unexpected-recovery-key-data':
+            init_document['recovery_keys_b64'] = [
+                self.synthetic_ciphertext('unexpected-recovery-key')
+            ]
 
         members: list[tuple[tarfile.TarInfo, bytes | None]] = []
         root = tarfile.TarInfo(prefix)
@@ -7979,11 +8100,25 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             hostile_payload = None
         elif case == 'extra-member':
             hostile = tarfile.TarInfo(f'{prefix}/extra.json')
+        elif case == 'device':
+            hostile = tarfile.TarInfo(f'{prefix}/device')
+            hostile.type = tarfile.CHRTYPE
+            hostile.devmajor = 1
+            hostile.devminor = 3
+            hostile_payload = None
         if hostile is not None:
             hostile.mode = 0o600
             hostile.uid = hostile.gid = 0
             hostile.size = len(hostile_payload or b'')
             members.append((hostile, hostile_payload))
+        if case == 'duplicate-member':
+            duplicate_name = f'{prefix}/metadata.json'
+            duplicate_payload = files[duplicate_name]
+            duplicate = tarfile.TarInfo(duplicate_name)
+            duplicate.mode = 0o600
+            duplicate.uid = duplicate.gid = 0
+            duplicate.size = len(duplicate_payload)
+            members.append((duplicate, duplicate_payload))
 
         archive = directory / f'{prefix}.tar.gz'
         with tarfile.open(archive, 'w:gz') as stream:
@@ -8167,11 +8302,18 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertEqual(accepted.stdout, '')
 
         cases = (
-            'absolute-path', 'dot-dot', 'symlink', 'hardlink', 'fifo',
-            'extra-member', 'missing-member', 'wrong-schema', 'wrong-source-sha',
-            'wrong-docs-baseline', 'wrong-platform-fingerprint',
-            'wrong-public-fingerprint', 'wrong-share-count', 'missing-root-token',
-            'checksum-drift',
+            'absolute-path', 'dot-dot', 'symlink', 'hardlink', 'fifo', 'device',
+            'duplicate-member', 'extra-member', 'missing-member', 'wrong-schema',
+            'wrong-source-sha', 'wrong-docs-baseline', 'wrong-docs-commit',
+            'wrong-deviation', 'wrong-platform-fingerprint',
+            'wrong-public-fingerprint', 'wrong-share-count',
+            'wrong-share-array-count', 'threshold-drift',
+            'metadata-threshold-drift', 'duplicate-share',
+            'base64-hex-mismatch',
+            'base64-wrapped-plaintext', 'base64-wrapped-private-key-marker',
+            'base64-wrapped-root-token', 'malformed-openpgp',
+            'wrong-ciphertext-recipient', 'unexpected-recovery-key-data',
+            'missing-root-token', 'checksum-drift',
         )
         for case in cases:
             with self.subTest(case=case):
