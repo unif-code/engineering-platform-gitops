@@ -25,6 +25,10 @@ OPENBAO_RECOVERY_ARCHIVE=
 OPENBAO_RECOVERY_SIDECAR=
 OPENBAO_SOURCE_RECOVERY_ARCHIVE=
 OPENBAO_SOURCE_RECOVERY_SIDECAR=
+OPENBAO_ROTATION_CANDIDATE_DIRECTORY=
+OPENBAO_ROTATION_CANDIDATE_ARCHIVE=
+OPENBAO_ROTATION_CANDIDATE_SIDECAR=
+OPENBAO_ROTATION_VERIFIED_MARKER=
 OPENBAO_SECRET_INPUT=
 OPENBAO_REMOTE_HOME=
 OPENBAO_REMOTE_SESSION_KIND=
@@ -78,6 +82,48 @@ openbao_initialize_ceremony_paths() {
   OPENBAO_RECOVERY_DIRECTORY=${OPENBAO_RECOVERY_ROOT}/openbao-recovery-${commit}
   OPENBAO_RECOVERY_ARCHIVE=${OPENBAO_RECOVERY_ROOT}/openbao-recovery-${commit}.tar.gz
   OPENBAO_RECOVERY_SIDECAR=${OPENBAO_RECOVERY_ARCHIVE}.sha256
+  openbao_rotation_artifact_paths
+}
+
+openbao_rotation_artifact_paths() {
+  [[ "$OPENBAO_RECOVERY_ID" =~ ^[0-9a-f]{40}$ ]] || return 1
+  OPENBAO_ROTATION_CANDIDATE_DIRECTORY=${OPENBAO_RECOVERY_ROOT}/openbao-recovery-rotation-candidate-${OPENBAO_RECOVERY_ID}
+  OPENBAO_ROTATION_CANDIDATE_ARCHIVE=${OPENBAO_ROTATION_CANDIDATE_DIRECTORY}.tar.gz
+  OPENBAO_ROTATION_CANDIDATE_SIDECAR=${OPENBAO_ROTATION_CANDIDATE_ARCHIVE}.sha256
+  OPENBAO_RECOVERY_DIRECTORY=${OPENBAO_RECOVERY_ROOT}/openbao-recovery-${OPENBAO_RECOVERY_ID}
+  OPENBAO_RECOVERY_ARCHIVE=${OPENBAO_RECOVERY_DIRECTORY}.tar.gz
+  OPENBAO_RECOVERY_SIDECAR=${OPENBAO_RECOVERY_ARCHIVE}.sha256
+  OPENBAO_ROTATION_VERIFIED_MARKER=${OPENBAO_RECOVERY_ROOT}/openbao-rotation-${OPENBAO_RECOVERY_ID}.verified.json
+}
+
+openbao_rotation_artifact_presence_state() {
+  local candidate_count=0 final_count=0 marker=false path
+  for path in "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY" \
+      "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+      "$OPENBAO_ROTATION_CANDIDATE_SIDECAR"; do
+    [[ -e "$path" || -L "$path" ]] && ((candidate_count += 1))
+  done
+  for path in "$OPENBAO_RECOVERY_DIRECTORY" "$OPENBAO_RECOVERY_ARCHIVE" \
+      "$OPENBAO_RECOVERY_SIDECAR"; do
+    [[ -e "$path" || -L "$path" ]] && ((final_count += 1))
+  done
+  [[ -e "$OPENBAO_ROTATION_VERIFIED_MARKER" || \
+     -L "$OPENBAO_ROTATION_VERIFIED_MARKER" ]] && marker=true
+  if (( candidate_count == 0 && final_count == 0 )) && \
+      [[ "$marker" == false ]]; then
+    printf 'MISSING\n'
+  elif (( candidate_count == 3 && final_count == 0 )) && \
+      [[ "$marker" == false ]]; then
+    printf 'CANDIDATE\n'
+  elif (( candidate_count == 3 && final_count == 3 )) && \
+      [[ "$marker" == false ]]; then
+    printf 'FINAL\n'
+  elif (( candidate_count == 3 && final_count == 3 )) && \
+      [[ "$marker" == true ]]; then
+    printf 'VERIFIED\n'
+  else
+    printf 'UNSAFE\n'
+  fi
 }
 
 openbao_public_key_is_valid() {
@@ -143,6 +189,107 @@ openbao_source_recovery_bundle_is_valid() {
     "$OPENBAO_SOURCE_RECOVERY_SHA" "$OPENBAO_DOCS_COMMIT" \
     "$OPENBAO_DOCS_BASELINE" "$OPENBAO_DEVIATION" "$public_key_sha" \
     "$fingerprint" "$platform_fingerprint"
+}
+
+openbao_cluster_identity_sha256() {
+  local cluster_id=$1 cluster_name=$2
+  "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" \
+    cluster-identity-sha256 --cluster-id "$cluster_id" \
+    --cluster-name "$cluster_name"
+}
+
+openbao_rotation_candidate_is_valid() {
+  local cluster_digest=$1 fingerprint public_key_sha source_digest
+  openbao_rotation_artifact_paths || return 1
+  openbao_source_recovery_bundle_is_valid || return 1
+  safe_owned_directory "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY" 0 || return 1
+  safe_file "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" 600 || return 1
+  safe_file "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" 600 || return 1
+  public_key_sha=$(sha256_file "$OPENBAO_PUBLIC_KEY") || return 1
+  source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
+  fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
+  "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" validate-candidate \
+    --archive "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+    --sidecar "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" \
+    --current-sha "$OPENBAO_RECOVERY_ID" \
+    --source-sha "$OPENBAO_SOURCE_RECOVERY_SHA" \
+    --source-bundle-sha256 "$source_digest" \
+    --public-key-sha256 "$public_key_sha" \
+    --public-key-fingerprint "$fingerprint" \
+    --cluster-identity-sha256 "$cluster_digest"
+}
+
+openbao_build_rotation_candidate() {
+  local response=$1 response_kind=$2 cluster_id=$3 cluster_name=$4
+  local verification_nonce=${5:-} cluster_digest source_digest
+  local -a nonce_arguments=()
+  openbao_rotation_artifact_paths || return 1
+  openbao_source_recovery_bundle_is_valid || return 1
+  safe_file "$response" 600 || return 1
+  cluster_digest=$(
+    openbao_cluster_identity_sha256 "$cluster_id" "$cluster_name"
+  ) || return 1
+  source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
+  if [[ -n "$verification_nonce" ]]; then
+    nonce_arguments=(--verification-nonce "$verification_nonce")
+  fi
+  "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" build-candidate \
+    --response "$response" --response-kind "$response_kind" \
+    "${nonce_arguments[@]}" \
+    --archive "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+    --sidecar "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" \
+    --current-sha "$OPENBAO_RECOVERY_ID" \
+    --source-sha "$OPENBAO_SOURCE_RECOVERY_SHA" \
+    --source-bundle-sha256 "$source_digest" \
+    --public-key "$OPENBAO_PUBLIC_KEY" \
+    --public-key-fingerprint-file "$OPENBAO_PUBLIC_KEY_FINGERPRINT" \
+    --cluster-id "$cluster_id" --cluster-name "$cluster_name" \
+    --key-shares 5 --key-threshold 3 || return 1
+  openbao_rotation_candidate_is_valid "$cluster_digest"
+}
+
+openbao_rotation_final_is_valid() {
+  local cluster_digest=$1 fingerprint public_key_sha source_digest
+  openbao_rotation_artifact_paths || return 1
+  openbao_source_recovery_bundle_is_valid || return 1
+  safe_owned_directory "$OPENBAO_RECOVERY_DIRECTORY" 0 || return 1
+  safe_file "$OPENBAO_RECOVERY_ARCHIVE" 600 || return 1
+  safe_file "$OPENBAO_RECOVERY_SIDECAR" 600 || return 1
+  public_key_sha=$(sha256_file "$OPENBAO_PUBLIC_KEY") || return 1
+  source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
+  fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
+  "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" validate-final \
+    --archive "$OPENBAO_RECOVERY_ARCHIVE" \
+    --sidecar "$OPENBAO_RECOVERY_SIDECAR" \
+    --current-sha "$OPENBAO_RECOVERY_ID" \
+    --source-sha "$OPENBAO_SOURCE_RECOVERY_SHA" \
+    --source-bundle-sha256 "$source_digest" \
+    --public-key-sha256 "$public_key_sha" \
+    --public-key-fingerprint "$fingerprint" \
+    --cluster-identity-sha256 "$cluster_digest"
+}
+
+openbao_build_rotation_final() {
+  local cluster_digest=$1 verified_at_utc=$2 fingerprint public_key_sha
+  local source_digest
+  openbao_rotation_artifact_paths || return 1
+  openbao_rotation_candidate_is_valid "$cluster_digest" || return 1
+  public_key_sha=$(sha256_file "$OPENBAO_PUBLIC_KEY") || return 1
+  source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
+  fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
+  "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" build-final \
+    --candidate-archive "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+    --candidate-sidecar "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" \
+    --archive "$OPENBAO_RECOVERY_ARCHIVE" \
+    --sidecar "$OPENBAO_RECOVERY_SIDECAR" \
+    --current-sha "$OPENBAO_RECOVERY_ID" \
+    --source-sha "$OPENBAO_SOURCE_RECOVERY_SHA" \
+    --source-bundle-sha256 "$source_digest" \
+    --public-key-sha256 "$public_key_sha" \
+    --public-key-fingerprint "$fingerprint" \
+    --cluster-identity-sha256 "$cluster_digest" \
+    --verified-at-utc "$verified_at_utc" || return 1
+  openbao_rotation_final_is_valid "$cluster_digest"
 }
 
 openbao_state_flags() {
