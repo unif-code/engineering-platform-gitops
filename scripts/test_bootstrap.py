@@ -8644,6 +8644,232 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             'start', 'configure', 'revoke', 'cleanup',
         ])
 
+    def test_root_revoke_requires_exact_silent_auth_denial(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        fake_bao = binary_directory / 'bao'
+        fake_bao.write_text(textwrap.dedent(
+            '''
+            #!/bin/sh
+            case "$*" in
+              'token revoke -self') exit 0 ;;
+              'token lookup -format=json')
+                cat "$OPENBAO_TEST_LOOKUP_ERROR_FILE" >&2
+                exit 2
+                ;;
+              *) exit 1 ;;
+            esac
+            '''
+        ).lstrip(), encoding='utf-8')
+        fake_bao.chmod(0o755)
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            export PATH=$2:$PATH
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            kubectl_run() {
+              while (($#)); do
+                if [[ "$1" == -- ]]; then
+                  shift
+                  break
+                fi
+                shift
+              done
+              "$@"
+            }
+            set +e
+            openbao_root_session_revoke
+            rc=$?
+            set -e
+            printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+            '''
+        )
+        cases = (
+            (
+                'denied',
+                'Error looking up token: Error making API request.\n\n'
+                'URL: GET https://openbao.example.invalid/v1/auth/token/lookup-self\n'
+                'Code: 403. Errors:\n\n* permission denied\n',
+                'RC=0\nHOME=/tmp/openbao-stage180.ABC123\nKIND=\n',
+            ),
+            (
+                'transport',
+                'Error looking up token: Get "https://openbao.example.invalid": '
+                'connection refused\n',
+                'RC=1\nHOME=/tmp/openbao-stage180.ABC123\nKIND=root\n',
+            ),
+        )
+        for name, lookup_error, expected_state in cases:
+            with self.subTest(name=name):
+                error_file = temporary / f'{name}.txt'
+                error_file.write_text(lookup_error, encoding='utf-8')
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'root-revoke',
+                        str(OPENBAO_INITIALIZE_LIB), str(binary_directory),
+                    ],
+                    env=self.sanitized_environment(
+                        BOOTSTRAP_TEST_MODE='1',
+                        OPENBAO_TEST_LOOKUP_ERROR_FILE=str(error_file),
+                    ),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected_state)
+                self.assertEqual(result.stderr, '')
+                self.assertNotIn('Code:', result.stdout)
+                self.assertNotIn('permission denied', result.stdout)
+                self.assertNotIn('connection refused', result.stdout)
+
+    def test_probe_start_failures_cleanup_pending_home_without_revoke(
+        self,
+    ) -> None:
+        for failed_stage in ('token-create', 'exchange', 'login'):
+            with self.subTest(failed_stage=failed_stage):
+                command_log = self.temporary_directory() / 'probe.log'
+                script = textwrap.dedent(
+                    '''
+                    set -o pipefail
+                    source "$1"
+                    OPENBAO_TEST_FAILED_STAGE=$2
+                    OPENBAO_TEST_COMMAND_LOG=$3
+                    kubectl_run() {
+                      case " $* " in
+                        *' mktemp -d /tmp/openbao-stage180.XXXXXX '*)
+                          printf 'home-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          printf '/tmp/openbao-stage180.ABC123\n'
+                          ;;
+                        *' create token openbao-runtime-probe '*)
+                          printf 'token-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          [[ "$OPENBAO_TEST_FAILED_STAGE" != token-create ]] ||
+                            return 1
+                          printf 'synthetic-jwt\n'
+                          ;;
+                        *' bao write -field=token auth/kubernetes/login '*)
+                          cat >/dev/null
+                          printf 'exchange\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          [[ "$OPENBAO_TEST_FAILED_STAGE" != exchange ]] ||
+                            return 1
+                          printf 'synthetic-session-token\n'
+                          ;;
+                        *' bao login -no-print '*)
+                          cat >/dev/null
+                          printf 'login\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          [[ "$OPENBAO_TEST_FAILED_STAGE" != login ]] ||
+                            return 1
+                          ;;
+                        *' bao token revoke -self '*)
+                          printf 'revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          return 1
+                          ;;
+                        *' rm -f -- "$1/.bao-token"; rmdir -- "$1" '*)
+                          printf 'cleanup-remove\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          ;;
+                        *) return 1 ;;
+                      esac
+                    }
+                    set +e
+                    openbao_auth_probe
+                    rc=$?
+                    set -e
+                    printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+                      "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+                    '''
+                )
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'probe-start-failure',
+                        str(OPENBAO_INITIALIZE_LIB), failed_stage,
+                        str(command_log),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'RC=1\nHOME=\nKIND=\n')
+                logged = command_log.read_text(encoding='utf-8')
+                self.assertIn('cleanup-remove\n', logged)
+                self.assertNotIn('revoke\n', logged)
+
+    def test_authenticated_probe_revoke_failure_retains_cleanup_handle(
+        self,
+    ) -> None:
+        command_log = self.temporary_directory() / 'probe-cleanup.log'
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_TEST_COMMAND_LOG=$2
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=probe
+            kubectl_run() {
+              case " $* " in
+                *' bao token revoke -self '*)
+                  printf 'revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  return 1
+                  ;;
+                *' rm -f -- "$1/.bao-token"; rmdir -- "$1" '*)
+                  printf 'cleanup-remove\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            set +e
+            openbao_remote_session_cleanup
+            rc=$?
+            set -e
+            printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'probe-cleanup-retain',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RC=1\nHOME=/tmp/openbao-stage180.ABC123\nKIND=probe\n',
+        )
+        self.assertEqual(command_log.read_text(encoding='utf-8'), 'revoke\n')
+
+    def test_remote_home_create_refuses_to_overwrite_cleanup_handle(self) -> None:
+        command_log = self.temporary_directory() / 'home-create.log'
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_TEST_COMMAND_LOG=$2
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.RETAIN
+            OPENBAO_REMOTE_SESSION_KIND=probe
+            kubectl_run() {
+              printf 'unexpected-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+              printf '/tmp/openbao-stage180.NEW123\n'
+            }
+            set +e
+            openbao_remote_home_create probe-pending
+            rc=$?
+            set -e
+            printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'home-create-retain',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RC=1\nHOME=/tmp/openbao-stage180.RETAIN\nKIND=probe\n',
+        )
+        self.assertFalse(command_log.exists())
+
     def test_remote_session_cleanup_failure_blocks_success(self) -> None:
         script = textwrap.dedent(
             '''

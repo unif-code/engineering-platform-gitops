@@ -362,6 +362,9 @@ env BAO_ADDR=https://openbao.openbao.svc:8200 \
 
 openbao_remote_home_create() {
   local kind=$1 path
+  [[ -z "$OPENBAO_REMOTE_HOME" && -z "$OPENBAO_REMOTE_SESSION_KIND" ]] ||
+    return 1
+  [[ "$kind" == root || "$kind" == probe-pending ]] || return 1
   path=$(kubectl_run --namespace=openbao exec pod/openbao-0 -- /bin/sh -c \
     'umask 077; mktemp -d /tmp/openbao-stage180.XXXXXX') || return 1
   [[ "$path" =~ ^/tmp/openbao-stage180\.[A-Za-z0-9]{6}$ ]] || return 1
@@ -409,13 +412,19 @@ openbao_bao_stdin() {
 
 openbao_remote_session_cleanup() {
   local path=$OPENBAO_REMOTE_HOME kind=$OPENBAO_REMOTE_SESSION_KIND
-  [[ -n "$path" ]] || return 0
+  if [[ -z "$path" ]]; then
+    [[ -z "$kind" ]]
+    return
+  fi
+  [[ "$path" =~ ^/tmp/openbao-stage180\.[A-Za-z0-9]{6}$ ]] || return 1
   if [[ "$kind" == probe ]]; then
     kubectl_run --namespace=openbao exec pod/openbao-0 -- env HOME="$path" \
       BAO_ADDR=https://openbao.openbao.svc:8200 \
       BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
       bao token revoke -self >/dev/null 2>&1 || return 1
-    OPENBAO_REMOTE_SESSION_KIND=
+    OPENBAO_REMOTE_SESSION_KIND=probe-pending
+  elif [[ "$kind" != root && "$kind" != probe-pending && -n "$kind" ]]; then
+    return 1
   fi
   # $1 is intentionally expanded by the remote shell.
   # shellcheck disable=SC2016
@@ -626,10 +635,40 @@ openbao_apply_configuration() {
 
 openbao_root_session_revoke() {
   openbao_bao token revoke -self >/dev/null || return 1
-  if openbao_bao token lookup -format=json >/dev/null 2>&1; then
-    return 1
-  fi
+  openbao_root_session_revocation_is_proven || return 1
   OPENBAO_REMOTE_SESSION_KIND=
+}
+
+openbao_root_session_revocation_is_proven() {
+  local path=$OPENBAO_REMOTE_HOME
+  [[ "$OPENBAO_REMOTE_SESSION_KIND" == root ]] || return 1
+  [[ "$path" =~ ^/tmp/openbao-stage180\.[A-Za-z0-9]{6}$ ]] || return 1
+  # The lookup error is bounded and inspected only inside the container. Nothing
+  # from stdout, stderr, or token metadata crosses the kubectl boundary.
+  # shellcheck disable=SC2016
+  kubectl_run --namespace=openbao exec pod/openbao-0 -- /bin/sh -c '
+set -eu
+umask 077
+error=$(mktemp /tmp/openbao-root-revoke.XXXXXX)
+status=$(mktemp /tmp/openbao-root-revoke-status.XXXXXX)
+trap '\''rm -f -- "$error" "$status"'\'' EXIT HUP INT TERM
+(
+  set +e
+  env HOME="$1" \
+      BAO_ADDR=https://openbao.openbao.svc:8200 \
+      BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+      bao token lookup -format=json >/dev/null
+  printf "%s\n" "$?" >"$status"
+  exit 0
+) 2>&1 | head -c 4097 >"$error"
+rc=$(cat "$status")
+case "$rc" in ""|*[!0-9]*) exit 1 ;; esac
+[ "$rc" -ne 0 ] || exit 1
+bytes=$(wc -c <"$error")
+[ "$bytes" -gt 0 ] && [ "$bytes" -le 4096 ] || exit 1
+grep -Fqx "Code: 403. Errors:" "$error" || exit 1
+grep -Fqx "* permission denied" "$error"
+' revoke-proof "$path" >/dev/null 2>&1
 }
 
 openbao_apply_configuration_with_root() {
@@ -645,12 +684,13 @@ openbao_apply_configuration_with_root() {
 }
 
 openbao_probe_session_start() {
-  openbao_remote_home_create probe || return 1
+  openbao_remote_home_create probe-pending || return 1
   kubectl_run --namespace=openbao create token openbao-runtime-probe \
     --audience=openbao --duration=10m |
     openbao_bao_stdin write -field=token auth/kubernetes/login \
       role=openbao-runtime-probe jwt=- |
-    openbao_bao_stdin login -no-print >/dev/null
+    openbao_bao_stdin login -no-print >/dev/null || return 1
+  OPENBAO_REMOTE_SESSION_KIND=probe
 }
 
 openbao_auth_probe() {
