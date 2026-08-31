@@ -2,9 +2,11 @@
 # 运维一行入口：校验已批准的提交与仓库状态后，在干净环境中执行 bootstrap-all
 # 或显式的 Stage 180 OpenBao 人工仪式入口。
 # 用法：scripts/bootstrap/run-approved.sh [<approved-sha>] --check|--apply
-#       scripts/bootstrap/run-approved.sh [<approved-sha>] --check --stage=180
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --check --stage=180 \
+#         --source-recovery-sha=<40-lowercase-hex>
 #       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
-#         --operation=initialize|configure|accept
+#         --operation=initialize|configure|accept|recover-start|recover-verify \
+#         [--source-recovery-sha=<40-lowercase-hex>]
 # 不带 SHA 时使用 CI 在 validation-gate 全绿后发布的 origin/validated；它必须仍在
 # origin/main 历史上，否则 fail-closed，杜绝部署未经门禁或已被回滚的提交。
 # 门禁与既往人工粘贴的脚本一致（SHA、origin、main、干净树、ff-only、helm 残留、
@@ -16,9 +18,10 @@ umask 022
 
 usage() {
   printf 'usage: %s [<approved-sha>] --check|--apply\n' "${0##*/}" >&2
-  printf '       %s [<approved-sha>] --check --stage=180\n' "${0##*/}" >&2
+  printf '       %s [<approved-sha>] --check --stage=180 ' "${0##*/}" >&2
+  printf '%s\n' '--source-recovery-sha=<40-lowercase-hex>' >&2
   printf '       %s [<approved-sha>] --apply --stage=180 ' "${0##*/}" >&2
-  printf '%s\n' '--operation=initialize|configure|accept' >&2
+  printf '%s\n' '--operation=initialize|configure|accept|recover-start|recover-verify' >&2
   printf '  省略 SHA 时使用 CI 发布的 origin/validated\n' >&2
   exit 2
 }
@@ -35,32 +38,16 @@ case "$mode" in
   --check|--apply) ;;
   *) usage ;;
 esac
-target=bootstrap
-target_argument=$mode
-case $# in
-  0) ;;
-  1)
-    if [[ "$mode" == --check && "$1" == --stage=180 ]]; then
-      target=openbao-initialize
-      target_argument=--check
-    else
-      usage
-    fi
-    ;;
-  2)
-    if [[ "$mode" != --apply || "$1" != --stage=180 ]]; then
-      usage
-    fi
-    target=openbao-initialize
-    case "$2" in
-      --operation=initialize) target_argument=--initialize ;;
-      --operation=configure) target_argument=--configure ;;
-      --operation=accept) target_argument=--accept ;;
-      *) usage ;;
-    esac
-    ;;
-  *) usage ;;
+script_source=${BASH_SOURCE[0]}
+case "$script_source" in
+  /*) ;;
+  *) script_source="$PWD/$script_source" ;;
 esac
+script_dir=$(cd "${script_source%/*}" && pwd -P)
+# shellcheck disable=SC1091
+source "${script_dir}/lib/run-approved-args.sh"
+run_approved_parse_arguments "$mode" "$@" || usage
+target=$RUN_APPROVED_TARGET
 if [[ -n "$approved_sha" && ! "$approved_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo 'STOP: invalid approved SHA'
   exit 90
@@ -70,12 +57,6 @@ if [[ "$mode" == --apply && "$EUID" -ne 0 ]]; then
   exit 91
 fi
 
-script_source=${BASH_SOURCE[0]}
-case "$script_source" in
-  /*) ;;
-  *) script_source="$PWD/$script_source" ;;
-esac
-script_dir=$(cd "${script_source%/*}" && pwd -P)
 repo=$(cd "${script_dir}/../.." && pwd -P)
 
 [[ -d "$repo/.git" && ! -L "$repo" ]] || {
@@ -126,6 +107,22 @@ else
   }
   approved_source=origin/validated
 fi
+if [[ "$target" == openbao-initialize ]]; then
+  /usr/bin/git -C "$repo" fetch --force origin \
+    'refs/heads/validated:refs/remotes/origin/validated' >/dev/null 2>&1 || {
+    echo 'STOP: validated ref unavailable (CI publishes it after validation-gate)'
+    exit 99
+  }
+  [[ "$(/usr/bin/git -C "$repo" rev-parse origin/main)" == "$approved_sha" &&
+     "$(/usr/bin/git -C "$repo" rev-parse --verify --quiet \
+       'refs/remotes/origin/validated^{commit}')" == "$approved_sha" ]] || {
+    echo 'STOP: Stage 180 requires main and validated to match approved SHA'
+    exit 102
+  }
+fi
+# shellcheck disable=SC2034
+# Kept as the reviewed wrapper output alongside the parser globals above.
+RUN_APPROVED_SHA=$approved_sha
 printf 'APPROVED_SHA=%s (source=%s)\n' "$approved_sha" "$approved_source"
 /usr/bin/git -C "$repo" merge --ff-only "$approved_sha"
 [[ "$(/usr/bin/git -C "$repo" rev-parse HEAD)" == "$approved_sha" ]] || {
@@ -154,7 +151,7 @@ case "$target" in
 esac
 set +e
 /usr/bin/env -i HOME="${HOME:-/root}" PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-  /bin/bash -p "$target_script" "$target_argument"
+  /bin/bash -p "$target_script" "${RUN_APPROVED_TARGET_ARGUMENTS[@]}"
 rc=$?
 set -e
 printf 'COMMAND_EXIT_CODE=%s\n' "$rc"

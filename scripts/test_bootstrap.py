@@ -57,6 +57,7 @@ FINAL_VERIFY = ROOT / STAGE_SCRIPTS['90']
 FLUX_PHASE_A = ROOT / STAGE_SCRIPTS['100']
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
+RUN_APPROVED_ARGS = ROOT / 'scripts/bootstrap/lib/run-approved-args.sh'
 OPENBAO_RUNTIME = ROOT / STAGE_SCRIPTS['170']
 OPENBAO_RUNTIME_LIB = ROOT / 'scripts/bootstrap/lib/openbao-runtime.sh'
 OPENBAO_INITIALIZE = (
@@ -3374,6 +3375,11 @@ class RunApprovedTest(BootstrapTestCase):
         scripts.mkdir(parents=True)
         (scripts / 'run-approved.sh').write_bytes(RUN_APPROVED.read_bytes())
         (scripts / 'run-approved.sh').chmod(0o755)
+        args_parser = scripts / 'lib/run-approved-args.sh'
+        if RUN_APPROVED_ARGS.is_file():
+            args_parser.parent.mkdir(parents=True, exist_ok=True)
+            args_parser.write_bytes(RUN_APPROVED_ARGS.read_bytes())
+            args_parser.chmod(0o755)
         self.write_executable(
             scripts / 'bootstrap-all.sh',
             '#!/bin/bash\n'
@@ -3385,6 +3391,11 @@ class RunApprovedTest(BootstrapTestCase):
             scripts / 'stages/180-openbao-initialize/run.sh',
             '#!/bin/bash\n'
             'printf \'FAKE_OPENBAO_OPERATION=%s\\n\' "$1"\n'
+            'index=0\n'
+            'for argument in "$@"; do\n'
+            '  printf \'FAKE_OPENBAO_ARG[%s]=%s\\n\' "$index" "$argument"\n'
+            '  index=$((index + 1))\n'
+            'done\n'
             'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
             'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
         )
@@ -3436,6 +3447,143 @@ class RunApprovedTest(BootstrapTestCase):
             env=environment,
         )
 
+    def run_argument_parser(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                '/bin/bash', '-c',
+                'source "$1" || exit $?\n'
+                'shift\n'
+                'run_approved_parse_arguments "$@" || exit $?\n'
+                'printf \'TARGET=%s\\n\' "$RUN_APPROVED_TARGET"\n'
+                'printf \'MODE=%s\\n\' "$RUN_APPROVED_MODE"\n'
+                'for index in "${!RUN_APPROVED_TARGET_ARGUMENTS[@]}"; do\n'
+                '  printf \'ARG[%s]=%s\\n\' "$index" '
+                '"${RUN_APPROVED_TARGET_ARGUMENTS[$index]}"\n'
+                'done\n',
+                'run-approved-parser-test', str(RUN_APPROVED_ARGS), *arguments,
+            ],
+            capture_output=True, text=True, check=False,
+            env=self.sanitized_environment(),
+        )
+
+    def run_openbao_operation_parser(
+        self, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                '/bin/bash', '-c',
+                'source "$1"\n'
+                'shift\n'
+                'openbao_parse_operation "$@" || exit $?\n'
+                'printf \'OPERATION=%s\\n\' "$OPENBAO_OPERATION"\n'
+                'printf \'SOURCE=%s\\n\' "$OPENBAO_SOURCE_RECOVERY_SHA"\n',
+                'openbao-operation-parser-test', str(OPENBAO_INITIALIZE_LIB), *arguments,
+            ],
+            capture_output=True, text=True, check=False,
+            env=self.sanitized_environment(),
+        )
+
+    def test_incident_operations_require_exact_source_sha_argv(self) -> None:
+        source = 'a' * 40
+        accepted = (
+            ('--check', '--stage=180', f'--source-recovery-sha={source}'),
+            ('--apply', '--stage=180', '--operation=recover-start',
+             f'--source-recovery-sha={source}'),
+            ('--apply', '--stage=180', '--operation=recover-verify',
+             f'--source-recovery-sha={source}'),
+        )
+        rejected = (
+            ('--apply', '--stage=180', '--operation=recover-start'),
+            ('--apply', '--stage=180', '--operation=accept',
+             f'--source-recovery-sha={source}'),
+            ('--apply', '--stage=180', '--operation=recover-start',
+             '--source-recovery-sha=' + 'A' * 40),
+            ('--apply', '--stage=180', '--operation=recover-start',
+             f'--source-recovery-sha={source}', '--extra'),
+        )
+        expected = (
+            ('openbao-initialize', '--check'),
+            ('openbao-initialize', '--recover-start'),
+            ('openbao-initialize', '--recover-verify'),
+        )
+
+        for arguments, (target, operation) in zip(accepted, expected):
+            with self.subTest(arguments=arguments):
+                result = self.run_argument_parser(*arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        f'TARGET={target}',
+                        f'MODE={arguments[0]}',
+                        f'ARG[0]={operation}',
+                        f'ARG[1]=--source-recovery-sha={source}',
+                    ],
+                )
+
+        for arguments in rejected:
+            with self.subTest(arguments=arguments):
+                result = self.run_argument_parser(*arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_openbao_operation_parser_revalidates_incident_source_sha(self) -> None:
+        source = 'a' * 40
+        accepted = (
+            ('--check', f'--source-recovery-sha={source}', 'CHECK'),
+            ('--recover-start', f'--source-recovery-sha={source}', 'RECOVER_START'),
+            ('--recover-verify', f'--source-recovery-sha={source}', 'RECOVER_VERIFY'),
+        )
+
+        for operation, source_argument, expected_operation in accepted:
+            with self.subTest(operation=operation):
+                result = self.run_openbao_operation_parser(operation, source_argument)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        f'OPERATION={expected_operation}',
+                        f'SOURCE={source}',
+                    ],
+                )
+
+        result = self.run_openbao_operation_parser(
+            '--recover-start', '--source-recovery-sha=' + 'A' * 40,
+        )
+        self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+
+    def test_stage_180_check_forwards_only_the_validated_incident_argv(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        source = 'a' * 40
+
+        result = self.run_wrapper(
+            clone, '--check', '--stage=180', f'--source-recovery-sha={source}',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAKE_OPENBAO_ARG[0]=--check', result.stdout)
+        self.assertIn(
+            f'FAKE_OPENBAO_ARG[1]=--source-recovery-sha={source}', result.stdout,
+        )
+        self.assertNotIn('FAKE_OPENBAO_ARG[2]=', result.stdout)
+
+    def test_stage_180_requires_main_and_validated_to_match_before_launch(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        (seed / 'unvalidated.txt').write_text('later\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'not yet validated', cwd=seed)
+        self.git('push', '-q', 'origin', 'main', cwd=seed)
+
+        result = self.run_wrapper(
+            clone, '--check', '--stage=180',
+            '--source-recovery-sha=' + 'a' * 40,
+        )
+
+        self.assertEqual(result.returncode, 102, result.stdout + result.stderr)
+        self.assertIn('STOP: Stage 180 requires main and validated to match', result.stdout)
+        self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
+
     def test_gates_then_launches_bootstrap_in_clean_environment(self) -> None:
         clone, approved, _ = self.make_gated_repo()
 
@@ -3456,15 +3604,21 @@ class RunApprovedTest(BootstrapTestCase):
         self.assertEqual(head, approved)
 
     def test_routes_stage_180_check_through_the_same_gates(self) -> None:
-        clone, approved, _ = self.make_gated_repo()
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        source = 'a' * 40
 
         result = self.run_wrapper(
             clone, approved, '--check', '--stage=180',
+            f'--source-recovery-sha={source}',
             extra_env={'KUBECACHEDIR': '/dev/null', 'PYTHONDONTWRITEBYTECODE': '1'},
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('FAKE_OPENBAO_OPERATION=--check', result.stdout)
+        self.assertIn(
+            f'FAKE_OPENBAO_ARG[1]=--source-recovery-sha={source}', result.stdout,
+        )
         self.assertNotIn('FAKE_MODE=', result.stdout)
         self.assertIn('KUBECACHEDIR_SEEN=ABSENT', result.stdout)
         self.assertIn('PYTHON_SEEN=ABSENT', result.stdout)
@@ -3485,6 +3639,7 @@ class RunApprovedTest(BootstrapTestCase):
         for arguments in (
             (approved, '--apply', '--stage=180'),
             (approved, '--check', '--stage=180', '--operation=initialize'),
+            (approved, '--check', '--stage=180'),
             (approved, '--apply', '--stage=180', '--operation=check'),
             (approved, '--check', '--stage=170'),
         ):
