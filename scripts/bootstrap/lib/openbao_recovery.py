@@ -18,6 +18,7 @@ import re
 import stat
 import sys
 import tarfile
+import zlib
 from typing import Any
 
 
@@ -219,27 +220,91 @@ def _artifact_snapshot(
 
 
 def _bounded_uncompressed_tar(archive_bytes: bytes) -> bytes:
+    if (
+        len(archive_bytes) < 18
+        or archive_bytes[:3] != b'\x1f\x8b\x08'
+        or archive_bytes[3] != 0
+    ):
+        _reject('noncanonical gzip header')
+    gzip_mtime = int.from_bytes(archive_bytes[4:8], 'little')
+    if gzip_mtime != 0 or (
+        archive_bytes[8], archive_bytes[9]
+    ) not in {(2, 255), (0, 3)}:
+        _reject('noncanonical gzip metadata')
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(archive_bytes), mode='rb') as stream:
-            uncompressed = stream.read(MAX_UNCOMPRESSED_ARCHIVE_BYTES + 1)
-    except (OSError, EOFError) as error:
+        uncompressed = decompressor.decompress(
+            archive_bytes[10:], MAX_UNCOMPRESSED_ARCHIVE_BYTES + 1
+        )
+    except zlib.error as error:
         raise RecoveryValidationError('invalid compressed archive') from error
-    if len(uncompressed) > MAX_UNCOMPRESSED_ARCHIVE_BYTES:
+    if (
+        len(uncompressed) > MAX_UNCOMPRESSED_ARCHIVE_BYTES
+        or not decompressor.eof
+        or decompressor.unconsumed_tail
+    ):
         _reject('uncompressed archive too large')
+    trailer = decompressor.unused_data
+    if len(trailer) != 8:
+        _reject('multiple or trailing gzip data')
+    expected_crc = int.from_bytes(trailer[:4], 'little')
+    expected_size = int.from_bytes(trailer[4:], 'little')
+    if (
+        expected_crc != zlib.crc32(uncompressed) & 0xFFFFFFFF
+        or expected_size != len(uncompressed) & 0xFFFFFFFF
+    ):
+        _reject('invalid gzip trailer')
     return uncompressed
 
 
-def _validate_member_extensions(member: tarfile.TarInfo) -> None:
-    header_span = member.offset_data - member.offset
-    if member.pax_headers:
-        if (
-            member.pax_headers != {'path': member.name}
-            or len(member.name.encode('utf-8')) <= tarfile.LENGTH_NAME
-            or header_span != 3 * tarfile.BLOCKSIZE
-        ):
-            _reject('noncanonical archive extension')
-    elif header_span != tarfile.BLOCKSIZE:
+def _canonical_member_header(member: tarfile.TarInfo) -> tuple[bytes, ...]:
+    if (
+        member.offset_data - member.offset != tarfile.BLOCKSIZE
+        or member.pax_headers
+        or member.linkname
+        or member.devmajor != 0
+        or member.devminor != 0
+        or member.uname not in ('', 'root')
+        or member.gname not in ('', 'root')
+    ):
         _reject('noncanonical archive extension')
+    canonical = tarfile.TarInfo(member.name)
+    canonical.mode = member.mode
+    canonical.uid = member.uid
+    canonical.gid = member.gid
+    canonical.size = member.size
+    canonical.mtime = member.mtime
+    canonical.type = member.type
+    canonical.uname = member.uname
+    canonical.gname = member.gname
+    headers: list[bytes] = []
+    for archive_format in (tarfile.USTAR_FORMAT, tarfile.GNU_FORMAT):
+        try:
+            header = canonical.tobuf(format=archive_format)
+        except ValueError:
+            continue
+        if len(header) == tarfile.BLOCKSIZE:
+            headers.append(header)
+    return tuple(headers)
+
+
+def _validate_raw_tar_member(
+    uncompressed: bytes, member: tarfile.TarInfo
+) -> None:
+    header = uncompressed[
+        member.offset:member.offset + tarfile.BLOCKSIZE
+    ]
+    if header not in _canonical_member_header(member):
+        _reject('noncanonical archive header')
+    data_end = member.offset_data + member.size
+    padding_end = (
+        member.offset_data
+        + (member.size + tarfile.BLOCKSIZE - 1)
+        // tarfile.BLOCKSIZE
+        * tarfile.BLOCKSIZE
+    )
+    if any(uncompressed[data_end:padding_end]):
+        _reject('noncanonical archive member padding')
 
 
 def _validate_tar_termination(
@@ -276,7 +341,7 @@ def read_exact_tar(
         if len(names) != len(set(names)) or set(names) != expected | {root}:
             _reject('unsafe archive members')
         for member in members:
-            _validate_member_extensions(member)
+            _validate_raw_tar_member(uncompressed, member)
             path = pathlib.PurePosixPath(member.name)
             if (
                 path.is_absolute()
@@ -306,6 +371,20 @@ def read_exact_tar(
             elif member.size < 0 or member.size > MAX_MEMBER_BYTES:
                 _reject('unsafe archive member size')
         _validate_tar_termination(uncompressed, members)
+        outside_files = bytearray(uncompressed)
+        for member in members:
+            if member.isfile():
+                outside_files[
+                    member.offset_data:member.offset_data + member.size
+                ] = b'\0' * member.size
+        outside_upper = bytes(outside_files).upper()
+        if (
+            TOKEN_SHAPE.search(outside_files)
+            or b'PRIVATE KEY' in outside_upper
+            or b'ROOT_TOKEN' in outside_upper
+            or b'ROOT-TOKEN' in outside_upper
+        ):
+            _reject('secret marker outside archive files')
         files: dict[str, bytes] = {}
         for member in members:
             if not member.isfile():
@@ -983,9 +1062,9 @@ def _write_bundle(
         'openbao-recovery-public-key.fingerprint',
     ):
         _exclusive_file(directory / name, files[name])
-    raw = io.BytesIO()
+    raw_tar = io.BytesIO()
     with tarfile.open(
-        fileobj=raw, mode='w:gz', format=tarfile.PAX_FORMAT
+        fileobj=raw_tar, mode='w:', format=tarfile.USTAR_FORMAT
     ) as stream:
         root_member = tarfile.TarInfo(root)
         root_member.type = tarfile.DIRTYPE
@@ -1006,7 +1085,12 @@ def _write_bundle(
             member.mtime = 0
             member.size = len(payload)
             stream.addfile(member, io.BytesIO(payload))
-    archive_bytes = raw.getvalue()
+    compressed = io.BytesIO()
+    with gzip.GzipFile(
+        filename='', mode='wb', fileobj=compressed, mtime=0
+    ) as stream:
+        stream.write(raw_tar.getvalue())
+    archive_bytes = compressed.getvalue()
     if len(archive_bytes) > MAX_ARCHIVE_BYTES:
         _reject('archive too large')
     _exclusive_file(archive, archive_bytes)
