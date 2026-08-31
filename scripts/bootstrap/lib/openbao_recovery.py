@@ -143,7 +143,171 @@ def _sidecar_digest(
     return actual
 
 
-def _validated_ciphertext(value: Any) -> bytes:
+def _openpgp_length(data: bytes, offset: int) -> tuple[int, bool, int]:
+    if offset >= len(data):
+        _reject('malformed openpgp packet')
+    first = data[offset]
+    offset += 1
+    if first < 192:
+        return first, False, offset
+    if first < 224:
+        if offset >= len(data):
+            _reject('malformed openpgp packet')
+        length = ((first - 192) << 8) + data[offset] + 192
+        return length, False, offset + 1
+    if first < 255:
+        return 1 << (first & 0x1F), True, offset
+    if offset + 4 > len(data):
+        _reject('malformed openpgp packet')
+    return int.from_bytes(data[offset : offset + 4], 'big'), False, offset + 4
+
+
+def _openpgp_packets(data: bytes) -> list[tuple[int, bytes]]:
+    packets: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset < len(data):
+        header = data[offset]
+        offset += 1
+        if header & 0x80 == 0:
+            _reject('malformed openpgp packet')
+        if header & 0x40:
+            tag = header & 0x3F
+            length, partial, offset = _openpgp_length(data, offset)
+            chunks: list[bytes] = []
+            while True:
+                if length > len(data) - offset:
+                    _reject('malformed openpgp packet')
+                chunks.append(data[offset : offset + length])
+                offset += length
+                if not partial:
+                    break
+                length, partial, offset = _openpgp_length(data, offset)
+            body = b''.join(chunks)
+        else:
+            tag = (header & 0x3F) >> 2
+            length_type = header & 0x03
+            if length_type == 3:
+                _reject('malformed openpgp packet')
+            length_bytes = 1 << length_type
+            if offset + length_bytes > len(data):
+                _reject('malformed openpgp packet')
+            length = int.from_bytes(
+                data[offset : offset + length_bytes], 'big'
+            )
+            offset += length_bytes
+            if length > len(data) - offset:
+                _reject('malformed openpgp packet')
+            body = data[offset : offset + length]
+            offset += length
+        packets.append((tag, body))
+    if not packets:
+        _reject('malformed openpgp packet')
+    return packets
+
+
+def _public_key_recipients(
+    exported_key: bytes, expected_fingerprint: str
+) -> tuple[set[bytes], set[bytes]]:
+    key_ids: set[bytes] = set()
+    fingerprints: set[bytes] = set()
+    primary_fingerprint: bytes | None = None
+    primary_count = 0
+    for tag, body in _openpgp_packets(exported_key):
+        if tag in (5, 7):
+            _reject('private key packet forbidden')
+        if tag not in (6, 14):
+            continue
+        if tag == 6:
+            primary_count += 1
+        if len(body) < 6:
+            _reject('invalid public key packet')
+        if body[0] == 4:
+            if len(body) > 0xFFFF:
+                _reject('invalid public key packet')
+            fingerprint = hashlib.sha1(
+                b'\x99' + len(body).to_bytes(2, 'big') + body
+            ).digest()
+            key_id = fingerprint[-8:]
+        elif body[0] == 6:
+            if len(body) < 10:
+                _reject('invalid public key packet')
+            material_length = int.from_bytes(body[6:10], 'big')
+            if material_length != len(body) - 10:
+                _reject('invalid public key packet')
+            fingerprint = hashlib.sha256(
+                b'\x9b' + len(body).to_bytes(4, 'big') + body
+            ).digest()
+            key_id = fingerprint[:8]
+        else:
+            _reject('unsupported public key version')
+        fingerprints.add(fingerprint)
+        key_ids.add(key_id)
+        if tag == 6:
+            primary_fingerprint = fingerprint
+    if primary_count != 1 or primary_fingerprint is None:
+        _reject('one public key required')
+    try:
+        expected = bytes.fromhex(expected_fingerprint)
+    except ValueError as error:
+        raise RecoveryValidationError('invalid public key fingerprint') from error
+    if not hmac.compare_digest(primary_fingerprint, expected):
+        _reject('public key packet fingerprint mismatch')
+    return key_ids, fingerprints
+
+
+def _consume_mpi(body: bytes, offset: int) -> int:
+    if offset + 2 > len(body):
+        _reject('malformed openpgp ciphertext')
+    bit_length = int.from_bytes(body[offset : offset + 2], 'big')
+    byte_length = (bit_length + 7) // 8
+    if bit_length == 0 or offset + 2 + byte_length > len(body):
+        _reject('malformed openpgp ciphertext')
+    return offset + 2 + byte_length
+
+
+def _validate_pkesk(
+    body: bytes, key_ids: set[bytes], fingerprints: set[bytes]
+) -> int:
+    if not body:
+        _reject('malformed openpgp ciphertext')
+    if body[0] == 3:
+        if len(body) < 13 or body[1:9] not in key_ids:
+            _reject('openpgp recipient mismatch')
+        algorithm = body[9]
+        offset = 10
+    elif body[0] == 6:
+        if len(body) < 5:
+            _reject('malformed openpgp ciphertext')
+        recipient_size = body[1]
+        if recipient_size not in (21, 33) or len(body) < 3 + recipient_size:
+            _reject('openpgp recipient mismatch')
+        key_version = body[2]
+        recipient = body[3 : 2 + recipient_size]
+        if (
+            (key_version == 4 and len(recipient) != 20)
+            or (key_version == 6 and len(recipient) != 32)
+            or recipient not in fingerprints
+        ):
+            _reject('openpgp recipient mismatch')
+        algorithm = body[2 + recipient_size]
+        offset = 3 + recipient_size
+    else:
+        _reject('unsupported pkesk version')
+    if algorithm in (1, 2):
+        offset = _consume_mpi(body, offset)
+    elif algorithm == 16:
+        offset = _consume_mpi(body, offset)
+        offset = _consume_mpi(body, offset)
+    else:
+        _reject('unsupported openpgp encryption algorithm')
+    if offset != len(body):
+        _reject('malformed openpgp ciphertext')
+    return body[0]
+
+
+def _validated_ciphertext(
+    value: Any, key_ids: set[bytes], fingerprints: set[bytes]
+) -> bytes:
     if not isinstance(value, str) or len(value) < 100:
         _reject('encrypted ciphertext required')
     try:
@@ -152,10 +316,23 @@ def _validated_ciphertext(value: Any) -> bytes:
         raise RecoveryValidationError('encrypted ciphertext required') from error
     if len(decoded) < 64:
         _reject('encrypted ciphertext required')
+    packets = _openpgp_packets(decoded)
+    if len(packets) != 2 or packets[0][0] != 1 or packets[1][0] != 18:
+        _reject('openpgp encrypted message required')
+    pkesk_version = _validate_pkesk(packets[0][1], key_ids, fingerprints)
+    encrypted = packets[1][1]
+    expected_seipd_version = 1 if pkesk_version == 3 else 2
+    if len(encrypted) < 64 or encrypted[0] != expected_seipd_version:
+        _reject('invalid integrity-protected ciphertext')
     return decoded
 
 
-def _validate_init(document: dict[str, Any], raw: bytes) -> None:
+def _validate_init(
+    document: dict[str, Any],
+    raw: bytes,
+    key_ids: set[bytes],
+    fingerprints: set[bytes],
+) -> None:
     allowed = {
         'unseal_shares',
         'unseal_threshold',
@@ -179,10 +356,12 @@ def _validate_init(document: dict[str, Any], raw: bytes) -> None:
     keys = document.get('unseal_keys_b64')
     if not isinstance(keys, list) or len(keys) != 5:
         _reject('invalid share contract')
-    decoded_keys = [_validated_ciphertext(value) for value in keys]
+    decoded_keys = [
+        _validated_ciphertext(value, key_ids, fingerprints) for value in keys
+    ]
     if len(set(decoded_keys)) != 5:
         _reject('duplicate share ciphertext')
-    _validated_ciphertext(document.get('root_token'))
+    _validated_ciphertext(document.get('root_token'), key_ids, fingerprints)
 
     hex_keys = document.get('unseal_keys_hex')
     if hex_keys is not None:
@@ -299,7 +478,15 @@ def validate_source(
         public_key_fingerprint=public_key_fingerprint,
         platform_secret_fingerprint=platform_secret_fingerprint,
     )
-    _validate_init(init_document, files[f'{prefix}/init.json'])
+    key_ids, key_fingerprints = _public_key_recipients(
+        decoded_key, public_key_fingerprint
+    )
+    _validate_init(
+        init_document,
+        files[f'{prefix}/init.json'],
+        key_ids,
+        key_fingerprints,
+    )
     return SourceBundleFacts(
         schema=V1_SCHEMA,
         archive_sha256=archive_sha256,
