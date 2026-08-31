@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -8173,7 +8174,13 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         root.type = tarfile.DIRTYPE
         root.mode = 0o700
         root.uid = root.gid = 0
-        members.append((root, None))
+        root_payload: bytes | None = None
+        if case == 'root-payload':
+            root_payload = b'x'
+        elif case == 'decompression-amplification':
+            root_payload = b'\0' * (3 * 1024 * 1024)
+        root.size = len(root_payload or b'')
+        members.append((root, root_payload))
         files = {
             f'{prefix}/init.json': json.dumps(
                 init_document, separators=(',', ':'), sort_keys=True
@@ -8193,6 +8200,8 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             member.mode = 0o600
             member.uid = member.gid = 0
             member.size = len(payload)
+            if case == 'noncanonical-pax' and name.endswith('/metadata.json'):
+                member.pax_headers = {'comment': 'unexpected-extension'}
             members.append((member, payload))
 
         hostile: tarfile.TarInfo | None = None
@@ -8238,12 +8247,38 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             members.append((duplicate, duplicate_payload))
 
         archive = directory / f'{prefix}.tar.gz'
-        with tarfile.open(archive, 'w:gz') as stream:
-            for member, payload in members:
-                stream.addfile(
-                    member,
-                    None if payload is None else io.BytesIO(payload),
-                )
+        if root_payload is not None:
+            uncompressed = io.BytesIO()
+            for member, payload in [*members[1:], members[0]]:
+                uncompressed.write(member.tobuf(format=tarfile.PAX_FORMAT))
+                if payload is not None:
+                    uncompressed.write(payload)
+                    uncompressed.write(
+                        b'\0' * (-len(payload) % tarfile.BLOCKSIZE)
+                    )
+            uncompressed.write(b'\0' * (2 * tarfile.BLOCKSIZE))
+            uncompressed.write(
+                b'\0' * (-uncompressed.tell() % tarfile.RECORDSIZE)
+            )
+            archive.write_bytes(gzip.compress(uncompressed.getvalue(), mtime=0))
+        else:
+            archive_format = (
+                tarfile.GNU_FORMAT
+                if case == 'valid-gnu'
+                else tarfile.PAX_FORMAT
+            )
+            with tarfile.open(
+                archive, 'w:gz', format=archive_format
+            ) as stream:
+                for member, payload in members:
+                    stream.addfile(
+                        member,
+                        None if payload is None else io.BytesIO(payload),
+                    )
+        if case == 'nonzero-trailing-data':
+            uncompressed = bytearray(gzip.decompress(archive.read_bytes()))
+            uncompressed[-1] = ord('x')
+            archive.write_bytes(gzip.compress(uncompressed, mtime=0))
         archive.chmod(0o600)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         if case == 'checksum-drift':
@@ -8391,6 +8426,148 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             arguments.extend(('--verification-nonce', verification_nonce))
         result = self.run_artifact_helper('build-candidate', *arguments)
         return result, archive, sidecar
+
+    def run_snapshot_replacement_harness(
+        self,
+        operation: str,
+        archive: Path,
+        sidecar: Path,
+        replacement_archive: Path,
+        replacement_sidecar: Path,
+        *arguments: object,
+    ) -> subprocess.CompletedProcess[str]:
+        script = textwrap.dedent(
+            r'''
+            import builtins
+            import importlib.util
+            import io
+            import os
+            import pathlib
+            import sys
+
+            (
+                helper, operation, archive, sidecar,
+                replacement_archive, replacement_sidecar, *arguments
+            ) = sys.argv[1:]
+            spec = importlib.util.spec_from_file_location(
+                'openbao_recovery_snapshot_test', helper
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+
+            original_builtin_open = builtins.open
+            original_io_open = io.open
+            original_os_open = os.open
+            targets = {
+                os.path.abspath(archive), os.path.abspath(sidecar)
+            }
+            replacements = {
+                os.path.abspath(archive): replacement_archive,
+                os.path.abspath(sidecar): replacement_sidecar,
+            }
+            opened = set()
+            open_counts = {target: 0 for target in targets}
+            replaced = False
+
+            def capture(path):
+                global replaced
+                try:
+                    normalized = os.path.abspath(os.fsdecode(path))
+                except TypeError:
+                    return
+                if normalized not in targets:
+                    return
+                open_counts[normalized] += 1
+                if open_counts[normalized] != 1:
+                    raise RuntimeError('artifact path reopened')
+                opened.add(normalized)
+                if opened == targets and not replaced:
+                    for destination, replacement in replacements.items():
+                        os.replace(replacement, destination)
+                    replaced = True
+
+            def intercepted_builtin_open(path, *args, **kwargs):
+                stream = original_builtin_open(path, *args, **kwargs)
+                capture(path)
+                return stream
+
+            def intercepted_io_open(path, *args, **kwargs):
+                stream = original_io_open(path, *args, **kwargs)
+                capture(path)
+                return stream
+
+            def intercepted_os_open(path, flags, mode=0o777, *, dir_fd=None):
+                if dir_fd is None:
+                    descriptor = original_os_open(path, flags, mode)
+                else:
+                    descriptor = original_os_open(
+                        path, flags, mode, dir_fd=dir_fd
+                    )
+                capture(path)
+                return descriptor
+
+            builtins.open = intercepted_builtin_open
+            io.open = intercepted_io_open
+            os.open = intercepted_os_open
+            try:
+                if operation == 'emit':
+                    value = module._emit_item(
+                        pathlib.Path(archive), pathlib.Path(sidecar), 'share1'
+                    )
+                    sys.stdout.write(value)
+                elif operation == 'build-final':
+                    module.build_final(
+                        candidate_archive=pathlib.Path(archive),
+                        candidate_sidecar=pathlib.Path(sidecar),
+                        archive=pathlib.Path(arguments[0]),
+                        sidecar=pathlib.Path(arguments[1]),
+                        current_sha=arguments[2],
+                        source_sha=arguments[3],
+                        source_bundle_sha256=arguments[4],
+                        public_key_sha256=arguments[5],
+                        public_key_fingerprint=arguments[6],
+                        cluster_identity_digest=arguments[7],
+                        verified_at_utc=arguments[8],
+                    )
+                else:
+                    raise ValueError('unsupported harness operation')
+            except Exception:
+                raise SystemExit(1)
+            if not replaced:
+                raise SystemExit(1)
+            '''
+        )
+        return self.run_command([
+            sys.executable, '-I', '-B', '-c', script,
+            str(OPENBAO_RECOVERY_HELPER), operation, str(archive), str(sidecar),
+            str(replacement_archive), str(replacement_sidecar),
+            *(str(argument) for argument in arguments),
+        ])
+
+    def build_distinct_candidate_pair(
+        self, directory: Path
+    ) -> tuple[Path, Path, Path, Path]:
+        first_result, first_archive, first_sidecar = (
+            self.build_candidate_artifact(directory / 'first')
+        )
+        self.assertEqual(first_result.returncode, 0, first_result.stderr)
+        second_response = self.rotation_response()
+        second_ciphertexts = [
+            self.synthetic_ciphertext(f'replacement-share-{index}')
+            for index in range(1, 6)
+        ]
+        second_response['keys_base64'] = second_ciphertexts
+        second_response['keys'] = [
+            base64.b64decode(value).hex() for value in second_ciphertexts
+        ]
+        second_result, second_archive, second_sidecar = (
+            self.build_candidate_artifact(
+                directory / 'second', response=second_response
+            )
+        )
+        self.assertEqual(second_result.returncode, 0, second_result.stderr)
+        return first_archive, first_sidecar, second_archive, second_sidecar
 
     @staticmethod
     def archive_files(archive: Path) -> dict[str, bytes]:
@@ -8554,6 +8731,15 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertEqual(accepted.stdout, '')
 
+        gnu_archive, gnu_sidecar = self.make_source_bundle(case='valid-gnu')
+        accepted_gnu = self.run_recovery_helper(
+            'validate-source', gnu_archive, gnu_sidecar
+        )
+        self.assertEqual(
+            (accepted_gnu.returncode, accepted_gnu.stdout, accepted_gnu.stderr),
+            (0, '', ''),
+        )
+
         cases = (
             'absolute-path', 'dot-dot', 'symlink', 'hardlink', 'fifo', 'device',
             'duplicate-member', 'extra-member', 'missing-member', 'wrong-schema',
@@ -8566,16 +8752,31 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             'base64-wrapped-plaintext', 'base64-wrapped-private-key-marker',
             'base64-wrapped-root-token', 'malformed-openpgp',
             'wrong-ciphertext-recipient', 'unexpected-recovery-key-data',
-            'missing-root-token', 'checksum-drift',
+            'missing-root-token', 'checksum-drift', 'root-payload',
+            'decompression-amplification', 'noncanonical-pax',
+            'nonzero-trailing-data',
         )
         for case in cases:
             with self.subTest(case=case):
                 archive, sidecar = self.make_source_bundle(case=case)
+                if case in ('root-payload', 'decompression-amplification'):
+                    with tarfile.open(archive, 'r:gz') as stream:
+                        root = next(
+                            member
+                            for member in stream.getmembers()
+                            if member.isdir()
+                        )
+                    expected_size = (
+                        1 if case == 'root-payload' else 3 * 1024 * 1024
+                    )
+                    self.assertEqual(root.size, expected_size)
+                    if case == 'decompression-amplification':
+                        self.assertLess(archive.stat().st_size, 16 * 1024)
                 result = self.run_recovery_helper(
                     'validate-source', archive, sidecar
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(result.stdout, '')
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
 
     def test_source_sha_must_resolve_to_ancestor_commit(self) -> None:
         repository, source, current, non_ancestor = self.make_git_ancestry()
@@ -8899,6 +9100,45 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 hashlib.sha256(final.read_bytes()).hexdigest(),
             ),
         )
+
+    def test_emit_item_stays_bound_to_one_validated_snapshot(self) -> None:
+        directory = self.temporary_directory() / 'emit-snapshot'
+        first, first_sidecar, replacement, replacement_sidecar = (
+            self.build_distinct_candidate_pair(directory)
+        )
+        expected_share = self.rotation_response()['keys_base64'][0]
+
+        emitted = self.run_snapshot_replacement_harness(
+            'emit', first, first_sidecar, replacement, replacement_sidecar
+        )
+
+        self.assertEqual(emitted.returncode, 0)
+        self.assertEqual(emitted.stdout, expected_share)
+        self.assertEqual(emitted.stderr, '')
+
+    def test_final_build_stays_bound_to_one_candidate_snapshot(self) -> None:
+        directory = self.temporary_directory() / 'final-snapshot'
+        first, first_sidecar, replacement, replacement_sidecar = (
+            self.build_distinct_candidate_pair(directory)
+        )
+        expected_shares, _ = self.archive_documents(first)
+        final = directory / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_sidecar = final.with_name(final.name + '.sha256')
+
+        built = self.run_snapshot_replacement_harness(
+            'build-final', first, first_sidecar, replacement,
+            replacement_sidecar, final, final_sidecar, self.CURRENT_SHA,
+            self.SOURCE_SHA, self.SOURCE_BUNDLE_SHA256,
+            self.PUBLIC_KEY_SHA256, self.PUBLIC_KEY_FINGERPRINT,
+            'abac3924a1218dcbf061892bebe08d08a5955222ece365564f356b39d10097c7',
+            '2026-08-31T01:02:03Z',
+        )
+
+        self.assertEqual(
+            (built.returncode, built.stdout, built.stderr), (0, '', '')
+        )
+        final_shares, _ = self.archive_documents(final)
+        self.assertEqual(final_shares, expected_shares)
 
     def test_rotation_response_and_artifact_rejection_matrix(self) -> None:
         direct = self.rotation_response()
