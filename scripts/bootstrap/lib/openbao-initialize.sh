@@ -369,8 +369,30 @@ openbao_remote_home_create() {
   OPENBAO_REMOTE_SESSION_KIND=$kind
 }
 
+openbao_bao_public() {
+  kubectl_run --namespace=openbao exec pod/openbao-0 -- env \
+    BAO_ADDR=https://openbao.openbao.svc:8200 \
+    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+    bao "$@"
+}
+
 openbao_bao() {
   kubectl_run --namespace=openbao exec pod/openbao-0 -- env \
+    HOME="$OPENBAO_REMOTE_HOME" \
+    BAO_ADDR=https://openbao.openbao.svc:8200 \
+    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+    bao "$@"
+}
+
+openbao_bao_tty_public() {
+  kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
+    BAO_ADDR=https://openbao.openbao.svc:8200 \
+    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+    bao "$@"
+}
+
+openbao_bao_tty() {
+  kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     HOME="$OPENBAO_REMOTE_HOME" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
@@ -387,26 +409,27 @@ openbao_bao_stdin() {
 
 openbao_remote_session_cleanup() {
   local path=$OPENBAO_REMOTE_HOME kind=$OPENBAO_REMOTE_SESSION_KIND
-  OPENBAO_REMOTE_HOME=
-  OPENBAO_REMOTE_SESSION_KIND=
   [[ -n "$path" ]] || return 0
   if [[ "$kind" == probe ]]; then
     kubectl_run --namespace=openbao exec pod/openbao-0 -- env HOME="$path" \
       BAO_ADDR=https://openbao.openbao.svc:8200 \
       BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
-      bao token revoke -self >/dev/null 2>&1 || true
+      bao token revoke -self >/dev/null 2>&1 || return 1
+    OPENBAO_REMOTE_SESSION_KIND=
   fi
   # $1 is intentionally expanded by the remote shell.
   # shellcheck disable=SC2016
   kubectl_run --namespace=openbao exec pod/openbao-0 -- /bin/sh -c \
     'rm -f -- "$1/.bao-token"; rmdir -- "$1"' cleanup "$path" \
-    >/dev/null 2>&1 || true
+    >/dev/null 2>&1 || return 1
+  OPENBAO_REMOTE_HOME=
+  OPENBAO_REMOTE_SESSION_KIND=
 }
 
 openbao_initialize_cleanup() {
   OPENBAO_SECRET_INPUT=
   unset OPENBAO_SECRET_INPUT
-  openbao_remote_session_cleanup
+  openbao_remote_session_cleanup || true
 }
 
 openbao_prompt_secret() {
@@ -419,54 +442,44 @@ openbao_prompt_secret() {
      "$OPENBAO_SECRET_INPUT" != *[[:space:]]* ]]
 }
 
-openbao_submit_unseal_share() {
-  local response rc=0
-  response=$(mktemp "$(host_path /root)/.openbao-unseal.XXXXXX") || return 1
-  chmod 600 "$response" || { rm -f -- "$response"; return 1; }
-  set +e
-  printf '%s\n' "$OPENBAO_SECRET_INPUT" |
-    kubectl_run --namespace=openbao exec -i pod/openbao-0 -- env \
-      BAO_ADDR=https://openbao.openbao.svc:8200 \
-      BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
-      bao operator unseal -format=json >"$response"
-  rc=$?
-  set -e
-  OPENBAO_SECRET_INPUT=
-  unset OPENBAO_SECRET_INPUT
-  if (( rc != 0 )); then
-    rm -f -- "$response"
+openbao_require_interactive_tty() {
+  if [[ ! -t 0 || ! -t 1 || ! -t 2 ]]; then
+    printf 'interactive-tty-required\n' >&2
     return 1
   fi
-  "$PYTHON_BINARY" -I -B - "$response" <<'PY'
+}
+
+openbao_unseal_progress_is_safe() {
+  local attempt=$1
+  openbao_bao_public status -format=json | "$PYTHON_BINARY" -I -B -c '
 import json
 import sys
 
-document = json.load(open(sys.argv[1], encoding="utf-8"))
+attempt = int(sys.argv[1])
+document = json.load(sys.stdin)
 if document.get("initialized") is not True:
     raise SystemExit(1)
-if not isinstance(document.get("sealed"), bool):
-    raise SystemExit(1)
 progress = document.get("progress")
-if isinstance(progress, bool) or not isinstance(progress, int) or progress < 0 or progress > 2:
+if attempt in (1, 2):
+    valid = document.get("sealed") is True and progress == attempt
+elif attempt == 3:
+    valid = document.get("sealed") is False and progress == 0
+else:
+    valid = False
+if not valid:
     raise SystemExit(1)
-PY
-  rc=$?
-  rm -f -- "$response"
-  return "$rc"
+' "$attempt"
 }
 
 openbao_unseal_interactively() {
-  local attempt state
-  kubectl_run --namespace=openbao exec pod/openbao-0 -- env \
-    BAO_ADDR=https://openbao.openbao.svc:8200 \
-    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
-    bao operator unseal -reset -format=json >/dev/null || return 1
+  local attempt
+  openbao_require_interactive_tty || return 1
+  openbao_bao_public operator unseal -reset -format=json >/dev/null || return 1
   for attempt in 1 2 3; do
-    openbao_prompt_secret "Paste decrypted unseal share ${attempt}/3 (hidden): " || return 1
-    openbao_submit_unseal_share || return 1
+    openbao_bao_tty_public operator unseal -format=json >/dev/null || return 1
+    openbao_unseal_progress_is_safe "$attempt" || return 1
   done
-  state=$(openbao_state_flags) || return 1
-  [[ "$state" == 'true|false' ]]
+  [[ "$(openbao_state_flags)" == 'true|false' ]]
 }
 
 openbao_probe_policy() {
@@ -576,19 +589,14 @@ if data.get("token_ttl") != 600 or data.get("token_max_ttl") != 600:
   openbao_audit_api_is_exact
 }
 
-openbao_apply_configuration_with_root() {
-  local auth_state mount_state rc=0
+openbao_root_session_start() {
+  openbao_require_interactive_tty || return 1
   openbao_remote_home_create root || return 1
-  openbao_prompt_secret 'Paste decrypted initial root token (hidden; revoked after setup): ' ||
-    return 1
-  set +e
-  printf '%s\n' "$OPENBAO_SECRET_INPUT" | openbao_bao_stdin login -no-print \
-    >/dev/null 2>&1
-  rc=$?
-  set -e
-  OPENBAO_SECRET_INPUT=
-  unset OPENBAO_SECRET_INPUT
-  (( rc == 0 )) || return 1
+  openbao_bao_tty login -no-print
+}
+
+openbao_apply_configuration() {
+  local auth_state mount_state
   openbao_bao token lookup -format=json >/dev/null || return 1
   openbao_audit_api_is_exact || return 1
 
@@ -613,10 +621,27 @@ openbao_apply_configuration_with_root() {
       >/dev/null || return 1
   openbao_probe_policy | openbao_bao_stdin policy write openbao-runtime-probe - \
     >/dev/null || return 1
-  openbao_configuration_readback_is_exact || return 1
+  openbao_configuration_readback_is_exact
+}
+
+openbao_root_session_revoke() {
   openbao_bao token revoke -self >/dev/null || return 1
+  if openbao_bao token lookup -format=json >/dev/null 2>&1; then
+    return 1
+  fi
   OPENBAO_REMOTE_SESSION_KIND=
-  openbao_remote_session_cleanup
+}
+
+openbao_apply_configuration_with_root() {
+  local rc=0
+  if ! openbao_root_session_start; then
+    openbao_remote_session_cleanup || true
+    return 1
+  fi
+  openbao_apply_configuration || rc=1
+  openbao_root_session_revoke || rc=1
+  openbao_remote_session_cleanup || rc=1
+  (( rc == 0 ))
 }
 
 openbao_probe_session_start() {
@@ -658,7 +683,7 @@ if servers[0].get("leader") is not True:
   else
     rc=1
   fi
-  openbao_remote_session_cleanup
+  openbao_remote_session_cleanup || rc=1
   set -e
   (( rc == 0 ))
 }

@@ -5,7 +5,9 @@ import hashlib
 import io
 import json
 import os
+import pty
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
 import textwrap
 import threading
 import time
@@ -7890,6 +7893,115 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
 
     @staticmethod
+    def openbao_function_source(name: str) -> str:
+        source = OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        match = re.search(
+            rf'^{re.escape(name)}\(\) \{{\n.*?^\}}$',
+            source,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise AssertionError(f'missing OpenBao function: {name}')
+        return match.group(0)
+
+    def run_stage180_function_in_pty(
+        self,
+        function_call: str,
+        *,
+        non_tty_fd: int | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        temporary = self.temporary_directory()
+        command_log = temporary / 'kubectl-argv.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            TEST_TEMP_ROOT=$3
+            PYTHON_BINARY=/usr/bin/python3
+            host_path() { printf '%s' "$TEST_TEMP_ROOT"; }
+            kubectl_run() {
+              {
+                printf '%s' "$1"
+                shift
+                printf ' %s' "$@"
+                printf '\n'
+              } >>"$TEST_COMMAND_LOG"
+              case " $* " in
+                *' mktemp -d /tmp/openbao-stage180.XXXXXX '*)
+                  printf '/tmp/openbao-stage180.ABC123\n'
+                  ;;
+              esac
+            }
+            openbao_unseal_progress_is_safe() { :; }
+            openbao_state_flags() { printf 'true|false\n'; }
+            '''
+        ) + function_call + '\n'
+        master_fd, slave_fd = pty.openpty()
+        terminal_attributes = termios.tcgetattr(slave_fd)
+        terminal_attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_attributes)
+        descriptors: list[int | object] = [slave_fd, slave_fd, slave_fd]
+        if non_tty_fd is not None:
+            descriptors[non_tty_fd] = subprocess.PIPE
+        process = subprocess.Popen(
+            [
+                '/bin/bash', '-c', script, 'stage180-pty',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+            stdin=descriptors[0],
+            stdout=descriptors[1],
+            stderr=descriptors[2],
+            text=False,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        if non_tty_fd == 0 and process.stdin is not None:
+            process.stdin.close()
+        if non_tty_fd != 0:
+            os.write(
+                master_fd,
+                b'synthetic-share-one\nsynthetic-share-two\n'
+                b'synthetic-share-three\nsynthetic-root-token\n',
+            )
+        pty_output = bytearray()
+        deadline = time.monotonic() + 10
+        while process.poll() is None and time.monotonic() < deadline:
+            readable, _, _ = select.select([master_fd], [], [], 0.1)
+            if readable:
+                try:
+                    pty_output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+            self.fail('Stage 180 PTY harness timed out')
+        try:
+            while True:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                pty_output.extend(chunk)
+        except OSError:
+            pass
+        os.close(master_fd)
+        pipe_stdout, pipe_stderr = process.communicate(timeout=1)
+        output = bytes(pty_output)
+        if pipe_stdout:
+            output += pipe_stdout
+        if pipe_stderr:
+            output += pipe_stderr
+        result = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            output.decode('utf-8', errors='replace').replace('\r\n', '\n'),
+            '',
+        )
+        logged = command_log.read_text(encoding='utf-8') if command_log.exists() else ''
+        return result, logged
+
+    @staticmethod
     def openpgp_packet(tag: int, body: bytes) -> bytes:
         if len(body) < 192:
             header = bytes((0xC0 | tag, len(body)))
@@ -8466,23 +8578,190 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             'openbao_stage_180_initialize() {', 1
         )[0])
 
-    def test_unseal_and_root_token_are_stdin_only(self) -> None:
-        body = self.implementation()
-        for expected in (
-            'read -r -s -p',
-            'bao operator unseal -format=json',
-            'login -no-print',
-            'unset OPENBAO_SECRET_INPUT',
+    def test_unseal_and_root_login_use_true_tty_without_outer_capture(
+        self,
+    ) -> None:
+        result, command_log = self.run_stage180_function_in_pty(
+            'openbao_unseal_interactively; openbao_root_session_start',
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('exec --stdin --tty pod/openbao-0', command_log)
+        self.assertIn('bao operator unseal -format=json', command_log)
+        self.assertIn('bao login -no-print', command_log)
+        unseal = self.openbao_function_source('openbao_unseal_interactively')
+        root_start = self.openbao_function_source('openbao_root_session_start')
+        for forbidden in ('OPENBAO_SECRET_INPUT', 'read ', 'printf'):
+            self.assertNotIn(forbidden, unseal)
+            self.assertNotIn(forbidden, root_start)
+        for forbidden in ('>/dev/null', '2>&1'):
+            self.assertNotIn(forbidden, root_start)
+        self.assertIn(
+            'openbao_bao_tty_public operator unseal -format=json >/dev/null',
+            unseal,
+        )
+        self.assertLess(
+            unseal.index('openbao_require_interactive_tty'),
+            unseal.index('operator unseal -reset'),
+        )
+        self.assertLess(
+            root_start.index('openbao_require_interactive_tty'),
+            root_start.index('openbao_remote_home_create root'),
+        )
+
+    def test_secret_operations_stop_before_read_without_tty(self) -> None:
+        for function in (
+            'openbao_unseal_interactively',
+            'openbao_root_session_start',
         ):
-            self.assertIn(expected, body)
+            for descriptor in (0, 1, 2):
+                with self.subTest(function=function, descriptor=descriptor):
+                    result, command_log = self.run_stage180_function_in_pty(
+                        function, non_tty_fd=descriptor,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        result.stdout.strip(), 'interactive-tty-required',
+                    )
+                    self.assertEqual(command_log, '')
+
+    def test_normal_root_session_revokes_then_cleans_up(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            openbao_root_session_start() { printf 'start\n'; }
+            openbao_apply_configuration() { printf 'configure\n'; }
+            openbao_root_session_revoke() { printf 'revoke\n'; }
+            openbao_remote_session_cleanup() { printf 'cleanup\n'; }
+            openbao_apply_configuration_with_root
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'root-lifecycle', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'start', 'configure', 'revoke', 'cleanup',
+        ])
+
+    def test_remote_session_cleanup_failure_blocks_success(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            kubectl_run() { return 1; }
+            openbao_remote_session_cleanup
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'cleanup-failure', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+        lifecycle = textwrap.dedent(
+            '''
+            source "$1"
+            openbao_root_session_start() { :; }
+            openbao_apply_configuration() { :; }
+            openbao_root_session_revoke() { :; }
+            openbao_remote_session_cleanup() { return 1; }
+            openbao_apply_configuration_with_root
+            '''
+        )
+        blocked = self.run_command(
+            ['/bin/bash', '-c', lifecycle, 'cleanup-blocks-success',
+             str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+
+    def test_unseal_progress_uses_independent_public_readback(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_TEST_STATUS=$2
+            kubectl_run() { printf '%s\n' "$OPENBAO_TEST_STATUS"; }
+            openbao_unseal_progress_is_safe "$3"
+            '''
+        )
+        cases = (
+            (1, '{"initialized":true,"sealed":true,"progress":1}', 0),
+            (2, '{"initialized":true,"sealed":true,"progress":2}', 0),
+            (3, '{"initialized":true,"sealed":false,"progress":0}', 0),
+            (2, '{"initialized":true,"sealed":false,"progress":0}', 1),
+        )
+        for attempt, status, expected_returncode in cases:
+            with self.subTest(attempt=attempt, status=status):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'unseal-progress',
+                        str(OPENBAO_INITIALIZE_LIB), status, str(attempt),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(
+                    result.returncode, expected_returncode, result.stderr,
+                )
+                self.assertEqual(result.stdout, '')
+
+    def test_probe_cleanup_failure_blocks_probe_success(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            openbao_probe_session_start() { :; }
+            openbao_bao() {
+              case "$*" in
+                'kv get -field=value openbao-probe/runtime-check')
+                  printf 'stage180-probe\n'
+                  ;;
+                'read sys/auth') return 1 ;;
+                'operator raft list-peers -format=json')
+                  printf '%s\n' '{"data":{"config":{"servers":[{"node_id":"openbao-0","leader":true}]}}}'
+                  ;;
+              esac
+            }
+            openbao_remote_session_cleanup() { return 1; }
+            openbao_auth_probe
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'probe-cleanup', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_secret_lifecycle_source_has_no_capture_argv_env_or_logging(
+        self,
+    ) -> None:
+        names = (
+            'openbao_bao_tty_public',
+            'openbao_bao_tty',
+            'openbao_unseal_interactively',
+            'openbao_root_session_start',
+            'openbao_root_session_revoke',
+            'openbao_remote_session_cleanup',
+            'openbao_prompt_secret',
+        )
+        source = '\n'.join(self.openbao_function_source(name) for name in names)
         for forbidden in (
+            'set -x',
             'BAO_TOKEN=',
             'VAULT_TOKEN=',
-            'bao operator unseal "$OPENBAO_SECRET_INPUT"',
-            'bao login "$OPENBAO_SECRET_INPUT"',
+            'operator unseal "$OPENBAO_SECRET_INPUT"',
+            'login "$OPENBAO_SECRET_INPUT"',
             'log_evidence "$OPENBAO_SECRET_INPUT"',
+            'echo "$OPENBAO_SECRET_INPUT"',
         ):
-            self.assertNotIn(forbidden, body)
+            self.assertNotIn(forbidden, source)
+        prompt = self.openbao_function_source('openbao_prompt_secret')
+        self.assertIn('read -r -s -p', prompt)
+        self.assertNotIn('operator unseal', prompt)
+        self.assertNotIn('login ', prompt)
 
     def test_configuration_and_probe_contract_are_exact(self) -> None:
         body = self.implementation()
