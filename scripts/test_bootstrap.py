@@ -8420,6 +8420,10 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               [[ "$TEST_FAILURE" != partial-final-cleanup ]] || return 1
               TEST_ARTIFACT_STATE=CANDIDATE
             }
+            openbao_rotation_final_staging_cleanup() {
+              log_call final-staging-cleanup
+              [[ "$TEST_FAILURE" != staging-cleanup ]]
+            }
             openbao_rotation_verified_marker_is_valid() {
               log_call final-marker-validate
               [[ "$TEST_FAILURE" != marker-validate ]]
@@ -8994,6 +8998,128 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             arguments.extend(('--verification-nonce', verification_nonce))
         result = self.run_artifact_helper('build-candidate', *arguments)
         return result, archive, sidecar
+
+    def run_final_publish_crash_harness(
+        self,
+        corruption: str,
+        *,
+        fail_fsync_at: int = 0,
+        fail_link_at: int = 0,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            recovery_root
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        source = recovery_root / 'source.tar.gz'
+        source.write_text('public-source-bundle\n', encoding='ascii')
+        source.chmod(0o600)
+        public_key = recovery_root / 'openbao-recovery-public-key.b64'
+        fingerprint = recovery_root / 'openbao-recovery-public-key.fingerprint'
+        wrapper = recovery_root / 'python-wrapper'
+        wrapper.write_text(
+            textwrap.dedent(
+                r'''#!/bin/sh
+                set -eu
+                /usr/bin/python3 "$@"
+                [ "${4:-}" = build-final ] || exit 0
+                archive=
+                sidecar=
+                shift 4
+                while [ "$#" -gt 0 ]; do
+                  case "$1" in
+                    --archive) archive=$2; shift 2 ;;
+                    --sidecar) sidecar=$2; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                case "$OPENBAO_TEST_FINAL_CORRUPTION" in
+                  sidecar-zero) : >"$sidecar" ;;
+                  sidecar-partial) printf 'partial' >"$sidecar" ;;
+                  sidecar-truncated) printf '000000000000' >"$sidecar" ;;
+                  archive) printf 'corrupt' >>"$archive" ;;
+                  directory)
+                    root=${archive%.tar.gz}
+                    printf 'corrupt' >"$root/metadata.json"
+                    ;;
+                  none) exit 0 ;;
+                  *) exit 92 ;;
+                esac
+                exit 91
+                '''
+            ),
+            encoding='ascii',
+        )
+        wrapper.chmod(0o755)
+        fsync_log = recovery_root / 'fsync.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=$7
+            OPENBAO_PUBLIC_KEY=$8
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$9
+            PYTHON_BINARY=${10}
+            TEST_SOURCE_DIGEST=${11}
+            TEST_CLUSTER_DIGEST=${12}
+            TEST_FSYNC_LOG=${13}
+            TEST_FAIL_FSYNC_AT=${14}
+            TEST_FAIL_LINK_AT=${15}
+            TEST_FSYNC_COUNT=0
+            TEST_LINK_COUNT=0
+            openbao_source_recovery_bundle_is_valid() { :; }
+            sha256_file() {
+              if [[ "$1" == "$OPENBAO_SOURCE_RECOVERY_ARCHIVE" ]]; then
+                printf '%s\n' "$TEST_SOURCE_DIGEST"
+              else
+                sha256sum "$1" | awk '{print $1}'
+              fi
+            }
+            openbao_fsync_directory() {
+              TEST_FSYNC_COUNT=$((TEST_FSYNC_COUNT + 1))
+              printf '%s\n' "$1" >>"$TEST_FSYNC_LOG"
+              (( TEST_FSYNC_COUNT != TEST_FAIL_FSYNC_AT ))
+            }
+            ln() {
+              TEST_LINK_COUNT=$((TEST_LINK_COUNT + 1))
+              (( TEST_LINK_COUNT != TEST_FAIL_LINK_AT )) || return 18
+              command ln "$@"
+            }
+            set +e
+            openbao_build_rotation_final \
+              "$TEST_CLUSTER_DIGEST" 2026-08-31T01:02:03Z
+            rc=$?
+            set -e
+            printf 'RC=%s\nSTATE=%s\n' \
+              "$rc" "$(openbao_rotation_artifact_presence_state)"
+            '''
+        )
+        cluster_digest = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'final-publish-crash',
+                str(OPENBAO_INITIALIZE_LIB), str(recovery_root),
+                self.CURRENT_SHA, self.SOURCE_SHA, str(source),
+                str(candidate), str(candidate_sidecar), str(public_key),
+                str(fingerprint), str(wrapper), self.SOURCE_BUNDLE_SHA256,
+                cluster_digest, str(fsync_log),
+                str(fail_fsync_at),
+                str(fail_link_at),
+            ],
+            env=self.sanitized_environment(
+                BOOTSTRAP_TEST_MODE='1',
+                OPENBAO_TEST_FINAL_CORRUPTION=corruption,
+            ),
+        )
+        return result, recovery_root, fsync_log
 
     def run_snapshot_replacement_harness(
         self,
@@ -10061,6 +10187,161 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         final_shares, _ = self.archive_documents(final)
         self.assertEqual(final_shares, expected_shares)
 
+    def test_final_publish_never_exposes_invalid_three_of_three_crash_state(
+        self,
+    ) -> None:
+        for corruption in (
+            'sidecar-zero', 'sidecar-partial', 'sidecar-truncated',
+            'archive', 'directory',
+        ):
+            with self.subTest(corruption=corruption):
+                result, recovery_root, _ = (
+                    self.run_final_publish_crash_harness(corruption)
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('RC=1\n', result.stdout)
+                self.assertIn('STATE=CANDIDATE\n', result.stdout)
+                final = recovery_root / f'openbao-recovery-{self.CURRENT_SHA}'
+                archive = final.with_name(final.name + '.tar.gz')
+                sidecar = archive.with_name(archive.name + '.sha256')
+                self.assertFalse(final.exists() or final.is_symlink())
+                self.assertFalse(archive.exists() or archive.is_symlink())
+                self.assertFalse(sidecar.exists() or sidecar.is_symlink())
+
+    def test_final_publish_each_parent_fsync_failure_is_fail_closed(
+        self,
+    ) -> None:
+        for fsync_index in range(1, 19):
+            with self.subTest(fsync_index=fsync_index):
+                result, recovery_root, fsync_log = (
+                    self.run_final_publish_crash_harness(
+                        'none', fail_fsync_at=fsync_index
+                    )
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected_state = (
+                    'CANDIDATE' if fsync_index <= 3
+                    else 'PARTIAL_FINAL' if fsync_index <= 9
+                    else 'FINAL'
+                )
+                self.assertEqual(
+                    result.stdout, f'RC=1\nSTATE={expected_state}\n'
+                )
+                self.assertTrue(fsync_log.is_file())
+                self.assertEqual(
+                    len(
+                        fsync_log.read_text(
+                            encoding='utf-8'
+                        ).splitlines()
+                    ),
+                    fsync_index,
+                )
+
+    def test_final_publish_hard_link_failures_never_expose_final_state(
+        self,
+    ) -> None:
+        for link_index in range(1, 7):
+            with self.subTest(link_index=link_index):
+                result, recovery_root, _ = (
+                    self.run_final_publish_crash_harness(
+                        'none', fail_link_at=link_index
+                    )
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'RC=1\nSTATE=PARTIAL_FINAL\n')
+                final = recovery_root / f'openbao-recovery-{self.CURRENT_SHA}'
+                archive = final.with_name(final.name + '.tar.gz')
+                sidecar = archive.with_name(archive.name + '.sha256')
+                self.assertTrue(final.is_dir())
+                self.assertFalse(sidecar.exists() or sidecar.is_symlink())
+                if link_index <= 5:
+                    self.assertFalse(archive.exists() or archive.is_symlink())
+
+    def test_final_publish_fsyncs_each_changed_parent_and_cleans_staging(
+        self,
+    ) -> None:
+        result, recovery_root, fsync_log = (
+            self.run_final_publish_crash_harness('none')
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=0\nSTATE=FINAL\n')
+        staging_root = recovery_root / (
+            f'.openbao-final-staging-{self.CURRENT_SHA}'
+        )
+        staging_directory = staging_root / (
+            f'openbao-recovery-{self.CURRENT_SHA}'
+        )
+        final_directory = recovery_root / (
+            f'openbao-recovery-{self.CURRENT_SHA}'
+        )
+        self.assertFalse(staging_root.exists() or staging_root.is_symlink())
+        self.assertEqual(
+            fsync_log.read_text(encoding='utf-8').splitlines(),
+            [
+                str(recovery_root),
+                str(staging_directory),
+                str(staging_root),
+                str(recovery_root),
+                *([str(final_directory)] * 4),
+                str(recovery_root),
+                str(recovery_root),
+                *([str(staging_directory)] * 4),
+                str(staging_root),
+                str(staging_root),
+                str(staging_root),
+                str(recovery_root),
+            ],
+        )
+
+    def test_final_staging_cleanup_is_scoped_and_reentry_safe(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            openbao_rotation_artifact_paths
+            set +e
+            openbao_rotation_final_staging_cleanup
+            rc=$?
+            set -e
+            staging_exists=false
+            if [[ -e "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ||
+                  -L "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ]]; then
+              staging_exists=true
+            fi
+            printf 'RC=%s\nSTATE=%s\nSTAGING_EXISTS=%s\n' \
+              "$rc" "$(openbao_rotation_artifact_presence_state)" \
+              "$staging_exists"
+            '''
+        )
+        for hostile, expected in (
+            (False, 'RC=0\nSTATE=CANDIDATE\nSTAGING_EXISTS=false\n'),
+            (True, 'RC=1\nSTATE=CANDIDATE\nSTAGING_EXISTS=true\n'),
+        ):
+            with self.subTest(hostile=hostile):
+                crashed, recovery_root, _ = (
+                    self.run_final_publish_crash_harness('sidecar-zero')
+                )
+                self.assertIn('RC=1\nSTATE=CANDIDATE\n', crashed.stdout)
+                staging_root = recovery_root / (
+                    f'.openbao-final-staging-{self.CURRENT_SHA}'
+                )
+                if hostile:
+                    unexpected = staging_root / 'unexpected'
+                    unexpected.write_text('public-unknown\n', encoding='ascii')
+                    unexpected.chmod(0o600)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'staging-cleanup',
+                        str(OPENBAO_INITIALIZE_LIB), str(recovery_root),
+                        self.CURRENT_SHA,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
     def test_rotation_response_and_artifact_rejection_matrix(self) -> None:
         direct = self.rotation_response()
         cases: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
@@ -10858,6 +11139,21 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                                'lookup-still-valid', 'helper-cleanup'):
                     self.assertNotIn('final-v2-build', calls)
 
+        staging_failure, staging_calls = self.run_recover_verify(
+            verification_progress=3,
+            artifact_state='FINAL',
+            checkpoint_state='REVOKED',
+            failure='staging-cleanup',
+        )
+        self.assertNotEqual(staging_failure.returncode, 0)
+        self.assertIn(
+            'REASON=recovery-final-bundle-state-unsafe\n',
+            staging_failure.stdout,
+        )
+        self.assertIn('final-staging-cleanup', staging_calls)
+        self.assertNotIn('verified-marker', staging_calls)
+        self.assertNotIn('checkpoint-cleanup', staging_calls)
+
     def test_accept_rejects_candidate_marker_or_live_pending_state(self) -> None:
         accepted, accepted_calls = self.run_incident_accept('verified')
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
@@ -11282,10 +11578,120 @@ PY
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, '')
 
+    def test_checkpoint_and_marker_parent_fsync_failures_are_fail_closed(
+        self,
+    ) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_READY_CHECKPOINT=$2/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$2/revoked.json
+            OPENBAO_RECOVERY_ARCHIVE=$2/final.tar.gz
+            OPENBAO_ROTATION_VERIFIED_MARKER=$2/verified.json
+            TEST_OPERATION=$7
+            TEST_FSYNC_LOG=$8
+            TEST_FAIL_FSYNC_AT=$9
+            TEST_FSYNC_COUNT=0
+            openbao_rotation_artifact_paths() { :; }
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            openbao_fsync_directory() {
+              TEST_FSYNC_COUNT=$((TEST_FSYNC_COUNT + 1))
+              printf '%s\n' "$1" >>"$TEST_FSYNC_LOG"
+              (( TEST_FSYNC_COUNT != TEST_FAIL_FSYNC_AT ))
+            }
+            openbao_rotation_final_is_valid() { :; }
+            cluster_digest=$(printf cluster | sha256sum | awk '{print $1}')
+            token_digest=$(printf root-token | sha256sum | awk '{print $1}')
+            binding=$(openbao_finalization_transaction_binding "$cluster_digest")
+            case "$TEST_OPERATION" in
+              ready) ;;
+              revoked|cleanup)
+                openbao_finalization_ready_checkpoint_create \
+                  "$cluster_digest" "$token_digest" \
+                  /tmp/openbao-stage180.ABC123 "$binding"
+                if [[ "$TEST_OPERATION" == cleanup ]]; then
+                  openbao_finalization_revoked_checkpoint_create \
+                    "$cluster_digest"
+                fi
+                ;;
+              marker) ;;
+              *) exit 90 ;;
+            esac
+            : >"$TEST_FSYNC_LOG"
+            TEST_FSYNC_COUNT=0
+            set +e
+            case "$TEST_OPERATION" in
+              ready)
+                openbao_finalization_ready_checkpoint_create \
+                  "$cluster_digest" "$token_digest" \
+                  /tmp/openbao-stage180.ABC123 "$binding"
+                ;;
+              revoked)
+                openbao_finalization_revoked_checkpoint_create \
+                  "$cluster_digest"
+                ;;
+              cleanup)
+                openbao_finalization_checkpoint_cleanup "$cluster_digest"
+                ;;
+              marker)
+                openbao_rotation_verified_marker_create "$cluster_digest"
+                ;;
+            esac
+            rc=$?
+            set -e
+            printf 'RC=%s\n' "$rc"
+            '''
+        )
+        for operation in ('ready', 'revoked', 'cleanup', 'marker'):
+            for fail_at in (1, 2):
+                temporary = self.temporary_directory()
+                source = temporary / 'source.tar.gz'
+                candidate = temporary / 'candidate.tar.gz'
+                final = temporary / 'final.tar.gz'
+                for path, content in (
+                    (source, 'public-source'),
+                    (candidate, 'public-candidate'),
+                    (final, 'public-final'),
+                ):
+                    path.write_text(content + '\n', encoding='ascii')
+                    path.chmod(0o600)
+                fsync_log = temporary / 'fsync.log'
+                with self.subTest(operation=operation, fail_at=fail_at):
+                    result = self.run_command(
+                        [
+                            '/bin/bash', '-c', script, 'durable-state',
+                            str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                            self.CURRENT_SHA, self.SOURCE_SHA, str(source),
+                            str(candidate), operation, str(fsync_log),
+                            str(fail_at),
+                        ],
+                        env=self.sanitized_environment(
+                            BOOTSTRAP_TEST_MODE='1'
+                        ),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, 'RC=1\n')
+                    self.assertEqual(
+                        fsync_log.read_text(
+                            encoding='utf-8'
+                        ).splitlines(),
+                        [str(temporary)] * fail_at,
+                    )
+
     def test_partial_final_crash_cleanup_is_scoped_and_fail_closed(self) -> None:
         script = textwrap.dedent(
             r'''
             source "$1"
+            PYTHON_BINARY=/usr/bin/python3
             OPENBAO_RECOVERY_ROOT=$2
             OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$2/candidate
             OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$2/candidate.tar.gz
@@ -11298,6 +11704,9 @@ PY
             safe_file() {
               [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
             }
+            if [[ "$3" == fsync-fail ]]; then
+              openbao_fsync_directory() { return 1; }
+            fi
             mkdir "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY"
             chmod 700 "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY"
             printf candidate >"$OPENBAO_ROTATION_CANDIDATE_ARCHIVE"
@@ -11325,6 +11734,7 @@ PY
         for case, expected in (
             ('safe', 'RC=0\nSTATE=CANDIDATE\n'),
             ('hostile', 'RC=1\nSTATE=PARTIAL_FINAL\n'),
+            ('fsync-fail', 'RC=1\nSTATE=PARTIAL_FINAL\n'),
         ):
             temporary = self.temporary_directory()
             with self.subTest(case=case):
