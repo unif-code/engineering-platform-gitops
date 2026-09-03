@@ -8217,6 +8217,300 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
         return result, calls
 
+    def run_recover_verify(
+        self,
+        *,
+        verification_progress: int = 0,
+        artifact_state: str = 'CANDIDATE',
+        failure: str = '',
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run the real recover-verify state machine over controlled facts."""
+        temporary = self.temporary_directory()
+        call_log = temporary / 'recover-verify-calls.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_CALL_LOG=$2
+            TEST_VERIFICATION_PROGRESS=$3
+            TEST_ARTIFACT_STATE=$4
+            TEST_FAILURE=$5
+            OPENBAO_SOURCE_RECOVERY_SHA=$6
+            OPENBAO_RECOVERY_ID=$7
+            OPENBAO_ROTATION_TEMP_DIRECTORY=/root/openbao-recovery/.openbao-rotation.ABC123
+            OPENBAO_ROTATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/response.json
+            OPENBAO_ROTATION_STATUS_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.json
+            OPENBAO_ROTATION_STATUS_STATE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.state
+            OPENBAO_ROTATION_VERIFICATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/verification.json
+            OPENBAO_ROTATION_VERIFICATION_STATE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/verification.state
+            OPENBAO_CLUSTER_ID=12345678-1234-4abc-8def-1234567890ab
+            OPENBAO_CLUSTER_NAME=openbao-cluster-dev
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            TEST_CANDIDATE_VALIDATIONS=0
+
+            log_call() { printf '%s\n' "$1" >>"$TEST_CALL_LOG"; }
+            openbao_stage_180_preflight() { log_call preflight; }
+            openbao_source_recovery_bundle_is_valid() {
+              log_call source-validate
+              [[ "$TEST_FAILURE" != source ]]
+            }
+            openbao_require_interactive_tty() {
+              log_call tty-check
+              [[ "$TEST_FAILURE" != tty ]]
+            }
+            openbao_state_flags() { printf 'true|false\n'; }
+            openbao_root_session_start() {
+              log_call root-login
+              [[ "$TEST_FAILURE" != root-login ]]
+            }
+            openbao_live_cluster_identity() { log_call live-cluster; }
+            openbao_rotation_temp_create() { log_call rotation-temp-create; }
+            openbao_rotation_temp_cleanup() {
+              log_call rotation-temp-cleanup
+              [[ "$TEST_FAILURE" != temp-cleanup ]]
+            }
+            openbao_rotation_artifact_presence_state() {
+              printf '%s\n' "$TEST_ARTIFACT_STATE"
+            }
+            openbao_rotation_status() {
+              local kind=$1
+              if [[ "$TEST_FAILURE" == status-read ]]; then
+                return 1
+              fi
+              case "$kind" in
+                normal)
+                  if (( TEST_VERIFICATION_PROGRESS >= 3 )); then
+                    log_call normal-status-idle
+                    OPENBAO_ROTATION_PHASE=IDLE
+                    OPENBAO_ROTATION_NONCE=
+                    OPENBAO_ROTATION_PROGRESS=0
+                    OPENBAO_ROTATION_REQUIRED=0
+                    OPENBAO_ROTATION_VERIFICATION_NONCE=
+                  else
+                    OPENBAO_ROTATION_PHASE=OLD_QUORUM_COMPLETE
+                    OPENBAO_ROTATION_NONCE=synthetic-old-rotation-nonce
+                    OPENBAO_ROTATION_PROGRESS=3
+                    OPENBAO_ROTATION_REQUIRED=3
+                    OPENBAO_ROTATION_VERIFICATION_NONCE=synthetic-verification-nonce
+                  fi
+                  ;;
+                verification)
+                  if (( TEST_VERIFICATION_PROGRESS >= 3 )); then
+                    log_call verification-status-idle
+                    OPENBAO_ROTATION_VERIFICATION_PHASE=IDLE
+                    OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=
+                    OPENBAO_ROTATION_VERIFICATION_PROGRESS=0
+                  else
+                    OPENBAO_ROTATION_VERIFICATION_PHASE=PENDING
+                    OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=synthetic-verification-nonce
+                    if [[ "$TEST_FAILURE" == verification-nonce-drift &&
+                          "$TEST_VERIFICATION_PROGRESS" -ge 1 ]]; then
+                      OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=synthetic-drifted-verification-nonce
+                    fi
+                    OPENBAO_ROTATION_VERIFICATION_PROGRESS=$TEST_VERIFICATION_PROGRESS
+                  fi
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            openbao_cluster_identity_sha256() { printf '%064d\n' 0; }
+            openbao_rotation_candidate_is_valid() {
+              TEST_CANDIDATE_VALIDATIONS=$((TEST_CANDIDATE_VALIDATIONS + 1))
+              if (( TEST_CANDIDATE_VALIDATIONS == 1 )); then
+                log_call candidate-validate-pre
+                [[ "$TEST_FAILURE" != candidate-pre ]]
+              else
+                log_call candidate-revalidate
+                [[ "$TEST_FAILURE" != candidate-revalidate ]]
+              fi
+            }
+            openbao_rotation_candidate_nonce_matches_live() {
+              log_call candidate-nonce
+              [[ "$1" == synthetic-verification-nonce &&
+                 "$TEST_FAILURE" != candidate-nonce ]]
+            }
+            openbao_rotation_verification_submit_share() {
+              [[ "$1" == synthetic-verification-nonce ]] || return 1
+              TEST_VERIFICATION_PROGRESS=$((TEST_VERIFICATION_PROGRESS + 1))
+              log_call "new-share-${TEST_VERIFICATION_PROGRESS}"
+              [[ "$TEST_FAILURE" != "share-${TEST_VERIFICATION_PROGRESS}" ]]
+            }
+            openbao_rotation_backup_delete() {
+              log_call backup-delete
+              [[ "$TEST_FAILURE" != backup-delete ]]
+            }
+            openbao_recover_runtime_readback() {
+              log_call runtime-readback
+              [[ "$TEST_FAILURE" != runtime-readback ]]
+            }
+            openbao_root_session_revoke_self() {
+              log_call root-revoke-self
+              [[ "$TEST_FAILURE" != root-revoke ]]
+            }
+            openbao_root_session_revocation_is_proven() {
+              case "$TEST_FAILURE" in
+                lookup-transport|lookup-still-valid) return 1 ;;
+              esac
+              log_call root-lookup-denied
+            }
+            openbao_remote_session_cleanup() {
+              log_call root-helper-cleanup
+              [[ "$TEST_FAILURE" != helper-cleanup ]]
+            }
+            openbao_rotation_verified_at_utc() {
+              [[ "$TEST_FAILURE" != timestamp ]] || return 1
+              printf '2026-09-03T00:00:00Z\n'
+            }
+            openbao_build_rotation_final() {
+              log_call final-v2-build
+              [[ "$TEST_FAILURE" != final-build ]]
+            }
+            openbao_rotation_final_is_valid() {
+              log_call final-bundle-validate
+              [[ "$TEST_FAILURE" != final-validate ]]
+            }
+            openbao_rotation_verified_marker_create() {
+              log_call verified-marker
+              [[ "$TEST_FAILURE" != marker ]]
+            }
+            openbao_stage_180_accept() { log_call FORBIDDEN-accept; return 1; }
+            complete() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+              exit "$3"
+            }
+
+            openbao_stage_180_recover_verify
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-verify',
+                str(OPENBAO_INITIALIZE_LIB), str(call_log),
+                str(verification_progress), artifact_state, failure,
+                self.SOURCE_SHA, self.CURRENT_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        calls = (
+            call_log.read_text(encoding='utf-8').splitlines()
+            if call_log.exists() else []
+        )
+        return result, calls
+
+    def run_incident_accept(
+        self, state: str
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run the real accept route with controlled incident gates."""
+        temporary = self.temporary_directory()
+        call_log = temporary / 'incident-accept-calls.log'
+        evidence = temporary / '17-openbao-runtime-test.txt'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_CALL_LOG=$2
+            TEST_EVIDENCE=$3
+            TEST_STATE=$4
+            TEST_ROOT=$9
+            OPENBAO_RECOVERY_ID=$5
+            OPENBAO_SOURCE_RECOVERY_SHA=$6
+            OPENBAO_RECOVERY_ARCHIVE=$7
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$8
+            printf 'public-fingerprint\n' >"$OPENBAO_PUBLIC_KEY_FINGERPRINT"
+            printf 'public-final-bundle\n' >"$OPENBAO_RECOVERY_ARCHIVE"
+            chmod 600 "$OPENBAO_PUBLIC_KEY_FINGERPRINT" \
+              "$OPENBAO_RECOVERY_ARCHIVE"
+            log_call() { printf '%s\n' "$1" >>"$TEST_CALL_LOG"; }
+            openbao_stage_180_preflight() { log_call preflight; }
+            openbao_incident_acceptance_state() {
+              case "$TEST_STATE" in
+                normal-v1) printf 'NORMAL_V1\n' ;;
+                candidate-only|marker-only) printf 'AMBIGUOUS\n' ;;
+                *) printf 'INCIDENT_V2\n' ;;
+              esac
+            }
+            openbao_recovery_bundle_is_valid() {
+              [[ "$TEST_STATE" == normal-v1 ]]
+            }
+            openbao_incident_source_sha_load() { :; }
+            openbao_source_recovery_bundle_is_valid() { :; }
+            openbao_incident_artifacts_are_valid() {
+              log_call incident-artifacts
+              case "$TEST_STATE" in
+                checksum-drift) return 1 ;;
+                *) return 0 ;;
+              esac
+            }
+            openbao_incident_live_rotation_is_idle() {
+              log_call live-no-pending
+              [[ "$TEST_STATE" != live-pending ]]
+            }
+            openbao_state_flags() { printf 'true|false\n'; }
+            openbao_platform_secrets_match_recovery_baseline() { :; }
+            openbao_auth_probe() { log_call auth-probe; }
+            openbao_audit_runtime_is_exact() { log_call audit-readback; }
+            business_apps_ready() { log_call applications-ready; }
+            business_https_smoke() { log_call https-smoke; }
+            openbao_existing_evidence() { return 1; }
+            host_path() { printf '%s\n' "$TEST_ROOT"; }
+            openbao_write_acceptance_payload() {
+              local destination=$1 acceptance_state=${2:-NORMAL_V1}
+              (umask 077; printf 'GIT_COMMIT=%s\n' "$OPENBAO_RECOVERY_ID" \
+                >"$destination")
+              if [[ "$acceptance_state" == INCIDENT_V2 ]]; then
+                printf '%s\n' \
+                  'UNSEAL_KEY_ROTATION=PASS' \
+                  'COMPROMISED_SHARE_INVALIDATED=true' \
+                  'INITIAL_ROOT_TOKEN=REVOKED' \
+                  'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2' \
+                  'MINIO=NOT_EXECUTED' \
+                  'SNAPSHOT=NOT_EXECUTED' \
+                  'BACKUP=NOT_EXECUTED' \
+                  'RESTORE=NOT_EXECUTED' \
+                  'APP_SECRET_MIGRATION=NOT_EXECUTED' \
+                  >>"$destination"
+              fi
+              chmod 600 "$destination"
+            }
+            openbao_evidence_is_secret_free() { :; }
+            open_evidence() {
+              EVIDENCE_FILE=$TEST_EVIDENCE
+              (umask 077; : >"$EVIDENCE_FILE")
+              chmod 600 "$EVIDENCE_FILE"
+              log_call evidence-created
+            }
+            log_evidence() { printf '%s\n' "$1" >>"$EVIDENCE_FILE"; }
+            finish_phase() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+            }
+            sha256_file() { printf '%064d\n' 0; }
+            complete() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+              exit "$3"
+            }
+
+            openbao_stage_180_accept
+            '''
+        )
+        public_fingerprint = temporary / 'fingerprint'
+        final_bundle = temporary / 'final.tar.gz'
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'incident-accept',
+                str(OPENBAO_INITIALIZE_LIB), str(call_log), str(evidence),
+                state, self.CURRENT_SHA, self.SOURCE_SHA, str(final_bundle),
+                str(public_fingerprint), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        calls = (
+            call_log.read_text(encoding='utf-8').splitlines()
+            if call_log.exists() else []
+        )
+        return result, calls
+
     @staticmethod
     def openpgp_packet(tag: int, body: bytes) -> bytes:
         if len(body) < 192:
@@ -10308,6 +10602,536 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                     self.assertNotIn('candidate-write', calls)
                     self.assertEqual(calls[-1], 'root-helper-cleanup')
 
+    def test_recover_verify_revokes_root_only_after_all_readbacks(self) -> None:
+        result, calls = self.run_recover_verify(verification_progress=0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RESULT=PASS_OPENBAO_RECOVERED\n'
+            'REASON=openbao-key-rotation-verified\n'
+            'EXIT_CODE=0\n'
+            'NEXT=stages/180-openbao-initialize/run.sh --accept\n',
+        )
+        for before, after in (
+            ('new-share-3', 'candidate-revalidate'),
+            ('candidate-revalidate', 'backup-delete'),
+            ('backup-delete', 'runtime-readback'),
+            ('runtime-readback', 'root-revoke-self'),
+            ('root-revoke-self', 'root-lookup-denied'),
+            ('root-lookup-denied', 'root-helper-cleanup'),
+            ('root-helper-cleanup', 'final-v2-build'),
+            ('final-v2-build', 'final-bundle-validate'),
+            ('final-bundle-validate', 'verified-marker'),
+        ):
+            self.assertLess(calls.index(before), calls.index(after))
+        self.assertEqual(
+            [call for call in calls if call.startswith('new-share-')],
+            ['new-share-1', 'new-share-2', 'new-share-3'],
+        )
+        self.assertLess(
+            calls.index('new-share-3'), calls.index('normal-status-idle'),
+        )
+        self.assertLess(
+            calls.index('normal-status-idle'),
+            calls.index('candidate-revalidate'),
+        )
+        self.assertLess(
+            max(
+                index for index, call in enumerate(calls)
+                if call == 'verification-status-idle'
+            ),
+            calls.index('candidate-revalidate'),
+        )
+        self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
+    def test_recover_verify_resumes_partial_verification_with_same_nonce(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_verify(verification_progress=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call for call in calls if call.startswith('new-share-')],
+            ['new-share-2', 'new-share-3'],
+        )
+        self.assertLess(calls.index('candidate-nonce'), calls.index('new-share-2'))
+        self.assertLess(calls.index('new-share-3'), calls.index('backup-delete'))
+
+    def test_recover_verify_resumes_after_live_verification_completed(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_verify(verification_progress=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call.startswith('new-share-') for call in calls))
+        self.assertNotIn('candidate-nonce', calls)
+        self.assertLess(
+            calls.index('normal-status-idle'),
+            calls.index('candidate-revalidate'),
+        )
+        self.assertLess(
+            calls.index('candidate-revalidate'), calls.index('backup-delete'),
+        )
+
+    def test_recover_verify_rejects_nonce_drift_before_next_new_share(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_verify(
+            verification_progress=0,
+            failure='verification-nonce-drift',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('REASON=openbao-rotation-state-unsafe\n', result.stdout)
+        self.assertEqual(
+            [call for call in calls if call.startswith('new-share-')],
+            ['new-share-1'],
+        )
+        self.assertNotIn('root-revoke-self', calls)
+        self.assertNotIn('final-v2-build', calls)
+
+    def test_recover_verify_pre_revoke_failures_never_revoke_root(self) -> None:
+        cases = (
+            ('source', 'source-recovery-bundle-unsafe'),
+            ('tty', 'interactive-tty-required'),
+            ('root-login', 'openbao-root-login-failed'),
+            ('candidate-pre', 'rotation-candidate-state-unsafe'),
+            ('candidate-nonce', 'rotation-candidate-state-unsafe'),
+            ('share-1', 'rotation-verification-failed'),
+            ('status-read', 'openbao-rotation-state-unsafe'),
+            ('candidate-revalidate', 'rotation-candidate-state-unsafe'),
+            ('backup-delete', 'rotation-backup-delete-failed'),
+            ('runtime-readback', 'openbao-auth-probe-failed'),
+        )
+        for failure, reason in cases:
+            with self.subTest(failure=failure):
+                result, calls = self.run_recover_verify(failure=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'REASON={reason}\n', result.stdout)
+                self.assertNotIn('root-revoke-self', calls)
+                self.assertNotIn('final-v2-build', calls)
+                self.assertNotIn('verified-marker', calls)
+
+    def test_recover_verify_post_verification_failures_fail_closed(self) -> None:
+        cases = (
+            ('root-revoke', 'initial-root-token-revoke-failed'),
+            ('lookup-transport', 'initial-root-token-still-valid'),
+            ('lookup-still-valid', 'initial-root-token-still-valid'),
+            ('helper-cleanup', 'remote-session-cleanup-failed'),
+            ('timestamp', 'recovery-final-bundle-state-unsafe'),
+            ('final-build', 'recovery-final-bundle-write-failed'),
+            ('final-validate', 'recovery-final-bundle-state-unsafe'),
+            ('marker', 'recovery-verification-marker-unsafe'),
+        )
+        for failure, reason in cases:
+            with self.subTest(failure=failure):
+                result, calls = self.run_recover_verify(failure=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'REASON={reason}\n', result.stdout)
+                if failure != 'marker':
+                    self.assertNotIn('verified-marker', calls)
+                if failure in ('root-revoke', 'lookup-transport',
+                               'lookup-still-valid', 'helper-cleanup'):
+                    self.assertNotIn('final-v2-build', calls)
+
+    def test_accept_rejects_candidate_marker_or_live_pending_state(self) -> None:
+        accepted, accepted_calls = self.run_incident_accept('verified')
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn('evidence-created', accepted_calls)
+        self.assertLess(
+            accepted_calls.index('incident-artifacts'),
+            accepted_calls.index('live-no-pending'),
+        )
+        self.assertLess(
+            accepted_calls.index('live-no-pending'),
+            accepted_calls.index('evidence-created'),
+        )
+
+        for state in (
+            'candidate-only', 'marker-only', 'checksum-drift', 'live-pending',
+        ):
+            with self.subTest(state=state):
+                result, calls = self.run_incident_accept(state)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('evidence-created', calls)
+
+    def test_accept_keeps_normal_v1_path_compatible(self) -> None:
+        result, calls = self.run_incident_accept('normal-v1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('evidence-created', calls)
+        self.assertNotIn('incident-artifacts', calls)
+        self.assertNotIn('live-no-pending', calls)
+
+    def test_incident_acceptance_classifier_is_fail_closed(self) -> None:
+        temporary = self.temporary_directory()
+        candidate = temporary / 'candidate.tar.gz'
+        marker = temporary / 'verified.json'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_CASE=$2
+            OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$3/candidate
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$3/candidate.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=$3/candidate.tar.gz.sha256
+            OPENBAO_ROTATION_VERIFIED_MARKER=$3/verified.json
+            openbao_recovery_bundle_is_valid() {
+              [[ "$TEST_CASE" == normal-v1 ]]
+            }
+            openbao_incident_acceptance_state
+            '''
+        )
+        cases = (
+            ('normal-v1', 'NORMAL_V1\n'),
+            ('none', 'AMBIGUOUS\n'),
+            ('candidate', 'INCIDENT_V2\n'),
+            ('marker', 'INCIDENT_V2\n'),
+        )
+        for case, expected in cases:
+            candidate.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            if case == 'candidate':
+                candidate.write_text('public-candidate\n', encoding='ascii')
+            elif case == 'marker':
+                marker.write_text('{}\n', encoding='ascii')
+            with self.subTest(case=case):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'incident-classifier',
+                        str(OPENBAO_INITIALIZE_LIB), case, str(temporary),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_rotation_verification_share_uses_hidden_key_dash_stdin(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        response = temporary / 'verification-response.json'
+        command_log = temporary / 'verification-command.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            OPENBAO_ROTATION_RESPONSE=$3
+            export OPENBAO_SECRET_INPUT=preexisting-exported-value
+            openbao_prompt_secret() {
+              OPENBAO_SECRET_INPUT=synthetic-new-share
+            }
+            openbao_bao_stdin() {
+              local input
+              /usr/bin/printenv OPENBAO_SECRET_INPUT >/dev/null && return 1
+              IFS= read -r input
+              [[ "$input" == synthetic-new-share ]] || return 1
+              printf '%s\n' "$*" >"$TEST_COMMAND_LOG"
+              printf '{}\n'
+            }
+            openbao_rotation_response_file_prepare "$OPENBAO_ROTATION_RESPONSE"
+            openbao_rotation_verification_submit_share \
+              synthetic-verification-nonce "$OPENBAO_ROTATION_RESPONSE"
+            [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'verification-share',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log), str(response),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8'),
+            'operator rotate-keys -format=json -verify '
+            '-nonce=synthetic-verification-nonce -\n',
+        )
+
+    def test_rotation_backup_delete_uses_the_authenticated_session(self) -> None:
+        command_log = self.temporary_directory() / 'backup-delete.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            openbao_bao() { printf '%s\n' "$*" >"$TEST_COMMAND_LOG"; }
+            openbao_rotation_backup_delete
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'backup-delete',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8'),
+            'operator rotate-keys -backup-delete\n',
+        )
+
+    def test_verified_marker_binds_final_digest_and_cluster_identity(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        final_bundle = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_bundle.write_text('public-final-bundle\n', encoding='ascii')
+        final_bundle.chmod(0o600)
+        marker = temporary / (
+            f'openbao-rotation-{self.CURRENT_SHA}.verified.json'
+        )
+        cluster_digest = 'd' * 64
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_VERIFIED_MARKER=$6
+            openbao_rotation_artifact_paths() { :; }
+            openbao_rotation_final_is_valid() { :; }
+            openbao_rotation_verified_marker_create "$7" || exit 90
+            printf 'MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_VERIFIED_MARKER")"
+            openbao_rotation_verified_marker_is_valid "$7" || exit 91
+            printf 'VALID=true\n'
+            printf 'changed\n' >>"$OPENBAO_RECOVERY_ARCHIVE"
+            if openbao_rotation_verified_marker_is_valid "$7"; then
+              printf 'DRIFT_REJECTED=false\n'
+            else
+              printf 'DRIFT_REJECTED=true\n'
+            fi
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'verified-marker',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary), self.CURRENT_SHA,
+                self.SOURCE_SHA, str(final_bundle), str(marker), cluster_digest,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'MODE=600\nVALID=true\nDRIFT_REJECTED=true\n',
+        )
+        marker_document = json.loads(marker.read_text(encoding='utf-8'))
+        self.assertEqual(
+            set(marker_document),
+            {
+                'schema', 'git_commit', 'source_recovery_sha',
+                'final_bundle_sha256', 'cluster_identity_sha256',
+                'rotation_state', 'initial_root_token',
+            },
+        )
+
+    def test_verified_marker_create_fails_closed_on_atomic_noclobber_race(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        final_bundle = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_bundle.write_text('public-final-bundle\n', encoding='ascii')
+        final_bundle.chmod(0o600)
+        marker = temporary / (
+            f'openbao-rotation-{self.CURRENT_SHA}.verified.json'
+        )
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_VERIFIED_MARKER=$6
+            openbao_rotation_artifact_paths() { :; }
+            openbao_rotation_final_is_valid() { :; }
+            mv() {
+              command cp "${@: -2:1}" "${@: -1}"
+              return 0
+            }
+            ln() {
+              command cp "${@: -2:1}" "${@: -1}"
+              return 1
+            }
+            set +e
+            openbao_rotation_verified_marker_create "$7"
+            rc=$?
+            set -e
+            shopt -s nullglob
+            temps=("$OPENBAO_RECOVERY_ROOT"/.openbao-rotation-marker.*)
+            marker_exists=false
+            [[ -f "$OPENBAO_ROTATION_VERIFIED_MARKER" ]] && marker_exists=true
+            printf 'RC=%s\nTEMP_COUNT=%s\nMARKER_EXISTS=%s\n' \
+              "$rc" "${#temps[@]}" "$marker_exists"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'verified-marker-race',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary), self.CURRENT_SHA,
+                self.SOURCE_SHA, str(final_bundle), str(marker), 'd' * 64,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RC=1\nTEMP_COUNT=0\nMARKER_EXISTS=true\n',
+        )
+
+    def test_incident_evidence_requires_exact_public_fields_and_rejects_shapes(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        archive = temporary / 'final.tar.gz'
+        fingerprint = temporary / 'fingerprint'
+        archive.write_text('public-final-bundle\n', encoding='ascii')
+        fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        archive.chmod(0o600)
+        fingerprint.chmod(0o600)
+        payload = temporary / 'evidence.txt'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ARCHIVE=$2
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$3
+            OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+            openbao_platform_secret_fingerprint() { printf '%064d\n' 0; }
+            openbao_status_evidence() {
+              printf '%s\n' OPENBAO_VERSION=2.6.1 \
+                OPENBAO_INITIALIZED=true OPENBAO_SEALED=false
+            }
+            openbao_resource_fact() {
+              printf '%s_UID=public-uid\n%s_GENERATION=1\n' "$4" "$4"
+            }
+            openbao_write_acceptance_payload "$4" INCIDENT_V2
+            openbao_incident_evidence_is_exact "$4"
+            openbao_evidence_is_secret_free "$4"
+            '''
+        )
+        accepted = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'incident-evidence',
+                str(OPENBAO_INITIALIZE_LIB), str(archive), str(fingerprint),
+                str(payload),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        evidence = payload.read_text(encoding='utf-8')
+        for required in (
+            'UNSEAL_KEY_ROTATION=PASS\n',
+            'COMPROMISED_SHARE_INVALIDATED=true\n',
+            'INITIAL_ROOT_TOKEN=REVOKED\n',
+            'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2\n',
+            'MINIO=NOT_EXECUTED\n',
+            'SNAPSHOT=NOT_EXECUTED\n',
+            'BACKUP=NOT_EXECUTED\n',
+            'RESTORE=NOT_EXECUTED\n',
+            'APP_SECRET_MIGRATION=NOT_EXECUTED\n',
+        ):
+            self.assertEqual(evidence.count(required), 1)
+        self.assertIn(self.PUBLIC_KEY_FINGERPRINT, evidence)
+        self.assertRegex(evidence, r'RECOVERY_BUNDLE_SHA256=[0-9a-f]{64}\n')
+
+        old_format = temporary / 'old-evidence.txt'
+        old_format.write_text(
+            ''.join(
+                line for line in evidence.splitlines(keepends=True)
+                if not line.startswith((
+                    'UNSEAL_KEY_ROTATION=',
+                    'COMPROMISED_SHARE_INVALIDATED=',
+                    'RECOVERY_BUNDLE_SCHEMA=',
+                ))
+            ),
+            encoding='utf-8',
+        )
+        old_format.chmod(0o600)
+        old_rejected = self.run_command(
+            [
+                '/bin/bash', '-c',
+                'source "$1"; openbao_incident_evidence_is_exact "$2"',
+                'old-incident-evidence', str(OPENBAO_INITIALIZE_LIB),
+                str(old_format),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(old_rejected.returncode, 0)
+
+        forbidden_lines = (
+            'verification_nonce=synthetic-public-value',
+            'keys_base64=[]',
+            'raw_rotation_response={}',
+            'ciphertext=' + 'A' * 96,
+            'value=hvs.abcdefgh',
+        )
+        for index, forbidden in enumerate(forbidden_lines):
+            with self.subTest(index=index):
+                hostile = temporary / f'hostile-{index}.txt'
+                hostile.write_text(evidence + forbidden + '\n', encoding='utf-8')
+                hostile.chmod(0o600)
+                rejected = self.run_command(
+                    [
+                        '/bin/bash', '-c',
+                        'source "$1"; openbao_evidence_is_secret_free "$2"',
+                        'hostile-incident-evidence',
+                        str(OPENBAO_INITIALIZE_LIB), str(hostile),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+
+    def test_incident_existing_evidence_rejects_old_format(self) -> None:
+        evidence_directory = self.temporary_directory() / 'evidence'
+        evidence_directory.mkdir(mode=0o700)
+        evidence = evidence_directory / '17-openbao-runtime-old.txt'
+        evidence.write_text(
+            f'GIT_COMMIT={self.CURRENT_SHA}\nMINIO=NOT_EXECUTED\n',
+            encoding='ascii',
+        )
+        evidence.chmod(0o600)
+        sidecar = evidence.with_name(evidence.name + '.sha256')
+        sidecar.write_text(
+            f'{hashlib.sha256(evidence.read_bytes()).hexdigest()}  '
+            f'{evidence.name}\n',
+            encoding='ascii',
+        )
+        sidecar.chmod(0o600)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            TEST_EVIDENCE_DIRECTORY=$2
+            OPENBAO_RECOVERY_ID=$3
+            host_path() { printf '%s\n' "$TEST_EVIDENCE_DIRECTORY"; }
+            normal=$(openbao_existing_evidence NORMAL_V1)
+            set +e
+            incident=$(openbao_existing_evidence INCIDENT_V2)
+            incident_rc=$?
+            set -e
+            printf 'NORMAL=%s\nINCIDENT_RC=%s\nINCIDENT=%s\n' \
+              "$normal" "$incident_rc" "$incident"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'incident-existing-evidence',
+                str(OPENBAO_INITIALIZE_LIB), str(evidence_directory),
+                self.CURRENT_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f'NORMAL={evidence}\nINCIDENT_RC=1\nINCIDENT=\n',
+        )
+
     def test_rotation_share_uses_hidden_input_key_dash_and_private_response(
         self,
     ) -> None:
@@ -10562,9 +11386,12 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               for name in OPENBAO_ROTATION_NONCE \
                   OPENBAO_ROTATION_VERIFICATION_NONCE \
                   OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE; do
-                /usr/bin/printenv "$name" >/dev/null && exit 1
+                if /usr/bin/printenv "$name" >/dev/null; then
+                  exit 1
+                fi
               done
-            '
+              exit 0
+            ' || exit 1
             printf 'CHILD_ENV_CLEAN=true\n'
             '''
         )
@@ -10615,6 +11442,36 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, 'dispatch-recover-start\n')
+
+    def test_recover_verify_dispatcher_routes_exact_operation(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            business_initialize() { :; }
+            require_command() { :; }
+            path_owner() { printf '0:0\n'; }
+            openbao_initialize_paths() { :; }
+            openbao_initialize_ceremony_paths() { :; }
+            openbao_stage_180_recover_verify() {
+              printf 'dispatch-recover-verify\n'
+            }
+            complete() {
+              printf 'dispatch-failed:%s\n' "$2"
+              exit "$3"
+            }
+            openbao_initialize_main --recover-verify \
+              --source-recovery-sha=1111111111111111111111111111111111111111
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-verify-dispatch',
+                str(OPENBAO_INITIALIZE_LIB),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'dispatch-recover-verify\n')
 
     def test_rotation_temp_files_are_private_and_trap_cleanup_is_bounded(
         self,
@@ -10718,6 +11575,8 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             }
             openbao_initialize_traps_install
             case "$TEST_EVENT" in
+              HUP) kill -HUP "$$" ;;
+              INT) kill -INT "$$" ;;
               TERM) kill -TERM "$$" ;;
               EXIT) exit 0 ;;
               *) exit 91 ;;
@@ -10726,6 +11585,8 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             '''
         )
         cases = (
+            ('HUP', 'none', 129, ''),
+            ('INT', 'none', 130, ''),
             ('TERM', 'none', 143, ''),
             (
                 'TERM', 'temp', 30,
@@ -11144,6 +12005,102 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
         self.assertNotEqual(result.returncode, 0)
 
+    def test_recover_auth_probe_preserves_root_session_and_cleans_own_helper(
+        self,
+    ) -> None:
+        command_log = self.temporary_directory() / 'recover-probe.log'
+        script = textwrap.dedent(
+            r'''
+            set -o pipefail
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_TEST_COMMAND_LOG=$2
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ROOT12
+            OPENBAO_REMOTE_SESSION_KIND=root
+            kubectl_run() {
+              if [[ " $* " == *' bao '* ]]; then
+                [[ " $* " == *' HOME=/tmp/openbao-stage180-probe.ABC123 '* ]] ||
+                  return 97
+              fi
+              case " $* " in
+                *' mktemp -d /tmp/openbao-stage180-probe.XXXXXX '*)
+                  printf 'probe-home-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf '/tmp/openbao-stage180-probe.ABC123\n'
+                  ;;
+                *' create token openbao-runtime-probe '*)
+                  printf 'token-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf 'synthetic-jwt\n'
+                  ;;
+                *' bao write -field=token auth/kubernetes/login '*)
+                  cat >/dev/null
+                  printf 'exchange\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf 'synthetic-session-token\n'
+                  ;;
+                *' bao login -no-print '*)
+                  cat >/dev/null
+                  printf 'login\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' bao kv put openbao-probe/runtime-check '*)
+                  printf 'put\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' bao kv get -field=value openbao-probe/runtime-check '*)
+                  printf 'get\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf 'stage180-probe\n'
+                  ;;
+                *' bao read sys/auth '*)
+                  printf 'negative-auth\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  return 2
+                  ;;
+                *' bao operator raft list-peers -format=json '*)
+                  printf 'raft\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf '%s\n' '{"data":{"config":{"servers":[{"node_id":"openbao-0","leader":true}]}}}'
+                  ;;
+                *' bao kv delete openbao-probe/runtime-check '*)
+                  printf 'delete\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' bao token revoke -self '*)
+                  printf 'probe-revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' rm -f -- "$1/.bao-token"; rmdir -- "$1" '*)
+                  printf 'probe-cleanup\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *) return 98 ;;
+              esac
+            }
+            openbao_recover_auth_probe
+            printf 'ROOT_HOME=%s\nROOT_KIND=%s\nPROBE_HOME=%s\nPROBE_KIND=%s\n' \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND" \
+              "$OPENBAO_RECOVER_PROBE_HOME" \
+              "$OPENBAO_RECOVER_PROBE_SESSION_KIND"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-auth-probe',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'ROOT_HOME=/tmp/openbao-stage180.ROOT12\n'
+            'ROOT_KIND=root\nPROBE_HOME=\nPROBE_KIND=\n',
+        )
+        calls = command_log.read_text(encoding='utf-8').splitlines()
+        for required in (
+            'probe-home-create', 'token-create', 'exchange', 'login', 'put',
+            'get', 'negative-auth', 'raft', 'delete', 'probe-revoke',
+            'probe-cleanup',
+        ):
+            self.assertEqual(calls.count(required), 1)
+        for before, after in (
+            ('login', 'put'), ('put', 'get'), ('get', 'negative-auth'),
+            ('negative-auth', 'raft'), ('raft', 'delete'),
+            ('delete', 'probe-revoke'), ('probe-revoke', 'probe-cleanup'),
+        ):
+            self.assertLess(calls.index(before), calls.index(after))
+
     def test_secret_lifecycle_source_has_no_capture_argv_env_or_logging(
         self,
     ) -> None:
@@ -11233,9 +12190,20 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             self.assertNotIn(forbidden, stages_source)
 
     def test_manual_stage_readme_stop_reasons_match_implementation(self) -> None:
-        reasons = sorted(set(StageReadmeTest.REASON.findall(
+        implemented = set(StageReadmeTest.REASON.findall(
             OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
-        )))
+        ))
+        # Task 7 owns the operator README and removes this explicit deferral
+        # when it documents the new incident-only stop reasons. Keeping the
+        # assertion makes either an implementation rename or an early README
+        # edit fail until both sides are reconciled in that task.
+        task_7_documentation = {
+            'openbao-rotation-state-unsafe',
+            'recovery-final-bundle-state-unsafe',
+            'recovery-verification-marker-unsafe',
+        }
+        self.assertTrue(task_7_documentation <= implemented)
+        reasons = sorted(implemented - task_7_documentation)
         listed = sorted(re.findall(
             r'^- `([a-z0-9-]+)`$',
             OPENBAO_INITIALIZE.with_name('README.md').read_text(encoding='utf-8'),
