@@ -48,6 +48,10 @@ OPENBAO_ROTATION_CANDIDATE_SIDECAR=
 OPENBAO_ROTATION_VERIFIED_MARKER=
 OPENBAO_ROTATION_READY_CHECKPOINT=
 OPENBAO_ROTATION_REVOKED_CHECKPOINT=
+OPENBAO_ROTATION_FINAL_STAGING_ROOT=
+OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY=
+OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE=
+OPENBAO_ROTATION_FINAL_STAGING_SIDECAR=
 OPENBAO_ROTATION_TEMP_DIRECTORY=
 OPENBAO_ROTATION_RESPONSE=
 OPENBAO_ROTATION_STATUS_RESPONSE=
@@ -137,6 +141,32 @@ openbao_rotation_artifact_paths() {
   OPENBAO_ROTATION_VERIFIED_MARKER=${OPENBAO_RECOVERY_ROOT}/openbao-rotation-${OPENBAO_RECOVERY_ID}.verified.json
   OPENBAO_ROTATION_READY_CHECKPOINT=${OPENBAO_RECOVERY_ROOT}/.openbao-rotation-${OPENBAO_RECOVERY_ID}.ready-to-revoke.json
   OPENBAO_ROTATION_REVOKED_CHECKPOINT=${OPENBAO_RECOVERY_ROOT}/.openbao-rotation-${OPENBAO_RECOVERY_ID}.root-revoked.json
+  OPENBAO_ROTATION_FINAL_STAGING_ROOT=${OPENBAO_RECOVERY_ROOT}/.openbao-final-staging-${OPENBAO_RECOVERY_ID}
+  OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY=${OPENBAO_ROTATION_FINAL_STAGING_ROOT}/openbao-recovery-${OPENBAO_RECOVERY_ID}
+  OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE=${OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY}.tar.gz
+  OPENBAO_ROTATION_FINAL_STAGING_SIDECAR=${OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE}.sha256
+}
+
+openbao_fsync_directory() {
+  local directory=$1
+  safe_owned_directory "$directory" 0 || return 1
+  "$PYTHON_BINARY" -I -B - "$directory" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY
+for name in ('O_DIRECTORY', 'O_NOFOLLOW', 'O_CLOEXEC'):
+    flags |= getattr(os, name, 0)
+descriptor = os.open(path, flags)
+try:
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        raise OSError('not a directory')
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
 }
 
 openbao_rotation_artifact_presence_state() {
@@ -631,19 +661,25 @@ module.build_candidate(
   openbao_rotation_candidate_is_valid "$cluster_digest"
 }
 
-openbao_rotation_final_is_valid() {
-  local cluster_digest=$1 fingerprint public_key_sha source_digest
-  openbao_rotation_artifact_paths || return 1
+openbao_rotation_final_paths_are_valid() {
+  local cluster_digest=$1 directory=$2 archive=$3 sidecar=$4
+  local fingerprint public_key_sha source_digest
   openbao_source_recovery_bundle_is_valid || return 1
-  safe_owned_directory "$OPENBAO_RECOVERY_DIRECTORY" 0 || return 1
-  safe_file "$OPENBAO_RECOVERY_ARCHIVE" 600 || return 1
-  safe_file "$OPENBAO_RECOVERY_SIDECAR" 600 || return 1
+  [[ "${directory##*/}" == "openbao-recovery-${OPENBAO_RECOVERY_ID}" &&
+     "${archive##*/}" == "openbao-recovery-${OPENBAO_RECOVERY_ID}.tar.gz" &&
+     "${sidecar##*/}" == \
+       "openbao-recovery-${OPENBAO_RECOVERY_ID}.tar.gz.sha256" &&
+     "${directory%/*}" == "${archive%/*}" &&
+     "${directory%/*}" == "${sidecar%/*}" ]] || return 1
+  safe_owned_directory "$directory" 0 || return 1
+  safe_file "$archive" 600 || return 1
+  safe_file "$sidecar" 600 || return 1
   public_key_sha=$(sha256_file "$OPENBAO_PUBLIC_KEY") || return 1
   source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
   fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
   "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" validate-final \
-    --archive "$OPENBAO_RECOVERY_ARCHIVE" \
-    --sidecar "$OPENBAO_RECOVERY_SIDECAR" \
+    --archive "$archive" \
+    --sidecar "$sidecar" \
     --current-sha "$OPENBAO_RECOVERY_ID" \
     --source-sha "$OPENBAO_SOURCE_RECOVERY_SHA" \
     --source-bundle-sha256 "$source_digest" \
@@ -652,19 +688,93 @@ openbao_rotation_final_is_valid() {
     --cluster-identity-sha256 "$cluster_digest"
 }
 
+openbao_rotation_final_is_valid() {
+  local cluster_digest=$1
+  openbao_rotation_artifact_paths || return 1
+  openbao_rotation_final_paths_are_valid "$cluster_digest" \
+    "$OPENBAO_RECOVERY_DIRECTORY" "$OPENBAO_RECOVERY_ARCHIVE" \
+    "$OPENBAO_RECOVERY_SIDECAR"
+}
+
+openbao_rotation_final_staging_cleanup() {
+  local entry name
+  openbao_rotation_artifact_paths || return 1
+  if [[ ! -e "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" &&
+        ! -L "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ]]; then
+    return 0
+  fi
+  safe_owned_directory "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" 0 || return 1
+  while IFS= read -r name; do
+    case "$name" in
+      "${OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY##*/}"|\
+      "${OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE##*/}"|\
+      "${OPENBAO_ROTATION_FINAL_STAGING_SIDECAR##*/}") ;;
+      *) return 1 ;;
+    esac
+  done < <(find "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" \
+    -mindepth 1 -maxdepth 1 -printf '%f\n')
+  if [[ -e "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" ||
+        -L "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" ]]; then
+    safe_owned_directory "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" 0 ||
+      return 1
+    while IFS= read -r name; do
+      case "$name" in
+        shares.json|metadata.json|openbao-recovery-public-key.b64|\
+          openbao-recovery-public-key.fingerprint) ;;
+        *) return 1 ;;
+      esac
+      safe_file "${OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY}/${name}" 600 ||
+        return 1
+    done < <(find "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" \
+      -mindepth 1 -maxdepth 1 -printf '%f\n')
+    for name in shares.json metadata.json openbao-recovery-public-key.b64 \
+        openbao-recovery-public-key.fingerprint; do
+      entry=${OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY}/${name}
+      if [[ -e "$entry" || -L "$entry" ]]; then
+        rm -f -- "$entry" || return 1
+        openbao_fsync_directory \
+          "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" || return 1
+      fi
+    done
+    rmdir -- "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" || return 1
+    openbao_fsync_directory "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" || return 1
+  fi
+  for entry in "$OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE" \
+      "$OPENBAO_ROTATION_FINAL_STAGING_SIDECAR"; do
+    if [[ -e "$entry" || -L "$entry" ]]; then
+      safe_file "$entry" 600 || return 1
+      rm -f -- "$entry" || return 1
+      openbao_fsync_directory "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ||
+        return 1
+    fi
+  done
+  rmdir -- "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT"
+}
+
 openbao_build_rotation_final() {
-  local cluster_digest=$1 verified_at_utc=$2 fingerprint public_key_sha
-  local source_digest
+  local cluster_digest=$1 verified_at_utc=$2 entry fingerprint name
+  local public_key_sha source_digest
   openbao_rotation_artifact_paths || return 1
   openbao_rotation_candidate_is_valid "$cluster_digest" || return 1
+  [[ ! -e "$OPENBAO_RECOVERY_DIRECTORY" &&
+     ! -L "$OPENBAO_RECOVERY_DIRECTORY" &&
+     ! -e "$OPENBAO_RECOVERY_ARCHIVE" &&
+     ! -L "$OPENBAO_RECOVERY_ARCHIVE" &&
+     ! -e "$OPENBAO_RECOVERY_SIDECAR" &&
+     ! -L "$OPENBAO_RECOVERY_SIDECAR" ]] || return 1
+  openbao_rotation_final_staging_cleanup || return 1
+  mkdir -- "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" || return 1
+  chmod 700 "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   public_key_sha=$(sha256_file "$OPENBAO_PUBLIC_KEY") || return 1
   source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
   fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
   "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" build-final \
     --candidate-archive "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
     --candidate-sidecar "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" \
-    --archive "$OPENBAO_RECOVERY_ARCHIVE" \
-    --sidecar "$OPENBAO_RECOVERY_SIDECAR" \
+    --archive "$OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE" \
+    --sidecar "$OPENBAO_ROTATION_FINAL_STAGING_SIDECAR" \
     --current-sha "$OPENBAO_RECOVERY_ID" \
     --source-sha "$OPENBAO_SOURCE_RECOVERY_SHA" \
     --source-bundle-sha256 "$source_digest" \
@@ -672,6 +782,34 @@ openbao_build_rotation_final() {
     --public-key-fingerprint "$fingerprint" \
     --cluster-identity-sha256 "$cluster_digest" \
     --verified-at-utc "$verified_at_utc" || return 1
+  openbao_rotation_final_paths_are_valid "$cluster_digest" \
+    "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" \
+    "$OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE" \
+    "$OPENBAO_ROTATION_FINAL_STAGING_SIDECAR" || return 1
+  openbao_fsync_directory "$OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY" ||
+    return 1
+  openbao_fsync_directory "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" || return 1
+
+  mkdir -- "$OPENBAO_RECOVERY_DIRECTORY" || return 1
+  chmod 700 "$OPENBAO_RECOVERY_DIRECTORY" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
+  for name in shares.json metadata.json openbao-recovery-public-key.b64 \
+      openbao-recovery-public-key.fingerprint; do
+    entry=${OPENBAO_ROTATION_FINAL_STAGING_DIRECTORY}/${name}
+    safe_file "$entry" 600 || return 1
+    ln -- "$entry" "${OPENBAO_RECOVERY_DIRECTORY}/${name}" || return 1
+    openbao_fsync_directory "$OPENBAO_RECOVERY_DIRECTORY" || return 1
+  done
+  ln -- "$OPENBAO_ROTATION_FINAL_STAGING_ARCHIVE" \
+    "$OPENBAO_RECOVERY_ARCHIVE" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
+  # The sidecar is published last. A three-of-three top-level shape therefore
+  # cannot appear until every canonical object already has its final bytes.
+  ln -- "$OPENBAO_ROTATION_FINAL_STAGING_SIDECAR" \
+    "$OPENBAO_RECOVERY_SIDECAR" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
+  openbao_rotation_final_is_valid "$cluster_digest" || return 1
+  openbao_rotation_final_staging_cleanup || return 1
   openbao_rotation_final_is_valid "$cluster_digest"
 }
 
@@ -774,12 +912,10 @@ PY
     rm -f -- "$marker_temp"
     return 1
   }
-  if ! rm -f -- "$marker_temp" ||
-      ! chmod 600 "$OPENBAO_ROTATION_VERIFIED_MARKER" ||
-      ! openbao_rotation_verified_marker_is_valid "$cluster_digest"; then
-    rm -f -- "$OPENBAO_ROTATION_VERIFIED_MARKER" || true
-    return 1
-  fi
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
+  rm -f -- "$marker_temp" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
+  openbao_rotation_verified_marker_is_valid "$cluster_digest"
 }
 
 openbao_rotation_partial_final_cleanup() {
@@ -803,16 +939,23 @@ openbao_rotation_partial_final_cleanup() {
       safe_file "${OPENBAO_RECOVERY_DIRECTORY}/${name}" 600 || return 1
     done < <(find "$OPENBAO_RECOVERY_DIRECTORY" -mindepth 1 -maxdepth 1 \
       -printf '%f\n')
-    rm -f -- \
-      "${OPENBAO_RECOVERY_DIRECTORY}/shares.json" \
-      "${OPENBAO_RECOVERY_DIRECTORY}/metadata.json" \
-      "${OPENBAO_RECOVERY_DIRECTORY}/openbao-recovery-public-key.b64" \
-      "${OPENBAO_RECOVERY_DIRECTORY}/openbao-recovery-public-key.fingerprint" ||
-      return 1
+    for name in shares.json metadata.json openbao-recovery-public-key.b64 \
+        openbao-recovery-public-key.fingerprint; do
+      entry=${OPENBAO_RECOVERY_DIRECTORY}/${name}
+      if [[ -e "$entry" || -L "$entry" ]]; then
+        rm -f -- "$entry" || return 1
+        openbao_fsync_directory "$OPENBAO_RECOVERY_DIRECTORY" || return 1
+      fi
+    done
     rmdir -- "$OPENBAO_RECOVERY_DIRECTORY" || return 1
+    openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   fi
-  rm -f -- "$OPENBAO_RECOVERY_ARCHIVE" "$OPENBAO_RECOVERY_SIDECAR" ||
-    return 1
+  for entry in "$OPENBAO_RECOVERY_ARCHIVE" "$OPENBAO_RECOVERY_SIDECAR"; do
+    if [[ -e "$entry" || -L "$entry" ]]; then
+      rm -f -- "$entry" || return 1
+      openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
+    fi
+  done
   state=$(openbao_rotation_artifact_presence_state) || return 1
   [[ "$state" == CANDIDATE ]]
 }
@@ -1038,8 +1181,9 @@ PY
     rm -f -- "$temporary"
     return 1
   }
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   rm -f -- "$temporary" || return 1
-  chmod 600 "$OPENBAO_ROTATION_READY_CHECKPOINT" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   openbao_finalization_ready_checkpoint_load "$cluster_digest"
 }
 
@@ -1121,8 +1265,9 @@ PY
     rm -f -- "$temporary"
     return 1
   }
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   rm -f -- "$temporary" || return 1
-  chmod 600 "$OPENBAO_ROTATION_REVOKED_CHECKPOINT" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   openbao_finalization_revoked_checkpoint_file_is_valid \
     "$OPENBAO_ROTATION_REVOKED_CHECKPOINT" "$cluster_digest"
 }
@@ -1161,8 +1306,10 @@ openbao_finalization_checkpoint_cleanup() {
   [[ "$state" == READY || "$state" == REVOKED ]] || return 1
   if [[ "$state" == REVOKED ]]; then
     rm -f -- "$OPENBAO_ROTATION_REVOKED_CHECKPOINT" || return 1
+    openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   fi
   rm -f -- "$OPENBAO_ROTATION_READY_CHECKPOINT" || return 1
+  openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" || return 1
   openbao_nonce_variables_sanitize \
     OPENBAO_FINALIZATION_ROOT_TOKEN_SHA256 \
     OPENBAO_FINALIZATION_REMOTE_HOME \
@@ -2208,7 +2355,8 @@ openbao_incident_acceptance_state() {
       incident_present=true
   done
   for path in "$OPENBAO_ROTATION_READY_CHECKPOINT" \
-      "$OPENBAO_ROTATION_REVOKED_CHECKPOINT"; do
+      "$OPENBAO_ROTATION_REVOKED_CHECKPOINT" \
+      "$OPENBAO_ROTATION_FINAL_STAGING_ROOT"; do
     [[ -n "$path" && ( -e "$path" || -L "$path" ) ]] &&
       checkpoint_present=true
   done
@@ -2940,6 +3088,10 @@ openbao_stage_180_recover_verify() {
         openbao_recover_verify_fail STOP_UNKNOWN_STATE \
           recovery-verification-marker-unsafe "$EXIT_UNKNOWN_STATE"
       fi
+      [[ ! -e "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" &&
+         ! -L "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ]] ||
+        openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+          recovery-verification-marker-unsafe "$EXIT_UNKNOWN_STATE"
       openbao_recover_verify_cleanup ||
         complete STOP_UNKNOWN_STATE "$OPENBAO_REASON_REMOTE_CLEANUP" \
           "$EXIT_UNKNOWN_STATE" NONE
@@ -2952,6 +3104,9 @@ openbao_stage_180_recover_verify() {
         openbao_recover_verify_fail STOP_UNKNOWN_STATE \
           recovery-verification-marker-unsafe "$EXIT_UNKNOWN_STATE"
       fi
+      openbao_rotation_final_staging_cleanup ||
+        openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+          recovery-final-bundle-state-unsafe "$EXIT_UNKNOWN_STATE"
       openbao_finalization_remote_helper_cleanup ||
         openbao_recover_verify_fail STOP_UNKNOWN_STATE \
           "$OPENBAO_REASON_REMOTE_CLEANUP" "$EXIT_UNKNOWN_STATE"
@@ -2970,6 +3125,9 @@ openbao_stage_180_recover_verify() {
         openbao_recover_verify_fail STOP_UNKNOWN_STATE \
           recovery-final-bundle-state-unsafe "$EXIT_UNKNOWN_STATE"
       fi
+      openbao_rotation_final_staging_cleanup ||
+        openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+          recovery-final-bundle-state-unsafe "$EXIT_UNKNOWN_STATE"
       ;;
     PARTIAL_FINAL:REVOKED)
       openbao_rotation_live_fields_are_idle ||
