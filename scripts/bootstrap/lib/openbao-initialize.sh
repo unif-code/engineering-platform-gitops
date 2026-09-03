@@ -62,6 +62,8 @@ OPENBAO_CLUSTER_NAME=
 OPENBAO_SECRET_INPUT=
 OPENBAO_REMOTE_HOME=
 OPENBAO_REMOTE_SESSION_KIND=
+OPENBAO_RECOVER_PROBE_HOME=
+OPENBAO_RECOVER_PROBE_SESSION_KIND=
 OPENBAO_INITIALIZE_TRAPS_ACTIVE=false
 
 safe_owned_directory() {
@@ -660,6 +662,113 @@ openbao_build_rotation_final() {
   openbao_rotation_final_is_valid "$cluster_digest"
 }
 
+openbao_rotation_verified_marker_file_is_valid() {
+  local marker=$1 cluster_digest=$2 final_digest
+  safe_file "$marker" 600 || return 1
+  safe_file "$OPENBAO_RECOVERY_ARCHIVE" 600 || return 1
+  final_digest=$(sha256_file "$OPENBAO_RECOVERY_ARCHIVE") || return 1
+  "$PYTHON_BINARY" -I -B - "$marker" "$OPENBAO_RECOVERY_ID" \
+    "$OPENBAO_SOURCE_RECOVERY_SHA" "$final_digest" "$cluster_digest" <<'PY'
+import hmac
+import json
+import re
+import sys
+
+marker, current_sha, source_sha, final_digest, cluster_digest = sys.argv[1:]
+try:
+    with open(marker, encoding='utf-8') as stream:
+        document = json.load(stream)
+    expected = {
+        'schema': 'engineering-platform/openbao-rotation-verification/v1',
+        'git_commit': current_sha,
+        'source_recovery_sha': source_sha,
+        'final_bundle_sha256': final_digest,
+        'cluster_identity_sha256': cluster_digest,
+        'rotation_state': 'verified',
+        'initial_root_token': 'revoked',
+    }
+    if (
+        not re.fullmatch(r'[0-9a-f]{40}', current_sha)
+        or not re.fullmatch(r'[0-9a-f]{40}', source_sha)
+        or not re.fullmatch(r'[0-9a-f]{64}', final_digest)
+        or not re.fullmatch(r'[0-9a-f]{64}', cluster_digest)
+        or set(document) != set(expected)
+        or any(
+            not isinstance(document[key], str)
+            or not hmac.compare_digest(document[key], value)
+            for key, value in expected.items()
+        )
+    ):
+        raise ValueError
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+openbao_rotation_verified_marker_is_valid() {
+  local cluster_digest=$1
+  openbao_rotation_artifact_paths || return 1
+  openbao_rotation_final_is_valid "$cluster_digest" || return 1
+  openbao_rotation_verified_marker_file_is_valid \
+    "$OPENBAO_ROTATION_VERIFIED_MARKER" "$cluster_digest"
+}
+
+openbao_rotation_verified_marker_create() {
+  local cluster_digest=$1 final_digest marker_temp
+  openbao_rotation_artifact_paths || return 1
+  openbao_rotation_final_is_valid "$cluster_digest" || return 1
+  [[ ! -e "$OPENBAO_ROTATION_VERIFIED_MARKER" &&
+     ! -L "$OPENBAO_ROTATION_VERIFIED_MARKER" ]] || return 1
+  final_digest=$(sha256_file "$OPENBAO_RECOVERY_ARCHIVE") || return 1
+  marker_temp=$(mktemp \
+    "${OPENBAO_RECOVERY_ROOT}/.openbao-rotation-marker.XXXXXX") || return 1
+  chmod 600 "$marker_temp" || { rm -f -- "$marker_temp"; return 1; }
+  if ! "$PYTHON_BINARY" -I -B - "$marker_temp" "$OPENBAO_RECOVERY_ID" \
+      "$OPENBAO_SOURCE_RECOVERY_SHA" "$final_digest" \
+      "$cluster_digest" <<'PY'
+import json
+import os
+import sys
+
+marker, current_sha, source_sha, final_digest, cluster_digest = sys.argv[1:]
+document = {
+    'schema': 'engineering-platform/openbao-rotation-verification/v1',
+    'git_commit': current_sha,
+    'source_recovery_sha': source_sha,
+    'final_bundle_sha256': final_digest,
+    'cluster_identity_sha256': cluster_digest,
+    'rotation_state': 'verified',
+    'initial_root_token': 'revoked',
+}
+with open(marker, 'w', encoding='utf-8') as stream:
+    json.dump(document, stream, ensure_ascii=True, separators=(',', ':'), sort_keys=True)
+    stream.write('\n')
+    stream.flush()
+    os.fsync(stream.fileno())
+PY
+  then
+    rm -f -- "$marker_temp"
+    return 1
+  fi
+  openbao_rotation_verified_marker_file_is_valid \
+    "$marker_temp" "$cluster_digest" || {
+      rm -f -- "$marker_temp"
+      return 1
+    }
+  # A same-filesystem hard link is an atomic noclobber publish. Unlike
+  # `mv -n`, link(2) fails when another process wins the destination race.
+  ln -- "$marker_temp" "$OPENBAO_ROTATION_VERIFIED_MARKER" || {
+    rm -f -- "$marker_temp"
+    return 1
+  }
+  if ! rm -f -- "$marker_temp" ||
+      ! chmod 600 "$OPENBAO_ROTATION_VERIFIED_MARKER" ||
+      ! openbao_rotation_verified_marker_is_valid "$cluster_digest"; then
+    rm -f -- "$OPENBAO_ROTATION_VERIFIED_MARKER" || true
+    return 1
+  fi
+}
+
 openbao_state_flags() {
   openbao_status_json | "$PYTHON_BINARY" -I -B -c '
 import json
@@ -1008,6 +1117,38 @@ openbao_rotation_submit_share() {
   (( rc == 0 ))
 }
 
+openbao_rotation_verification_submit_share() {
+  local verification_nonce=$1 response=$2 rc
+  set +x
+  [[ "$verification_nonce" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || return 1
+  openbao_rotation_response_file_prepare "$response" || return 1
+  if ! openbao_prompt_secret \
+      'Paste one new unseal share for rotation verification (hidden): '; then
+    OPENBAO_SECRET_INPUT=
+    unset OPENBAO_SECRET_INPUT
+    return 1
+  fi
+  if ! export -n OPENBAO_SECRET_INPUT 2>/dev/null; then
+    OPENBAO_SECRET_INPUT=
+    unset OPENBAO_SECRET_INPUT
+    return 1
+  fi
+  if printf '%s\n' "$OPENBAO_SECRET_INPUT" |
+      openbao_bao_stdin operator rotate-keys -format=json -verify \
+        "-nonce=${verification_nonce}" - >"$response"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  OPENBAO_SECRET_INPUT=
+  unset OPENBAO_SECRET_INPUT
+  (( rc == 0 ))
+}
+
+openbao_rotation_backup_delete() {
+  openbao_bao operator rotate-keys -backup-delete >/dev/null
+}
+
 openbao_rotation_backup_retrieve() {
   local response=$1
   openbao_rotation_response_file_prepare "$response" || return 1
@@ -1084,12 +1225,104 @@ openbao_remote_session_cleanup() {
   OPENBAO_REMOTE_SESSION_KIND=
 }
 
+openbao_recover_probe_home_create() {
+  local path
+  [[ -z "$OPENBAO_RECOVER_PROBE_HOME" &&
+     -z "$OPENBAO_RECOVER_PROBE_SESSION_KIND" ]] || return 1
+  path=$(kubectl_run --namespace=openbao exec pod/openbao-0 -- /bin/sh -c \
+    'umask 077; mktemp -d /tmp/openbao-stage180-probe.XXXXXX') || return 1
+  [[ "$path" =~ ^/tmp/openbao-stage180-probe\.[A-Za-z0-9]{6}$ ]] || return 1
+  OPENBAO_RECOVER_PROBE_HOME=$path
+  OPENBAO_RECOVER_PROBE_SESSION_KIND=pending
+}
+
+openbao_bao_recover_probe() {
+  kubectl_run --namespace=openbao exec pod/openbao-0 -- env \
+    HOME="$OPENBAO_RECOVER_PROBE_HOME" \
+    BAO_ADDR=https://openbao.openbao.svc:8200 \
+    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+    bao "$@"
+}
+
+openbao_bao_recover_probe_stdin() {
+  kubectl_run --namespace=openbao exec -i pod/openbao-0 -- env \
+    HOME="$OPENBAO_RECOVER_PROBE_HOME" \
+    BAO_ADDR=https://openbao.openbao.svc:8200 \
+    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+    bao "$@"
+}
+
+openbao_recover_probe_cleanup() {
+  local path=$OPENBAO_RECOVER_PROBE_HOME
+  local kind=$OPENBAO_RECOVER_PROBE_SESSION_KIND
+  if [[ -z "$path" ]]; then
+    [[ -z "$kind" ]]
+    return
+  fi
+  [[ "$path" =~ ^/tmp/openbao-stage180-probe\.[A-Za-z0-9]{6}$ ]] || return 1
+  if [[ "$kind" == authenticated ]]; then
+    openbao_bao_recover_probe token revoke -self >/dev/null 2>&1 || return 1
+    OPENBAO_RECOVER_PROBE_SESSION_KIND=pending
+  elif [[ "$kind" != pending ]]; then
+    return 1
+  fi
+  # $1 is intentionally expanded by the remote shell.
+  # shellcheck disable=SC2016
+  kubectl_run --namespace=openbao exec pod/openbao-0 -- /bin/sh -c \
+    'rm -f -- "$1/.bao-token"; rmdir -- "$1"' cleanup "$path" \
+    >/dev/null 2>&1 || return 1
+  OPENBAO_RECOVER_PROBE_HOME=
+  OPENBAO_RECOVER_PROBE_SESSION_KIND=
+}
+
+openbao_recover_auth_probe() {
+  local observed rc=0
+  openbao_recover_probe_home_create || return 1
+  if kubectl_run --namespace=openbao create token openbao-runtime-probe \
+      --audience=openbao --duration=10m |
+      openbao_bao_recover_probe_stdin write -field=token \
+        auth/kubernetes/login role=openbao-runtime-probe jwt=- |
+      openbao_bao_recover_probe_stdin login -no-print >/dev/null; then
+    OPENBAO_RECOVER_PROBE_SESSION_KIND=authenticated
+  else
+    openbao_recover_probe_cleanup || true
+    return 1
+  fi
+  set +e
+  openbao_bao_recover_probe kv put openbao-probe/runtime-check \
+    value="$OPENBAO_PROBE_VALUE" >/dev/null || rc=1
+  observed=$(openbao_bao_recover_probe kv get -field=value \
+    openbao-probe/runtime-check 2>/dev/null) || rc=1
+  [[ "$observed" == "$OPENBAO_PROBE_VALUE" ]] || rc=1
+  if openbao_bao_recover_probe read sys/auth >/dev/null 2>&1; then
+    rc=1
+  fi
+  openbao_bao_recover_probe operator raft list-peers -format=json |
+    "$PYTHON_BINARY" -I -B -c '
+import json
+import sys
+
+data = json.load(sys.stdin).get("data", {})
+servers = data.get("config", {}).get("servers", [])
+if len(servers) != 1 or servers[0].get("node_id") != "openbao-0":
+    raise SystemExit(1)
+if servers[0].get("leader") is not True:
+    raise SystemExit(1)
+' || rc=1
+  openbao_bao_recover_probe kv delete openbao-probe/runtime-check \
+    >/dev/null || rc=1
+  openbao_recover_probe_cleanup || rc=1
+  set -e
+  (( rc == 0 ))
+}
+
 openbao_initialize_cleanup() {
   local rc=0
   set +x
   OPENBAO_SECRET_INPUT=
   unset OPENBAO_SECRET_INPUT
   openbao_rotation_temp_cleanup || rc=1
+  openbao_recover_probe_cleanup || rc=1
   openbao_remote_session_cleanup || rc=1
   (( rc == 0 ))
 }
@@ -1182,6 +1415,14 @@ path "openbao-probe/data/runtime-check" {
 }
 
 path "sys/storage/raft/configuration" {
+  capabilities = ["read"]
+}
+
+path "sys/rotate/root" {
+  capabilities = ["read"]
+}
+
+path "sys/rotate/root/verification" {
   capabilities = ["read"]
 }
 HCL
@@ -1279,6 +1520,10 @@ if data.get("token_ttl") != 600 or data.get("token_max_ttl") != 600:
     >/dev/null || return 1
   printf '%s' "$policy" | grep -F 'path "sys/storage/raft/configuration"' \
     >/dev/null || return 1
+  printf '%s' "$policy" | grep -F 'path "sys/rotate/root"' \
+    >/dev/null || return 1
+  printf '%s' "$policy" | grep -F 'path "sys/rotate/root/verification"' \
+    >/dev/null || return 1
   openbao_audit_api_is_exact
 }
 
@@ -1318,9 +1563,13 @@ openbao_apply_configuration() {
 }
 
 openbao_root_session_revoke() {
-  openbao_bao token revoke -self >/dev/null || return 1
+  openbao_root_session_revoke_self || return 1
   openbao_root_session_revocation_is_proven || return 1
   OPENBAO_REMOTE_SESSION_KIND=
+}
+
+openbao_root_session_revoke_self() {
+  openbao_bao token revoke -self >/dev/null
 }
 
 openbao_root_session_revocation_is_proven() {
@@ -1437,6 +1686,128 @@ openbao_platform_secrets_match_recovery_baseline() {
   [[ "$observed" == "$expected" ]]
 }
 
+openbao_incident_acceptance_state() {
+  local incident_present=false path
+  for path in "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY" \
+      "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+      "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" \
+      "$OPENBAO_ROTATION_VERIFIED_MARKER"; do
+    [[ -n "$path" && ( -e "$path" || -L "$path" ) ]] &&
+      incident_present=true
+  done
+  if openbao_recovery_bundle_is_valid &&
+      [[ "$incident_present" == false ]]; then
+    printf 'NORMAL_V1\n'
+  elif [[ "$incident_present" == true ]] ||
+      [[ -n "$OPENBAO_RECOVERY_ARCHIVE" &&
+         ( -e "$OPENBAO_RECOVERY_ARCHIVE" ||
+           -L "$OPENBAO_RECOVERY_ARCHIVE" ) ]]; then
+    printf 'INCIDENT_V2\n'
+  else
+    printf 'AMBIGUOUS\n'
+  fi
+}
+
+openbao_incident_source_sha_load() {
+  local metadata source_sha
+  metadata=${OPENBAO_RECOVERY_DIRECTORY}/metadata.json
+  safe_file "$metadata" 600 || return 1
+  source_sha=$("$PYTHON_BINARY" -I -B - "$metadata" \
+    "$OPENBAO_RECOVERY_ID" <<'PY'
+import json
+import re
+import sys
+
+metadata_path, current_sha = sys.argv[1:]
+try:
+    with open(metadata_path, encoding='utf-8') as stream:
+        document = json.load(stream)
+    source_sha = document.get('source_recovery_sha')
+    if (
+        document.get('schema') != 'engineering-platform/openbao-recovery/v2'
+        or document.get('git_commit') != current_sha
+        or not isinstance(source_sha, str)
+        or re.fullmatch(r'[0-9a-f]{40}', source_sha) is None
+    ):
+        raise ValueError
+    print(source_sha)
+except Exception:
+    raise SystemExit(1)
+PY
+  ) || return 1
+  OPENBAO_SOURCE_RECOVERY_SHA=$source_sha
+}
+
+openbao_incident_artifacts_are_valid() {
+  local artifact_state cluster_digest
+  artifact_state=$(openbao_rotation_artifact_presence_state) || return 1
+  [[ "$artifact_state" == VERIFIED ]] || return 1
+  openbao_incident_source_sha_load || return 1
+  openbao_source_recovery_bundle_is_valid || return 1
+  openbao_live_cluster_identity || return 1
+  cluster_digest=$(openbao_cluster_identity_sha256 \
+    "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME") || return 1
+  openbao_rotation_candidate_is_valid "$cluster_digest" || return 1
+  openbao_rotation_final_is_valid "$cluster_digest" || return 1
+  openbao_rotation_verified_marker_is_valid "$cluster_digest"
+}
+
+openbao_incident_live_rotation_is_idle() {
+  local rc=0
+  openbao_rotation_temp_create || return 1
+  if ! openbao_probe_session_start; then
+    openbao_remote_session_cleanup || true
+    openbao_rotation_temp_cleanup || true
+    return 1
+  fi
+  openbao_rotation_status normal || rc=1
+  openbao_rotation_status verification || rc=1
+  [[ "$OPENBAO_ROTATION_PHASE" == IDLE &&
+     "$OPENBAO_ROTATION_PROGRESS" == 0 &&
+     "$OPENBAO_ROTATION_REQUIRED" == 0 &&
+     -z "$OPENBAO_ROTATION_NONCE" &&
+     -z "$OPENBAO_ROTATION_VERIFICATION_NONCE" &&
+     "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
+     "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" == 0 &&
+     -z "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ]] || rc=1
+  openbao_remote_session_cleanup || rc=1
+  openbao_rotation_temp_cleanup || rc=1
+  (( rc == 0 ))
+}
+
+openbao_recover_runtime_readback() {
+  [[ "$(openbao_state_flags)" == 'true|false' ]] &&
+    openbao_configuration_readback_is_exact &&
+    openbao_recover_auth_probe &&
+    openbao_audit_runtime_is_exact &&
+    openbao_source_recovery_bundle_is_valid
+}
+
+openbao_rotation_verified_at_utc() {
+  local timestamp
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
+  [[ "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+    return 1
+  printf '%s\n' "$timestamp"
+}
+
+openbao_incident_evidence_is_exact() {
+  local file=$1 line
+  safe_file "$file" 600 || return 1
+  for line in \
+      'UNSEAL_KEY_ROTATION=PASS' \
+      'COMPROMISED_SHARE_INVALIDATED=true' \
+      'INITIAL_ROOT_TOKEN=REVOKED' \
+      'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2' \
+      'MINIO=NOT_EXECUTED' \
+      'SNAPSHOT=NOT_EXECUTED' \
+      'BACKUP=NOT_EXECUTED' \
+      'RESTORE=NOT_EXECUTED' \
+      'APP_SECRET_MIGRATION=NOT_EXECUTED'; do
+    [[ "$(grep -Fxc "$line" "$file")" == 1 ]] || return 1
+  done
+}
+
 openbao_resource_fact() {
   local namespace=$1 resource=$2 name=$3 label=$4 document
   if [[ -n "$namespace" ]]; then
@@ -1494,6 +1865,8 @@ for pattern in (
     r'(?i)(?:hvs|hvb|hvr|s)\.[A-Za-z0-9_-]{8,}',
     r'(?i)"?(?:unseal_keys_b64|root_token|client_token|jwt)"?\s*[:=]\s*["A-Za-z0-9+/_.-]{8,}',
     r'[A-Za-z0-9+/]{43}=',
+    r'(?i)(?:verification_nonce|keys_base64|raw_rotation_response|rotation_response|ciphertext)\s*[:=]',
+    r'[A-Za-z0-9+/]{80,}={0,2}',
 ):
     if re.search(pattern, text):
         raise SystemExit(1)
@@ -1501,12 +1874,16 @@ PY
 }
 
 openbao_existing_evidence() {
+  local acceptance_state=${1:-NORMAL_V1}
   local candidate digest recorded recorded_name sidecar
   for candidate in "$(host_path /root/dev-infra-evidence)"/17-openbao-runtime-*.txt; do
     safe_file "$candidate" 600 || continue
     grep -Fx "GIT_COMMIT=${OPENBAO_RECOVERY_ID}" "$candidate" >/dev/null 2>&1 ||
       continue
     openbao_evidence_is_secret_free "$candidate" || continue
+    if [[ "$acceptance_state" == INCIDENT_V2 ]]; then
+      openbao_incident_evidence_is_exact "$candidate" || continue
+    fi
     sidecar=${candidate}.sha256
     safe_file "$sidecar" 600 || continue
     digest=$(sha256_file "$candidate") || continue
@@ -1522,7 +1899,8 @@ openbao_existing_evidence() {
 }
 
 openbao_write_acceptance_payload() {
-  local destination=$1 bundle_sha platform_fingerprint public_fingerprint
+  local destination=$1 acceptance_state=${2:-NORMAL_V1}
+  local bundle_sha platform_fingerprint public_fingerprint
   bundle_sha=$(sha256_file "$OPENBAO_RECOVERY_ARCHIVE") || return 1
   platform_fingerprint=$(openbao_platform_secret_fingerprint) || return 1
   public_fingerprint=$(<"$OPENBAO_PUBLIC_KEY_FINGERPRINT") || return 1
@@ -1555,6 +1933,11 @@ openbao_write_acceptance_payload() {
     printf 'POLICY_NEGATIVE_PROBE=PASS\n'
     printf 'TEMPORARY_TOKEN=REVOKED\n'
     printf 'INITIAL_ROOT_TOKEN=REVOKED\n'
+    if [[ "$acceptance_state" == INCIDENT_V2 ]]; then
+      printf 'UNSEAL_KEY_ROTATION=PASS\n'
+      printf 'COMPROMISED_SHARE_INVALIDATED=true\n'
+      printf 'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2\n'
+    fi
     printf 'PLATFORM_SECRET_FINGERPRINT=%s\n' "$platform_fingerprint"
     printf 'PLATFORM_SECRET_DRIFT=NONE\n'
     printf 'APPLICATIONS=READY\n'
@@ -1917,6 +2300,164 @@ openbao_stage_180_recover_start() {
     "download and verify ${OPENBAO_ROTATION_CANDIDATE_ARCHIVE} and ${OPENBAO_ROTATION_CANDIDATE_SIDECAR}; then run stages/180-openbao-initialize/run.sh --recover-verify --source-recovery-sha=${OPENBAO_SOURCE_RECOVERY_SHA}"
 }
 
+openbao_recover_verify_cleanup() {
+  local rc=0
+  openbao_rotation_temp_cleanup || rc=1
+  openbao_recover_probe_cleanup || rc=1
+  openbao_remote_session_cleanup || rc=1
+  (( rc == 0 ))
+}
+
+openbao_recover_verify_fail() {
+  local result=$1 reason=$2 code=$3
+  if ! openbao_recover_verify_cleanup; then
+    complete STOP_UNKNOWN_STATE "$OPENBAO_REASON_REMOTE_CLEANUP" \
+      "$EXIT_UNKNOWN_STATE" NONE
+  fi
+  complete "$result" "$reason" "$code" NONE
+}
+
+openbao_stage_180_recover_verify() {
+  local artifact_state cluster_digest expected_progress state verified_at
+  local expected_verification_nonce=
+  export -n expected_verification_nonce 2>/dev/null || return 1
+  set +x
+  openbao_stage_180_preflight
+  openbao_source_recovery_bundle_is_valid ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      "$OPENBAO_REASON_SOURCE_UNSAFE" "$EXIT_UNKNOWN_STATE"
+  openbao_require_interactive_tty ||
+    openbao_recover_verify_fail STOP_PRECONDITION interactive-tty-required \
+      "$EXIT_PRECONDITION"
+  state=$(openbao_state_flags) ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE unexpected-openbao-state \
+      "$EXIT_UNKNOWN_STATE"
+  [[ "$state" == 'true|false' ]] ||
+    openbao_recover_verify_fail STOP_PRECONDITION unexpected-openbao-state \
+      "$EXIT_PRECONDITION"
+  openbao_root_session_start ||
+    openbao_recover_verify_fail STOP_APPLY_FAILED openbao-root-login-failed \
+      "$EXIT_APPLY_FAILED"
+  openbao_live_cluster_identity ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-cluster-identity-invalid "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_temp_create ||
+    openbao_recover_verify_fail STOP_APPLY_FAILED \
+      rotation-candidate-state-unsafe "$EXIT_APPLY_FAILED"
+  artifact_state=$(openbao_rotation_artifact_presence_state) ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      rotation-candidate-state-unsafe "$EXIT_UNKNOWN_STATE"
+  [[ "$artifact_state" == CANDIDATE ]] ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      rotation-candidate-state-unsafe "$EXIT_UNKNOWN_STATE"
+  cluster_digest=$(openbao_cluster_identity_sha256 \
+    "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME") ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-cluster-identity-invalid "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_status normal ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_status verification ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_candidate_is_valid "$cluster_digest" ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      rotation-candidate-state-unsafe "$EXIT_UNKNOWN_STATE"
+
+  if [[ "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_COMPLETE &&
+        "$OPENBAO_ROTATION_VERIFICATION_PHASE" == PENDING &&
+        "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" =~ ^[0-2]$ &&
+        "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" =~ ^[A-Za-z0-9_-]{8,128}$ ]] &&
+      [[ -z "$OPENBAO_ROTATION_VERIFICATION_NONCE" ||
+        "$OPENBAO_ROTATION_VERIFICATION_NONCE" == "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ]]; then
+    expected_verification_nonce=$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE
+    openbao_rotation_candidate_nonce_matches_live \
+      "$expected_verification_nonce" ||
+      openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+        rotation-candidate-state-unsafe "$EXIT_UNKNOWN_STATE"
+    while (( OPENBAO_ROTATION_VERIFICATION_PROGRESS < 3 )); do
+      expected_progress=$((OPENBAO_ROTATION_VERIFICATION_PROGRESS + 1))
+      openbao_rotation_verification_submit_share \
+        "$expected_verification_nonce" "$OPENBAO_ROTATION_RESPONSE" ||
+        openbao_recover_verify_fail STOP_APPLY_FAILED \
+          rotation-verification-failed "$EXIT_APPLY_FAILED"
+      openbao_rotation_status verification ||
+        openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+          openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+      if (( expected_progress < 3 )); then
+        [[ "$OPENBAO_ROTATION_VERIFICATION_PHASE" == PENDING &&
+           "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" == "$expected_progress" &&
+           "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" == "$expected_verification_nonce" ]] ||
+          openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+            openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+      else
+        [[ "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
+           "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" == 0 &&
+           -z "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ]] ||
+          openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+            openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+        OPENBAO_ROTATION_VERIFICATION_PROGRESS=3
+      fi
+    done
+  elif [[ "$OPENBAO_ROTATION_PHASE" == IDLE &&
+          "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE ]]; then
+    :
+  else
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  fi
+
+  openbao_rotation_status normal ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_status verification ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  [[ "$OPENBAO_ROTATION_PHASE" == IDLE &&
+     "$OPENBAO_ROTATION_PROGRESS" == 0 &&
+     "$OPENBAO_ROTATION_REQUIRED" == 0 &&
+     -z "$OPENBAO_ROTATION_NONCE" &&
+     -z "$OPENBAO_ROTATION_VERIFICATION_NONCE" &&
+     "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
+     "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" == 0 &&
+     -z "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ]] ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_candidate_is_valid "$cluster_digest" ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      rotation-candidate-state-unsafe "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_backup_delete ||
+    openbao_recover_verify_fail STOP_APPLY_FAILED \
+      rotation-backup-delete-failed "$EXIT_APPLY_FAILED"
+  openbao_recover_runtime_readback ||
+    openbao_recover_verify_fail STOP_VERIFY_FAILED openbao-auth-probe-failed \
+      "$EXIT_VERIFY_FAILED"
+  openbao_root_session_revoke_self ||
+    openbao_recover_verify_fail STOP_APPLY_FAILED \
+      initial-root-token-revoke-failed "$EXIT_APPLY_FAILED"
+  openbao_root_session_revocation_is_proven ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      initial-root-token-still-valid "$EXIT_UNKNOWN_STATE"
+  OPENBAO_REMOTE_SESSION_KIND=
+  openbao_recover_verify_cleanup ||
+    complete STOP_UNKNOWN_STATE "$OPENBAO_REASON_REMOTE_CLEANUP" \
+      "$EXIT_UNKNOWN_STATE" NONE
+  verified_at=$(openbao_rotation_verified_at_utc) ||
+    complete STOP_UNKNOWN_STATE recovery-final-bundle-state-unsafe \
+      "$EXIT_UNKNOWN_STATE" NONE
+  openbao_build_rotation_final "$cluster_digest" "$verified_at" ||
+    openbao_recover_verify_fail STOP_APPLY_FAILED \
+      recovery-final-bundle-write-failed "$EXIT_APPLY_FAILED"
+  openbao_rotation_final_is_valid "$cluster_digest" ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      recovery-final-bundle-state-unsafe "$EXIT_UNKNOWN_STATE"
+  openbao_rotation_verified_marker_create "$cluster_digest" ||
+    openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+      recovery-verification-marker-unsafe "$EXIT_UNKNOWN_STATE"
+  complete PASS_OPENBAO_RECOVERED openbao-key-rotation-verified 0 \
+    'stages/180-openbao-initialize/run.sh --accept'
+}
+
 openbao_stage_180_configure() {
   local state
   openbao_stage_180_preflight
@@ -1964,17 +2505,42 @@ openbao_stage_180_configure() {
 }
 
 openbao_stage_180_accept() {
-  local evidence_dir payload digest sidecar
+  local acceptance_state evidence_dir payload digest sidecar
   openbao_stage_180_preflight
-  openbao_recovery_bundle_is_valid ||
-    complete STOP_UNKNOWN_STATE recovery-bundle-state-unsafe \
+  acceptance_state=$(openbao_incident_acceptance_state) ||
+    complete STOP_UNKNOWN_STATE recovery-verification-marker-unsafe \
       "$EXIT_UNKNOWN_STATE" NONE
+  case "$acceptance_state" in
+    NORMAL_V1)
+      openbao_recovery_bundle_is_valid ||
+        complete STOP_UNKNOWN_STATE recovery-bundle-state-unsafe \
+          "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+    INCIDENT_V2)
+      openbao_incident_artifacts_are_valid ||
+        complete STOP_UNKNOWN_STATE recovery-verification-marker-unsafe \
+          "$EXIT_UNKNOWN_STATE" NONE
+      openbao_incident_live_rotation_is_idle ||
+        complete STOP_UNKNOWN_STATE openbao-rotation-state-unsafe \
+          "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+    *)
+      complete STOP_UNKNOWN_STATE recovery-verification-marker-unsafe \
+        "$EXIT_UNKNOWN_STATE" NONE
+      ;;
+  esac
   [[ "$(openbao_state_flags)" == 'true|false' ]] ||
     complete STOP_PRECONDITION unexpected-openbao-state \
       "$EXIT_PRECONDITION" NONE
-  openbao_platform_secrets_match_recovery_baseline ||
-    complete STOP_VERIFY_FAILED platform-secret-drift \
-      "$EXIT_VERIFY_FAILED" NONE
+  if [[ "$acceptance_state" == NORMAL_V1 ]]; then
+    openbao_platform_secrets_match_recovery_baseline ||
+      complete STOP_VERIFY_FAILED platform-secret-drift \
+        "$EXIT_VERIFY_FAILED" NONE
+  else
+    openbao_source_recovery_bundle_is_valid ||
+      complete STOP_VERIFY_FAILED platform-secret-drift \
+        "$EXIT_VERIFY_FAILED" NONE
+  fi
   openbao_auth_probe ||
     complete STOP_VERIFY_FAILED openbao-auth-probe-failed \
       "$EXIT_VERIFY_FAILED" NONE
@@ -1987,10 +2553,16 @@ openbao_stage_180_accept() {
   business_https_smoke ||
     complete STOP_VERIFY_FAILED https-smoke-failed \
       "$EXIT_VERIFY_FAILED" NONE
-  openbao_platform_secrets_match_recovery_baseline ||
-    complete STOP_VERIFY_FAILED platform-secret-drift \
-      "$EXIT_VERIFY_FAILED" NONE
-  if openbao_existing_evidence >/dev/null; then
+  if [[ "$acceptance_state" == NORMAL_V1 ]]; then
+    openbao_platform_secrets_match_recovery_baseline ||
+      complete STOP_VERIFY_FAILED platform-secret-drift \
+        "$EXIT_VERIFY_FAILED" NONE
+  else
+    openbao_source_recovery_bundle_is_valid ||
+      complete STOP_VERIFY_FAILED platform-secret-drift \
+        "$EXIT_VERIFY_FAILED" NONE
+  fi
+  if openbao_existing_evidence "$acceptance_state" >/dev/null; then
     complete ALREADY_COMPLIANT openbao-runtime-evidence-exists 0 NONE
   fi
   evidence_dir=$(host_path /root/dev-infra-evidence)
@@ -2000,9 +2572,14 @@ openbao_stage_180_accept() {
   rm -f -- "$payload" ||
     complete STOP_APPLY_FAILED evidence-open-failed \
       "$EXIT_APPLY_FAILED" NONE
-  openbao_write_acceptance_payload "$payload" ||
+  openbao_write_acceptance_payload "$payload" "$acceptance_state" ||
     complete STOP_APPLY_FAILED evidence-open-failed \
       "$EXIT_APPLY_FAILED" NONE
+  if [[ "$acceptance_state" == INCIDENT_V2 ]]; then
+    openbao_incident_evidence_is_exact "$payload" ||
+      complete STOP_VERIFY_FAILED evidence-scan-failed \
+        "$EXIT_VERIFY_FAILED" NONE
+  fi
   openbao_evidence_is_secret_free "$payload" ||
     complete STOP_VERIFY_FAILED evidence-scan-failed \
       "$EXIT_VERIFY_FAILED" NONE
@@ -2016,6 +2593,10 @@ openbao_stage_180_accept() {
   finish_phase PASS_OPENBAO_RUNTIME_ACCEPTED openbao-runtime-accepted 0 NONE ||
     exit "$?"
   openbao_evidence_is_secret_free "$EVIDENCE_FILE" || exit "$EXIT_VERIFY_FAILED"
+  if [[ "$acceptance_state" == INCIDENT_V2 ]]; then
+    openbao_incident_evidence_is_exact "$EVIDENCE_FILE" ||
+      exit "$EXIT_VERIFY_FAILED"
+  fi
   digest=$(sha256_file "$EVIDENCE_FILE") || exit "$EXIT_UNKNOWN_STATE"
   sidecar=${EVIDENCE_FILE}.sha256
   (umask 077; set -o noclobber; printf '%s  %s\n' "$digest" \
@@ -2065,6 +2646,7 @@ openbao_initialize_main() {
     INITIALIZE) openbao_stage_180_initialize ;;
     CONFIGURE) openbao_stage_180_configure ;;
     RECOVER_START) openbao_stage_180_recover_start ;;
+    RECOVER_VERIFY) openbao_stage_180_recover_verify ;;
     ACCEPT) openbao_stage_180_accept ;;
     *) complete STOP_PRECONDITION invalid-openbao-operation \
       "$EXIT_PRECONDITION" NONE ;;
