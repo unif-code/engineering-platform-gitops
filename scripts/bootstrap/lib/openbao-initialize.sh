@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
 
+openbao_nonce_variables_sanitize() {
+  local name
+  for name in "$@"; do
+    unset "$name" || return 1
+    export -n "${name?}" 2>/dev/null || return 1
+  done
+}
+
+openbao_nonce_variables_sanitize \
+  OPENBAO_ROTATION_NONCE \
+  OPENBAO_ROTATION_VERIFICATION_NONCE \
+  OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE || exit 1
+
 openbao_initialize_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck disable=SC1091
 source "${openbao_initialize_lib_dir}/openbao-runtime.sh"
@@ -49,6 +62,7 @@ OPENBAO_CLUSTER_NAME=
 OPENBAO_SECRET_INPUT=
 OPENBAO_REMOTE_HOME=
 OPENBAO_REMOTE_SESSION_KIND=
+OPENBAO_INITIALIZE_TRAPS_ACTIVE=false
 
 safe_owned_directory() {
   local path=$1 expected_uid=$2
@@ -378,6 +392,9 @@ openbao_rotation_status() {
   local -a fields=()
   case "$kind" in
     normal)
+      openbao_nonce_variables_sanitize \
+        OPENBAO_ROTATION_NONCE \
+        OPENBAO_ROTATION_VERIFICATION_NONCE || return 1
       OPENBAO_ROTATION_PHASE=
       OPENBAO_ROTATION_NONCE=
       OPENBAO_ROTATION_PROGRESS=
@@ -402,6 +419,8 @@ openbao_rotation_status() {
       OPENBAO_ROTATION_VERIFICATION_NONCE=${fields[4]}
       ;;
     verification)
+      openbao_nonce_variables_sanitize \
+        OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE || return 1
       OPENBAO_ROTATION_VERIFICATION_PHASE=
       OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=
       OPENBAO_ROTATION_VERIFICATION_PROGRESS=
@@ -1066,11 +1085,44 @@ openbao_remote_session_cleanup() {
 }
 
 openbao_initialize_cleanup() {
+  local rc=0
   set +x
   OPENBAO_SECRET_INPUT=
   unset OPENBAO_SECRET_INPUT
-  openbao_rotation_temp_cleanup || true
-  openbao_remote_session_cleanup || true
+  openbao_rotation_temp_cleanup || rc=1
+  openbao_remote_session_cleanup || rc=1
+  (( rc == 0 ))
+}
+
+openbao_initialize_trap() {
+  local event=$1 prior_status=$2 final_status
+  trap - EXIT HUP INT TERM
+  if [[ "$OPENBAO_INITIALIZE_TRAPS_ACTIVE" != true ]]; then
+    exit "$prior_status"
+  fi
+  OPENBAO_INITIALIZE_TRAPS_ACTIVE=false
+  case "$event" in
+    EXIT) final_status=$prior_status ;;
+    HUP) final_status=129 ;;
+    INT) final_status=130 ;;
+    TERM) final_status=143 ;;
+    *) final_status=$EXIT_UNKNOWN_STATE ;;
+  esac
+  if openbao_initialize_cleanup; then
+    exit "$final_status"
+  fi
+  finish_phase STOP_UNKNOWN_STATE "$OPENBAO_REASON_REMOTE_CLEANUP" \
+    "$EXIT_UNKNOWN_STATE" NONE || true
+  exit "$EXIT_UNKNOWN_STATE"
+}
+
+openbao_initialize_traps_install() {
+  [[ "$OPENBAO_INITIALIZE_TRAPS_ACTIVE" == false ]] || return 1
+  OPENBAO_INITIALIZE_TRAPS_ACTIVE=true
+  trap 'openbao_initialize_trap EXIT "$?"' EXIT
+  trap 'openbao_initialize_trap HUP 129' HUP
+  trap 'openbao_initialize_trap INT 130' INT
+  trap 'openbao_initialize_trap TERM 143' TERM
 }
 
 openbao_prompt_secret() {
@@ -1677,7 +1729,9 @@ openbao_recover_start_fail() {
 
 openbao_stage_180_recover_start() {
   local artifact_state cluster_digest expected_progress response_kind state
+  local expected_rotation_nonce=
   local submitted_final_response=false
+  export -n expected_rotation_nonce 2>/dev/null || return 1
   set +x
   openbao_stage_180_preflight
   openbao_source_recovery_bundle_is_valid ||
@@ -1732,6 +1786,11 @@ openbao_stage_180_recover_start() {
   openbao_rotation_status verification ||
     openbao_recover_start_fail STOP_UNKNOWN_STATE \
       openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  if [[ "$OPENBAO_ROTATION_VERIFICATION_PHASE" == PENDING &&
+        "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" != 0 ]]; then
+    openbao_recover_start_fail STOP_UNKNOWN_STATE \
+      openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+  fi
 
   if [[ "$artifact_state" == CANDIDATE ]]; then
     [[ "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_COMPLETE &&
@@ -1775,13 +1834,17 @@ openbao_stage_180_recover_start() {
 
   if [[ "$artifact_state" == MISSING &&
         "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_PENDING ]]; then
+    expected_rotation_nonce=$OPENBAO_ROTATION_NONCE
     while (( OPENBAO_ROTATION_PROGRESS < OPENBAO_ROTATION_REQUIRED )); do
       expected_progress=$((OPENBAO_ROTATION_PROGRESS + 1))
-      openbao_rotation_submit_share "$OPENBAO_ROTATION_NONCE" \
+      openbao_rotation_submit_share "$expected_rotation_nonce" \
         "$OPENBAO_ROTATION_RESPONSE" ||
         openbao_recover_start_fail STOP_APPLY_FAILED \
           openbao-rotation-share-submit-failed "$EXIT_APPLY_FAILED"
       openbao_rotation_status normal ||
+        openbao_recover_start_fail STOP_UNKNOWN_STATE \
+          openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+      [[ "$OPENBAO_ROTATION_NONCE" == "$expected_rotation_nonce" ]] ||
         openbao_recover_start_fail STOP_UNKNOWN_STATE \
           openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
       if (( expected_progress < 3 )); then
@@ -1994,7 +2057,9 @@ openbao_initialize_main() {
   openbao_initialize_ceremony_paths ||
     complete STOP_UNKNOWN_STATE git-commit-unreadable \
       "$EXIT_UNKNOWN_STATE" NONE
-  trap openbao_initialize_cleanup EXIT HUP INT TERM
+  openbao_initialize_traps_install ||
+    complete STOP_UNKNOWN_STATE "$OPENBAO_REASON_REMOTE_CLEANUP" \
+      "$EXIT_UNKNOWN_STATE" NONE
   case "$OPENBAO_OPERATION" in
     CHECK) openbao_stage_180_check ;;
     INITIALIZE) openbao_stage_180_initialize ;;
