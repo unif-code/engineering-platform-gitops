@@ -8222,6 +8222,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         *,
         verification_progress: int = 0,
         artifact_state: str = 'CANDIDATE',
+        checkpoint_state: str = 'NONE',
         failure: str = '',
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         """Run the real recover-verify state machine over controlled facts."""
@@ -8236,6 +8237,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             TEST_FAILURE=$5
             OPENBAO_SOURCE_RECOVERY_SHA=$6
             OPENBAO_RECOVERY_ID=$7
+            TEST_CHECKPOINT_STATE=$8
             OPENBAO_ROTATION_TEMP_DIRECTORY=/root/openbao-recovery/.openbao-rotation.ABC123
             OPENBAO_ROTATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/response.json
             OPENBAO_ROTATION_STATUS_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.json
@@ -8264,6 +8266,8 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               [[ "$TEST_FAILURE" != root-login ]]
             }
             openbao_live_cluster_identity() { log_call live-cluster; }
+            openbao_finalization_transaction_binding() { printf '%064d\n' 1; }
+            openbao_root_session_binding_create() { log_call root-helper-bind; }
             openbao_rotation_temp_create() { log_call rotation-temp-create; }
             openbao_rotation_temp_cleanup() {
               log_call rotation-temp-cleanup
@@ -8313,6 +8317,11 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 *) return 1 ;;
               esac
             }
+            openbao_recover_verify_live_readback() {
+              log_call probe-live-readback
+              openbao_rotation_status normal &&
+                openbao_rotation_status verification
+            }
             openbao_cluster_identity_sha256() { printf '%064d\n' 0; }
             openbao_rotation_candidate_is_valid() {
               TEST_CANDIDATE_VALIDATIONS=$((TEST_CANDIDATE_VALIDATIONS + 1))
@@ -8353,6 +8362,43 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               esac
               log_call root-lookup-denied
             }
+            openbao_root_token_sha256() {
+              log_call root-token-commitment
+              printf '%064d\n' 2
+            }
+            openbao_finalization_ready_checkpoint_create() {
+              log_call ready-checkpoint
+              [[ "$TEST_FAILURE" != ready-checkpoint ]] || return 1
+              TEST_CHECKPOINT_STATE=READY
+            }
+            openbao_finalization_checkpoint_state() {
+              log_call "checkpoint-${TEST_CHECKPOINT_STATE}"
+              printf '%s\n' "$TEST_CHECKPOINT_STATE"
+            }
+            openbao_finalization_ready_checkpoint_load() {
+              OPENBAO_FINALIZATION_ROOT_TOKEN_SHA256=$(printf '%064d' 2)
+              OPENBAO_FINALIZATION_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+              OPENBAO_FINALIZATION_REMOTE_BINDING=$(printf '%064d' 1)
+            }
+            openbao_finalization_resume_root_revocation() {
+              log_call root-resume-proof
+              case "$TEST_FAILURE" in
+                resume-commitment|resume-transport|resume-still-valid) return 1 ;;
+              esac
+            }
+            openbao_finalization_revoked_checkpoint_create() {
+              log_call revoked-checkpoint
+              [[ "$TEST_FAILURE" != revoked-checkpoint ]] || return 1
+              TEST_CHECKPOINT_STATE=REVOKED
+            }
+            openbao_finalization_remote_helper_cleanup() {
+              log_call root-helper-cleanup
+              [[ "$TEST_FAILURE" != helper-cleanup ]]
+            }
+            openbao_finalization_checkpoint_cleanup() {
+              log_call checkpoint-cleanup
+              [[ "$TEST_FAILURE" != checkpoint-cleanup ]]
+            }
             openbao_remote_session_cleanup() {
               log_call root-helper-cleanup
               [[ "$TEST_FAILURE" != helper-cleanup ]]
@@ -8368,6 +8414,15 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             openbao_rotation_final_is_valid() {
               log_call final-bundle-validate
               [[ "$TEST_FAILURE" != final-validate ]]
+            }
+            openbao_rotation_partial_final_cleanup() {
+              log_call partial-final-cleanup
+              [[ "$TEST_FAILURE" != partial-final-cleanup ]] || return 1
+              TEST_ARTIFACT_STATE=CANDIDATE
+            }
+            openbao_rotation_verified_marker_is_valid() {
+              log_call final-marker-validate
+              [[ "$TEST_FAILURE" != marker-validate ]]
             }
             openbao_rotation_verified_marker_create() {
               log_call verified-marker
@@ -8388,7 +8443,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 '/bin/bash', '-c', script, 'recover-verify',
                 str(OPENBAO_INITIALIZE_LIB), str(call_log),
                 str(verification_progress), artifact_state, failure,
-                self.SOURCE_SHA, self.CURRENT_SHA,
+                self.SOURCE_SHA, self.CURRENT_SHA, checkpoint_state,
             ],
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
@@ -8412,6 +8467,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             TEST_EVIDENCE=$3
             TEST_STATE=$4
             TEST_ROOT=$9
+            PYTHON_BINARY=/usr/bin/python3
             OPENBAO_RECOVERY_ID=$5
             OPENBAO_SOURCE_RECOVERY_SHA=$6
             OPENBAO_RECOVERY_ARCHIVE=$7
@@ -10613,8 +10669,9 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             'NEXT=stages/180-openbao-initialize/run.sh --accept\n',
         )
         for before, after in (
-            ('new-share-3', 'candidate-revalidate'),
-            ('candidate-revalidate', 'backup-delete'),
+            ('source-validate', 'live-cluster'),
+            ('live-cluster', 'candidate-validate-pre'),
+            ('candidate-validate-pre', 'root-login'),
             ('backup-delete', 'runtime-readback'),
             ('runtime-readback', 'root-revoke-self'),
             ('root-revoke-self', 'root-lookup-denied'),
@@ -10624,6 +10681,12 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             ('final-bundle-validate', 'verified-marker'),
         ):
             self.assertLess(calls.index(before), calls.index(after))
+        final_revalidation = max(
+            index for index, call in enumerate(calls)
+            if call == 'candidate-revalidate'
+        )
+        self.assertLess(calls.index('new-share-3'), final_revalidation)
+        self.assertLess(final_revalidation, calls.index('backup-delete'))
         self.assertEqual(
             [call for call in calls if call.startswith('new-share-')],
             ['new-share-1', 'new-share-2', 'new-share-3'],
@@ -10633,14 +10696,14 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
         self.assertLess(
             calls.index('normal-status-idle'),
-            calls.index('candidate-revalidate'),
+            final_revalidation,
         )
         self.assertLess(
             max(
                 index for index, call in enumerate(calls)
                 if call == 'verification-status-idle'
             ),
-            calls.index('candidate-revalidate'),
+            final_revalidation,
         )
         self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
 
@@ -10670,6 +10733,70 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertLess(
             calls.index('candidate-revalidate'), calls.index('backup-delete'),
         )
+
+    def test_recover_verify_resumes_every_post_revoke_crash_window(self) -> None:
+        cases = (
+            ('proof-before-checkpoint', 'READY', 'CANDIDATE'),
+            ('proof-after-checkpoint', 'REVOKED', 'CANDIDATE'),
+            ('helper-cleanup', 'REVOKED', 'CANDIDATE'),
+            ('timestamp', 'REVOKED', 'CANDIDATE'),
+            ('final-build-before-output', 'REVOKED', 'CANDIDATE'),
+            ('final-build-partial-output', 'REVOKED', 'PARTIAL_FINAL'),
+            ('final-validate', 'REVOKED', 'FINAL'),
+            ('marker', 'REVOKED', 'FINAL'),
+            ('marker-before-cleanup', 'REVOKED', 'VERIFIED'),
+            ('half-cleaned-checkpoint', 'READY', 'VERIFIED'),
+        )
+        for crash_window, checkpoint_state, artifact_state in cases:
+            with self.subTest(crash_window=crash_window):
+                result, calls = self.run_recover_verify(
+                    verification_progress=3,
+                    artifact_state=artifact_state,
+                    checkpoint_state=checkpoint_state,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('root-login', calls)
+                self.assertNotIn('root-revoke-self', calls)
+                if checkpoint_state == 'READY' and artifact_state == 'CANDIDATE':
+                    self.assertIn('root-resume-proof', calls)
+                    self.assertIn('revoked-checkpoint', calls)
+                else:
+                    self.assertNotIn('root-resume-proof', calls)
+                if artifact_state == 'CANDIDATE':
+                    self.assertIn('final-v2-build', calls)
+                elif artifact_state == 'PARTIAL_FINAL':
+                    self.assertIn('partial-final-cleanup', calls)
+                    self.assertIn('final-v2-build', calls)
+                else:
+                    self.assertNotIn('final-v2-build', calls)
+                if artifact_state != 'VERIFIED':
+                    self.assertIn('verified-marker', calls)
+                self.assertEqual(calls[-1], 'checkpoint-cleanup')
+
+    def test_recover_verify_rejects_unsafe_checkpoint_artifact_pairs(self) -> None:
+        cases = (
+            ('UNSAFE', 'CANDIDATE'),
+            ('NONE', 'FINAL'),
+            ('READY', 'FINAL'),
+            ('UNSAFE', 'VERIFIED'),
+            ('REVOKED', 'UNSAFE'),
+            ('READY', 'PARTIAL_FINAL'),
+        )
+        for checkpoint_state, artifact_state in cases:
+            with self.subTest(
+                checkpoint_state=checkpoint_state,
+                artifact_state=artifact_state,
+            ):
+                result, calls = self.run_recover_verify(
+                    verification_progress=3,
+                    artifact_state=artifact_state,
+                    checkpoint_state=checkpoint_state,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('root-login', calls)
+                self.assertNotIn('root-resume-proof', calls)
+                self.assertNotIn('final-v2-build', calls)
+                self.assertNotIn('verified-marker', calls)
 
     def test_recover_verify_rejects_nonce_drift_before_next_new_share(
         self,
@@ -10771,6 +10898,11 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$3/candidate.tar.gz
             OPENBAO_ROTATION_CANDIDATE_SIDECAR=$3/candidate.tar.gz.sha256
             OPENBAO_ROTATION_VERIFIED_MARKER=$3/verified.json
+            OPENBAO_RECOVERY_DIRECTORY=$3/final
+            OPENBAO_RECOVERY_ARCHIVE=$3/final.tar.gz
+            OPENBAO_RECOVERY_SIDECAR=$3/final.tar.gz.sha256
+            OPENBAO_ROTATION_READY_CHECKPOINT=$3/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$3/revoked.json
             openbao_recovery_bundle_is_valid() {
               [[ "$TEST_CASE" == normal-v1 ]]
             }
@@ -10780,16 +10912,46 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         cases = (
             ('normal-v1', 'NORMAL_V1\n'),
             ('none', 'AMBIGUOUS\n'),
-            ('candidate', 'INCIDENT_V2\n'),
-            ('marker', 'INCIDENT_V2\n'),
+            ('candidate', 'AMBIGUOUS\n'),
+            ('marker', 'AMBIGUOUS\n'),
+            ('checkpoint', 'AMBIGUOUS\n'),
+            ('verified', 'INCIDENT_V2\n'),
         )
         for case, expected in cases:
-            candidate.unlink(missing_ok=True)
-            marker.unlink(missing_ok=True)
+            for path in (
+                temporary / 'candidate',
+                temporary / 'candidate.tar.gz',
+                temporary / 'candidate.tar.gz.sha256',
+                temporary / 'final',
+                temporary / 'final.tar.gz',
+                temporary / 'final.tar.gz.sha256',
+                marker,
+                temporary / 'ready.json',
+                temporary / 'revoked.json',
+            ):
+                if path.is_dir():
+                    path.rmdir()
+                else:
+                    path.unlink(missing_ok=True)
             if case == 'candidate':
                 candidate.write_text('public-candidate\n', encoding='ascii')
             elif case == 'marker':
                 marker.write_text('{}\n', encoding='ascii')
+            elif case == 'verified':
+                (temporary / 'candidate').mkdir()
+                (temporary / 'final').mkdir()
+                for path in (
+                    temporary / 'candidate.tar.gz',
+                    temporary / 'candidate.tar.gz.sha256',
+                    temporary / 'final.tar.gz',
+                    temporary / 'final.tar.gz.sha256',
+                    marker,
+                ):
+                    path.write_text('public-artifact\n', encoding='ascii')
+            elif case == 'checkpoint':
+                (temporary / 'ready.json').write_text(
+                    '{}\n', encoding='ascii',
+                )
             with self.subTest(case=case):
                 result = self.run_command(
                     [
@@ -10800,6 +10962,80 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
+
+    def test_probe_policy_readback_requires_the_exact_complete_policy(self) -> None:
+        temporary = self.temporary_directory()
+        policy = temporary / 'policy.hcl'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_POLICY=$2
+            PYTHON_BINARY=/usr/bin/python3
+            openbao_bao() {
+              case "$*" in
+                'read -format=json auth/kubernetes/config')
+                  printf '%s\n' '{"data":{"kubernetes_host":"https://kubernetes.default.svc:443","disable_iss_validation":true}}'
+                  ;;
+                'read -format=json auth/kubernetes/role/openbao-runtime-probe')
+                  printf '%s\n' '{"data":{"bound_service_account_names":["openbao-runtime-probe"],"bound_service_account_namespaces":["openbao"],"audience":"openbao","token_policies":["openbao-runtime-probe"],"token_no_default_policy":true,"token_ttl":600,"token_max_ttl":600}}'
+                  ;;
+                'policy read openbao-runtime-probe') cat "$TEST_POLICY" ;;
+                *) return 1 ;;
+              esac
+            }
+            openbao_audit_api_is_exact() { :; }
+            openbao_configuration_readback_is_exact
+            '''
+        )
+        exact = textwrap.dedent(
+            '''\
+            path "openbao-probe/data/runtime-check" {
+              capabilities = ["create", "update", "read", "delete"]
+            }
+
+            path "sys/storage/raft/configuration" {
+              capabilities = ["read"]
+            }
+
+            path "sys/rotate/root" {
+              capabilities = ["read"]
+            }
+
+            path "sys/rotate/root/verification" {
+              capabilities = ["read"]
+            }
+            '''
+        )
+        variants = {
+            'exact': exact,
+            'root-write': exact.replace(
+                'path "sys/rotate/root" {\n  capabilities = ["read"]',
+                'path "sys/rotate/root" {\n  capabilities = ["read", "update"]',
+            ),
+            'verification-sudo': exact.replace(
+                'path "sys/rotate/root/verification" {\n  capabilities = ["read"]',
+                'path "sys/rotate/root/verification" {\n  capabilities = ["read", "sudo"]',
+            ),
+            'runtime-extra': exact.replace(
+                '["create", "update", "read", "delete"]',
+                '["create", "update", "read", "delete", "sudo"]',
+            ),
+            'extra-path': exact + 'path "sys/auth" {\n  capabilities = ["read"]\n}\n',
+        }
+        for name, contents in variants.items():
+            policy.write_text(contents, encoding='ascii')
+            with self.subTest(name=name):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'policy-readback',
+                        str(OPENBAO_INITIALIZE_LIB), str(policy),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                if name == 'exact':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
 
     def test_rotation_verification_share_uses_hidden_key_dash_stdin(
         self,
@@ -10868,6 +11104,452 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             command_log.read_text(encoding='utf-8'),
             'operator rotate-keys -backup-delete\n',
         )
+
+    def test_finalization_checkpoints_are_private_bound_and_removed_after_marker(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        source = temporary / 'source.tar.gz'
+        candidate = temporary / 'candidate.tar.gz'
+        source.write_text('public-source-bundle\n', encoding='ascii')
+        candidate.write_text('public-candidate-bundle\n', encoding='ascii')
+        source.chmod(0o600)
+        candidate.chmod(0o600)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_READY_CHECKPOINT=$2/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$2/revoked.json
+            openbao_rotation_artifact_paths() { :; }
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            cluster_digest=$(printf cluster | sha256sum | awk '{print $1}')
+            token_digest=$(printf root-token | sha256sum | awk '{print $1}')
+            binding=$(openbao_finalization_transaction_binding "$cluster_digest")
+            openbao_finalization_ready_checkpoint_create \
+              "$cluster_digest" "$token_digest" \
+              /tmp/openbao-stage180.ABC123 "$binding"
+            printf 'READY_MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_READY_CHECKPOINT")"
+            [[ "$(stat -c %u "$OPENBAO_ROTATION_READY_CHECKPOINT")" == \
+               "$(stat -c %u "$OPENBAO_RECOVERY_ROOT")" ]]
+            "$PYTHON_BINARY" -I -B - "$OPENBAO_ROTATION_READY_CHECKPOINT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as stream:
+    document = json.load(stream)
+assert set(document) == {
+    'schema', 'state', 'git_commit', 'source_recovery_sha',
+    'source_bundle_sha256', 'candidate_bundle_sha256',
+    'cluster_identity_sha256', 'live_rotation_state', 'root_token_sha256',
+    'remote_home', 'remote_session_binding',
+}
+assert not any(name in document for name in ('token', 'share', 'nonce'))
+PY
+            printf 'STATE_1=%s\n' "$(openbao_finalization_checkpoint_state "$cluster_digest")"
+            openbao_finalization_revoked_checkpoint_create "$cluster_digest"
+            printf 'REVOKED_MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_REVOKED_CHECKPOINT")"
+            [[ "$(stat -c %u "$OPENBAO_ROTATION_REVOKED_CHECKPOINT")" == \
+               "$(stat -c %u "$OPENBAO_RECOVERY_ROOT")" ]]
+            "$PYTHON_BINARY" -I -B - "$OPENBAO_ROTATION_REVOKED_CHECKPOINT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as stream:
+    document = json.load(stream)
+assert set(document) == {
+    'schema', 'state', 'ready_checkpoint_sha256', 'root_token_sha256'
+}
+assert not any(name in document for name in ('token', 'share', 'nonce'))
+PY
+            printf 'STATE_2=%s\n' "$(openbao_finalization_checkpoint_state "$cluster_digest")"
+            openbao_finalization_checkpoint_cleanup "$cluster_digest"
+            printf 'STATE_3=%s\n' "$(openbao_finalization_checkpoint_state "$cluster_digest")"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'finalization-checkpoints',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary), self.CURRENT_SHA,
+                self.SOURCE_SHA, str(source), str(candidate),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'READY_MODE=600\nSTATE_1=READY\n'
+            'REVOKED_MODE=600\nSTATE_2=REVOKED\nSTATE_3=NONE\n',
+        )
+        self.assertNotIn('root-token', result.stdout + result.stderr)
+
+    def test_finalization_checkpoints_reject_tamper_and_noclobber(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_READY_CHECKPOINT=$2/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$2/revoked.json
+            TEST_MUTATION=$7
+            openbao_rotation_artifact_paths() { :; }
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            cluster_digest=$(printf cluster | sha256sum | awk '{print $1}')
+            token_digest=$(printf root-token | sha256sum | awk '{print $1}')
+            binding=$(openbao_finalization_transaction_binding "$cluster_digest")
+            openbao_finalization_ready_checkpoint_create \
+              "$cluster_digest" "$token_digest" \
+              /tmp/openbao-stage180.ABC123 "$binding"
+            before=$(sha256sum "$OPENBAO_ROTATION_READY_CHECKPOINT" | awk '{print $1}')
+            if openbao_finalization_ready_checkpoint_create \
+                "$cluster_digest" "$token_digest" \
+                /tmp/openbao-stage180.ABC123 "$binding"; then
+              exit 80
+            fi
+            [[ "$before" == \
+               "$(sha256sum "$OPENBAO_ROTATION_READY_CHECKPOINT" | awk '{print $1}')" ]]
+            if [[ "$TEST_MUTATION" == revoked-* ]]; then
+              openbao_finalization_revoked_checkpoint_create "$cluster_digest"
+              target=$OPENBAO_ROTATION_REVOKED_CHECKPOINT
+              key=${TEST_MUTATION#revoked-}
+            else
+              target=$OPENBAO_ROTATION_READY_CHECKPOINT
+              key=$TEST_MUTATION
+            fi
+            "$PYTHON_BINARY" -I -B - "$target" "$key" <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1:]
+with open(path, encoding='utf-8') as stream:
+    document = json.load(stream)
+if key == 'extra':
+    document['unexpected'] = 'public-value'
+elif key == 'mode':
+    pass
+else:
+    document[key] = '0' * 64
+with open(path, 'w', encoding='utf-8') as stream:
+    json.dump(document, stream, separators=(',', ':'), sort_keys=True)
+    stream.write('\n')
+PY
+            if [[ "$key" == mode ]]; then chmod 644 "$target"; fi
+            [[ "$(openbao_finalization_checkpoint_state "$cluster_digest")" == UNSAFE ]]
+            '''
+        )
+        mutations = (
+            'schema', 'state', 'git_commit', 'source_recovery_sha',
+            'source_bundle_sha256', 'candidate_bundle_sha256',
+            'cluster_identity_sha256', 'live_rotation_state',
+            'remote_home', 'remote_session_binding',
+            'extra', 'mode', 'revoked-state',
+            'revoked-ready_checkpoint_sha256', 'revoked-root_token_sha256',
+            'revoked-extra', 'revoked-mode',
+        )
+        for mutation in mutations:
+            temporary = self.temporary_directory()
+            source = temporary / 'source.tar.gz'
+            candidate = temporary / 'candidate.tar.gz'
+            source.write_text('public-source-bundle\n', encoding='ascii')
+            candidate.write_text('public-candidate-bundle\n', encoding='ascii')
+            source.chmod(0o600)
+            candidate.chmod(0o600)
+            with self.subTest(mutation=mutation):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'checkpoint-tamper',
+                        str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                        self.CURRENT_SHA, self.SOURCE_SHA, str(source),
+                        str(candidate), mutation,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, '')
+
+    def test_partial_final_crash_cleanup_is_scoped_and_fail_closed(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$2/candidate
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$2/candidate.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=$2/candidate.tar.gz.sha256
+            OPENBAO_RECOVERY_DIRECTORY=$2/final
+            OPENBAO_RECOVERY_ARCHIVE=$2/final.tar.gz
+            OPENBAO_RECOVERY_SIDECAR=$2/final.tar.gz.sha256
+            OPENBAO_ROTATION_VERIFIED_MARKER=$2/verified.json
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            mkdir "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY"
+            chmod 700 "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY"
+            printf candidate >"$OPENBAO_ROTATION_CANDIDATE_ARCHIVE"
+            printf sidecar >"$OPENBAO_ROTATION_CANDIDATE_SIDECAR"
+            chmod 600 "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+              "$OPENBAO_ROTATION_CANDIDATE_SIDECAR"
+            mkdir "$OPENBAO_RECOVERY_DIRECTORY"
+            chmod 700 "$OPENBAO_RECOVERY_DIRECTORY"
+            printf metadata >"$OPENBAO_RECOVERY_DIRECTORY/metadata.json"
+            chmod 600 "$OPENBAO_RECOVERY_DIRECTORY/metadata.json"
+            printf archive >"$OPENBAO_RECOVERY_ARCHIVE"
+            chmod 600 "$OPENBAO_RECOVERY_ARCHIVE"
+            if [[ "$3" == hostile ]]; then
+              printf unknown >"$OPENBAO_RECOVERY_DIRECTORY/unexpected"
+              chmod 600 "$OPENBAO_RECOVERY_DIRECTORY/unexpected"
+            fi
+            set +e
+            openbao_rotation_partial_final_cleanup
+            rc=$?
+            set -e
+            printf 'RC=%s\nSTATE=%s\n' \
+              "$rc" "$(openbao_rotation_artifact_presence_state)"
+            '''
+        )
+        for case, expected in (
+            ('safe', 'RC=0\nSTATE=CANDIDATE\n'),
+            ('hostile', 'RC=1\nSTATE=PARTIAL_FINAL\n'),
+        ):
+            temporary = self.temporary_directory()
+            with self.subTest(case=case):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'partial-final-cleanup',
+                        str(OPENBAO_INITIALIZE_LIB), str(temporary), case,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_resume_revocation_secret_uses_only_hidden_stdin(self) -> None:
+        command_log = self.temporary_directory() / 'resume-proof.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            export OPENBAO_SECRET_INPUT=hostile-export
+            openbao_prompt_secret() { OPENBAO_SECRET_INPUT=synthetic-root-secret; }
+            kubectl_run() {
+              local input
+              /usr/bin/printenv OPENBAO_SECRET_INPUT >/dev/null && return 1
+              [[ "$*" != *synthetic-root-secret* ]] || return 1
+              IFS= read -r input
+              [[ "$input" == synthetic-root-secret ]] || return 1
+              printf '%s\n' "$*" >"$TEST_COMMAND_LOG"
+            }
+            openbao_finalization_resume_root_revocation \
+              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'resume-root-revocation',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertNotIn(
+            'synthetic-root-secret',
+            command_log.read_text(encoding='utf-8'),
+        )
+
+    def test_resume_revocation_proves_the_same_committed_token_exactly(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        fake_bin = temporary / 'bin'
+        fake_bin.mkdir()
+        fake_bao = fake_bin / 'bao'
+        fake_bao.write_text(
+            textwrap.dedent(
+                r'''#!/bin/sh
+                set -eu
+                env | grep -F 'synthetic-root-secret' >/dev/null && exit 90
+                printf '%s\n' "$*" >>"$TEST_BAO_LOG"
+                case "$*" in
+                  'token lookup -format=json')
+                    case "$(cat "$TEST_TOKEN_STATE")" in
+                      valid) exit 0 ;;
+                      revoked)
+                        printf '%s\n' 'Error making API request.' \
+                          'Code: 403. Errors:' '' '* permission denied' >&2
+                        exit 2
+                        ;;
+                      transport)
+                        printf '%s\n' 'connection refused' >&2
+                        exit 2
+                        ;;
+                      *) exit 3 ;;
+                    esac
+                    ;;
+                  'token revoke -self')
+                    case "${TEST_REVOKE_MODE:-normal}" in
+                      normal) printf '%s\n' revoked >"$TEST_TOKEN_STATE" ;;
+                      noop) : ;;
+                      fail) exit 4 ;;
+                    esac
+                    ;;
+                  *) exit 5 ;;
+                esac
+                '''
+            ),
+            encoding='ascii',
+        )
+        fake_bao.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_TOKEN_STATE=$2
+            TEST_BAO_LOG=$3
+            export TEST_TOKEN_STATE TEST_BAO_LOG TEST_REVOKE_MODE
+            openbao_prompt_secret() { OPENBAO_SECRET_INPUT=synthetic-root-secret; }
+            kubectl_run() {
+              while [[ "$1" != -- ]]; do shift; done
+              shift
+              "$@"
+            }
+            set +e
+            openbao_finalization_resume_root_revocation "$4"
+            rc=$?
+            set -e
+            [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
+            exit "$rc"
+            '''
+        )
+        token_digest = hashlib.sha256(b'synthetic-root-secret').hexdigest()
+        cases = (
+            ('valid', 'normal', token_digest, True, True),
+            ('revoked', 'normal', token_digest, True, False),
+            ('valid', 'normal', '0' * 64, False, False),
+            ('transport', 'normal', token_digest, False, False),
+            ('valid', 'noop', token_digest, False, True),
+            ('valid', 'fail', token_digest, False, True),
+        )
+        for index, (
+            initial_state, revoke_mode, commitment, succeeds, revoke_called,
+        ) in enumerate(cases):
+            state = temporary / f'state-{index}'
+            log = temporary / f'bao-{index}.log'
+            state.write_text(initial_state + '\n', encoding='ascii')
+            log.write_text('', encoding='ascii')
+            with self.subTest(
+                initial_state=initial_state,
+                revoke_mode=revoke_mode,
+                commitment_matches=commitment == token_digest,
+            ):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'exact-root-proof',
+                        str(OPENBAO_INITIALIZE_LIB), str(state), str(log),
+                        commitment,
+                    ],
+                    env=self.sanitized_environment(
+                        BOOTSTRAP_TEST_MODE='1',
+                        PATH=f'{fake_bin}:/usr/bin:/bin',
+                        TEST_REVOKE_MODE=revoke_mode,
+                    ),
+                )
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                self.assertEqual(result.stdout, '')
+                calls = log.read_text(encoding='ascii').splitlines()
+                self.assertEqual('token revoke -self' in calls, revoke_called)
+                self.assertNotIn('synthetic-root-secret', result.stderr)
+                self.assertNotIn('synthetic-root-secret', '\n'.join(calls))
+
+    def test_bound_remote_helper_cleanup_rejects_reused_or_unsafe_path(
+        self,
+    ) -> None:
+        binding = 'b' * 64
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_REMOTE_PATH=$2
+            OPENBAO_FINALIZATION_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_FINALIZATION_REMOTE_BINDING=$3
+            kubectl_run() {
+              [[ "$1" == --namespace=openbao && "$2" == exec &&
+                 "$3" == pod/openbao-0 && "$4" == -- &&
+                 "$5" == /bin/sh && "$6" == -c ]] || return 97
+              /bin/sh -c "$7" "$8" "$TEST_REMOTE_PATH" "${10}"
+            }
+            openbao_finalization_remote_helper_cleanup
+            '''
+        )
+        for case in (
+            'missing', 'valid', 'broken-path-symlink', 'directory-mode',
+            'binding-mode', 'binding-drift', 'binding-symlink',
+            'token-mode', 'token-symlink',
+        ):
+            with self.subTest(case=case):
+                temporary = self.temporary_directory()
+                remote = temporary / 'remote-helper'
+                if case == 'broken-path-symlink':
+                    remote.symlink_to(
+                        temporary / 'missing-target', target_is_directory=True
+                    )
+                elif case != 'missing':
+                    remote.mkdir(mode=0o700)
+                    sentinel = remote / '.openbao-session-binding'
+                    if case == 'binding-symlink':
+                        target = temporary / 'binding-target'
+                        target.write_text(binding + '\n', encoding='ascii')
+                        target.chmod(0o600)
+                        sentinel.symlink_to(target)
+                    else:
+                        sentinel.write_text(
+                            ('f' * 64 if case == 'binding-drift' else binding)
+                            + '\n',
+                            encoding='ascii',
+                        )
+                        sentinel.chmod(
+                            0o644 if case == 'binding-mode' else 0o600
+                        )
+                    token = remote / '.bao-token'
+                    if case == 'token-symlink':
+                        target = temporary / 'token-target'
+                        target.write_text('opaque\n', encoding='ascii')
+                        target.chmod(0o600)
+                        token.symlink_to(target)
+                    else:
+                        token.write_text('opaque\n', encoding='ascii')
+                        token.chmod(
+                            0o644 if case == 'token-mode' else 0o600
+                        )
+                    if case == 'directory-mode':
+                        remote.chmod(0o755)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'bound-helper-cleanup',
+                        str(OPENBAO_INITIALIZE_LIB), str(remote), binding,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                if case in ('missing', 'valid'):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(remote.exists() or remote.is_symlink())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(remote.exists() or remote.is_symlink())
 
     def test_verified_marker_binds_final_digest_and_cluster_identity(
         self,
@@ -11062,6 +11744,28 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
         self.assertNotEqual(old_rejected.returncode, 0)
+
+        for index, duplicate in enumerate((
+            'INITIAL_ROOT_TOKEN=REVOKED',
+            'INITIAL_ROOT_TOKEN=ACTIVE',
+            'UNSEAL_KEY_ROTATION=FAIL',
+        )):
+            with self.subTest(duplicate_key=index):
+                duplicate_payload = temporary / f'duplicate-{index}.txt'
+                duplicate_payload.write_text(
+                    evidence + duplicate + '\n', encoding='utf-8',
+                )
+                duplicate_payload.chmod(0o600)
+                duplicate_rejected = self.run_command(
+                    [
+                        '/bin/bash', '-c',
+                        'source "$1"; openbao_incident_evidence_is_exact "$2"',
+                        'duplicate-incident-evidence',
+                        str(OPENBAO_INITIALIZE_LIB), str(duplicate_payload),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertNotEqual(duplicate_rejected.returncode, 0)
 
         forbidden_lines = (
             'verification_nonce=synthetic-public-value',
@@ -11808,7 +12512,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                           printf 'revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                           return 1
                           ;;
-                        *' rm -f -- "$1/.bao-token"; rmdir -- "$1" '*)
+                        *' rm -f -- "$1/.bao-token" "$1/.openbao-session-binding"; rmdir -- "$1" '*)
                           printf 'cleanup-remove\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                           ;;
                         *) return 1 ;;
@@ -11852,7 +12556,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                   printf 'revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                   return 1
                   ;;
-                *' rm -f -- "$1/.bao-token"; rmdir -- "$1" '*)
+                *' rm -f -- "$1/.bao-token" "$1/.openbao-session-binding"; rmdir -- "$1" '*)
                   printf 'cleanup-remove\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                   ;;
                 *) return 1 ;;
