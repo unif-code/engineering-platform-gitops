@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -6016,7 +6017,7 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         return result.stdout
 
     def sourced_names_inside_gate(
-        self, script: Path, gated_dir: str
+        self, script: Path, gated_dir: str, *, wrapper: bool = False
     ) -> list[str]:
         """逐字展开脚本里每条 source 的目标，钉在门禁目录内，返回文件名。"""
         body = script.read_text(encoding='utf-8')
@@ -6026,11 +6027,19 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
             )
             for line in shell_directory_assignments(body)
         ]
+        if wrapper:
+            source_binding = 'script_source=${BASH_SOURCE[0]}'
+            self.assertIn(source_binding, body.splitlines())
+            assignments.insert(
+                0, source_binding.replace(
+                    '${BASH_SOURCE[0]}', '${BOOTSTRAP_REAL_SCRIPT_SOURCE}'
+                ),
+            )
         # 允许两类目标：被门禁覆盖的 lib 目录，以及 stage 自己目录下的 gates.sh。
         # 后者由 bootstrap-all.sh 的 stage 目录**逐条目**门禁覆盖（属主、权限、
         # 非符号链接），与 lib 同级保护；判定族拆出去是为了让"事实是什么"能被单独
         # 阅读，而不是为了绕开门禁。除这两处之外一律判死。
-        allowed = {gated_dir, str(script.parent)}
+        allowed = {gated_dir} if wrapper else {gated_dir, str(script.parent)}
         names: list[str] = []
         for word in shell_source_words(body):
             target = Path(
@@ -6089,6 +6098,14 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
             names = self.sourced_names_inside_gate(script, gated_dir)
             self.assertTrue(names, f'{script.name} 没有 source 任何文件')
             sourced.update(names)
+        wrapper_names = self.sourced_names_inside_gate(
+            RUN_APPROVED, gated_dir, wrapper=True
+        )
+        self.assertEqual(
+            wrapper_names, ['run-approved-args.sh'],
+            'wrapper must source only its parser library',
+        )
+        sourced.update(wrapper_names)
         self.assertEqual(
             sorted(sourced),
             sorted(path.name for path in real_library_dir.glob('*.sh')),
@@ -6110,6 +6127,58 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         self.assertTrue(
             library_sourced, '放宽后的断言需要真实的跨 lib 依赖来喂，否则空转'
         )
+
+    def test_wrapper_source_contract_rejects_escape_and_extra_library(self) -> None:
+        from validation_catalog import selectors_for_profile
+
+        self.assertIn(
+            'test_bootstrap.BootstrapOrchestratorTest.'
+            'test_real_stages_source_only_files_under_the_gated_library_dir',
+            selectors_for_profile('fast'),
+        )
+        for tamper, expected_guard in (
+            ('source-escape', '门禁覆盖之外'),
+            ('wrong-parser', 'wrapper must source only its parser library'),
+            ('extra-library', '被 source 的文件集合必须与门禁目录内容一致'),
+        ):
+            with self.subTest(tamper=tamper):
+                root = self.temporary_directory()
+                bootstrap = root / 'scripts/bootstrap'
+                shutil.copytree(ROOT / 'scripts/bootstrap', bootstrap)
+                wrapper = bootstrap / 'run-approved.sh'
+                mutation_log = root / 'must-not-execute'
+                with mock.patch.multiple(
+                    sys.modules[__name__],
+                    ROOT=root,
+                    BOOTSTRAP_ALL=bootstrap / 'bootstrap-all.sh',
+                    RUN_APPROVED=wrapper,
+                    OPENBAO_INITIALIZE=bootstrap / 'stages/180-openbao-initialize/run.sh',
+                ):
+                    # Every single mutation starts from a valid real-source control.
+                    self.test_real_stages_source_only_files_under_the_gated_library_dir()
+                    if tamper == 'extra-library':
+                        (bootstrap / 'lib/extra-library.sh').write_text(
+                            f'printf executed >{shlex.quote(str(mutation_log))}\n',
+                            encoding='utf-8',
+                        )
+                    else:
+                        original = 'source "${script_dir}/lib/run-approved-args.sh"'
+                        replacement = (
+                            'source "${script_dir}/../escape.sh"'
+                            if tamper == 'source-escape' else
+                            'source "${script_dir}/lib/common.sh"'
+                        )
+                        body = wrapper.read_text(encoding='utf-8')
+                        self.assertEqual(body.count(original), 1)
+                        wrapper.write_text(body.replace(original, replacement), encoding='utf-8')
+                        if tamper == 'source-escape':
+                            (bootstrap.parent / 'escape.sh').write_text(
+                                f'printf executed >{shlex.quote(str(mutation_log))}\n',
+                                encoding='utf-8',
+                            )
+                    with self.assertRaisesRegex(AssertionError, expected_guard):
+                        self.test_real_stages_source_only_files_under_the_gated_library_dir()
+                    self.assertFalse(mutation_log.exists())
 
 
 class BusinessReadyStageTest(BootstrapTestCase):
@@ -8215,6 +8284,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         os.close(slave_fd)
         if non_tty_fd == 0 and process.stdin is not None:
             process.stdin.close()
+            process.stdin = None
         if non_tty_fd != 0:
             os.write(
                 master_fd,
@@ -8483,10 +8553,6 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         script = textwrap.dedent(
             r'''
             source "$1"
-            real_checkpoint_functions=$(declare -f \
-              openbao_finalization_ready_checkpoint_create \
-              openbao_finalization_ready_checkpoint_load \
-              openbao_finalization_checkpoint_state)
             real_fsync_function=$(declare -f openbao_fsync_directory)
             eval "${real_fsync_function/openbao_fsync_directory/real_fsync_directory}"
             TEST_CALL_LOG=$2
@@ -8634,20 +8700,22 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
               log_call root-token-commitment
               printf '%064d\n' 2
             }
-            openbao_finalization_ready_checkpoint_create() {
-              log_call ready-checkpoint
-              [[ "$TEST_FAILURE" != ready-checkpoint ]] || return 1
-              TEST_CHECKPOINT_STATE=READY
-            }
-            openbao_finalization_checkpoint_state() {
-              log_call "checkpoint-${TEST_CHECKPOINT_STATE}"
-              printf '%s\n' "$TEST_CHECKPOINT_STATE"
-            }
-            openbao_finalization_ready_checkpoint_load() {
-              OPENBAO_FINALIZATION_ROOT_TOKEN_SHA256=$(printf '%064d' 2)
-              OPENBAO_FINALIZATION_REMOTE_HOME=/tmp/openbao-stage180.ABC123
-              OPENBAO_FINALIZATION_REMOTE_BINDING=$(printf '%064d' 1)
-            }
+            if [[ -z "$TEST_RECOVERY_ROOT" ]]; then
+              openbao_finalization_ready_checkpoint_create() {
+                log_call ready-checkpoint
+                [[ "$TEST_FAILURE" != ready-checkpoint ]] || return 1
+                TEST_CHECKPOINT_STATE=READY
+              }
+              openbao_finalization_checkpoint_state() {
+                log_call "checkpoint-${TEST_CHECKPOINT_STATE}"
+                printf '%s\n' "$TEST_CHECKPOINT_STATE"
+              }
+              openbao_finalization_ready_checkpoint_load() {
+                OPENBAO_FINALIZATION_ROOT_TOKEN_SHA256=$(printf '%064d' 2)
+                OPENBAO_FINALIZATION_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+                OPENBAO_FINALIZATION_REMOTE_BINDING=$(printf '%064d' 1)
+              }
+            fi
             openbao_finalization_resume_root_revocation() {
               log_call root-resume-proof
               case "$TEST_FAILURE" in
@@ -8711,9 +8779,8 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             }
 
             if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
-              # Keep publication, validation, and restart classification real;
-              # only remote operations and the fsync failure seam are doubled.
-              eval "$real_checkpoint_functions"
+              # Keep original sourced checkpoint functions intact: Bash 5.2
+              # declare -f/eval does not preserve their conditional heredocs.
               PYTHON_BINARY=/usr/bin/python3
               OPENBAO_RECOVERY_ROOT=$TEST_RECOVERY_ROOT
               OPENBAO_SOURCE_RECOVERY_ARCHIVE=$TEST_RECOVERY_ROOT/source.tar.gz
@@ -11406,6 +11473,7 @@ else:
                     recovery_root=recovery_root,
                 )
                 self.assertNotEqual(first.returncode, 0)
+                self.assertEqual(first.stderr, '')
                 self.assertIn('recovery-verification-marker-unsafe', first.stdout)
                 self.assertEqual(first_calls.count('recovery-root-fsync'), 1)
                 self.assertNotIn('root-revoke-self', first_calls)
@@ -11419,6 +11487,7 @@ else:
                     failure=reentry_failure,
                     recovery_root=recovery_root,
                 )
+                self.assertEqual(resumed.stderr, '')
                 if reentry_failure:
                     for forbidden in (
                         'root-revoke-self', 'root-resume-proof',
