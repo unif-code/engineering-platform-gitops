@@ -10620,6 +10620,19 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
 
     def test_wizard_item_permissions_follow_bundle_schema(self) -> None:
         source_archive, source_sidecar = self.make_source_bundle()
+        v1_schema = 'engineering-platform/openbao-recovery/v1'
+        candidate_schema = (
+            'engineering-platform/openbao-recovery-rotation-candidate/v1'
+        )
+        v2_schema = 'engineering-platform/openbao-recovery/v2'
+        verified_v1 = self.run_artifact_helper(
+            'verified-schema', '--archive', source_archive,
+            '--sidecar', source_sidecar,
+        )
+        self.assertEqual(
+            (verified_v1.returncode, verified_v1.stdout, verified_v1.stderr),
+            (0, v1_schema + '\n', ''),
+        )
         v1_shares = [
             self.synthetic_ciphertext(f'share-{index}') for index in range(5)
         ]
@@ -10632,11 +10645,19 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             with self.subTest(schema='v1', item=item):
                 emitted = self.run_artifact_helper(
                     'emit-item', '--archive', source_archive,
-                    '--sidecar', source_sidecar, '--item', item,
+                    '--sidecar', source_sidecar, '--expected-schema', v1_schema,
+                    '--item', item,
                 )
                 self.assertEqual(emitted.returncode, 0, emitted.stderr)
                 self.assertEqual(emitted.stdout, expected)
                 self.assertEqual(emitted.stderr, '')
+
+        mismatched_v1 = self.run_artifact_helper(
+            'emit-item', '--archive', source_archive, '--sidecar', source_sidecar,
+            '--expected-schema', candidate_schema, '--item', 'share1',
+        )
+        self.assertNotEqual(mismatched_v1.returncode, 0)
+        self.assertEqual((mismatched_v1.stdout, mismatched_v1.stderr), ('', ''))
 
         temporary = self.temporary_directory() / 'rotated'
         built, candidate, candidate_sidecar = self.build_candidate_artifact(
@@ -10668,10 +10689,17 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         )
         self.assertEqual(final_built.returncode, 0, final_built.stderr)
         expected_shares = self.rotation_response()['keys_base64']
-        for schema, archive, sidecar in (
-            ('candidate', candidate, candidate_sidecar),
-            ('v2', final, final_sidecar),
+        for schema, expected_schema, archive, sidecar in (
+            ('candidate', candidate_schema, candidate, candidate_sidecar),
+            ('v2', v2_schema, final, final_sidecar),
         ):
+            verified = self.run_artifact_helper(
+                'verified-schema', '--archive', archive, '--sidecar', sidecar,
+            )
+            self.assertEqual(
+                (verified.returncode, verified.stdout, verified.stderr),
+                (0, expected_schema + '\n', ''),
+            )
             for item, expected in (
                 ('share1', expected_shares[0]),
                 ('share5', expected_shares[4]),
@@ -10679,17 +10707,25 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 with self.subTest(schema=schema, item=item):
                     emitted = self.run_artifact_helper(
                         'emit-item', '--archive', archive,
-                        '--sidecar', sidecar, '--item', item,
+                        '--sidecar', sidecar,
+                        '--expected-schema', expected_schema, '--item', item,
                     )
                     self.assertEqual(emitted.returncode, 0, emitted.stderr)
                     self.assertEqual(emitted.stdout, expected)
                     self.assertEqual(emitted.stderr, '')
             rejected_root = self.run_artifact_helper(
                 'emit-item', '--archive', archive, '--sidecar', sidecar,
-                '--item', 'root',
+                '--expected-schema', expected_schema, '--item', 'root',
             )
             self.assertNotEqual(rejected_root.returncode, 0)
             self.assertEqual((rejected_root.stdout, rejected_root.stderr), ('', ''))
+
+            mismatched = self.run_artifact_helper(
+                'emit-item', '--archive', archive, '--sidecar', sidecar,
+                '--expected-schema', v1_schema, '--item', 'share1',
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertEqual((mismatched.stdout, mismatched.stderr), ('', ''))
 
         for item in ('share0', 'share6', 'metadata', '../share1'):
             with self.subTest(item=item):
@@ -13412,6 +13448,14 @@ PY
             self.assertIn(schema, wizard)
         self.assertIn('候选恢复包尚未完成验证', wizard)
         self.assertIn('初始 root token 已撤销', wizard)
+        self.assertIn('verified-schema', wizard)
+        self.assertIn('--expected-schema "$expected_schema"', wizard)
+        self.assertIn(
+            '"$RECOVERY_ARCHIVE" "$RECOVERY_SCHEMA" "$RECOVERY_ITEM"',
+            wizard,
+        )
+        self.assertNotIn('ask RECOVERY_SCHEMA', wizard)
+        self.assertIn('不是正常 v1 configure 路径', wizard)
 
     def test_manual_stage_readme_stop_reasons_match_implementation(self) -> None:
         source = OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
@@ -13428,9 +13472,18 @@ PY
             reason_constants.get(reason.removeprefix('$'), reason)
             for reason in emitted
         }
+        loop = re.search(
+            r'for required in ([a-z ]+); do\s+'
+            r'require_command "\$required" \|\|\s+'
+            r'complete STOP_PRECONDITION "missing-command-\$\{required\}"',
+            source,
+        )
+        self.assertIsNotNone(loop)
+        assert loop is not None
         implemented.discard('missing-command-')
-        self.assertIn('for required in install mkdir tar;', source)
-        implemented.add('missing-command-tar')
+        implemented.update(
+            f'missing-command-{command}' for command in loop.group(1).split()
+        )
         listed = sorted(re.findall(
             r'^- `([a-z0-9-]+)`$',
             OPENBAO_INITIALIZE.with_name('README.md').read_text(encoding='utf-8'),

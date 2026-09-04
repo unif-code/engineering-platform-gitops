@@ -103,6 +103,13 @@ class _RotatedBundleValidation:
     files: dict[str, bytes]
 
 
+@dataclasses.dataclass(frozen=True)
+class _VerifiedRecoveryBundle:
+    schema: str
+    ciphertexts: tuple[str, ...]
+    root_token: str | None
+
+
 def _reject(message: str) -> None:
     raise RecoveryValidationError(message)
 
@@ -1440,9 +1447,9 @@ def build_final(
     )
 
 
-def _emit_item(
-    archive: pathlib.Path, sidecar: pathlib.Path, item: str
-) -> str:
+def _validate_recovery_bundle(
+    archive: pathlib.Path, sidecar: pathlib.Path
+) -> _VerifiedRecoveryBundle:
     candidate_match = re.fullmatch(
         r'openbao-recovery-rotation-candidate-([0-9a-f]{40})\.tar\.gz',
         archive.name,
@@ -1468,9 +1475,11 @@ def _emit_item(
             public_key_fingerprint=metadata.get('public_key_fingerprint'),
             cluster_identity_digest=metadata.get('cluster_identity_sha256'),
         )
-        if item == 'root':
-            _reject('root item forbidden for rotated bundle')
-        ciphertexts = validation.facts.ciphertexts
+        return _VerifiedRecoveryBundle(
+            schema=CANDIDATE_SCHEMA,
+            ciphertexts=validation.facts.ciphertexts,
+            root_token=None,
+        )
     elif recovery_match is not None:
         current_sha = recovery_match.group(1)
         root = f'openbao-recovery-{current_sha}'
@@ -1496,9 +1505,11 @@ def _emit_item(
                     'platform_secret_fingerprint'
                 ),
             )
-            if item == 'root':
-                return validation_v1.root_token
-            ciphertexts = validation_v1.ciphertexts
+            return _VerifiedRecoveryBundle(
+                schema=V1_SCHEMA,
+                ciphertexts=validation_v1.ciphertexts,
+                root_token=validation_v1.root_token,
+            )
         except RecoveryValidationError as v1_error:
             try:
                 files = read_exact_tar(snapshot.archive_bytes, v2_names)
@@ -1519,13 +1530,35 @@ def _emit_item(
                 )
             except RecoveryValidationError:
                 raise v1_error
-            if item == 'root':
-                _reject('root item forbidden for rotated bundle')
-            ciphertexts = validation_v2.facts.ciphertexts
+            return _VerifiedRecoveryBundle(
+                schema=V2_SCHEMA,
+                ciphertexts=validation_v2.facts.ciphertexts,
+                root_token=None,
+            )
+
+
+def _emit_item(
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
+    item: str,
+    *,
+    expected_schema: str | None = None,
+) -> str:
+    bundle = _validate_recovery_bundle(archive, sidecar)
+    if expected_schema is not None and expected_schema != bundle.schema:
+        _reject('verified schema mismatch')
+    if item == 'root':
+        if bundle.root_token is None:
+            _reject('root item forbidden for rotated bundle')
+        return bundle.root_token
     match = re.fullmatch(r'share([1-5])', item)
     if match is None:
         _reject('unsupported recovery item')
-    return ciphertexts[int(match.group(1)) - 1]
+    return bundle.ciphertexts[int(match.group(1)) - 1]
+
+
+def _verified_schema(archive: pathlib.Path, sidecar: pathlib.Path) -> str:
+    return _validate_recovery_bundle(archive, sidecar).schema
 
 
 def _add_validation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1574,7 +1607,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     emit = commands.add_parser('emit-item', add_help=False)
     emit.add_argument('--archive', required=True)
     emit.add_argument('--sidecar', required=True)
+    emit.add_argument('--expected-schema')
     emit.add_argument('--item', required=True)
+
+    schema = commands.add_parser('verified-schema', add_help=False)
+    schema.add_argument('--archive', required=True)
+    schema.add_argument('--sidecar', required=True)
 
     cluster = commands.add_parser('cluster-identity-sha256', add_help=False)
     cluster.add_argument('--cluster-id', required=True)
@@ -1663,7 +1701,15 @@ def main(arguments: list[str]) -> int:
                     pathlib.Path(parsed.archive),
                     pathlib.Path(parsed.sidecar),
                     parsed.item,
+                    expected_schema=parsed.expected_schema,
                 )
+            )
+        elif operation == 'verified-schema':
+            sys.stdout.write(
+                _verified_schema(
+                    pathlib.Path(parsed.archive), pathlib.Path(parsed.sidecar)
+                )
+                + '\n'
             )
         elif operation == 'cluster-identity-sha256':
             sys.stdout.write(

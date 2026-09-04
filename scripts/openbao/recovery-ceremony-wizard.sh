@@ -191,7 +191,7 @@ wizard_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly OPENBAO_RECOVERY_HELPER="${wizard_dir}/../bootstrap/lib/openbao_recovery.py"
 
 copy_recovery_item_to_clipboard() {
-  local archive=$1 item=$2
+  local archive=$1 expected_schema=$2 item=$3
   [[ -f "$OPENBAO_RECOVERY_HELPER" ]] || {
     warn "未找到恢复包校验工具；请在仓库根目录重新运行向导"
     return 1
@@ -199,7 +199,8 @@ copy_recovery_item_to_clipboard() {
   # PowerShell expands $plain inside its own process.
   # shellcheck disable=SC2016
   python "$OPENBAO_RECOVERY_HELPER" emit-item \
-    --archive "$archive" --sidecar "${archive}.sha256" --item "$item" |
+    --archive "$archive" --sidecar "${archive}.sha256" \
+    --expected-schema "$expected_schema" --item "$item" |
     base64 --decode |
     gpg --decrypt |
     powershell.exe -NoProfile -NonInteractive -Command \
@@ -271,22 +272,24 @@ ask RECOVERY_ARCHIVE "已下载 recovery .tar.gz 的路径："
   exit 1
 }
 (cd "$(dirname "$RECOVERY_ARCHIVE")" && sha256sum -c "$(basename "$RECOVERY_ARCHIVE").sha256")
-ask RECOVERY_SCHEMA "恢复包 schema（v1、candidate 或 v2）："
+RECOVERY_SCHEMA=$(python "$OPENBAO_RECOVERY_HELPER" verified-schema \
+  --archive "$RECOVERY_ARCHIVE" --sidecar "${RECOVERY_ARCHIVE}.sha256") || {
+  warn "恢复包未通过完整 schema 校验"
+  exit 1
+}
+say "已由校验通过的恢复包读取 schema：$RECOVERY_SCHEMA"
 case "$RECOVERY_SCHEMA" in
-  v1)
-    RECOVERY_SCHEMA='engineering-platform/openbao-recovery/v1'
+  engineering-platform/openbao-recovery/v1)
     RECOVERY_ITEM_PROMPT='要解密到剪贴板的项目（share1..share5 或 root）：'
     ;;
-  candidate)
-    RECOVERY_SCHEMA='engineering-platform/openbao-recovery-rotation-candidate/v1'
+  engineering-platform/openbao-recovery-rotation-candidate/v1)
     RECOVERY_ITEM_PROMPT='要解密到剪贴板的新 share（share1..share5）：'
     ;;
-  v2)
-    RECOVERY_SCHEMA='engineering-platform/openbao-recovery/v2'
+  engineering-platform/openbao-recovery/v2)
     RECOVERY_ITEM_PROMPT='要解密到剪贴板的新 share（share1..share5）：'
     ;;
   *)
-    warn "schema 必须是 v1、candidate 或 v2"
+    warn "恢复包 schema 不受支持"
     exit 1
     ;;
 esac
@@ -298,7 +301,8 @@ case "$RECOVERY_SCHEMA:$RECOVERY_ITEM" in
     exit 1
     ;;
 esac
-copy_recovery_item_to_clipboard "$RECOVERY_ARCHIVE" "$RECOVERY_ITEM" || {
+copy_recovery_item_to_clipboard \
+  "$RECOVERY_ARCHIVE" "$RECOVERY_SCHEMA" "$RECOVERY_ITEM" || {
   warn "恢复包未通过校验，或该项目不被该 schema 允许"
   exit 1
 }
@@ -308,6 +312,7 @@ stage "隐藏提示、服务器仪式与清理"
 step "服务器操作仅能在外部 Chrome 的最新 Web终端 - 统一企业堡垒机 标签页执行；不得使用 SSH、应用内浏览器或本地终端。"
 case "$RECOVERY_SCHEMA" in
   engineering-platform/openbao-recovery/v1)
+    step "这是事故 v1 恢复，不是正常 v1 configure 路径；不得跳步或改用 configure。"
     step "先按 runbook 运行带 source SHA 的只读 check；收到预期 readback 后才运行 recover-start。"
     step "在三个隐藏 unseal prompt 中仅使用三份未暴露的旧 share；严禁使用已暴露的旧 share。"
     step "只有出现隐藏 root-token prompt 时才选择 root；绝不把它输入命令行、聊天或普通 shell。"
