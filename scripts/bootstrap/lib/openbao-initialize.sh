@@ -3142,6 +3142,11 @@ openbao_stage_180_recover_verify() {
       openbao_rotation_live_fields_are_idle ||
         openbao_recover_verify_fail STOP_UNKNOWN_STATE \
           openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+      # A prior publish may have linked READY but failed its directory fsync.
+      # Reestablish durability before crossing the irreversible revoke boundary.
+      openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT" ||
+        openbao_recover_verify_fail STOP_UNKNOWN_STATE \
+          recovery-verification-marker-unsafe "$EXIT_UNKNOWN_STATE"
       openbao_finalization_resume_root_revocation \
         "$OPENBAO_FINALIZATION_ROOT_TOKEN_SHA256" ||
         openbao_recover_verify_fail STOP_UNKNOWN_STATE \

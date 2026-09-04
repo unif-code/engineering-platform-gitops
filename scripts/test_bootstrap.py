@@ -8224,6 +8224,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         artifact_state: str = 'CANDIDATE',
         checkpoint_state: str = 'NONE',
         failure: str = '',
+        recovery_root: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         """Run the real recover-verify state machine over controlled facts."""
         temporary = self.temporary_directory()
@@ -8231,6 +8232,12 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         script = textwrap.dedent(
             r'''
             source "$1"
+            real_checkpoint_functions=$(declare -f \
+              openbao_finalization_ready_checkpoint_create \
+              openbao_finalization_ready_checkpoint_load \
+              openbao_finalization_checkpoint_state)
+            real_fsync_function=$(declare -f openbao_fsync_directory)
+            eval "${real_fsync_function/openbao_fsync_directory/real_fsync_directory}"
             TEST_CALL_LOG=$2
             TEST_VERIFICATION_PROGRESS=$3
             TEST_ARTIFACT_STATE=$4
@@ -8238,6 +8245,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             OPENBAO_SOURCE_RECOVERY_SHA=$6
             OPENBAO_RECOVERY_ID=$7
             TEST_CHECKPOINT_STATE=$8
+            TEST_RECOVERY_ROOT=$9
             OPENBAO_ROTATION_TEMP_DIRECTORY=/root/openbao-recovery/.openbao-rotation.ABC123
             OPENBAO_ROTATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/response.json
             OPENBAO_ROTATION_STATUS_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.json
@@ -8251,6 +8259,15 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             TEST_CANDIDATE_VALIDATIONS=0
 
             log_call() { printf '%s\n' "$1" >>"$TEST_CALL_LOG"; }
+            openbao_fsync_directory() {
+              [[ -z "$TEST_RECOVERY_ROOT" || "$1" == "$TEST_RECOVERY_ROOT" ]] || return 1
+              log_call recovery-root-fsync
+              [[ "$TEST_FAILURE" != ready-fsync ]] || return 1
+              if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
+                real_fsync_directory "$1" || return 1
+              fi
+              log_call recovery-root-durable
+            }
             openbao_stage_180_preflight() { log_call preflight; }
             openbao_source_recovery_bundle_is_valid() {
               log_call source-validate
@@ -8385,6 +8402,9 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               case "$TEST_FAILURE" in
                 resume-commitment|resume-transport|resume-still-valid) return 1 ;;
               esac
+              if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
+                openbao_root_session_revoke_self
+              fi
             }
             openbao_finalization_revoked_checkpoint_create() {
               log_call revoked-checkpoint
@@ -8439,6 +8459,22 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               exit "$3"
             }
 
+            if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
+              # Keep publication, validation, and restart classification real;
+              # only remote operations and the fsync failure seam are doubled.
+              eval "$real_checkpoint_functions"
+              PYTHON_BINARY=/usr/bin/python3
+              OPENBAO_RECOVERY_ROOT=$TEST_RECOVERY_ROOT
+              OPENBAO_SOURCE_RECOVERY_ARCHIVE=$TEST_RECOVERY_ROOT/source.tar.gz
+              OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$TEST_RECOVERY_ROOT/candidate.tar.gz
+              OPENBAO_ROTATION_READY_CHECKPOINT=$TEST_RECOVERY_ROOT/ready.json
+              OPENBAO_ROTATION_REVOKED_CHECKPOINT=$TEST_RECOVERY_ROOT/revoked.json
+              openbao_rotation_artifact_paths() { :; }
+              safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+              safe_file() {
+                [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+              }
+            fi
             openbao_stage_180_recover_verify
             '''
         )
@@ -8448,6 +8484,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 str(OPENBAO_INITIALIZE_LIB), str(call_log),
                 str(verification_progress), artifact_state, failure,
                 self.SOURCE_SHA, self.CURRENT_SHA, checkpoint_state,
+                str(recovery_root) if recovery_root is not None else '',
             ],
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
@@ -11014,6 +11051,68 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertLess(
             calls.index('candidate-revalidate'), calls.index('backup-delete'),
         )
+
+    def test_recover_verify_reentry_requires_durable_ready_before_revoke(
+        self,
+    ) -> None:
+        for reentry_failure in ('ready-fsync', ''):
+            with self.subTest(reentry_failure=reentry_failure):
+                recovery_root = self.temporary_directory()
+                preserved = {
+                    recovery_root / 'source.tar.gz': b'public-source\n',
+                    recovery_root / 'candidate.tar.gz': b'public-candidate\n',
+                }
+                for path, content in preserved.items():
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+                first, first_calls = self.run_recover_verify(
+                    verification_progress=3,
+                    failure='ready-fsync',
+                    recovery_root=recovery_root,
+                )
+                self.assertNotEqual(first.returncode, 0)
+                self.assertIn('recovery-verification-marker-unsafe', first.stdout)
+                self.assertEqual(first_calls.count('recovery-root-fsync'), 1)
+                self.assertNotIn('root-revoke-self', first_calls)
+                ready = recovery_root / 'ready.json'
+                self.assertTrue(ready.is_file())
+                ready_digest = hashlib.sha256(ready.read_bytes()).digest()
+
+                # A fresh Bash process must not infer durability from visibility.
+                resumed, calls = self.run_recover_verify(
+                    verification_progress=3,
+                    failure=reentry_failure,
+                    recovery_root=recovery_root,
+                )
+                if reentry_failure:
+                    for forbidden in (
+                        'root-revoke-self', 'root-resume-proof',
+                        'revoked-checkpoint', 'final-v2-build', 'verified-marker',
+                    ):
+                        self.assertNotIn(forbidden, calls)
+                    self.assertNotEqual(resumed.returncode, 0)
+                    self.assertIn(
+                        'recovery-verification-marker-unsafe', resumed.stdout
+                    )
+                    self.assertNotIn('recovery-root-durable', calls)
+                    self.assertEqual(
+                        hashlib.sha256(ready.read_bytes()).digest(), ready_digest
+                    )
+                else:
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                    self.assertIn('recovery-root-durable', calls)
+                    self.assertLess(
+                        calls.index('recovery-root-durable'),
+                        calls.index('root-resume-proof'),
+                    )
+                    self.assertLess(
+                        calls.index('recovery-root-durable'),
+                        calls.index('root-revoke-self'),
+                    )
+                self.assertEqual(calls.count('recovery-root-fsync'), 1)
+                for path, content in preserved.items():
+                    self.assertEqual(path.read_bytes(), content)
+                self.assertNotIn('root-login', calls)
 
     def test_recover_verify_resumes_every_post_revoke_crash_window(self) -> None:
         cases = (
