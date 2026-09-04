@@ -55,7 +55,7 @@ READY checkpoint 重入使用固定 v2.6.1 的 `bao login -no-print lookup=false
 - 从已验证的旧 recovery bundle 恢复配置流程，且不覆盖旧包；
 - 完成 TLS、Audit、Kubernetes Auth、最小 Policy 与验证 Role 配置；
 - 使用同一专用 OpenPGP 公钥启动 OpenBao `5/3` root key rotation；
-- 用三份未泄露的旧 share 授权 rotation，禁止再次使用已泄露 share；
+- 用三份不同的有效旧 share 授权 rotation，无需识别泄露编号；
 - 生成仅含新 share 密文和非敏感元数据的候选恢复包；
 - 用三份新 share 完成 OpenBao rotation verification；
 - verification 成功后撤销初始 root token，并证明泄露的旧 share 已随整组旧 key 失效；
@@ -71,6 +71,18 @@ READY checkpoint 重入使用固定 v2.6.1 的 `bao login -no-print lookup=false
 - 任何分支、worktree 或用户本地提交清理。
 
 最终 Evidence 必须继续将上述未执行项记录为 `NOT_EXECUTED`。
+
+### 3.3 2026-09-04 获批调整：有效旧份额 quorum
+
+操作者已无法确认曾暴露的旧 share 编号，选择保留数据、轮换份额的非破坏性路径。此前
+“只能使用未泄露旧 share”的人工限制在本次恢复中改为：从已校验 source v1 包选择任意
+三份不同的有效旧 share，分别用于 unseal 与 rotation 授权；两轮可复用同三份。无需寻找、
+比对或记录泄露明文，不从聊天/日志取回 share，也不根据提示中的提交次序猜测包内编号。
+
+该调整不改变 OpenBao quorum 或输入契约，不把旧材料重新判为安全。整组旧份额均按待替换
+材料处理；只有新份额 verification 的 live readback 成功后，才能声明当前实例的旧份额
+失效，不据此声称历史备份或已泄露数据安全。新 5/3 份额仍由同一专用 PGP 公钥加密，保留
+新份额验证、root token 撤销、恢复包与最终验收门禁；不得先删除旧包、GPG 私钥或 PVC。
 
 ## 4. 跨 SHA recovery bundle 采用
 
@@ -127,13 +139,13 @@ ACCEPTED
 `recover-start` 必须按顺序执行：
 
 1. 重跑 Stage 170/180 非敏感前置 readback，并采用经过验证的 source bundle；
-2. 连续三次启动真实 TTY unseal，每次由 OpenBao CLI 自己隐藏读取一份未泄露旧 share；
+2. 连续三次启动真实 TTY unseal，每次由 OpenBao CLI 自己隐藏读取一份不同的有效旧 share；
 3. 每次提交后用独立 `bao status -format=json` readback 判断 progress，禁止解析或保存输入；
 4. OpenBao unsealed 后，通过真实 TTY 隐藏登录初始 root token；
 5. 幂等配置并验证 TLS、两个 Audit device、Kubernetes Auth、最小 Policy 与 Role；
 6. 用 source bundle 中同一 OpenPGP public key 初始化 `5/3` rotation，并要求 PGP 加密与
    verification；
-7. 通过 `KEY=-` 分别提交三份未泄露旧 share，保存 OpenBao 返回的新 share 密文、
+7. 通过 `KEY=-` 分别提交三份不同的有效旧 share，保存 OpenBao 返回的新 share 密文、
    verification nonce 和非敏感状态；
 8. 生成 mode `0600`、noclobber 的候选包及 SHA-256 sidecar；
 9. 无论成功或失败都删除容器内 token helper，并关闭 shell tracing。

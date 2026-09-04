@@ -280,6 +280,7 @@ RECOVERY_SCHEMA=$(python "$OPENBAO_RECOVERY_HELPER" verified-schema \
 say "已由校验通过的恢复包读取 schema：$RECOVERY_SCHEMA"
 case "$RECOVERY_SCHEMA" in
   engineering-platform/openbao-recovery/v1)
+    say "本次恢复可从已校验旧包选择三份不同的有效旧 share，无需识别泄露编号；仅在对应隐藏提示中粘贴。"
     RECOVERY_ITEM_PROMPT='要解密到剪贴板的项目（share1..share5 或 root）：'
     ;;
   engineering-platform/openbao-recovery-rotation-candidate/v1)
@@ -314,7 +315,9 @@ case "$RECOVERY_SCHEMA" in
   engineering-platform/openbao-recovery/v1)
     step "这是事故 v1 恢复，不是正常 v1 configure 路径；不得跳步或改用 configure。"
     step "先按 runbook 运行带 source SHA 的只读 check；收到预期 readback 后才运行 recover-start。"
-    step "在三个隐藏 unseal prompt 中仅使用三份未暴露的旧 share；严禁使用已暴露的旧 share。"
+    step "从已校验旧包选择三份不同的有效旧 share，无需识别泄露编号；逐份粘贴到三个隐藏 unseal prompt。"
+    step "随后旧 share 轮换授权也需三份不同的有效旧 share，可复用刚才三份；不要把同一份重复当作三份。"
+    step "verification 成功前不能宣称旧份额失效；保留旧恢复包和 GPG 私钥，不重新初始化或删除 PVC。"
     step "只有出现隐藏 root-token prompt 时才选择 root；绝不把它输入命令行、聊天或普通 shell。"
     ;;
   engineering-platform/openbao-recovery-rotation-candidate/v1)

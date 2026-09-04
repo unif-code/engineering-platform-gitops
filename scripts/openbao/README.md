@@ -8,7 +8,8 @@ Windows GPG、pinentry、剪贴板和受控云存储步骤；不在 CI 中运行
 使检查与取出之间的 schema 变化失败关闭：
 
 - `engineering-platform/openbao-recovery/v1`：只用于本次事故恢复；可选择
-  `share1..share5` 或初始 `root`，但绝不可再次使用已暴露的旧 share。
+  `share1..share5` 或初始 `root`。unseal 和旧份额轮换授权分别需要三份不同的有效旧 share，
+  两轮可以复用同三份；无需识别泄露编号，不从聊天或日志取回明文。
 - `engineering-platform/openbao-recovery-rotation-candidate/v1`：只允许
   `share1..share5`；候选恢复包尚未完成验证，不是最终恢复包。
 - `engineering-platform/openbao-recovery/v2`：只允许 `share1..share5`；初始 root
@@ -16,6 +17,10 @@ Windows GPG、pinentry、剪贴板和受控云存储步骤；不在 CI 中运行
 
 这里的 v1 是事故恢复路径：先带 source SHA 的只读 check，再 `recover-start`。它不是
 Stage 180 正常首次配置的 `--configure` 路径；事故恢复不得跳步或改用 `configure`。
+
+整组旧 share 均按待替换材料处理；只有新份额 verification 成功后，才能声明当前实例的
+旧份额失效。恢复完成前保留旧包和 GPG 私钥，不重新生成 GPG key，也不重新初始化 OpenBao。
+新份额验证、初始 root token 撤销、最终包验证与验收门禁全部保留。
 
 明文只经 GPG pinentry 解密到 Windows 剪贴板，绝不写入仓库、`.env`、GitHub、stdout、
 命令参数、环境变量或文件。私钥和口令不得上传，也不得与密文包放在同一云端位置。

@@ -14065,7 +14065,6 @@ openbao_apply_configuration_with_root
             'gpg --full-generate-key',
             'openbao-recovery-public-key.b64',
             'Set-Clipboard',
-            '三份未暴露的旧 share',
             '受控云存储',
             'Clear-Clipboard',
         ):
@@ -14073,6 +14072,36 @@ openbao_apply_configuration_with_root
         for forbidden in ('write_env ', 'set_secret ', 'set_var '):
             stages_source = wizard.split('# STAGES', 1)[1]
             self.assertNotIn(forbidden, stages_source)
+
+    def test_recovery_wizard_v1_guides_distinct_valid_old_shares(self) -> None:
+        # Exercise only the schema-routed instructions, never GPG or clipboard.
+        wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
+        instructions = wizard.split(
+            'stage "隐藏提示、服务器仪式与清理"', 1,
+        )[1].rsplit('\nfinish', 1)[0]
+        result = subprocess.run(
+            ['bash', '-euo', 'pipefail', '-c', textwrap.dedent('''\
+                step() { printf '%s\\n' "$*"; }
+                say() { printf '%s\\n' "$*"; }
+                RECOVERY_SCHEMA=engineering-platform/openbao-recovery/v1
+            ''') + instructions],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8'},
+            timeout=10,
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for required in (
+            '三份不同的有效旧 share',
+            '无需识别泄露编号',
+            '旧 share 轮换授权',
+            'verification 成功前不能宣称旧份额失效',
+            '保留旧恢复包和 GPG 私钥',
+            '隐藏 root-token prompt',
+            'recover-start',
+        ):
+            self.assertIn(required, result.stdout)
+        self.assertNotIn('未暴露', result.stdout)
+        self.assertNotIn('初始 root token 已撤销', result.stdout)
 
     def test_recovery_wizard_routes_all_three_bundle_schemas(self) -> None:
         wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
