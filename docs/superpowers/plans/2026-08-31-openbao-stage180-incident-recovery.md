@@ -19,6 +19,7 @@
 - Do not re-run `operator init`, delete/recreate Raft or Audit PVCs, patch live objects by hand, or bypass `scripts/bootstrap/run-approved.sh`.
 - Keep MinIO, Snapshot, Backup, Restore, and application Secret migration `NOT_EXECUTED`.
 - Keep the source v1 bundle and candidate bundle; do not auto-delete server/local recovery artifacts, branches, worktrees, or user commits.
+- Approved amendment (2026-09-04, spec section 3.3): use any three distinct valid old shares from the verified source bundle for each old-key quorum; unseal and rotation may reuse the same three. Identifying the exposed share is not a prerequisite. Never retrieve plaintext from chat/logs or infer its identity from prompt order. Treat the entire old set as pending replacement until live new-share verification succeeds; retain all other gates.
 - A PGP-encrypted OpenBao rotation backup is allowed only as crash protection; plaintext backup is forbidden. After live verification completes, revalidate all five candidate ciphertexts, delete the encrypted backup, require Runtime readback, then revoke/prove/clean the root helper. Only after that proof may final v2 and its marker be built and validated. If finalization is interrupted, retain and resume from the validated candidate and bound durable checkpoints.
 - Incident acceptance requires `origin/main == origin/validated == approved SHA`; the existing ordinary bootstrap rule that permits main ahead of validated remains unchanged.
 - A fresh environment with a valid current-SHA v1 bundle and no incident artifact keeps the normal `configure`/legacy acceptance path. Source/candidate/final/marker presence selects the incident path permanently; mixed or ambiguous state stops.
@@ -487,7 +488,7 @@ openbao_bao operator rotate-keys -format=json -backup-retrieve >"$response"
 
 Normalize that response through the same allowlist; never print it and never request a plaintext backup.
 
-The script cannot identify which old share was exposed. Prompts and runbook must say to use three other old shares. The verifiable security claim is made only after the complete old key set is invalidated by verified rotation.
+The script cannot identify which old share was exposed. Prompts and runbook must say to use three distinct valid old shares from the verified source bundle, without requiring identification of the exposed item. Unseal and rotation authorization may reuse the same three; each quorum must use distinct shares. The verifiable security claim for the current instance is made only after the complete old key set is invalidated by verified rotation. Preserve old recovery material and do not claim historical backups are made safe.
 
 - [ ] **Step 4: Run recover-start and existing Stage 180 tests and confirm GREEN**
 
@@ -666,7 +667,7 @@ python "$OPENBAO_RECOVERY_HELPER" emit-item \
     '$plain = [Console]::In.ReadToEnd(); Set-Clipboard -Value $plain'
 ```
 
-Translate stage names, questions, warnings, and operator actions below the marker into Chinese. Stage 5 branches on schema: v1 instructs `recover-start` and forbids the exposed share; candidate instructs `recover-verify` and says it is not final; v2 confirms cloud upload of the final ciphertext bundle and clears the clipboard.
+Translate stage names, questions, warnings, and operator actions below the marker into Chinese. Stage 5 branches on schema: v1 instructs `recover-start`, three distinct valid old shares for each old quorum, no exposed-index prerequisite, and retention until verification; candidate instructs `recover-verify` and says it is not final; v2 confirms cloud upload of the final ciphertext bundle and clears the clipboard.
 
 Document exact server order and expected results without secret values:
 

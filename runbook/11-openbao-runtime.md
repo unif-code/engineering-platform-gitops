@@ -196,8 +196,16 @@ rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
 ```
 
 预期 `RESULT=PASS_OPENBAO_RECOVERY_STARTED`、
-`REASON=openbao-key-rotation-verification-required`。三个 hidden unseal prompt 只能输入三份
-未暴露旧 share；禁止使用已暴露 share。候选包是：
+`REASON=openbao-key-rotation-verification-required`。从已校验的 source v1 包选择三份不同的
+有效旧 share，逐一在实际终端的 hidden unseal prompt 中输入；无需识别泄露编号，也不得
+从聊天或日志取回明文。随后在隐藏 root-token prompt 输入旧包中的初始 root token，再在
+旧 share 轮换授权的隐藏提示中提交三份不同的有效旧 share；两轮可复用同三份，但每轮不能
+重复提交同一份充数。share 编号仅表示包内项目，不由提示中的第几次提交推断泄露身份。
+
+整组旧份额按待替换材料处理。新份额 verification 成功前，旧份额仍须保留，不能声明其
+已经失效；新份额验证成功后才可声明当前实例不再接受旧份额，不据此声称历史备份安全。
+不删除旧包或 GPG 私钥，不重新生成 GPG key，不重新初始化 OpenBao。初始 root token
+仍由后续 `recover-verify` 按原门禁撤销；候选生成不等于事故关闭。候选包是：
 
 ```text
 /root/openbao-recovery/openbao-recovery-rotation-candidate-<MERGED_SHA>.tar.gz

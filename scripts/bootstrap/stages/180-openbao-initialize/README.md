@@ -13,8 +13,9 @@ Stage 180 是手工、交互式仪式，故意不在 `bootstrap-all.sh` 中。�
   archive 及其 checksum。
 - `--configure` 是正常 v1 路径：通过隐藏终端提示读取三份 unseal share 和初始 root token，
   在精确配置和 readback 后撤销 root token。
-- `--recover-start` 仅用于已初始化事故现场：验证 source v1 包，使用三份未暴露旧 share，
-  配置 Runtime 并生成候选恢复包；它不会撤销 root token。
+- `--recover-start` 仅用于已初始化事故现场：验证 source v1 包，unseal 与 rotation 授权各用
+  三份不同的有效旧 share（两轮可复用同三份，无需识别泄露编号），配置 Runtime 并生成
+  候选恢复包；它不会撤销 root token，也不能证明旧份额已失效。
 - `--recover-verify` 验证候选包后通过三份新 share 完成 rotation verification，证明撤销初始
   root token，写入最终 v2 包和 verified marker。
 - `--accept` 使用短期 Kubernetes-auth token，运行正反 Policy probe、核对两条 audit 流并写入
