@@ -17,6 +17,8 @@ Gate 通过。
 - 所有服务器入口统一经过 `scripts/bootstrap/run-approved.sh`；它校验 SHA、origin、
   `main`、干净工作树、ff-only 与残留，并用 `env -i` 启动。
 - Stage 170 在 `bootstrap-all` 中；Stage 180 永不自动串联，必须显式选择单个操作。
+- 服务器只能通过外部 Chrome 最新的“Web终端 - 统一企业堡垒机”标签页操作；禁止 SSH、应用内
+  浏览器和本地终端。每条下列命令都须先完整展示并等待当前回执，才能执行下一条。
 - 每条服务器或 Kubernetes 写命令仍须在执行前完整展示，说明影响与预期 readback，并等待
   当前回执审核。不得把 blanket approval 当成跳过现场回执。
 - 不得把 share、root token、私钥、口令、JWT、kubeconfig 或解密后的任何值写入聊天、
@@ -152,7 +154,89 @@ helper，配置并精确 readback：
 和 ciphertext bundle，不创建第二次初始化；清空 clipboard 后先审核 `STOP_*` 再重跑同一
 显式操作。
 
-## 7. 验收与 evidence
+## 7. 已初始化事故的受控恢复
+
+本节只适用于 OpenBao 已初始化但首次配置因非 TTY 隐藏输入中断的已知事故。`<SOURCE_RECOVERY_SHA>`
+是旧 v1 bundle 的 40 位小写 Git SHA，不是路径；`<MERGED_SHA>` 是已通过 CI 的当前完整 SHA，
+且运行前必须满足 `origin/main == origin/validated == <MERGED_SHA>`。不得重新执行
+`operator init`，不得删除 PVC，也不得手工 patch 集群对象。
+
+严格顺序为：带 source SHA 的 check → `recover-start` → 候选包下载/校验 → Windows 本地解密
+三份新 share → `recover-verify` → 最终 v2 包下载/校验 → `accept`。任一 `STOP_*` 或非零退出码
+都停止并保留 source、candidate、PVC 和现场状态；不得跳步或改用普通 `configure`。
+
+### 7.1 只读 check（带 source SHA）
+
+【运维】完整命令：
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops && \
+./scripts/bootstrap/run-approved.sh <MERGED_SHA> --check --stage=180 --source-recovery-sha=<SOURCE_RECOVERY_SHA>; \
+rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
+```
+
+预期 `RESULT=PASS_OPENBAO_RECOVERY_CHECK`、`REASON=recover-start-required`，并在 `NEXT` 中回显
+同一 source SHA 的 `--recover-start`。该检查不 unseal、不读取隐藏值、不写 evidence。
+
+### 7.2 启动 rotation 并生成候选包
+
+【运维】【写入，需真实 TTY】完整命令：
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops && \
+./scripts/bootstrap/run-approved.sh <MERGED_SHA> --apply --stage=180 --operation=recover-start --source-recovery-sha=<SOURCE_RECOVERY_SHA>; \
+rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
+```
+
+预期 `RESULT=PASS_OPENBAO_RECOVERY_STARTED`、
+`REASON=openbao-key-rotation-verification-required`。三个 hidden unseal prompt 只能输入三份
+未暴露旧 share；禁止使用已暴露 share。候选包是：
+
+```text
+/root/openbao-recovery/openbao-recovery-rotation-candidate-<MERGED_SHA>.tar.gz
+/root/openbao-recovery/openbao-recovery-rotation-candidate-<MERGED_SHA>.tar.gz.sha256
+```
+
+将两份候选密文文件下载到 Windows，用向导先校验 sidecar 与 schema，再本地解密三份新
+`share1..share5` 中的三份到 clipboard。候选 schema 为
+`engineering-platform/openbao-recovery-rotation-candidate/v1`，尚未完成 verification，不能
+当作最终恢复包，也不允许选择 `root`。
+
+### 7.3 完成验证、下载最终 v2 包并验收
+
+【运维】【写入，需真实 TTY】完整命令：
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops && \
+./scripts/bootstrap/run-approved.sh <MERGED_SHA> --apply --stage=180 --operation=recover-verify --source-recovery-sha=<SOURCE_RECOVERY_SHA>; \
+rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
+```
+
+预期 `RESULT=PASS_OPENBAO_RECOVERED`、`REASON=openbao-key-rotation-verified`。该操作验证三份新
+share、Runtime readback 和最小权限 probe，撤销初始 root token，并写入最终 v2 包及 marker：
+
+```text
+/root/openbao-recovery/openbao-recovery-<MERGED_SHA>.tar.gz
+/root/openbao-recovery/openbao-recovery-<MERGED_SHA>.tar.gz.sha256
+```
+
+下载最终两份密文文件到 Windows，以向导校验 sidecar/schema；v2 为
+`engineering-platform/openbao-recovery/v2`，只允许新 share，初始 root token 已撤销。确认最终
+v2 密文包与 checksum 已上传到受控云存储后清空 clipboard。source 与 candidate 包的删除/清理
+必须作为另一项工作，列明精确路径并获得单独明确批准。
+
+最终才执行 `accept`：
+
+```bash
+cd /opt/uni-code/engineering-platform-gitops && \
+./scripts/bootstrap/run-approved.sh <MERGED_SHA> --apply --stage=180 --operation=accept; \
+rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
+```
+
+预期 `RESULT=PASS_OPENBAO_RUNTIME_ACCEPTED`、`REASON=openbao-runtime-accepted`，并生成
+`17-openbao-runtime-<UTC>.txt` 及其 `.sha256` sidecar。
+
+## 8. 验收与 evidence
 
 【运维】【写入 probe 与 evidence】完整命令：
 
@@ -175,10 +259,14 @@ readback，并吊销临时 token。随后验证 file/stdout audit 都包含 HMAC
 /root/dev-infra-evidence/17-openbao-runtime-<UTC>.txt.sha256
 ```
 
-evidence 必须包含 `MINIO=NOT_EXECUTED`、`BACKUP=NOT_EXECUTED`、
-`APP_SECRET_MIGRATION=NOT_EXECUTED`、`INITIAL_ROOT_TOKEN=REVOKED` 和
-`SECRET_VALUES=NOT_RECORDED`，不得包含 share、root token、JWT、OpenBao client token
-或 recovery ciphertext。用 `sha256sum -c` 核验 sidecar 后再回填验收记录。
+事故恢复 Evidence 必须包含 `UNSEAL_KEY_ROTATION=PASS`、
+`COMPROMISED_SHARE_INVALIDATED=true`、`INITIAL_ROOT_TOKEN=REVOKED`、
+`RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2`、
+`MINIO=NOT_EXECUTED`、`SNAPSHOT=NOT_EXECUTED`、`BACKUP=NOT_EXECUTED`、
+`RESTORE=NOT_EXECUTED`、`APP_SECRET_MIGRATION=NOT_EXECUTED` 和
+`SECRET_VALUES=NOT_RECORDED`，不得包含 share、root token、JWT、OpenBao client token 或
+recovery ciphertext。用 `sha256sum -c` 核验 sidecar 后再回填验收记录；这些五项 deferred
+系统仍为 NOT_EXECUTED，本次不执行任何 Backup、Restore 或应用迁移。
 
 ## STOP 分类
 
