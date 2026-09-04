@@ -1690,10 +1690,15 @@ openbao_bao() {
 }
 
 openbao_bao_tty_public() {
+  [[ $# -eq 3 && $1 == operator && $2 == unseal && $3 == -format=json ]] ||
+    return 1
+  # Discard public status inside the container, before the remote PTY merges
+  # stdout and stderr; the CLI's hidden prompt must reach the operator.
+  # shellcheck disable=SC2016
   kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
-    bao "$@"
+    /bin/sh -c 'exec bao operator unseal -format=json >/dev/null'
 }
 
 openbao_bao_tty() {
@@ -2067,7 +2072,7 @@ openbao_unseal_interactively() {
   openbao_require_interactive_tty || return 1
   openbao_bao_public operator unseal -reset -format=json >/dev/null || return 1
   for attempt in 1 2 3; do
-    openbao_bao_tty_public operator unseal -format=json >/dev/null || return 1
+    openbao_bao_tty_public operator unseal -format=json || return 1
     openbao_unseal_progress_is_safe "$attempt" || return 1
   done
   [[ "$(openbao_state_flags)" == 'true|false' ]]

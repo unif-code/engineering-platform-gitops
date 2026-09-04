@@ -13435,10 +13435,6 @@ openbao_apply_configuration_with_root
             self.assertNotIn(forbidden, root_start)
         for forbidden in ('>/dev/null', '2>&1'):
             self.assertNotIn(forbidden, root_start)
-        self.assertIn(
-            'openbao_bao_tty_public operator unseal -format=json >/dev/null',
-            unseal,
-        )
         self.assertLess(
             unseal.index('openbao_require_interactive_tty'),
             unseal.index('operator unseal -reset'),
@@ -13447,6 +13443,93 @@ openbao_apply_configuration_with_root
             root_start.index('openbao_require_interactive_tty'),
             root_start.index('openbao_remote_home_create root'),
         )
+
+    def test_unseal_prompts_survive_remote_pty_without_status_output(self) -> None:
+        # An outer redirect must fail this test: kubectl's remote PTY merges
+        # stderr prompts into stdout before returning to the real caller.
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        bao = binary_directory / 'bao'
+        bao.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            [[ "$*" == 'operator unseal -format=json' ]] || exit 98
+            [[ -t 0 && -t 2 ]] || exit 97
+            printf 'synthetic-unseal-hidden-prompt\\n' >&2
+            printf 'synthetic-unseal-status\\n'
+            exit "$FIXTURE_UNSEAL_EXIT_CODE"
+            '''), encoding='utf-8')
+        bao.chmod(0o755)
+        bridge = temporary / 'remote-pty.py'
+        bridge.write_text(textwrap.dedent('''\
+            import errno
+            import os
+            import pty
+            import sys
+
+            arguments = sys.argv[1:]
+            assert arguments[:6] == [
+                '--namespace=openbao', 'exec', '--stdin', '--tty',
+                'pod/openbao-0', '--',
+            ]
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execvp(arguments[6], arguments[6:])
+            try:
+                while True:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    os.write(1, data)
+            finally:
+                os.close(master)
+                _, status = os.waitpid(pid, 0)
+            raise SystemExit(os.waitstatus_to_exitcode(status))
+            '''), encoding='utf-8')
+        for cli_exit, expected_prompts, expected_exit in ((0, 3, 0), (23, 1, 1)):
+            with self.subTest(cli_exit=cli_exit):
+                script = (
+                    f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
+                    f'export FIXTURE_UNSEAL_EXIT_CODE={cli_exit}\n'
+                    f'fixture_bridge={shlex.quote(str(bridge))}\n'
+                    + textwrap.dedent(r'''
+                        kubectl_run() {
+                          if [[ "$*" == '--namespace=openbao exec pod/openbao-0 -- env BAO_ADDR=https://openbao.openbao.svc:8200 BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt bao operator unseal -reset -format=json' ]]; then
+                            return 0
+                          fi
+                          python3 "$fixture_bridge" "$@"
+                        }
+                        openbao_unseal_interactively
+                        ''')
+                )
+                result, _ = self.run_stage180_function_in_pty(script)
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertEqual(
+                    result.stdout.count('synthetic-unseal-hidden-prompt'),
+                    expected_prompts,
+                    result.stdout,
+                )
+                self.assertNotIn('synthetic-unseal-status', result.stdout)
+                self.assertNotIn('synthetic-share-', result.stdout)
+
+    def test_unseal_tty_wrapper_rejects_unexpected_commands(self) -> None:
+        for command in (
+            'token lookup -format=json',
+            'operator unseal -format=json synthetic-share',
+            'operator unseal -reset -format=json',
+        ):
+            with self.subTest(command=command):
+                result, logged = self.run_stage180_function_in_pty(
+                    f'openbao_bao_tty_public {command}',
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(logged, '')
 
     def test_secret_operations_stop_before_read_without_tty(self) -> None:
         for function in (
