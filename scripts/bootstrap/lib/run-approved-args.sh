@@ -17,6 +17,11 @@ run_approved_parse_arguments() {
     --apply:0)
       RUN_APPROVED_TARGET_ARGUMENTS=(--apply)
       ;;
+    --check:1)
+      [[ "$1" == --stage=180 ]] || return 2
+      RUN_APPROVED_TARGET=openbao-initialize
+      RUN_APPROVED_TARGET_ARGUMENTS=(--check)
+      ;;
     --check:2)
       [[ "$1" == --stage=180 && "$2" == --source-recovery-sha=* ]] || return 2
       source_sha=${2#--source-recovery-sha=}

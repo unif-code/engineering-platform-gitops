@@ -42,6 +42,11 @@ bao operator unseal -format=json
 实现不得以 `-key=<value>`、`BAO_TOKEN=<value>`、临时 Kubernetes Secret、命令替换、
 调试回显或 shell tracing 规避输入问题。
 
+READY checkpoint 重入使用固定 v2.6.1 的 `bao login -no-print lookup=false`（无 token
+参数），仍由 CLI 自身隐藏读取。stdout 在容器内丢弃、早于 kubectl TTY 合流，stderr 保留
+隐藏提示，避免 token-helper Store 失败时输出 token。Store 成功不代表认证或撤销成功；
+必须先匹配 checkpoint commitment，再验证 lookup/revoke 与精确认证拒绝，且检查清理。
+
 ## 3. 锁定范围
 
 ### 3.1 本批次必须完成
@@ -205,6 +210,12 @@ Windows wizard 必须识别 v1 source 包和 v2 最终包：
 - rotation 已初始化但未提交满旧 quorum 时，从 OpenBao status 恢复同一 nonce，禁止启动
   第二次 rotation；
 - candidate 已存在时验证并复用，禁止覆盖或生成另一组新 share；
+- candidate 在同文件系统 mode `0700` 的 `.openbao-candidate-staging-<SHA>` 中构建，
+  固定 intent 绑定预期密文字节，文件 mode `0600` 并逐文件/父目录 fsync。完整 archive、
+  sidecar 与目录验证一致后只用 noclobber hardlink 发布，sidecar 最后可见。中断重入从同一
+  已认证加密 backup 重建预期字节，私有半写文件只补齐严格匹配前缀的缺失后缀；已发布
+  部分必须与 staging 同 inode。未知成员、字节/属主/mode/nonce 不一致均停止。staging
+  有界保留，不自动删除 source/candidate/staging；使用完整候选包前重新确认目录持久性；
 - verification 部分完成时恢复同一 nonce，禁止重新初始化 rotation；
 - root token 撤销只发生在 verification 和 Runtime readback 均成功之后；
 - token helper 清理使用 trap，失败也执行；清理失败使操作失败并阻止 Evidence；

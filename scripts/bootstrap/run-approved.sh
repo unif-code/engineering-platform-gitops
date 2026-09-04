@@ -3,10 +3,12 @@
 # 或显式的 Stage 180 OpenBao 人工仪式入口。
 # 用法：scripts/bootstrap/run-approved.sh [<approved-sha>] --check|--apply
 #       scripts/bootstrap/run-approved.sh [<approved-sha>] --check --stage=180 \
-#         --source-recovery-sha=<40-lowercase-hex>
-#       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
-#         --operation=initialize|configure|accept|recover-start|recover-verify \
 #         [--source-recovery-sha=<40-lowercase-hex>]
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
+#         --operation=initialize|configure|accept
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
+#         --operation=recover-start|recover-verify \
+#         --source-recovery-sha=<40-lowercase-hex>
 # 不带 SHA 时使用 CI 在 validation-gate 全绿后发布的 origin/validated；它必须仍在
 # origin/main 历史上，否则 fail-closed，杜绝部署未经门禁或已被回滚的提交。
 # 门禁与既往人工粘贴的脚本一致（SHA、origin、main、干净树、ff-only、helm 残留、
@@ -19,9 +21,11 @@ umask 022
 usage() {
   printf 'usage: %s [<approved-sha>] --check|--apply\n' "${0##*/}" >&2
   printf '       %s [<approved-sha>] --check --stage=180 ' "${0##*/}" >&2
-  printf '%s\n' '--source-recovery-sha=<40-lowercase-hex>' >&2
+  printf '%s\n' '[--source-recovery-sha=<40-lowercase-hex>]' >&2
   printf '       %s [<approved-sha>] --apply --stage=180 ' "${0##*/}" >&2
-  printf '%s\n' '--operation=initialize|configure|accept|recover-start|recover-verify' >&2
+  printf '%s\n' '--operation=initialize|configure|accept' >&2
+  printf '       %s [<approved-sha>] --apply --stage=180 ' "${0##*/}" >&2
+  printf '%s\n' '--operation=recover-start|recover-verify --source-recovery-sha=<40-lowercase-hex>' >&2
   printf '  省略 SHA 时使用 CI 发布的 origin/validated\n' >&2
   exit 2
 }
