@@ -13393,8 +13393,8 @@ PY
             'gpg --full-generate-key',
             'openbao-recovery-public-key.b64',
             'Set-Clipboard',
-            'three unseal shares',
-            'cloud',
+            '三份未暴露的旧 share',
+            '受控云存储',
             'Clear-Clipboard',
         ):
             self.assertIn(expected, wizard)
@@ -13402,28 +13402,42 @@ PY
             stages_source = wizard.split('# STAGES', 1)[1]
             self.assertNotIn(forbidden, stages_source)
 
+    def test_recovery_wizard_routes_all_three_bundle_schemas(self) -> None:
+        wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
+        for schema in (
+            'engineering-platform/openbao-recovery/v1',
+            'engineering-platform/openbao-recovery-rotation-candidate/v1',
+            'engineering-platform/openbao-recovery/v2',
+        ):
+            self.assertIn(schema, wizard)
+        self.assertIn('候选恢复包尚未完成验证', wizard)
+        self.assertIn('初始 root token 已撤销', wizard)
+
     def test_manual_stage_readme_stop_reasons_match_implementation(self) -> None:
-        implemented = set(StageReadmeTest.REASON.findall(
-            OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        source = OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        reason_constants = dict(re.findall(
+            r'^readonly (OPENBAO_REASON_[A-Z_]+)=([a-z0-9-]+)$', source,
+            re.MULTILINE,
         ))
-        # Task 7 owns the operator README and removes this explicit deferral
-        # when it documents the new incident-only stop reasons. Keeping the
-        # assertion makes either an implementation rename or an early README
-        # edit fail until both sides are reconciled in that task.
-        task_7_documentation = {
-            'openbao-rotation-state-unsafe',
-            'recovery-final-bundle-state-unsafe',
-            'recovery-verification-marker-unsafe',
+        emitted = re.findall(
+            r'(?:complete|openbao_recover_start_fail|openbao_recover_verify_fail)'
+            r'\s+STOP_[A-Z_]+\s+(?:\\\s*)?["\']?(\$?[A-Za-z0-9_-]+)',
+            source,
+        )
+        implemented = {
+            reason_constants.get(reason.removeprefix('$'), reason)
+            for reason in emitted
         }
-        self.assertTrue(task_7_documentation <= implemented)
-        reasons = sorted(implemented - task_7_documentation)
+        implemented.discard('missing-command-')
+        self.assertIn('for required in install mkdir tar;', source)
+        implemented.add('missing-command-tar')
         listed = sorted(re.findall(
             r'^- `([a-z0-9-]+)`$',
             OPENBAO_INITIALIZE.with_name('README.md').read_text(encoding='utf-8'),
             re.MULTILINE,
         ))
-        self.assertTrue(reasons)
-        self.assertEqual(listed, reasons)
+        self.assertTrue(implemented)
+        self.assertEqual(listed, sorted(implemented))
 
 
 class ArtifactStageTest(BootstrapTestCase):

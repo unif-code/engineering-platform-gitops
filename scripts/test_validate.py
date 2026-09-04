@@ -515,13 +515,20 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
             validator.ROOT / 'pcs/candidate-3.md'
         ).read_text(encoding='utf-8')
 
-        for operation in ('initialize', 'configure', 'accept'):
+        for operation in (
+            'initialize', 'configure', 'recover-start', 'recover-verify', 'accept'
+        ):
             self.assertIn(
                 f'--apply --stage=180 --operation={operation}',
                 runtime,
             )
         for expected in (
             '--check --stage=180',
+            '--source-recovery-sha=',
+            'openbao-recovery-rotation-candidate-<MERGED_SHA>.tar.gz',
+            'openbao-recovery-rotation-candidate-<MERGED_SHA>.tar.gz.sha256',
+            'openbao-recovery-<MERGED_SHA>.tar.gz',
+            'openbao-recovery-<MERGED_SHA>.tar.gz.sha256',
             '17-openbao-runtime-<UTC>.txt',
             '17-openbao-runtime-<UTC>.txt.sha256',
             'Shamir 5/3',
@@ -530,8 +537,14 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
             'PVC',
             'cloud',
             'STOP_',
+            'UNSEAL_KEY_ROTATION=PASS',
+            'COMPROMISED_SHARE_INVALIDATED=true',
+            'INITIAL_ROOT_TOKEN=REVOKED',
+            'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2',
             'MINIO=NOT_EXECUTED',
+            'SNAPSHOT=NOT_EXECUTED',
             'BACKUP=NOT_EXECUTED',
+            'RESTORE=NOT_EXECUTED',
             'APP_SECRET_MIGRATION=NOT_EXECUTED',
         ):
             self.assertIn(expected, runtime)

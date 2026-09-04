@@ -187,67 +187,56 @@ finish() {
 TOTAL_STAGES=5
 RECOVERY_HOME="${OPENBAO_RECOVERY_HOME:-$HOME/OpenBao-Recovery}"
 OPENBAO_GPG_FINGERPRINT=""
+wizard_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly OPENBAO_RECOVERY_HELPER="${wizard_dir}/../bootstrap/lib/openbao_recovery.py"
 
 copy_recovery_item_to_clipboard() {
   local archive=$1 item=$2
+  [[ -f "$OPENBAO_RECOVERY_HELPER" ]] || {
+    warn "未找到恢复包校验工具；请在仓库根目录重新运行向导"
+    return 1
+  }
   # PowerShell expands $plain inside its own process.
   # shellcheck disable=SC2016
-  tar -xOf "$archive" --wildcards '*/init.json' |
-    python -c '
-import json
-import sys
-
-item = sys.argv[1]
-document = json.load(sys.stdin)
-if item == "root":
-    value = document.get("root_token")
-elif item.startswith("share") and item[5:].isdigit():
-    index = int(item[5:]) - 1
-    keys = document.get("unseal_keys_b64", [])
-    value = keys[index] if 0 <= index < len(keys) else None
-else:
-    value = None
-if not isinstance(value, str) or len(value) < 100:
-    raise SystemExit(1)
-sys.stdout.write(value)
-' "$item" |
+  python "$OPENBAO_RECOVERY_HELPER" emit-item \
+    --archive "$archive" --sidecar "${archive}.sha256" --item "$item" |
     base64 --decode |
     gpg --decrypt |
     powershell.exe -NoProfile -NonInteractive -Command \
       '$plain = [Console]::In.ReadToEnd(); Set-Clipboard -Value $plain'
 }
 
-banner "DEV OpenBao recovery ceremony"
+banner "DEV OpenBao 恢复仪式"
 
 stage "Gpg4win / GnuPG"
-say "This wizard runs on Windows Git Bash and never captures a private key or passphrase."
+say "本向导只在 Windows Git Bash 运行；绝不读取私钥或口令。"
 if ! command -v gpg >/dev/null 2>&1; then
   open_url "https://www.gpg4win.org/get-gpg4win.html"
-  step "Download Gpg4win from the official page, install GnuPG, then reopen Git Bash."
-  pause "Press Enter after gpg is installed."
+  step "从官方页面安装 Gpg4win（含 GnuPG），随后重新打开 Git Bash。"
+  pause "确认 gpg 已安装后按 Enter。"
 fi
-command -v gpg >/dev/null 2>&1 || { warn "gpg is still unavailable"; exit 1; }
-printf "%b\n" "${RED}Sensitive ceremony:${RESET} never paste plaintext into this shell."
-say "Gpg4win / GnuPG is ready."
+command -v gpg >/dev/null 2>&1 || { warn "gpg 仍不可用"; exit 1; }
+printf "%b\n" "${RED}敏感仪式：${RESET}绝不把明文粘贴到此 shell。"
+say "Gpg4win / GnuPG 已就绪。"
 
-stage "Dedicated recovery key"
-say "Use a dedicated key protected by GPG pinentry. The passphrase stays in pinentry."
-if ! confirm "Reuse an existing dedicated OpenBao recovery key?"; then
-  step "Run gpg --full-generate-key and complete the pinentry prompts."
+stage "专用恢复密钥"
+say "使用受 GPG pinentry 保护的专用密钥；口令始终只留在 pinentry。"
+if ! confirm "是否复用已有的专用 OpenBao 恢复密钥？"; then
+  step "执行 gpg --full-generate-key，并仅在 pinentry 中完成提示。"
   gpg --full-generate-key
 fi
 gpg --list-secret-keys --keyid-format long
-ask OPENBAO_GPG_FINGERPRINT "Paste the dedicated key fingerprint (public):"
+ask OPENBAO_GPG_FINGERPRINT "输入专用密钥 fingerprint（公开值）："
 OPENBAO_GPG_FINGERPRINT=${OPENBAO_GPG_FINGERPRINT//[[:space:]]/}
 [[ "$OPENBAO_GPG_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$|^[0-9A-Fa-f]{64}$ ]] || {
-  warn "fingerprint must be 40 or 64 hexadecimal characters"
+  warn "fingerprint 必须是 40 或 64 位十六进制字符"
   exit 1
 }
 OPENBAO_GPG_FINGERPRINT=${OPENBAO_GPG_FINGERPRINT^^}
 gpg --batch --list-secret-keys "$OPENBAO_GPG_FINGERPRINT" >/dev/null
 
-stage "Export public key only"
-say "Only a base64-encoded public key and its public fingerprint are exported."
+stage "仅导出公钥"
+say "只导出 base64 公钥和公开 fingerprint。"
 mkdir -p "$RECOVERY_HOME"
 chmod 700 "$RECOVERY_HOME"
 public_key="$RECOVERY_HOME/openbao-recovery-public-key.b64"
@@ -270,39 +259,77 @@ else
   mv "$public_tmp" "$public_key"
   mv "$fingerprint_tmp" "$fingerprint_file"
 fi
-say "Public key: $public_key"
-say "Fingerprint: $OPENBAO_GPG_FINGERPRINT"
-step "Upload these two public files to /root/.config/engineering-platform on the server."
+say "公钥：$public_key"
+say "Fingerprint：$OPENBAO_GPG_FINGERPRINT"
+step "仅将这两个公开文件上传到服务器 /root/.config/engineering-platform。"
 
-stage "Ciphertext bundle and clipboard"
-say "Download the server-produced recovery .tar.gz and .sha256 into $RECOVERY_HOME."
-ask RECOVERY_ARCHIVE "Path to the downloaded recovery .tar.gz:"
+stage "密文恢复包与剪贴板"
+say "将服务器生成的 recovery .tar.gz 及其 .sha256 下载到 $RECOVERY_HOME。"
+ask RECOVERY_ARCHIVE "已下载 recovery .tar.gz 的路径："
 [[ -f "$RECOVERY_ARCHIVE" && -f "${RECOVERY_ARCHIVE}.sha256" ]] || {
-  warn "archive or checksum sidecar is missing"
+  warn "缺少 archive 或 checksum sidecar"
   exit 1
 }
 (cd "$(dirname "$RECOVERY_ARCHIVE")" && sha256sum -c "$(basename "$RECOVERY_ARCHIVE").sha256")
-ask RECOVERY_ITEM "Item to decrypt to clipboard (share1..share5 or root):"
-[[ "$RECOVERY_ITEM" =~ ^share[1-5]$|^root$ ]] || {
-  warn "item must be share1..share5 or root"
+ask RECOVERY_SCHEMA "恢复包 schema（v1、candidate 或 v2）："
+case "$RECOVERY_SCHEMA" in
+  v1)
+    RECOVERY_SCHEMA='engineering-platform/openbao-recovery/v1'
+    RECOVERY_ITEM_PROMPT='要解密到剪贴板的项目（share1..share5 或 root）：'
+    ;;
+  candidate)
+    RECOVERY_SCHEMA='engineering-platform/openbao-recovery-rotation-candidate/v1'
+    RECOVERY_ITEM_PROMPT='要解密到剪贴板的新 share（share1..share5）：'
+    ;;
+  v2)
+    RECOVERY_SCHEMA='engineering-platform/openbao-recovery/v2'
+    RECOVERY_ITEM_PROMPT='要解密到剪贴板的新 share（share1..share5）：'
+    ;;
+  *)
+    warn "schema 必须是 v1、candidate 或 v2"
+    exit 1
+    ;;
+esac
+ask RECOVERY_ITEM "$RECOVERY_ITEM_PROMPT"
+case "$RECOVERY_SCHEMA:$RECOVERY_ITEM" in
+  engineering-platform/openbao-recovery/v1:share[1-5]|engineering-platform/openbao-recovery/v1:root|engineering-platform/openbao-recovery-rotation-candidate/v1:share[1-5]|engineering-platform/openbao-recovery/v2:share[1-5]) ;;
+  *)
+    warn "该 schema 仅允许选择规定的恢复项目"
+    exit 1
+    ;;
+esac
+copy_recovery_item_to_clipboard "$RECOVERY_ARCHIVE" "$RECOVERY_ITEM" || {
+  warn "恢复包未通过校验，或该项目不被该 schema 允许"
   exit 1
 }
-copy_recovery_item_to_clipboard "$RECOVERY_ARCHIVE" "$RECOVERY_ITEM"
-say "The selected plaintext exists only in the Windows clipboard; it was not printed or saved."
+say "已选明文只存在于 Windows 剪贴板；不会打印或落盘。"
 
-stage "Hidden prompts, cloud upload, cleanup"
-step "In the approved bastion terminal, run Stage 180 --configure."
-step "Use the prior stage repeatedly to paste three unseal shares into the three hidden prompts."
-step "Then decrypt root and paste it only into the hidden root-token prompt; Stage 180 revokes it."
-step "Upload the ciphertext .tar.gz and .sha256 to your controlled cloud drive."
-confirm "Confirm the ciphertext bundle and checksum are safely uploaded to cloud storage." || {
-  warn "cloud upload remains incomplete"
-  exit 1
-}
-say "Running the Clear-Clipboard safety step now."
-# PowerShell expands $null inside its own process.
-# shellcheck disable=SC2016
-powershell.exe -NoProfile -NonInteractive -Command 'Set-Clipboard -Value $null'
-say "Clipboard cleared. Keep the private key and passphrase separate from the cloud bundle."
+stage "隐藏提示、服务器仪式与清理"
+step "服务器操作仅能在外部 Chrome 的最新 Web终端 - 统一企业堡垒机 标签页执行；不得使用 SSH、应用内浏览器或本地终端。"
+case "$RECOVERY_SCHEMA" in
+  engineering-platform/openbao-recovery/v1)
+    step "先按 runbook 运行带 source SHA 的只读 check；收到预期 readback 后才运行 recover-start。"
+    step "在三个隐藏 unseal prompt 中仅使用三份未暴露的旧 share；严禁使用已暴露的旧 share。"
+    step "只有出现隐藏 root-token prompt 时才选择 root；绝不把它输入命令行、聊天或普通 shell。"
+    ;;
+  engineering-platform/openbao-recovery-rotation-candidate/v1)
+    step "候选恢复包尚未完成验证，不是最终恢复包；仅解密三份新 share。"
+    step "在收到候选包下载/sidecar 校验成功的回执后，按 runbook 运行 recover-verify。"
+    ;;
+  engineering-platform/openbao-recovery/v2)
+    step "初始 root token 已撤销；v2 只允许新 share，不能选择 root。"
+    step "确认最终 v2 密文恢复包及其 checksum 已上传到受控云存储。"
+    confirm "确认最终 v2 密文包与 checksum 已上传到受控云存储？" || {
+      warn "cloud 上传尚未完成"
+      exit 1
+    }
+    say "现在执行 Clear-Clipboard 安全步骤。"
+    # PowerShell expands $null inside its own process.
+    # shellcheck disable=SC2016
+    powershell.exe -NoProfile -NonInteractive -Command 'Set-Clipboard -Value $null'
+    say "剪贴板已清空。私钥和口令必须与云端密文包分离保存。"
+    ;;
+esac
+say "source/candidate 恢复包清理需要单独的明确批准；本向导不会删除任何恢复材料。"
 
 finish
