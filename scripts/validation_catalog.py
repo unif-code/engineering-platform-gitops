@@ -83,6 +83,7 @@ FAST_SELECTORS = (
     'test_bootstrap.BootstrapOrchestratorTest.test_structured_output_and_postcheck_fail_closed',
     'test_bootstrap.BootstrapOrchestratorTest.test_apply_requires_main_clean_repo_and_exclusive_lock',
     'test_bootstrap.BootstrapOrchestratorTest.test_gnu_stat_fallback_discards_failed_probe_stdout',
+    'test_bootstrap.BootstrapOrchestratorTest.test_real_stages_source_only_files_under_the_gated_library_dir',
     'test_bootstrap.FluxPhaseAStageTest',
     'test_bootstrap.BusinessReadyStageTest',
     'test_bootstrap.OpenBaoRuntimeStageTest',
