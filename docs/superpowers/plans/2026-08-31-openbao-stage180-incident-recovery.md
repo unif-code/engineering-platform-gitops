@@ -19,7 +19,7 @@
 - Do not re-run `operator init`, delete/recreate Raft or Audit PVCs, patch live objects by hand, or bypass `scripts/bootstrap/run-approved.sh`.
 - Keep MinIO, Snapshot, Backup, Restore, and application Secret migration `NOT_EXECUTED`.
 - Keep the source v1 bundle and candidate bundle; do not auto-delete server/local recovery artifacts, branches, worktrees, or user commits.
-- A PGP-encrypted OpenBao rotation backup is allowed only as crash protection; plaintext backup is forbidden, and the encrypted backup must be deleted after the final v2 bundle validates and before root-token revocation.
+- A PGP-encrypted OpenBao rotation backup is allowed only as crash protection; plaintext backup is forbidden. After live verification completes, revalidate all five candidate ciphertexts, delete the encrypted backup, require Runtime readback, then revoke/prove/clean the root helper. Only after that proof may final v2 and its marker be built and validated. If finalization is interrupted, retain and resume from the validated candidate and bound durable checkpoints.
 - Incident acceptance requires `origin/main == origin/validated == approved SHA`; the existing ordinary bootstrap rule that permits main ahead of validated remains unchanged.
 - A fresh environment with a valid current-SHA v1 bundle and no incident artifact keeps the normal `configure`/legacy acceptance path. Source/candidate/final/marker presence selects the incident path permanently; mixed or ambiguous state stops.
 - Do not update `docs/superpowers/progress/current.md` without the exact user instruction `【同步进度】`.
@@ -569,7 +569,7 @@ printf '%s\n' "$OPENBAO_SECRET_INPUT" |
 
 After three shares, require both normal and verification status to report no pending rotation. Revalidate that the candidate contains every ciphertext needed for finalization, delete the OpenBao PGP-encrypted backup, rerun Auth/Audit/Runtime probes, then `token revoke -self`; a subsequent lookup must fail specifically as authentication denial, not network/CLI failure. Check helper cleanup, then build and validate final v2 with `initial_root_token=revoked`, and finally atomically write the verified marker. A final v2 bundle must never claim revocation before the revoke proof exists.
 
-Add read-only capabilities for `sys/rotate/root` and `sys/rotate/root/verification` to the dedicated probe policy only so incident acceptance can compare the marker/final digest with live no-pending status; do not grant rotation mutation. Classify acceptance as:
+Add only `read` capabilities for the exact OpenBao v2.6.1 endpoints `sys/rotate/root/init` and `sys/rotate/root/verify` to the dedicated probe policy so incident acceptance can compare the marker/final digest with live no-pending status; no wildcard, write, or sudo is authorized. Classify acceptance as:
 
 ```text
 NORMAL_V1: current-SHA v1 bundle and no incident artifacts -> existing acceptance

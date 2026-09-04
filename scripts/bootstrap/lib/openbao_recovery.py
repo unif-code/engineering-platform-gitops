@@ -922,8 +922,7 @@ def normalize_rotation_response(
             not isinstance(expected_fingerprints, list)
             or len(expected_fingerprints) != 5
             or any(
-                not isinstance(value, str)
-                or not hmac.compare_digest(value, expected_fingerprint)
+                _api_fingerprint(value) != expected_fingerprint
                 for value in expected_fingerprints
             )
         ):
@@ -960,6 +959,8 @@ def normalize_rotation_response(
         _safe_nonce(data['nonce'])
         keys = data['keys']
         keys_base64 = data['keys_base64']
+        keys = _api_fingerprint_map(keys)
+        keys_base64 = _api_fingerprint_map(keys_base64)
         if (
             not isinstance(keys, dict)
             or not isinstance(keys_base64, dict)
@@ -979,6 +980,24 @@ def normalize_rotation_response(
     if TOKEN_SHAPE.search(payload) or b'PRIVATE KEY' in payload.upper():
         _reject('plaintext secret shape detected')
     return ciphertexts, candidate_nonce
+
+
+def _api_fingerprint(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r'(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})', value) is None:
+        _reject('invalid API PGP fingerprint')
+    return value.upper()
+
+
+def _api_fingerprint_map(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        _reject('invalid API PGP fingerprint map')
+    normalized = {}
+    for key, item in value.items():
+        fingerprint = _api_fingerprint(key)
+        if fingerprint in normalized:
+            _reject('duplicate normalized PGP fingerprint')
+        normalized[fingerprint] = item
+    return normalized
 
 
 def _share_document(
@@ -1037,38 +1056,9 @@ def _exclusive_file(path: pathlib.Path, payload: bytes, mode: int = 0o600) -> No
     os.chmod(path, mode, follow_symlinks=False)
 
 
-def _write_bundle(
-    archive: pathlib.Path,
-    sidecar: pathlib.Path,
-    *,
-    root: str,
-    files: dict[str, bytes],
-) -> None:
+def _bundle_archive_bytes(root: str, files: dict[str, bytes]) -> bytes:
     if set(files) != ROTATED_FILES:
         _reject('unexpected artifact files')
-    if archive.parent != sidecar.parent:
-        _reject('artifact parents differ')
-    directory = archive.parent / root
-    for path in (directory, archive, sidecar):
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise RecoveryValidationError('unsafe artifact path') from error
-        _reject('artifact path already exists')
-    try:
-        os.mkdir(directory, 0o700)
-    except OSError as error:
-        raise RecoveryValidationError('artifact directory create failed') from error
-    os.chmod(directory, 0o700)
-    for name in (
-        'shares.json',
-        'metadata.json',
-        'openbao-recovery-public-key.b64',
-        'openbao-recovery-public-key.fingerprint',
-    ):
-        _exclusive_file(directory / name, files[name])
     raw_tar = io.BytesIO()
     with tarfile.open(
         fileobj=raw_tar, mode='w:', format=tarfile.USTAR_FORMAT
@@ -1100,11 +1090,194 @@ def _write_bundle(
     archive_bytes = compressed.getvalue()
     if len(archive_bytes) > MAX_ARCHIVE_BYTES:
         _reject('archive too large')
+    return archive_bytes
+
+
+def _write_bundle(
+    archive: pathlib.Path, sidecar: pathlib.Path, *, root: str, files: dict[str, bytes]
+) -> None:
+    archive_bytes = _bundle_archive_bytes(root, files)
+    if archive.parent != sidecar.parent:
+        _reject('artifact parents differ')
+    directory = archive.parent / root
+    if any(path.exists() or path.is_symlink() for path in (directory, archive, sidecar)):
+        _reject('artifact path already exists')
+    os.mkdir(directory, 0o700)
+    os.chmod(directory, 0o700)
+    for name, payload in files.items():
+        _exclusive_file(directory / name, payload)
     _exclusive_file(archive, archive_bytes)
     digest = hashlib.sha256(archive_bytes).hexdigest()
     _exclusive_file(
         sidecar, f'{digest}  {archive.name}\n'.encode('ascii')
     )
+
+
+def _private_directory(path: pathlib.Path) -> None:
+    facts = path.lstat()
+    if (not stat.S_ISDIR(facts.st_mode) or stat.S_IMODE(facts.st_mode) != 0o700
+            or facts.st_uid != os.geteuid()):
+        _reject('unsafe private staging directory')
+
+
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _private_prefix(path: pathlib.Path, payload: bytes) -> bytes | None:
+    try:
+        facts = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISREG(facts.st_mode) or stat.S_IMODE(facts.st_mode) != 0o600
+            or facts.st_uid != os.geteuid()):
+        _reject('unsafe private staging file')
+    observed = _read_regular_file_once(path, MAX_ARCHIVE_BYTES, require_mode=True)
+    if not payload.startswith(observed) or (facts.st_nlink != 1 and observed != payload):
+        _reject('staging bytes disagree with encrypted backup')
+    return observed
+
+
+def _resume_private_file(path: pathlib.Path, payload: bytes) -> None:
+    observed = _private_prefix(path, payload)
+    if observed is None:
+        _exclusive_file(path, payload)
+        return
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+    try:
+        remaining = memoryview(payload)[len(observed):]
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                _reject('staging append failed')
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_candidate(
+    archive: pathlib.Path, sidecar: pathlib.Path, *, root: str, files: dict[str, bytes],
+    validation_arguments: dict[str, Any],
+) -> None:
+    """Retain a bounded private transaction; publish only validated same-inode links.
+
+    An interrupted private write can only append the exact missing suffix of
+    bytes reconstructed from the authenticated encrypted backup. No canonical
+    object is overwritten or removed. Unknown names/bytes/owners stop before
+    writes. Retained staging is intentional, including after successful publish.
+    """
+    if archive.parent != sidecar.parent:
+        _reject('artifact parents differ')
+    directory = archive.parent / root
+    staging = archive.parent / ('.openbao-candidate-staging-' + validation_arguments['current_sha'])
+    staged_directory = staging / root
+    staged_archive, staged_sidecar = staging / archive.name, staging / sidecar.name
+    archive_bytes = _bundle_archive_bytes(root, files)
+    digest = hashlib.sha256(archive_bytes).hexdigest()
+    payloads = {staged_directory / name: payload for name, payload in files.items()}
+    payloads[staged_archive] = archive_bytes
+    payloads[staged_sidecar] = f'{digest}  {archive.name}\n'.encode('ascii')
+    intent = _candidate_publication_intent(staging, payloads, digest)
+    canonical_present = any(path.exists() or path.is_symlink() for path in (directory, archive, sidecar))
+    if not staging.exists() and not staging.is_symlink():
+        if canonical_present:
+            _reject('candidate exists without owned staging')
+        os.mkdir(staging, 0o700)
+    _private_directory(staging)
+    allowed = {root, archive.name, sidecar.name, 'intent.json'}
+    if not {path.name for path in staging.iterdir()} <= allowed:
+        _reject('unexpected candidate staging member')
+    if staged_directory.exists() or staged_directory.is_symlink():
+        _private_directory(staged_directory)
+        if not {path.name for path in staged_directory.iterdir()} <= set(files):
+            _reject('unexpected staged bundle member')
+    for path, payload in {staging / 'intent.json': intent, **payloads}.items():
+        observed = _private_prefix(path, payload)
+        if canonical_present and observed != payload:
+            _reject('canonical publication lacks complete staging')
+    if canonical_present:
+        _private_directory(directory)
+        if not {path.name for path in directory.iterdir()} <= set(files):
+            _reject('unexpected canonical candidate member')
+        for source, destination in (
+            *((staged_directory / name, directory / name) for name in files),
+            (staged_archive, archive), (staged_sidecar, sidecar),
+        ):
+            if destination.exists() or destination.is_symlink():
+                facts = destination.lstat()
+                if not stat.S_ISREG(facts.st_mode) or not os.path.samestat(facts, source.lstat()):
+                    _reject('candidate publication is not owned by staging')
+    _fsync_directory(archive.parent)
+    _resume_private_file(staging / 'intent.json', intent)
+    _fsync_directory(staging)
+    if not staged_directory.exists():
+        os.mkdir(staged_directory, 0o700)
+    _private_directory(staged_directory)
+    _fsync_directory(staging)
+    for path, payload in payloads.items():
+        _resume_private_file(path, payload)
+        _fsync_directory(path.parent)
+    validate_rotated_bundle(staged_archive, staged_sidecar, directory=staged_directory,
+                            **validation_arguments)
+    _fsync_directory(staged_directory)
+    _fsync_directory(staging)
+    if not directory.exists():
+        os.mkdir(directory, 0o700)
+    _private_directory(directory)
+    _fsync_directory(archive.parent)
+    for source, destination in (
+        *((staged_directory / name, directory / name) for name in files),
+        (staged_archive, archive), (staged_sidecar, sidecar),
+    ):
+        if not destination.exists():
+            os.link(source, destination, follow_symlinks=False)
+        if not os.path.samestat(source.lstat(), destination.lstat()):
+            _reject('candidate publication ownership changed')
+        _fsync_directory(destination.parent)
+    validate_rotated_bundle(archive, sidecar, directory=directory, **validation_arguments)
+
+
+def _candidate_publication_intent(
+    staging: pathlib.Path, payloads: dict[pathlib.Path, bytes], digest: str,
+) -> bytes:
+    return _json_bytes({
+        'schema': 'engineering-platform/openbao-candidate-publication/v1',
+        'archive_sha256': digest,
+        'files': {str(path.relative_to(staging)): hashlib.sha256(payload).hexdigest()
+                  for path, payload in payloads.items()},
+    })
+
+
+def _validate_retained_candidate_staging(
+    archive: pathlib.Path, directory: pathlib.Path,
+    snapshot: _ArtifactSnapshot, validation: _RotatedBundleValidation,
+) -> None:
+    staging = archive.parent / ('.openbao-candidate-staging-' + validation.facts.current_sha)
+    if not staging.exists() and not staging.is_symlink():
+        return  # Existing pre-staging candidates remain immutable and valid.
+    _private_directory(staging)
+    allowed = {directory.name, archive.name, archive.name + '.sha256', 'intent.json'}
+    if {path.name for path in staging.iterdir()} != allowed:
+        _reject('unexpected candidate staging member')
+    staged_directory = staging / directory.name
+    _private_directory(staged_directory)
+    _match_bundle_directory(staged_directory, validation.files)
+    payloads = {staged_directory / name: payload for name, payload in validation.files.items()}
+    payloads[staging / archive.name] = snapshot.archive_bytes
+    payloads[staging / (archive.name + '.sha256')] = snapshot.sidecar_bytes
+    expected_intent = _candidate_publication_intent(staging, payloads, snapshot.archive_sha256)
+    for path, payload in {staging / 'intent.json': expected_intent, **payloads}.items():
+        if _private_prefix(path, payload) != payload:
+            _reject('candidate staging incomplete')
+    for source in payloads:
+        destination = archive.parent / source.relative_to(staging)
+        if not os.path.samestat(source.lstat(), destination.lstat()):
+            _reject('candidate staging ownership mismatch')
 
 
 def _rotated_bundle_files(
@@ -1251,6 +1424,8 @@ def validate_rotated_bundle(
     public_key_fingerprint: str,
     cluster_identity_digest: str,
     require_file_mode: bool = False,
+    directory: pathlib.Path | None = None,
+    live_nonce: str | None = None,
 ) -> RotatedBundleFacts:
     if expected_schema == CANDIDATE_SCHEMA:
         root = f'openbao-recovery-rotation-candidate-{current_sha}'
@@ -1264,7 +1439,7 @@ def validate_rotated_bundle(
         root + '.tar.gz',
         require_mode=require_file_mode,
     )
-    return _validate_rotated_snapshot(
+    validation = _validate_rotated_snapshot(
         snapshot,
         expected_schema=expected_schema,
         current_sha=current_sha,
@@ -1273,7 +1448,29 @@ def validate_rotated_bundle(
         public_key_sha256=public_key_sha256,
         public_key_fingerprint=public_key_fingerprint,
         cluster_identity_digest=cluster_identity_digest,
-    ).facts
+    )
+    if directory is not None:
+        _match_bundle_directory(directory, validation.files)
+        if expected_schema == CANDIDATE_SCHEMA:
+            _validate_retained_candidate_staging(archive, directory, snapshot, validation)
+    if live_nonce is not None:
+        if expected_schema != CANDIDATE_SCHEMA or not hmac.compare_digest(
+            _safe_nonce(live_nonce), validation.facts.verification_nonce
+        ):
+            _reject('candidate live nonce mismatch')
+    return validation.facts
+
+
+def _match_bundle_directory(directory: pathlib.Path, files: dict[str, bytes]) -> None:
+    facts = directory.lstat()
+    if not stat.S_ISDIR(facts.st_mode) or stat.S_IMODE(facts.st_mode) != 0o700:
+        _reject('unsafe bundle directory')
+    if {path.name for path in directory.iterdir()} != set(files):
+        _reject('unexpected bundle directory member')
+    for name, expected in files.items():
+        observed = _read_regular_file_once(directory / name, MAX_MEMBER_BYTES, require_mode=True)
+        if not hmac.compare_digest(observed, expected):
+            _reject('directory archive disagreement')
 
 
 def build_candidate(
@@ -1337,10 +1534,17 @@ def build_candidate(
     root = f'openbao-recovery-rotation-candidate-{current_sha}'
     if archive.name != root + '.tar.gz' or sidecar.name != archive.name + '.sha256':
         _reject('candidate output path mismatch')
-    _write_bundle(
+    validation_arguments = dict(
+        expected_schema=CANDIDATE_SCHEMA, current_sha=current_sha,
+        source_sha=source_sha, source_bundle_sha256=source_bundle_sha256,
+        public_key_sha256=public_key_sha256, public_key_fingerprint=fingerprint,
+        cluster_identity_digest=cluster_digest, require_file_mode=True,
+    )
+    _publish_candidate(
         archive,
         sidecar,
         root=root,
+        validation_arguments=validation_arguments,
         files={
             'shares.json': _json_bytes(shares),
             'metadata.json': _json_bytes(metadata),
@@ -1594,6 +1798,8 @@ def _argument_parser() -> argparse.ArgumentParser:
         validate = commands.add_parser(operation, add_help=False)
         validate.add_argument('--archive', required=True)
         validate.add_argument('--sidecar', required=True)
+        validate.add_argument('--directory')
+        validate.add_argument('--live-nonce-stdin', action='store_true')
         _add_validation_arguments(validate)
 
     final = commands.add_parser('build-final', add_help=False)
@@ -1665,6 +1871,12 @@ def main(arguments: list[str]) -> int:
                 key_threshold=parsed.key_threshold,
             )
         elif operation in ('validate-candidate', 'validate-final'):
+            live_nonce = None
+            if parsed.live_nonce_stdin:
+                payload = sys.stdin.buffer.read(130)
+                if not payload.endswith(b'\n') or payload.count(b'\n') != 1:
+                    _reject('invalid nonce input')
+                live_nonce = _safe_nonce(payload[:-1].decode('ascii'))
             validate_rotated_bundle(
                 pathlib.Path(parsed.archive),
                 pathlib.Path(parsed.sidecar),
@@ -1680,6 +1892,8 @@ def main(arguments: list[str]) -> int:
                 public_key_fingerprint=parsed.public_key_fingerprint,
                 cluster_identity_digest=parsed.cluster_identity_sha256,
                 require_file_mode=True,
+                directory=pathlib.Path(parsed.directory) if parsed.directory else None,
+                live_nonce=live_nonce,
             )
         elif operation == 'build-final':
             build_final(

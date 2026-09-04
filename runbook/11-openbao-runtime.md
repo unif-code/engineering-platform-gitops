@@ -182,6 +182,11 @@ rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
 
 ### 7.2 启动 rotation 并生成候选包
 
+候选发布中断时保留同文件系统私有 `.openbao-candidate-staging-<MERGED_SHA>` 与所有已存在
+文件。仅重跑下列同 SHA/source 的批准入口，从 OpenBao 加密 crash backup 补齐经验证的
+私有 partial，再 noclobber 发布；不要手工删除 canonical/私有文件来绕过 STOP。未知成员、
+不匹配 intent/nonce/字节/owner/mode 或失去 backup 的不完整候选，均需单独人工处置。
+
 【运维】【写入，需真实 TTY】完整命令：
 
 ```bash
@@ -205,6 +210,12 @@ rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
 当作最终恢复包，也不允许选择 `root`。
 
 ### 7.3 完成验证、下载最终 v2 包并验收
+
+若中断后进入 READY 撤销重入，仍只在实际 OpenBao CLI 隐藏提示输入同一初始 root token。
+固定 CLI 使用 `login -no-print lookup=false` 储存到受控临时 helper；这不证明 token 有效
+或已撤销。脚本先比对 checkpoint commitment，再要求精确认证拒绝和 helper 清理成功。
+不得改用普通 shell prompt、命令参数或环境变量。普通 login 与重入 login 都在容器内
+隐藏 stdout，以防 Store 失败输出 token；stderr 隐藏提示保留。
 
 【运维】【写入，需真实 TTY】完整命令：
 

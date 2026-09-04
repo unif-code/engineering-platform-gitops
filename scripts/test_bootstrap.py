@@ -3354,6 +3354,11 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 class RunApprovedTest(BootstrapTestCase):
     """一行式运维入口：门禁 + 干净环境启动 bootstrap-all。"""
 
+    def test_fresh_stage180_check_keeps_exact_argv(self) -> None:
+        result = self.run_argument_parser('--check', '--stage=180')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'TARGET=openbao-initialize\nMODE=--check\nARG[0]=--check\n')
+
     def write_executable(self, path: Path, source: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
@@ -3728,7 +3733,6 @@ class RunApprovedTest(BootstrapTestCase):
         for arguments in (
             (approved, '--apply', '--stage=180'),
             (approved, '--check', '--stage=180', '--operation=initialize'),
-            (approved, '--check', '--stage=180'),
             (approved, '--apply', '--stage=180', '--operation=check'),
             (approved, '--check', '--stage=170'),
         ):
@@ -7892,6 +7896,253 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
     ) + b'\n'
     PUBLIC_KEY_SHA256 = hashlib.sha256(PUBLIC_KEY_BYTES).hexdigest()
 
+    def test_failed_configuration_never_revokes_but_always_cleans(self) -> None:
+        script = r'''
+source "$1"
+openbao_root_session_start() { echo login; }
+openbao_apply_configuration() { echo configure; return "$2"; }
+openbao_root_session_revoke() { echo revoke; }
+openbao_remote_session_cleanup() { echo cleanup; return "$3"; }
+config_rc=$2 cleanup_rc=$3
+openbao_apply_configuration() { echo configure; return "$config_rc"; }
+openbao_remote_session_cleanup() { echo cleanup; return "$cleanup_rc"; }
+openbao_apply_configuration_with_root
+'''
+        for config_rc, cleanup_rc in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            with self.subTest(config=config_rc, cleanup=cleanup_rc):
+                result = self.run_command(['/bin/bash', '-c', script, 'config-failure',
+                    str(OPENBAO_INITIALIZE_LIB), str(config_rc), str(cleanup_rc)])
+                expected = ['login', 'configure']
+                if config_rc == 0:
+                    expected.append('revoke')
+                expected.append('cleanup')
+                self.assertEqual(result.stdout.splitlines(), expected)
+                self.assertEqual(result.returncode == 0, config_rc == cleanup_rc == 0)
+
+    def test_candidate_nonce_is_bound_to_archive_not_directory(self) -> None:
+        built, archive, sidecar = self.build_candidate_artifact(self.temporary_directory())
+        self.assertEqual(built.returncode, 0)
+        directory = archive.with_name(archive.name.removesuffix('.tar.gz'))
+        metadata = directory / 'metadata.json'
+        original = metadata.read_bytes()
+        document = json.loads(original)
+        document['verification_nonce'] = 'another-verification-nonce'
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$3
+OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$4
+OPENBAO_ROTATION_CANDIDATE_SIDECAR=$5
+safe_file() { [[ -f "$1" && ! -L "$1" ]]; }
+safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+OPENBAO_RECOVERY_ROOT=${3%/*}
+openbao_rotation_artifact_paths() { :; }
+openbao_source_recovery_bundle_is_valid() { :; }
+OPENBAO_PUBLIC_KEY=${3%/*}/openbao-recovery-public-key.b64
+OPENBAO_PUBLIC_KEY_FINGERPRINT=${3%/*}/openbao-recovery-public-key.fingerprint
+OPENBAO_SOURCE_RECOVERY_ARCHIVE=synthetic-source
+OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+OPENBAO_SOURCE_RECOVERY_SHA=1111111111111111111111111111111111111111
+sha256_file() {
+  if [[ "$1" == synthetic-source ]]; then printf '%064d' 0 | tr 0 c
+  else sha256sum "$1" | cut -d ' ' -f 1; fi
+}
+openbao_rotation_candidate_nonce_matches_live "$6" "$7"
+'''
+        for contents, nonce, succeeds in (
+            (original, self.VERIFICATION_NONCE, True),
+            (json.dumps(document).encode(), document['verification_nonce'], False),
+            (json.dumps(document).encode(), self.VERIFICATION_NONCE, False),
+        ):
+            metadata.write_bytes(contents)
+            result = self.run_command(['/bin/bash', '-c', script, 'bound-nonce',
+                str(OPENBAO_INITIALIZE_LIB), str(OPENBAO_RECOVERY_HELPER),
+                str(directory), str(archive), str(sidecar), nonce,
+                hashlib.sha256(b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab","cluster_name":"openbao-cluster-dev"}').hexdigest()])
+            self.assertEqual(result.returncode == 0, succeeds)
+            self.assertEqual((result.stdout, result.stderr), ('', ''))
+
+    def test_api_lowercase_fingerprints_are_canonicalized_not_coerced(self) -> None:
+        for kind in ('direct', 'backup'):
+            response = self.rotation_response() if kind == 'direct' else self.backup_retrieve_response()
+            if kind == 'direct':
+                response['pgp_fingerprints'] = [self.PUBLIC_KEY_FINGERPRINT.lower()] * 5
+            else:
+                for field in ('keys', 'keys_base64'):
+                    values = response['data'][field].pop(self.PUBLIC_KEY_FINGERPRINT)
+                    response['data'][field][self.PUBLIC_KEY_FINGERPRINT.lower()] = values
+            with self.subTest(kind=kind):
+                result, archive, _ = self.build_candidate_artifact(self.temporary_directory(),
+                    response=response, response_kind=kind,
+                    verification_nonce=self.VERIFICATION_NONCE if kind == 'backup' else None)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with tarfile.open(archive) as stream:
+                    metadata = json.load(stream.extractfile(archive.name[:-7] + '/metadata.json'))
+                self.assertEqual(metadata['public_key_fingerprint'], self.PUBLIC_KEY_FINGERPRINT)
+        response = self.backup_retrieve_response()
+        for field in ('keys', 'keys_base64'):
+            response['data'][field][self.PUBLIC_KEY_FINGERPRINT.lower()] = response['data'][field][self.PUBLIC_KEY_FINGERPRINT]
+        result, _, _ = self.build_candidate_artifact(self.temporary_directory(), response=response,
+            response_kind='backup', verification_nonce=self.VERIFICATION_NONCE)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_candidate_publication_resumes_every_local_io_boundary(self) -> None:
+        # Fail once AFTER each durable/create/link/write primitive. Restart the
+        # actual builder from the same synthetic encrypted backup; no cleanup.
+        script = r'''
+import importlib.util, pathlib, sys
+from unittest import mock
+spec = importlib.util.spec_from_file_location('recovery_under_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+operation, fail_at = sys.argv[3], int(sys.argv[4])
+arguments = sys.argv[5:]
+target = module if operation == '_exclusive_file' else module.os
+original = getattr(target, operation)
+count = 0
+def interrupted(*args, **kwargs):
+    global count
+    if operation == '_exclusive_file' and count + 1 == fail_at:
+        count += 1
+        path, payload = args[:2]
+        with open(path, 'xb') as stream:
+            stream.write(payload[:max(1, len(payload) // 2)])
+        path.chmod(0o600)
+        raise OSError('synthetic partial private write')
+    result = original(*args, **kwargs)
+    count += 1
+    if count == fail_at:
+        raise OSError('synthetic crash boundary')
+    return result
+with mock.patch.object(target, operation, interrupted):
+    first = module.main(arguments)
+assert count >= fail_at, (operation, count, fail_at)
+assert first != 0, 'injected I/O failure must stop'
+second = module.main(arguments)
+assert second == 0, 'same encrypted backup must resume without artifact deletion'
+print('RESUMED')
+'''
+        # mkdir covers private/canonical empty-directory crash; fsync includes
+        # file, directory, archive and final sidecar publication durability.
+        for operation, boundaries in (('mkdir', range(1, 4)), ('fsync', range(1, 26)),
+            ('link', range(1, 7)), ('_exclusive_file', range(1, 8))):
+            for boundary in boundaries:
+                with self.subTest(operation=operation, boundary=boundary):
+                    root = self.temporary_directory()
+                    public, fingerprint = self.artifact_public_key_files(root)
+                    response = self.write_rotation_response(root, self.backup_retrieve_response())
+                    archive = root / f'openbao-recovery-rotation-candidate-{self.CURRENT_SHA}.tar.gz'
+                    result = self.run_command([sys.executable, '-I', '-B', '-c', script,
+                        str(OPENBAO_RECOVERY_HELPER), str(root), operation, str(boundary),
+                        'build-candidate', '--response', str(response), '--response-kind', 'backup',
+                        '--verification-nonce', self.VERIFICATION_NONCE,
+                        '--archive', str(archive), '--sidecar', str(archive) + '.sha256',
+                        '--current-sha', self.CURRENT_SHA, '--source-sha', self.SOURCE_SHA,
+                        '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+                        '--public-key', str(public), '--public-key-fingerprint-file', str(fingerprint),
+                        '--cluster-id', self.CLUSTER_ID, '--cluster-name', self.CLUSTER_NAME,
+                        '--key-shares', '5', '--key-threshold', '3'])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, 'RESUMED\n')
+
+    def test_candidate_validation_rejects_foreign_retained_staging(self) -> None:
+        for mutation in ('unexpected', 'intent', 'owner-mode'):
+            with self.subTest(mutation=mutation):
+                root = self.temporary_directory()
+                built, archive, sidecar = self.build_candidate_artifact(root)
+                self.assertEqual(built.returncode, 0)
+                staging = root / f'.openbao-candidate-staging-{self.CURRENT_SHA}'
+                if mutation == 'unexpected':
+                    (staging / 'foreign').write_bytes(b'foreign')
+                elif mutation == 'intent':
+                    (staging / 'intent.json').write_bytes(b'foreign')
+                else:
+                    staging.chmod(0o755)
+                before = archive.read_bytes()
+                result = self.run_artifact_helper('validate-candidate',
+                    '--archive', archive, '--sidecar', sidecar,
+                    '--directory', archive.with_name(archive.name[:-7]),
+                    '--current-sha', self.CURRENT_SHA, '--source-sha', self.SOURCE_SHA,
+                    '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+                    '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+                    '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+                    '--cluster-identity-sha256', hashlib.sha256(
+                        b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab","cluster_name":"openbao-cluster-dev"}').hexdigest())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
+                self.assertEqual(archive.read_bytes(), before)
+
+    def test_root_proof_tempfiles_cleanup_if_second_allocation_fails(self) -> None:
+        root = self.temporary_directory()
+        binary = root / 'bin'
+        binary.mkdir()
+        executable = binary / 'mktemp'
+        executable.write_text('''#!/bin/sh
+if [ -e "$TEST_ALLOC_ROOT/allocated" ]; then exit 1; fi
+: >"$TEST_ALLOC_ROOT/allocated"
+case "$*" in
+  '-d '*) /usr/bin/mktemp -d "$TEST_ALLOC_ROOT/resume.XXXXXX" ;;
+  *) /usr/bin/mktemp "$TEST_ALLOC_ROOT/proof.XXXXXX" ;;
+esac
+''')
+        executable.chmod(0o755)
+        script = r'''
+source "$1"
+openbao_require_interactive_tty() { :; }
+openbao_prompt_secret() { OPENBAO_SECRET_INPUT=synthetic-input; }
+OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+OPENBAO_REMOTE_SESSION_KIND=root
+kubectl_run() {
+  while [[ "$1" != -- ]]; do shift; done
+  shift
+  "$@"
+}
+"$2" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+'''
+        for function in ('openbao_root_session_revocation_is_proven',
+            'openbao_finalization_resume_root_revocation'):
+            allocation = self.temporary_directory()
+            result = self.run_command(['/bin/bash', '-c', script, 'allocation-failure',
+                str(OPENBAO_INITIALIZE_LIB), function], env=self.sanitized_environment(
+                    PATH=f'{binary}:/usr/bin:/bin', TEST_ALLOC_ROOT=str(allocation)))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(sorted(path.name for path in allocation.iterdir()), ['allocated'])
+
+    def test_ordinary_check_and_configure_reject_mixed_incident_artifacts(self) -> None:
+        script = r'''
+source "$1"
+OPENBAO_RECOVERY_ROOT=$2
+OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+openbao_rotation_artifact_paths
+openbao_stage_180_preflight() { :; }
+openbao_recovery_bundle_is_valid() { return 0; }
+openbao_recovery_state() { echo COMPLIANT; }
+openbao_state_flags() { echo 'true|true'; }
+openbao_platform_secrets_match_recovery_baseline() { :; }
+openbao_unseal_interactively() { echo MUTATION-unseal; }
+openbao_auth_probe() { echo MUTATION-auth; return 1; }
+openbao_apply_configuration_with_root() { echo MUTATION-root; }
+openbao_audit_runtime_is_exact() { :; }
+complete() { printf '%s\n' "$1" "$2"; exit 0; }
+"openbao_stage_180_$3"
+'''
+        suffixes = ('openbao-recovery-rotation-candidate-' + self.CURRENT_SHA + '.tar.gz',
+            'openbao-rotation-' + self.CURRENT_SHA + '.verified.json',
+            '.openbao-rotation-' + self.CURRENT_SHA + '.ready-to-revoke.json',
+            '.openbao-final-staging-' + self.CURRENT_SHA,
+            '.openbao-candidate-staging-' + self.CURRENT_SHA)
+        for suffix in suffixes:
+            for operation in ('check', 'configure'):
+                with self.subTest(suffix=suffix, operation=operation):
+                    root = self.temporary_directory()
+                    (root / suffix).write_text('foreign-state\n')
+                    result = self.run_command(['/bin/bash', '-c', script, 'ordinary-mixed',
+                        str(OPENBAO_INITIALIZE_LIB), str(root), operation])
+                    self.assertNotIn('MUTATION', result.stdout)
+                    self.assertIn('STOP_UNKNOWN_STATE', result.stdout)
+
     @staticmethod
     def implementation() -> str:
         return OPENBAO_INITIALIZE.read_text(encoding='utf-8') + (
@@ -10166,7 +10417,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
             hashlib.sha256(final.read_bytes()).hexdigest(),
         )
         candidate_rebuild, _, _ = self.build_candidate_artifact(temporary)
-        self.assertNotEqual(candidate_rebuild.returncode, 0)
+        self.assertEqual(candidate_rebuild.returncode, 0, candidate_rebuild.stderr)
         final_rebuild = self.run_artifact_helper(
             'build-final',
             '--candidate-archive', candidate,
@@ -10248,7 +10499,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
     def test_final_publish_each_parent_fsync_failure_is_fail_closed(
         self,
     ) -> None:
-        for fsync_index in range(1, 19):
+        for fsync_index in range(1, 21):
             with self.subTest(fsync_index=fsync_index):
                 result, recovery_root, fsync_log = (
                     self.run_final_publish_crash_harness(
@@ -10257,8 +10508,8 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected_state = (
-                    'CANDIDATE' if fsync_index <= 3
-                    else 'PARTIAL_FINAL' if fsync_index <= 9
+                    'CANDIDATE' if fsync_index <= 5
+                    else 'PARTIAL_FINAL' if fsync_index <= 11
                     else 'FINAL'
                 )
                 self.assertEqual(
@@ -10315,6 +10566,8 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertEqual(
             fsync_log.read_text(encoding='utf-8').splitlines(),
             [
+                str(recovery_root / f'openbao-recovery-rotation-candidate-{self.CURRENT_SHA}'),
+                str(recovery_root),
                 str(recovery_root),
                 str(staging_directory),
                 str(staging_root),
@@ -10512,14 +10765,23 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                 for member in stream.getmembers()
             ]
         for case in (
-            'extra-member', 'symlink', 'member-mode', 'mixed-schema',
+            'canonical-control', 'extra-member', 'symlink', 'member-mode', 'mixed-schema',
             'duplicate-json-field', 'root-token-field',
         ):
             with self.subTest(archive_case=case):
                 case_directory = self.temporary_directory() / case
                 case_directory.mkdir()
                 mutated_archive = case_directory / archive.name
-                with tarfile.open(mutated_archive, 'w:gz') as output:
+                control_archive, control_sidecar = self.write_artifact_bytes(
+                    case_directory / 'control', archive.name,
+                    self.canonical_python_gzip(self.canonical_ustar_bytes(archive)),
+                )
+                control = self.run_artifact_helper('emit-item', '--archive', control_archive,
+                    '--sidecar', control_sidecar, '--item', 'share1')
+                self.assertEqual(control.returncode, 0, control.stderr)
+                self.assertEqual(control.stdout.strip(), self.rotation_response()['keys_base64'][0])
+                raw_archive = io.BytesIO()
+                with tarfile.open(fileobj=raw_archive, mode='w:', format=tarfile.USTAR_FORMAT) as output:
                     for original_member, original_payload in original_members:
                         member = tarfile.TarInfo(original_member.name)
                         member.type = original_member.type
@@ -10532,6 +10794,11 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                             '/shares.json'
                         ):
                             member.mode = 0o640
+                        if case == 'symlink' and member.name.endswith('/shares.json'):
+                            member.type = tarfile.SYMTYPE
+                            member.linkname = 'metadata.json'
+                            member.size = 0
+                            payload = None
                         if case in (
                             'mixed-schema', 'duplicate-json-field'
                         ) and member.name.endswith('/metadata.json'):
@@ -10569,7 +10836,7 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                             member,
                             None if payload is None else io.BytesIO(payload),
                         )
-                    if case in ('extra-member', 'symlink'):
+                    if case == 'extra-member':
                         root = (
                             'openbao-recovery-rotation-candidate-'
                             + self.CURRENT_SHA
@@ -10577,13 +10844,9 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                         hostile = tarfile.TarInfo(f'{root}/hostile')
                         hostile.mode = 0o600
                         hostile.uid = hostile.gid = 0
-                        if case == 'symlink':
-                            hostile.type = tarfile.SYMTYPE
-                            hostile.linkname = 'shares.json'
-                            output.addfile(hostile)
-                        else:
-                            hostile.size = 1
-                            output.addfile(hostile, io.BytesIO(b'x'))
+                        hostile.size = 1
+                        output.addfile(hostile, io.BytesIO(b'x'))
+                mutated_archive.write_bytes(self.canonical_python_gzip(raw_archive.getvalue()))
                 mutated_archive.chmod(0o600)
                 mutated_sidecar = mutated_archive.with_name(
                     mutated_archive.name + '.sha256'
@@ -10600,8 +10863,36 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
                     'emit-item', '--archive', mutated_archive,
                     '--sidecar', mutated_sidecar, '--item', 'share1',
                 )
-                self.assertNotEqual(rejected.returncode, 0)
-                self.assertEqual((rejected.stdout, rejected.stderr), ('', ''))
+                if case == 'canonical-control':
+                    self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                else:
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual((rejected.stdout, rejected.stderr), ('', ''))
+                    guard_script = r'''
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location('guard_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+try:
+    module._emit_item(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), 'share1')
+except module.RecoveryValidationError as error:
+    print(str(error))
+else:
+    raise SystemExit(1)
+'''
+                    guard = self.run_command([sys.executable, '-I', '-B', '-c', guard_script,
+                        str(OPENBAO_RECOVERY_HELPER), str(mutated_archive), str(mutated_sidecar)])
+                    expected_guard = {
+                        'extra-member': 'unsafe archive members',
+                        'symlink': 'noncanonical archive extension',
+                        'member-mode': 'unsafe archive members',
+                        'mixed-schema': 'rotated metadata mismatch',
+                        'duplicate-json-field': 'duplicate json field',
+                        'root-token-field': 'unexpected shares field',
+                    }[case]
+                    self.assertEqual((guard.returncode, guard.stdout, guard.stderr),
+                        (0, expected_guard + '\n', ''))
 
         symlink_directory = self.temporary_directory() / 'symlink-output'
         symlink_directory.mkdir()
@@ -10926,6 +11217,14 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         self.assertFalse(any(
             call.startswith('FORBIDDEN-') for call in backup_calls
         ))
+
+        partial_result, partial_calls = self.run_recover_start(
+            state='true|false', rotation_progress=3, verification_progress=0,
+            artifact_state='PARTIAL_CANDIDATE')
+        self.assertEqual(partial_result.returncode, 0, partial_result.stderr)
+        self.assertLess(partial_calls.index('backup-retrieve'), partial_calls.index('candidate-write'))
+        self.assertNotIn('rotation-init-5-3-pgp-verify-backup', partial_calls)
+        self.assertFalse(any(call.startswith(('old-share-', 'FORBIDDEN-')) for call in partial_calls))
 
     def test_recover_start_failures_clean_root_helper_and_fail_closed(
         self,
@@ -11428,11 +11727,11 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
               capabilities = ["read"]
             }
 
-            path "sys/rotate/root" {
+            path "sys/rotate/root/init" {
               capabilities = ["read"]
             }
 
-            path "sys/rotate/root/verification" {
+            path "sys/rotate/root/verify" {
               capabilities = ["read"]
             }
             '''
@@ -11440,12 +11739,12 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
         variants = {
             'exact': exact,
             'root-write': exact.replace(
-                'path "sys/rotate/root" {\n  capabilities = ["read"]',
-                'path "sys/rotate/root" {\n  capabilities = ["read", "update"]',
+                'path "sys/rotate/root/init" {\n  capabilities = ["read"]',
+                'path "sys/rotate/root/init" {\n  capabilities = ["read", "update"]',
             ),
             'verification-sudo': exact.replace(
-                'path "sys/rotate/root/verification" {\n  capabilities = ["read"]',
-                'path "sys/rotate/root/verification" {\n  capabilities = ["read", "sudo"]',
+                'path "sys/rotate/root/verify" {\n  capabilities = ["read"]',
+                'path "sys/rotate/root/verify" {\n  capabilities = ["read", "sudo"]',
             ),
             'runtime-extra': exact.replace(
                 '["create", "update", "read", "delete"]',
@@ -11883,25 +12182,21 @@ PY
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
 
-    def test_resume_revocation_secret_uses_only_hidden_stdin(self) -> None:
+    def test_resume_revocation_uses_cli_tty_not_outer_secret_capture(self) -> None:
         command_log = self.temporary_directory() / 'resume-proof.log'
         script = textwrap.dedent(
             r'''
             source "$1"
             TEST_COMMAND_LOG=$2
-            export OPENBAO_SECRET_INPUT=hostile-export
-            openbao_prompt_secret() { OPENBAO_SECRET_INPUT=synthetic-root-secret; }
+            openbao_require_interactive_tty() { :; }
+            openbao_prompt_secret() { echo FORBIDDEN-shell-prompt >&2; return 1; }
             kubectl_run() {
-              local input
-              /usr/bin/printenv OPENBAO_SECRET_INPUT >/dev/null && return 1
-              [[ "$*" != *synthetic-root-secret* ]] || return 1
-              IFS= read -r input
-              [[ "$input" == synthetic-root-secret ]] || return 1
+              [[ "$*" == *' exec --stdin --tty '* ]] || return 1
               printf '%s\n' "$*" >"$TEST_COMMAND_LOG"
             }
             openbao_finalization_resume_root_revocation \
               aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-            [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
+            [[ -z ${OPENBAO_SECRET_INPUT:-} ]]
             '''
         )
         result = self.run_command(
@@ -11913,6 +12208,8 @@ PY
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr, '')
+        self.assertIn('bao login -no-print lookup=false', command_log.read_text())
         self.assertNotIn(
             'synthetic-root-secret',
             command_log.read_text(encoding='utf-8'),
@@ -11932,6 +12229,21 @@ PY
                 env | grep -F 'synthetic-root-secret' >/dev/null && exit 90
                 printf '%s\n' "$*" >>"$TEST_BAO_LOG"
                 case "$*" in
+                  'login -no-print lookup=false')
+                    [ -t 0 ] && [ -t 2 ] || exit 91
+                    printf 'Synthetic hidden: ' >&2
+                    IFS= read -r value
+                    [ "$value" = synthetic-root-secret ] || exit 92
+                    printf %s "$value" >"$HOME/.bao-token"
+                    printf '%s\n' "$HOME" >"$TEST_HELPER_PATH"
+                    if [ "${TEST_REVOKE_MODE:-normal}" = cleanup-fail ]; then
+                      : >"$HOME/foreign"
+                    fi
+                    if [ "${TEST_REVOKE_MODE:-normal}" = store-fail ]; then
+                      printf '%s\n' "$value"
+                      exit 2
+                    fi
+                    ;;
                   'token lookup -format=json')
                     case "$(cat "$TEST_TOKEN_STATE")" in
                       valid) exit 0 ;;
@@ -11949,7 +12261,7 @@ PY
                     ;;
                   'token revoke -self')
                     case "${TEST_REVOKE_MODE:-normal}" in
-                      normal) printf '%s\n' revoked >"$TEST_TOKEN_STATE" ;;
+                      normal|cleanup-fail) printf '%s\n' revoked >"$TEST_TOKEN_STATE" ;;
                       noop) : ;;
                       fail) exit 4 ;;
                     esac
@@ -11967,7 +12279,7 @@ PY
             TEST_TOKEN_STATE=$2
             TEST_BAO_LOG=$3
             export TEST_TOKEN_STATE TEST_BAO_LOG TEST_REVOKE_MODE
-            openbao_prompt_secret() { OPENBAO_SECRET_INPUT=synthetic-root-secret; }
+            openbao_prompt_secret() { echo FORBIDDEN-shell-prompt >&2; return 1; }
             kubectl_run() {
               while [[ "$1" != -- ]]; do shift; done
               shift
@@ -11977,7 +12289,7 @@ PY
             openbao_finalization_resume_root_revocation "$4"
             rc=$?
             set -e
-            [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
+            [[ -z ${OPENBAO_SECRET_INPUT:-} ]]
             exit "$rc"
             '''
         )
@@ -11989,12 +12301,15 @@ PY
             ('transport', 'normal', token_digest, False, False),
             ('valid', 'noop', token_digest, False, True),
             ('valid', 'fail', token_digest, False, True),
+            ('valid', 'store-fail', token_digest, False, False),
+            ('valid', 'cleanup-fail', token_digest, False, True),
         )
         for index, (
             initial_state, revoke_mode, commitment, succeeds, revoke_called,
         ) in enumerate(cases):
             state = temporary / f'state-{index}'
             log = temporary / f'bao-{index}.log'
+            helper_path = temporary / f'helper-{index}.path'
             state.write_text(initial_state + '\n', encoding='ascii')
             log.write_text('', encoding='ascii')
             with self.subTest(
@@ -12002,7 +12317,7 @@ PY
                 revoke_mode=revoke_mode,
                 commitment_matches=commitment == token_digest,
             ):
-                result = self.run_command(
+                result = self.run_synthetic_hidden_cli(
                     [
                         '/bin/bash', '-c', script, 'exact-root-proof',
                         str(OPENBAO_INITIALIZE_LIB), str(state), str(log),
@@ -12012,6 +12327,7 @@ PY
                         BOOTSTRAP_TEST_MODE='1',
                         PATH=f'{fake_bin}:/usr/bin:/bin',
                         TEST_REVOKE_MODE=revoke_mode,
+                        TEST_HELPER_PATH=str(helper_path),
                     ),
                 )
                 self.assertEqual(result.returncode == 0, succeeds, result.stderr)
@@ -12020,6 +12336,79 @@ PY
                 self.assertEqual('token revoke -self' in calls, revoke_called)
                 self.assertNotIn('synthetic-root-secret', result.stderr)
                 self.assertNotIn('synthetic-root-secret', '\n'.join(calls))
+                home = Path(helper_path.read_text().strip())
+                self.assertFalse((home / '.bao-token').exists())
+                if revoke_mode == 'cleanup-fail':
+                    self.assertTrue((home / 'foreign').exists())
+                    (home / 'foreign').unlink()  # synthetic test-only cleanup
+                    home.rmdir()
+                else:
+                    self.assertFalse(home.exists())
+
+    def test_normal_login_store_failure_is_hidden_before_tty_multiplexing(self) -> None:
+        temporary = self.temporary_directory()
+        fake_bao = temporary / 'bao'
+        fake_bao.write_text('''#!/bin/sh
+[ "$*" = 'login -no-print' ] || exit 91
+[ -t 0 ] && [ -t 2 ] || exit 92
+printf 'Synthetic hidden: ' >&2
+IFS= read -r value
+printf '%s\\n' "$value"
+exit 2
+''')
+        fake_bao.chmod(0o755)
+        script = r'''
+source "$1"
+TEST_REMOTE_PATH=$2
+openbao_remote_home_create() { OPENBAO_REMOTE_HOME=$TEST_REMOTE_PATH; }
+openbao_apply_configuration() { echo FORBIDDEN-configuration; }
+openbao_root_session_revoke() { echo FORBIDDEN-revoke; }
+openbao_remote_session_cleanup() { :; }
+kubectl_run() { while [[ "$1" != -- ]]; do shift; done; shift; "$@"; }
+openbao_apply_configuration_with_root
+'''
+        result = self.run_synthetic_hidden_cli(['/bin/bash', '-c', script,
+            'normal-store-error', str(OPENBAO_INITIALIZE_LIB), str(temporary)],
+            env=self.sanitized_environment(PATH=f'{temporary}:/usr/bin:/bin'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, 'Synthetic hidden: ')
+
+    def run_synthetic_hidden_cli(self, arguments, *, env):
+        master, slave = pty.openpty()
+        attributes = termios.tcgetattr(slave)
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        process = subprocess.Popen(arguments, stdin=slave, stdout=slave,
+            stderr=slave, env=env, close_fds=True)
+        os.close(slave)
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        sent = False
+        try:
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if b'Synthetic hidden: ' in output and not sent:
+                        os.write(master, b'synthetic-root-secret\n')
+                        sent = True
+                if process.poll() is not None:
+                    break
+            returncode = process.wait(timeout=2)
+        finally:
+            os.close(master)
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        rendered = output.decode('utf-8', errors='replace')
+        self.assertNotIn('synthetic-root-secret', rendered)
+        self.assertNotIn('FORBIDDEN-shell-prompt', rendered)
+        return subprocess.CompletedProcess(arguments, returncode, '', rendered)
 
     def test_bound_remote_helper_cleanup_rejects_reused_or_unsafe_path(
         self,
@@ -12521,7 +12910,7 @@ PY
             'n': 5,
             'progress': 2,
             'required': 3,
-            'pgp_fingerprints': [fingerprint] * 5,
+            'pgp_fingerprints': [fingerprint.lower()] * 5,
             'backup': True,
             'verification_required': True,
             'verification_nonce': '',
@@ -12905,6 +13294,7 @@ PY
         for function in (
             'openbao_unseal_interactively',
             'openbao_root_session_start',
+            'openbao_finalization_resume_root_revocation ' + 'a' * 64,
         ):
             for descriptor in (0, 1, 2):
                 with self.subTest(function=function, descriptor=descriptor):
@@ -13200,25 +13590,30 @@ PY
     def test_unseal_progress_uses_independent_public_readback(self) -> None:
         script = textwrap.dedent(
             '''
+            set -o pipefail
             source "$1"
             PYTHON_BINARY=/usr/bin/python3
             OPENBAO_TEST_STATUS=$2
-            kubectl_run() { printf '%s\n' "$OPENBAO_TEST_STATUS"; }
+            cli_rc=$4
+            kubectl_run() { printf '%s\n' "$OPENBAO_TEST_STATUS"; return "$cli_rc"; }
             openbao_unseal_progress_is_safe "$3"
             '''
         )
         cases = (
-            (1, '{"initialized":true,"sealed":true,"progress":1}', 0),
-            (2, '{"initialized":true,"sealed":true,"progress":2}', 0),
-            (3, '{"initialized":true,"sealed":false,"progress":0}', 0),
-            (2, '{"initialized":true,"sealed":false,"progress":0}', 1),
+            (1, '{"initialized":true,"sealed":true,"progress":1}', 2, 0),
+            (2, '{"initialized":true,"sealed":true,"progress":2}', 2, 0),
+            (3, '{"initialized":true,"sealed":false,"progress":0}', 0, 0),
+            (2, '{"initialized":true,"sealed":false,"progress":0}', 0, 1),
+            (1, '{"initialized":true,"sealed":true,"progress":1}', 1, 1),
+            (1, '{}', 2, 1),
+            (1, '{"initialized":true,"sealed":true,"progress":true}', 2, 1),
         )
-        for attempt, status, expected_returncode in cases:
+        for attempt, status, cli_rc, expected_returncode in cases:
             with self.subTest(attempt=attempt, status=status):
                 result = self.run_command(
                     [
                         '/bin/bash', '-c', script, 'unseal-progress',
-                        str(OPENBAO_INITIALIZE_LIB), status, str(attempt),
+                        str(OPENBAO_INITIALIZE_LIB), status, str(attempt), str(cli_rc),
                     ],
                     env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
                 )

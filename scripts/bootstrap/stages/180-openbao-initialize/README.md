@@ -6,6 +6,9 @@ Stage 180 是手工、交互式仪式，故意不在 `bootstrap-all.sh` 中。�
 
 - `--check` 是只读操作，报告下一条显式操作；事故恢复必须带
   `--source-recovery-sha=<40 位小写 SHA>`。
+  正常全新环境仍使用 `run-approved.sh [<SHA>] --check --stage=180`，无需 source SHA。
+  普通 check/configure 遇到 candidate、marker、checkpoint 或私有 staging 时必须停止，
+  不得把有效 v1 与事故材料混合状态当作普通配置。
 - `--initialize` 仅执行一次 Shamir 5/3 初始化，仅写入 PGP 密文、公开 metadata、受保护的
   archive 及其 checksum。
 - `--configure` 是正常 v1 路径：通过隐藏终端提示读取三份 unseal share 和初始 root token，
