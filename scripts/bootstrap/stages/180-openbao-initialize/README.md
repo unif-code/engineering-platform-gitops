@@ -33,6 +33,8 @@ candidate 包的清理不是本操作的一部分，必须另列精确路径并�
 - `recovery-bundle-state-unsafe`
 - `unexpected-openbao-state`
 - `git-commit-unreadable`
+- `missing-command-install`
+- `missing-command-mkdir`
 - `missing-command-tar`
 - `platform-secret-fingerprint-failed`
 - `platform-secret-drift`

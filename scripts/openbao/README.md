@@ -3,8 +3,9 @@
 仅在 Windows Git Bash 运行 `recovery-ceremony-wizard.sh`。它只协助需要操作者的
 Windows GPG、pinentry、剪贴板和受控云存储步骤；不在 CI 中运行，也不连接服务器。
 
-向导要求操作者选择已下载恢复包的 schema，并在解密前同时核对 `.sha256` sidecar 和
-仓库内的 `openbao_recovery.py emit-item` 校验：
+向导从已完整校验的恢复包读取 schema；操作者不声明 schema。它在解密前同时核对
+`.sha256` sidecar，并将读取到的 schema 作为 `openbao_recovery.py emit-item` 的预期值，
+使检查与取出之间的 schema 变化失败关闭：
 
 - `engineering-platform/openbao-recovery/v1`：只用于本次事故恢复；可选择
   `share1..share5` 或初始 `root`，但绝不可再次使用已暴露的旧 share。
@@ -12,6 +13,9 @@ Windows GPG、pinentry、剪贴板和受控云存储步骤；不在 CI 中运行
   `share1..share5`；候选恢复包尚未完成验证，不是最终恢复包。
 - `engineering-platform/openbao-recovery/v2`：只允许 `share1..share5`；初始 root
   token 已撤销，确认最终密文包和 sidecar 已上传到受控云存储后清空剪贴板。
+
+这里的 v1 是事故恢复路径：先带 source SHA 的只读 check，再 `recover-start`。它不是
+Stage 180 正常首次配置的 `--configure` 路径；事故恢复不得跳步或改用 `configure`。
 
 明文只经 GPG pinentry 解密到 Windows 剪贴板，绝不写入仓库、`.env`、GitHub、stdout、
 命令参数、环境变量或文件。私钥和口令不得上传，也不得与密文包放在同一云端位置。

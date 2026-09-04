@@ -164,6 +164,8 @@ helper，配置并精确 readback：
 严格顺序为：带 source SHA 的 check → `recover-start` → 候选包下载/校验 → Windows 本地解密
 三份新 share → `recover-verify` → 最终 v2 包下载/校验 → `accept`。任一 `STOP_*` 或非零退出码
 都停止并保留 source、candidate、PVC 和现场状态；不得跳步或改用普通 `configure`。
+这是事故 v1 恢复，不是正常 v1 配置路径：正常首次配置仍使用 `--configure`，而事故现场必须
+按上述 source SHA 绑定的 `recover-start`/`recover-verify` 顺序执行。
 
 ### 7.1 只读 check（带 source SHA）
 

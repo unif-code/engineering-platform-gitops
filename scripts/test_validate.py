@@ -546,6 +546,8 @@ class OpenBaoGitOpsContractTest(unittest.TestCase):
             'BACKUP=NOT_EXECUTED',
             'RESTORE=NOT_EXECUTED',
             'APP_SECRET_MIGRATION=NOT_EXECUTED',
+            '正常 v1 配置路径',
+            '事故 v1',
         ):
             self.assertIn(expected, runtime)
         for forbidden in (
