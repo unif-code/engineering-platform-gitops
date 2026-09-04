@@ -1865,8 +1865,8 @@ openbao_rotation_candidate_nonce_matches_live() {
 openbao_remote_session_cleanup() {
   local path=$OPENBAO_REMOTE_HOME kind=$OPENBAO_REMOTE_SESSION_KIND
   if [[ -z "$path" ]]; then
-    [[ -z "$kind" ]]
-    return
+    [[ -z "$kind" ]] || return 1
+    return 0
   fi
   [[ "$path" =~ ^/tmp/openbao-stage180\.[A-Za-z0-9]{6}$ ]] || return 1
   if [[ "$kind" == probe ]]; then
@@ -1919,8 +1919,8 @@ openbao_recover_probe_cleanup() {
   local path=$OPENBAO_RECOVER_PROBE_HOME
   local kind=$OPENBAO_RECOVER_PROBE_SESSION_KIND
   if [[ -z "$path" ]]; then
-    [[ -z "$kind" ]]
-    return
+    [[ -z "$kind" ]] || return 1
+    return 0
   fi
   [[ "$path" =~ ^/tmp/openbao-stage180-probe\.[A-Za-z0-9]{6}$ ]] || return 1
   if [[ "$kind" == authenticated ]]; then

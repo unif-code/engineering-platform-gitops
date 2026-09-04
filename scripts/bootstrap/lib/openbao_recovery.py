@@ -637,7 +637,8 @@ def _validate_init(
         if decoded_hex != decoded_keys:
             _reject('ciphertext representations differ')
     for field in ('recovery_keys_b64', 'recovery_keys_hex'):
-        if field in document and document[field] != []:
+        # OpenBao 2.6.1 emits nil slices as null when recovery keys are unused.
+        if document.get(field) is not None and document[field] != []:
             _reject('unexpected recovery keys')
     for field in ('recovery_keys_shares', 'recovery_keys_threshold'):
         if field in document and document[field] != 0:

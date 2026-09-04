@@ -8981,6 +8981,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         case: str = 'valid',
         directory: Path | None = None,
         source_sha: str | None = None,
+        recovery_fields: dict[str, object] | None = None,
     ) -> tuple[Path, Path]:
         directory = directory or self.temporary_directory()
         directory.mkdir(parents=True, exist_ok=True)
@@ -9087,6 +9088,15 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             init_document['recovery_keys_b64'] = [
                 self.synthetic_ciphertext('unexpected-recovery-key')
             ]
+        elif case == 'null-recovery-keys':
+            # OpenBao v2.6.1 newMachineInit preserves nil Go slices as null.
+            init_document['recovery_keys_b64'] = None
+            init_document['recovery_keys_hex'] = None
+        elif case == 'absent-recovery-keys':
+            del init_document['recovery_keys_b64']
+            del init_document['recovery_keys_hex']
+        if recovery_fields is not None:
+            init_document.update(recovery_fields)
 
         members: list[tuple[tarfile.TarInfo, bytes | None]] = []
         root = tarfile.TarInfo(prefix)
@@ -9850,6 +9860,41 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             ],
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
+
+    def test_source_v1_accepts_unused_null_recovery_arrays(self) -> None:
+        for case in ('null-recovery-keys', 'absent-recovery-keys', 'valid'):
+            with self.subTest(case=case):
+                archive, sidecar = self.make_source_bundle(case=case)
+                validated = self.run_recovery_helper('validate-source', archive, sidecar)
+                self.assertEqual(
+                    (validated.returncode, validated.stdout, validated.stderr),
+                    (0, '', ''),
+                )
+                schema = self.run_command([
+                    sys.executable, '-I', '-B', str(OPENBAO_RECOVERY_HELPER),
+                    'verified-schema', '--archive', str(archive),
+                    '--sidecar', str(sidecar),
+                ])
+                self.assertEqual(schema.returncode, 0, schema.stderr)
+                self.assertEqual(schema.stdout.strip(), 'engineering-platform/openbao-recovery/v1')
+                self.assertEqual(schema.stderr, '')
+
+    def test_unused_recovery_arrays_reject_nonempty_or_wrong_types(self) -> None:
+        for field in ('recovery_keys_b64', 'recovery_keys_hex'):
+            for value in (0, False, '', {}, ['unexpected'], [None]):
+                with self.subTest(field=field, value=value):
+                    archive, sidecar = self.make_source_bundle(
+                        case='null-recovery-keys', recovery_fields={field: value},
+                    )
+                    result = self.run_recovery_helper('validate-source', archive, sidecar)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (1, '', ''))
+        for field in ('recovery_keys_shares', 'recovery_keys_threshold'):
+            with self.subTest(field=field):
+                archive, sidecar = self.make_source_bundle(
+                    case='null-recovery-keys', recovery_fields={field: 1},
+                )
+                result = self.run_recovery_helper('validate-source', archive, sidecar)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (1, '', ''))
 
     def test_source_v1_rejects_unsafe_members_and_metadata(self) -> None:
         archive, sidecar = self.make_source_bundle()
@@ -13255,6 +13300,50 @@ openbao_apply_configuration_with_root
             failed.stdout,
             'CREATE_RC=1\nCLEANUP_RC=0\nREMAINING=0\n',
         )
+
+    def test_initialize_exit_preserves_status_with_real_empty_cleanup(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            kubectl_run() { printf 'FORBIDDEN_KUBECTL_CALL\n' >&2; return 99; }
+            finish_phase() { printf 'UNEXPECTED_CLEANUP_FAILURE\n'; }
+            openbao_initialize_traps_install
+            exit "$2"
+            '''
+        )
+        for status in (0, 10, 20, 30, 40, 50):
+            with self.subTest(status=status):
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'real-empty-cleanup',
+                     str(OPENBAO_INITIALIZE_LIB), str(status)],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, '')
+
+    def test_empty_cleanup_rejects_orphaned_session_kind(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            kubectl_run() { printf 'FORBIDDEN_KUBECTL_CALL\n' >&2; return 99; }
+            printf -v "$3" '%s' orphaned
+            "$2"
+            '''
+        )
+        for function, kind in (
+            ('openbao_remote_session_cleanup', 'OPENBAO_REMOTE_SESSION_KIND'),
+            ('openbao_recover_probe_cleanup', 'OPENBAO_RECOVER_PROBE_SESSION_KIND'),
+        ):
+            with self.subTest(function=function):
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'orphaned-cleanup',
+                     str(OPENBAO_INITIALIZE_LIB), function, kind],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, '')
 
     def test_initialize_traps_surface_cleanup_failures_and_terminate_signals(
         self,
