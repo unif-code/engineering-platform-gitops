@@ -8235,6 +8235,11 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         function_call: str,
         *,
         non_tty_fd: int | None = None,
+        initial_echo: bool = False,
+        pty_input: bytes | None = (
+            b'synthetic-share-one\nsynthetic-share-two\n'
+            b'synthetic-share-three\nsynthetic-root-token\n'
+        ),
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         temporary = self.temporary_directory()
         command_log = temporary / 'kubectl-argv.log'
@@ -8264,7 +8269,10 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         ) + function_call + '\n'
         master_fd, slave_fd = pty.openpty()
         terminal_attributes = termios.tcgetattr(slave_fd)
-        terminal_attributes[3] &= ~termios.ECHO
+        if initial_echo:
+            terminal_attributes[3] |= termios.ECHO
+        else:
+            terminal_attributes[3] &= ~termios.ECHO
         termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_attributes)
         descriptors: list[int | object] = [slave_fd, slave_fd, slave_fd]
         if non_tty_fd is not None:
@@ -8285,12 +8293,8 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         if non_tty_fd == 0 and process.stdin is not None:
             process.stdin.close()
             process.stdin = None
-        if non_tty_fd != 0:
-            os.write(
-                master_fd,
-                b'synthetic-share-one\nsynthetic-share-two\n'
-                b'synthetic-share-three\nsynthetic-root-token\n',
-            )
+        if non_tty_fd != 0 and pty_input is not None:
+            os.write(master_fd, pty_input)
         pty_output = bytearray()
         deadline = time.monotonic() + 10
         while process.poll() is None and time.monotonic() < deadline:
@@ -12485,7 +12489,10 @@ openbao_apply_configuration_with_root
             'normal-store-error', str(OPENBAO_INITIALIZE_LIB), str(temporary)],
             env=self.sanitized_environment(PATH=f'{temporary}:/usr/bin:/bin'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stderr, 'Synthetic hidden: ')
+        self.assertEqual(
+            result.stderr,
+            'OPENBAO_HIDDEN_INPUT_READY=root-token\r\nSynthetic hidden: ',
+        )
 
     def run_synthetic_hidden_cli(self, arguments, *, env):
         master, slave = pty.openpty()
@@ -13517,11 +13524,106 @@ openbao_apply_configuration_with_root
                 self.assertNotIn('synthetic-unseal-status', result.stdout)
                 self.assertNotIn('synthetic-share-', result.stdout)
 
+    def test_hidden_tty_is_noecho_before_ready_marker_and_restored(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        bao = binary_directory / 'bao'
+        bao.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            [[ "$*" == "$FIXTURE_EXPECTED_BAO_COMMAND" ]] || exit 98
+            [[ -t 0 && -t 2 ]] || exit 97
+            terminal_flags=" $(stty -a | tr ';\\n' '  ') "
+            [[ "$terminal_flags" == *' -echo '* ]] || exit 96
+            '''), encoding='utf-8')
+        bao.chmod(0o755)
+        bridge = temporary / 'remote-pty.py'
+        bridge.write_text(textwrap.dedent('''\
+            import errno
+            import os
+            import pty
+            import sys
+
+            arguments = sys.argv[1:]
+            assert arguments[:6] == [
+                '--namespace=openbao', 'exec', '--stdin', '--tty',
+                'pod/openbao-0', '--',
+            ]
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execvp(arguments[6], arguments[6:])
+            try:
+                while True:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    os.write(1, data)
+            finally:
+                os.close(master)
+                _, status = os.waitpid(pid, 0)
+            raise SystemExit(os.waitstatus_to_exitcode(status))
+            '''), encoding='utf-8')
+        cases = (
+            (
+                'openbao_bao_tty_public unseal-share-1 operator unseal '
+                '-format=json',
+                'operator unseal -format=json',
+                'OPENBAO_HIDDEN_INPUT_READY=unseal-share-1',
+            ),
+            (
+                'OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123; '
+                'openbao_bao_tty root-token login -no-print',
+                'login -no-print',
+                'OPENBAO_HIDDEN_INPUT_READY=root-token',
+            ),
+        )
+        for function_call, expected_command, ready_marker in cases:
+            with self.subTest(function_call=function_call):
+                script = (
+                    f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
+                    f'export FIXTURE_EXPECTED_BAO_COMMAND='
+                    f'{shlex.quote(expected_command)}\n'
+                    f'fixture_bridge={shlex.quote(str(bridge))}\n'
+                    + textwrap.dedent(r'''
+                        kubectl_run() {
+                          local terminal_flags
+                          terminal_flags=" $(stty -a | tr ';\n' '  ') "
+                          [[ "$terminal_flags" == *' -echo '* ]] || return 95
+                          python3 "$fixture_bridge" "$@"
+                        }
+                        '''
+                    )
+                    + function_call
+                    + textwrap.dedent(r'''
+                        rc=$?
+                        terminal_flags=" $(stty -a | tr ';\n' '  ') "
+                        [[ "$terminal_flags" == *' -echo '* ]] && exit 94
+                        printf 'HOST_ECHO_RESTORED=true\n'
+                        exit "$rc"
+                        ''')
+                )
+                result, _ = self.run_stage180_function_in_pty(
+                    script,
+                    initial_echo=True,
+                    pty_input=None,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn(ready_marker, result.stdout)
+                self.assertIn('HOST_ECHO_RESTORED=true', result.stdout)
+                self.assertNotIn('synthetic-share-', result.stdout)
+
     def test_unseal_tty_wrapper_rejects_unexpected_commands(self) -> None:
         for command in (
-            'token lookup -format=json',
-            'operator unseal -format=json synthetic-share',
-            'operator unseal -reset -format=json',
+            'unseal-share-1 token lookup -format=json',
+            'unseal-share-1 operator unseal -format=json synthetic-share',
+            'unseal-share-1 operator unseal -reset -format=json',
+            'unseal-share-4 operator unseal -format=json',
+            'root-token operator unseal -format=json',
         ):
             with self.subTest(command=command):
                 result, logged = self.run_stage180_function_in_pty(
@@ -13990,6 +14092,8 @@ openbao_apply_configuration_with_root
         self,
     ) -> None:
         names = (
+            'openbao_hidden_input_label_is_valid',
+            'openbao_run_hidden_tty',
             'openbao_bao_tty_public',
             'openbao_bao_tty',
             'openbao_unseal_interactively',
