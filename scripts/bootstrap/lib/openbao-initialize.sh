@@ -1689,28 +1689,81 @@ openbao_bao() {
     bao "$@"
 }
 
+openbao_hidden_input_label_is_valid() {
+  [[ $# -eq 1 ]] || return 1
+  case "$1" in
+    root-token | unseal-share-[123]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+openbao_run_hidden_tty() {
+  local input_label=$1
+  shift
+  openbao_hidden_input_label_is_valid "$input_label" || return 1
+  openbao_require_interactive_tty || return 1
+  (
+    local terminal_state
+    terminal_state=$(/bin/stty -g) || exit 1
+    trap '/bin/stty "$terminal_state"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    /bin/stty -echo || exit 1
+    "$@"
+  )
+}
+
 openbao_bao_tty_public() {
+  local input_label=$1
+  shift
+  [[ "$input_label" == unseal-share-[123] ]] || return 1
   [[ $# -eq 3 && $1 == operator && $2 == unseal && $3 == -format=json ]] ||
     return 1
-  # Discard public status inside the container, before the remote PTY merges
-  # stdout and stderr; the CLI's hidden prompt must reach the operator.
+  # Disable echo on both terminals before exposing the readiness marker. The
+  # pinned Alpine image provides stty through BusyBox. Discard public status
+  # inside the container before the remote PTY merges stdout and stderr.
   # shellcheck disable=SC2016
-  kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
+  openbao_run_hidden_tty "$input_label" \
+    kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
-    /bin/sh -c 'exec bao operator unseal -format=json >/dev/null'
+    /bin/sh -c '
+set -eu
+terminal_state=$(stty -g)
+trap '\''stty "$terminal_state"'\'' EXIT
+trap '\''exit 129'\'' HUP
+trap '\''exit 130'\'' INT
+trap '\''exit 143'\'' TERM
+stty -echo
+printf '\''OPENBAO_HIDDEN_INPUT_READY=%s\n'\'' "$1" >&2
+bao operator unseal -format=json >/dev/null
+' openbao-hidden-input "$input_label"
 }
 
 openbao_bao_tty() {
   # This wrapper is reserved for hidden root login; discard CLI stdout inside
   # the container, before kubectl multiplexes the remote terminal streams.
-  [[ "$*" == 'login -no-print' ]] || return 1
+  local input_label=$1
+  shift
+  [[ "$input_label" == root-token && "$*" == 'login -no-print' ]] || return 1
   # shellcheck disable=SC2016
-  kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
+  openbao_run_hidden_tty "$input_label" \
+    kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     HOME="$OPENBAO_REMOTE_HOME" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
-    /bin/sh -c 'exec bao login -no-print >/dev/null'
+    /bin/sh -c '
+set -eu
+terminal_state=$(stty -g)
+trap '\''stty "$terminal_state"'\'' EXIT
+trap '\''exit 129'\'' HUP
+trap '\''exit 130'\'' INT
+trap '\''exit 143'\'' TERM
+stty -echo
+printf '\''OPENBAO_HIDDEN_INPUT_READY=%s\n'\'' "$1" >&2
+bao login -no-print >/dev/null
+' openbao-hidden-input "$input_label"
 }
 
 openbao_bao_stdin() {
@@ -2072,7 +2125,8 @@ openbao_unseal_interactively() {
   openbao_require_interactive_tty || return 1
   openbao_bao_public operator unseal -reset -format=json >/dev/null || return 1
   for attempt in 1 2 3; do
-    openbao_bao_tty_public operator unseal -format=json || return 1
+    openbao_bao_tty_public "unseal-share-${attempt}" operator unseal \
+      -format=json || return 1
     openbao_unseal_progress_is_safe "$attempt" || return 1
   done
   [[ "$(openbao_state_flags)" == 'true|false' ]]
@@ -2194,7 +2248,7 @@ if data.get("token_ttl") != 600 or data.get("token_max_ttl") != 600:
 openbao_root_session_start() {
   openbao_require_interactive_tty || return 1
   openbao_remote_home_create root || return 1
-  openbao_bao_tty login -no-print
+  openbao_bao_tty root-token login -no-print
 }
 
 openbao_apply_configuration() {
