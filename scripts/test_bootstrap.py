@@ -9,6 +9,7 @@ import os
 import pty
 import re
 import select
+import signal
 import shlex
 import shutil
 import socket
@@ -1713,6 +1714,11 @@ class KubectlLibraryTest(BootstrapTestCase):
         'capture_admin_conf()',
         'admin_conf_is_safe()',
         'kubectl_run()',
+        'kubectl_isolated_read_control()',
+        'kubectl_isolated_start()',
+        'kubectl_isolated_wait()',
+        'kubectl_isolated_wait_interruptibly()',
+        'kubectl_isolated_terminate()',
         'kubectl_query_is_empty()',
     )
 
@@ -1767,6 +1773,558 @@ class KubectlLibraryTest(BootstrapTestCase):
         self.assertIn('--kubeconfig <(printf', run_body)
         self.assertNotIn('--kubeconfig "$admin_conf"', run_body)
         self.assertEqual(run_body.count('admin_conf_is_safe || return 1'), 2)
+
+    def test_isolated_runner_terminates_its_complete_process_group(self) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'isolated-pids.log'
+        fake_kubectl = temporary / 'fake-kubectl'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            printf 'PID=%s\n' "$BASHPID" >>"$TEST_PID_LOG"
+            (
+              printf 'PID=%s\n' "$BASHPID" >>"$TEST_PID_LOG"
+              /bin/sleep 30 &
+              printf 'PID=%s\n' "$!" >>"$TEST_PID_LOG"
+              wait
+            ) &
+            wait
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_PID_LOG=$3
+            export TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" &&
+                 $(wc -l <"$TEST_PID_LOG") -ge 3 ]] && break
+              /bin/sleep 0.01
+            done
+            [[ $(wc -l <"$TEST_PID_LOG") -eq 3 ]] || exit 97
+            printf 'SUPERVISOR_PID=%s\n' "$KUBE_RUNNER_PID"
+            printf 'ACTIVE_BEFORE=%s\n' "$KUBE_RUNNER_ACTIVE"
+            kubectl_isolated_terminate TERM
+            printf 'ACTIVE_AFTER=%s\n' "$KUBE_RUNNER_ACTIVE"
+            printf 'ADMIN_CALLS=%s\n' "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl',
+                str(KUBECTL_LIB), str(fake_kubectl), str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ACTIVE_BEFORE=1', result.stdout)
+        self.assertIn('ACTIVE_AFTER=0', result.stdout)
+        self.assertIn('ADMIN_CALLS=2', result.stdout)
+        supervisor = re.search(r'SUPERVISOR_PID=(\d+)', result.stdout)
+        self.assertIsNotNone(supervisor, result.stdout)
+        pids = [int(supervisor.group(1))]
+        pids.extend(
+            int(line.removeprefix('PID='))
+            for line in pid_log.read_text(encoding='utf-8').splitlines()
+        )
+        self.assertEqual(len(set(pids)), 4)
+        for process_id in pids:
+            with self.subTest(process_id=process_id):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process_id, 0)
+
+    def test_isolated_runner_terminates_group_after_leader_exits(self) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'leader-exit-pids.log'
+        fake_kubectl = temporary / 'leader-exits'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            /bin/sleep 30 &
+            printf 'PID=%s\n' "$!" >"$TEST_PID_LOG"
+            exit 0
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_PID_LOG=$3
+            export TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            group_leader=$KUBE_RUNNER_GROUP
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" && ! -e "/proc/$group_leader" ]] && break
+              /bin/sleep 0.01
+            done
+            [[ -f "$TEST_PID_LOG" && ! -e "/proc/$group_leader" ]] || exit 97
+            printf 'SUPERVISOR_PID=%s\nGROUP_LEADER=%s\n' \
+              "$KUBE_RUNNER_PID" "$group_leader"
+            kubectl_isolated_terminate TERM
+            printf 'ACTIVE_AFTER=%s\nADMIN_CALLS=%s\n' \
+              "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-leader-exit',
+                str(KUBECTL_LIB), str(fake_kubectl), str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ACTIVE_AFTER=0\nADMIN_CALLS=2\n', result.stdout)
+        pids = [int(pid_log.read_text(encoding='utf-8').removeprefix('PID='))]
+        pids.extend(
+            int(value)
+            for value in re.findall(
+                r'^(?:SUPERVISOR_PID|GROUP_LEADER)=(\d+)$',
+                result.stdout,
+                re.MULTILINE,
+            )
+        )
+        for process_id in pids:
+            with self.subTest(process_id=process_id):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process_id, 0)
+
+    def test_isolated_runner_reaps_descendant_that_escapes_original_group(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'escaped-pid.log'
+        detached = temporary / 'detached.py'
+        detached.write_text(textwrap.dedent('''\
+            import os
+            import pathlib
+            import sys
+            import time
+
+            os.setsid()
+            pathlib.Path(sys.argv[1]).write_text(
+                str(os.getpid()), encoding='ascii',
+            )
+            time.sleep(30)
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl = temporary / 'escaping-kubectl'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            /usr/bin/python3 "$TEST_DETACHED" "$TEST_PID_LOG" &
+            exit 0
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_DETACHED=$3
+            TEST_PID_LOG=$4
+            export TEST_DETACHED TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" ]] && break
+              /bin/sleep 0.01
+            done
+            [[ -f "$TEST_PID_LOG" ]] || exit 97
+            leader_reaped=false
+            for _ in {1..100}; do
+              if ! kubectl_process_identity "$KUBE_RUNNER_GROUP" \
+                >/dev/null 2>&1; then
+                leader_reaped=true
+                break
+              fi
+              /bin/sleep 0.01
+            done
+            [[ "$leader_reaped" == true ]] || exit 96
+            printf 'SUPERVISOR_PID=%s\nGROUP_LEADER=%s\n' \
+              "$KUBE_RUNNER_PID" "$KUBE_RUNNER_GROUP"
+            kubectl_isolated_terminate TERM
+            printf 'ACTIVE_AFTER=%s\nADMIN_CALLS=%s\n' \
+              "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-escaped-descendant',
+                str(KUBECTL_LIB), str(fake_kubectl), str(detached),
+                str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ACTIVE_AFTER=0\nADMIN_CALLS=2\n', result.stdout)
+        escaped_pid = int(pid_log.read_text(encoding='ascii'))
+        escaped_survived = True
+        try:
+            os.kill(escaped_pid, 0)
+        except ProcessLookupError:
+            escaped_survived = False
+        finally:
+            if escaped_survived:
+                os.kill(escaped_pid, signal.SIGKILL)
+        self.assertFalse(
+            escaped_survived,
+            f'escaped hidden-TTY descendant survived: {escaped_pid}',
+        )
+
+    def test_isolated_control_reader_preserves_partial_timeout(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            exec {control_fd}< <(
+              printf 'S'
+              /bin/sleep 0.05
+              printf 'TOPPED|OK\n'
+            )
+            KUBE_RUNNER_CONTROL_READ_FD=$control_fd
+            first_status=0
+            kubectl_isolated_read_control 0.01 || first_status=$?
+            printf 'FIRST_STATUS=%s\nFIRST_BUFFER=%s\n' \
+              "$first_status" "$KUBE_RUNNER_CONTROL_BUFFER"
+            for _ in {1..20}; do
+              if kubectl_isolated_read_control 0.01; then
+                printf 'MESSAGE=%s\n' "$KUBE_RUNNER_CONTROL_MESSAGE"
+                exit 0
+              fi
+            done
+            exit 1
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'partial-control', str(KUBECTL_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FIRST_STATUS=2\nFIRST_BUFFER=S\n', result.stdout)
+        self.assertIn('MESSAGE=STOPPED|OK\n', result.stdout)
+
+    def test_isolated_supervisor_never_reuses_reaped_leader_group(self) -> None:
+        body = KUBECTL_LIB.read_text(encoding='utf-8')
+        helper = body.split(
+            'def signal_original_group(signal_number):\n', 1,
+        )[1].split('\n\ndef ', 1)[0]
+        self.assertTrue(
+            helper.startswith(
+                '    if main_status is not None:\n'
+                '        return\n',
+            ),
+            helper,
+        )
+
+    def test_isolated_done_stop_race_preserves_protocol_and_postcheck(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        fake_kubectl = temporary / 'fast-kubectl'
+        fake_kubectl.write_text('#!/bin/bash\nexit 23\n', encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            POSTCHECK_FAIL=$3
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() {
+              ADMIN_CALLS=$((ADMIN_CALLS + 1))
+              [[ "$POSTCHECK_FAIL" != true || "$ADMIN_CALLS" -lt 2 ]]
+            }
+            eval "$(
+              declare -f kubectl_isolated_read_control |
+                sed '1s/kubectl_isolated_read_control/kubectl_isolated_read_control_real/'
+            )"
+            eval "$(
+              declare -f kubectl_isolated_wait |
+                sed '1s/kubectl_isolated_wait/kubectl_isolated_wait_real/'
+            )"
+            kubectl_isolated_wait() {
+              local wait_status=0
+              printf 'WAIT_ARG=%s\n' "$1"
+              kubectl_isolated_wait_real "$@" || wait_status=$?
+              printf 'WAIT_STATUS=%s\n' "$wait_status"
+              return "$wait_status"
+            }
+            kubectl_isolated_start --fixture || exit 97
+            queued_done=
+            for _ in {1..100}; do
+              if kubectl_isolated_read_control_real 0.01; then
+                queued_done=$KUBE_RUNNER_CONTROL_MESSAGE
+                break
+              fi
+            done
+            [[ "$queued_done" == 'DONE|23' ]] || exit 96
+            kubectl_isolated_read_control() {
+              if [[ -n "$queued_done" ]]; then
+                KUBE_RUNNER_CONTROL_MESSAGE=$queued_done
+                queued_done=
+                printf 'CONTROL_SHIM=host-done-branch\n'
+                return 0
+              fi
+              kubectl_isolated_read_control_real "$@"
+            }
+            terminate_status=0
+            kubectl_isolated_terminate TERM || terminate_status=$?
+            printf 'TERMINATE_STATUS=%s\nACTIVE_AFTER=%s\nADMIN_CALLS=%s\n' \
+              "$terminate_status" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            ''')
+        for postcheck_fail, expected_status in (('false', 0), ('true', 1)):
+            with self.subTest(postcheck_fail=postcheck_fail):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'done-stop-race',
+                        str(KUBECTL_LIB), str(fake_kubectl), postcheck_fail,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr,
+                )
+                self.assertIn(
+                    'CONTROL_SHIM=host-done-branch\n', result.stdout,
+                )
+                self.assertIn('WAIT_ARG=0\n', result.stdout)
+                self.assertIn(
+                    f'WAIT_STATUS={expected_status}\n'
+                    f'TERMINATE_STATUS={expected_status}\n'
+                    'ACTIVE_AFTER=0\nADMIN_CALLS=2\n',
+                    result.stdout,
+                )
+
+    def test_isolated_terminate_uses_control_after_persistent_identity_error(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'identity-error-pids.log'
+        fake_kubectl = temporary / 'identity-error-kubectl'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            printf 'PID=%s\n' "$BASHPID" >"$TEST_PID_LOG"
+            /bin/sleep 30
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_PID_LOG=$3
+            export TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" ]] && break
+              /bin/sleep 0.01
+            done
+            [[ -f "$TEST_PID_LOG" ]] || exit 97
+            printf 'SUPERVISOR_PID=%s\n' "$KUBE_RUNNER_PID"
+            kubectl_process_identity() { return 1; }
+            if kubectl_isolated_terminate TERM; then
+              observed=0
+            else
+              observed=$?
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-identity-error',
+                str(KUBECTL_LIB), str(fake_kubectl), str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            'OBSERVED=0\nACTIVE=0\nADMIN_CALLS=2\n', result.stdout,
+        )
+        pids = [int(pid_log.read_text(encoding='utf-8').removeprefix('PID='))]
+        supervisor = re.search(
+            r'^SUPERVISOR_PID=(\d+)$', result.stdout, re.MULTILINE,
+        )
+        self.assertIsNotNone(supervisor, result.stdout)
+        pids.append(int(supervisor.group(1)))
+        for process_id in pids:
+            with self.subTest(process_id=process_id):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process_id, 0)
+
+    def test_isolated_runner_preserves_fast_exit_and_postchecks_admin_conf(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            if kubectl_isolated_wait_interruptibly; then
+              observed=0
+            else
+              observed=$?
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        for exit_code in (0, 23):
+            with self.subTest(exit_code=exit_code):
+                fake_kubectl = temporary / f'fast-exit-{exit_code}'
+                fake_kubectl.write_text(
+                    f'#!/bin/sh\nexit {exit_code}\n', encoding='utf-8',
+                )
+                fake_kubectl.chmod(0o755)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'isolated-kubectl-exit',
+                        str(KUBECTL_LIB), str(fake_kubectl),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr,
+                )
+                self.assertEqual(
+                    result.stdout,
+                    f'OBSERVED={exit_code}\nACTIVE=0\nADMIN_CALLS=2\n',
+                )
+
+    def test_isolated_runner_reports_exec_failure_and_postchecks(self) -> None:
+        missing_kubectl = self.temporary_directory() / 'missing-kubectl'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            if kubectl_isolated_wait_interruptibly; then
+              observed=0
+            else
+              observed=$?
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl-exec-failure',
+                str(KUBECTL_LIB), str(missing_kubectl),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'OBSERVED=127\nACTIVE=0\nADMIN_CALLS=2\n',
+        )
+
+    def test_isolated_runner_rejects_post_launch_admin_conf_drift(self) -> None:
+        temporary = self.temporary_directory()
+        fake_kubectl = temporary / 'fast-success'
+        fake_kubectl.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() {
+              ADMIN_CALLS=$((ADMIN_CALLS + 1))
+              (( ADMIN_CALLS == 1 ))
+            }
+            kubectl_isolated_start --fixture
+            start_rc=$?
+            if [[ "$start_rc" == 0 ]]; then
+              kubectl_isolated_wait_interruptibly
+              observed=$?
+            else
+              observed=$start_rc
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl-admin-drift',
+                str(KUBECTL_LIB), str(fake_kubectl),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'OBSERVED=1\nACTIVE=0\nADMIN_CALLS=2\n',
+        )
+
+    def test_isolated_runner_can_be_reused_sequentially(self) -> None:
+        temporary = self.temporary_directory()
+        fake_kubectl = temporary / 'sequential-kubectl'
+        fake_kubectl.write_text(
+            '#!/bin/sh\nexit "$4"\n', encoding='utf-8',
+        )
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            for expected in 0 17 0 23; do
+              kubectl_isolated_start "$expected"
+              if kubectl_isolated_wait_interruptibly; then
+                observed=0
+              else
+                observed=$?
+              fi
+              printf 'EXPECTED=%s OBSERVED=%s ACTIVE=%s\n' \
+                "$expected" "$observed" "$KUBE_RUNNER_ACTIVE"
+            done
+            printf 'ADMIN_CALLS=%s\n' "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl-sequential',
+                str(KUBECTL_LIB), str(fake_kubectl),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'EXPECTED=0 OBSERVED=0 ACTIVE=0\n'
+            'EXPECTED=17 OBSERVED=17 ACTIVE=0\n'
+            'EXPECTED=0 OBSERVED=0 ACTIVE=0\n'
+            'EXPECTED=23 OBSERVED=23 ACTIVE=0\n'
+            'ADMIN_CALLS=8\n',
+        )
 
 
 class HelmLibraryTest(BootstrapTestCase):
@@ -8240,6 +8798,11 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             b'synthetic-share-one\nsynthetic-share-two\n'
             b'synthetic-share-three\nsynthetic-root-token\n'
         ),
+        signal_after_output: tuple[bytes, int, bool] | None = None,
+        second_signal: int | None = None,
+        second_signal_after_output: bytes | None = None,
+        foreground_process_group: bool = False,
+        report_echo_after: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         temporary = self.temporary_directory()
         command_log = temporary / 'kubectl-argv.log'
@@ -8277,11 +8840,35 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         descriptors: list[int | object] = [slave_fd, slave_fd, slave_fd]
         if non_tty_fd is not None:
             descriptors[non_tty_fd] = subprocess.PIPE
+        process_command = [
+            '/bin/bash', '-c', script, 'stage180-pty',
+            str(OPENBAO_INITIALIZE_LIB), str(command_log), str(temporary),
+        ]
+        if (
+            foreground_process_group
+            or (signal_after_output is not None and signal_after_output[2])
+        ):
+            process_command = [
+                sys.executable, '-c', textwrap.dedent(r'''
+                    import fcntl
+                    import os
+                    import signal
+                    import sys
+                    import termios
+
+                    os.setsid()
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                    os.tcsetpgrp(0, os.getpgrp())
+                    for signal_number in (
+                        signal.SIGHUP, signal.SIGINT, signal.SIGTERM,
+                    ):
+                        signal.signal(signal_number, signal.SIG_DFL)
+                    os.execv(sys.argv[1], sys.argv[1:])
+                    '''),
+                *process_command,
+            ]
         process = subprocess.Popen(
-            [
-                '/bin/bash', '-c', script, 'stage180-pty',
-                str(OPENBAO_INITIALIZE_LIB), str(command_log), str(temporary),
-            ],
+            process_command,
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
             stdin=descriptors[0],
             stdout=descriptors[1],
@@ -8296,6 +8883,9 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         if non_tty_fd != 0 and pty_input is not None:
             os.write(master_fd, pty_input)
         pty_output = bytearray()
+        signal_sent = False
+        second_signal_sent = False
+        second_signal_at: float | None = None
         deadline = time.monotonic() + 10
         while process.poll() is None and time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
@@ -8304,10 +8894,55 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                     pty_output.extend(os.read(master_fd, 4096))
                 except OSError:
                     break
+            if (
+                signal_after_output is not None
+                and not signal_sent
+                and signal_after_output[0] in pty_output
+            ):
+                if signal_after_output[2]:
+                    os.killpg(process.pid, signal_after_output[1])
+                else:
+                    os.kill(process.pid, signal_after_output[1])
+                signal_sent = True
+                if second_signal is not None and second_signal_after_output is None:
+                    second_signal_at = time.monotonic() + 0.05
+            if (
+                second_signal is not None
+                and not second_signal_sent
+                and (
+                    (
+                        second_signal_after_output is not None
+                        and second_signal_after_output in pty_output
+                    )
+                    or (
+                        second_signal_at is not None
+                        and time.monotonic() >= second_signal_at
+                    )
+                )
+            ):
+                os.kill(process.pid, second_signal)
+                second_signal_sent = True
         if process.poll() is None:
+            if command_log.exists():
+                pid_log = command_log.read_text(
+                    encoding='utf-8', errors='replace',
+                )
+                for process_id in re.findall(
+                    r'^(?:PID|LATE_PID)=(\d+)$', pid_log, re.MULTILINE,
+                ):
+                    try:
+                        os.kill(int(process_id), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             process.kill()
             process.wait()
             self.fail('Stage 180 PTY harness timed out')
+        if signal_after_output is not None and not signal_sent:
+            self.fail('Stage 180 PTY harness did not observe signal marker')
+        if second_signal is not None and not second_signal_sent:
+            self.fail('Stage 180 PTY harness did not send second signal')
+        echo_after = bool(termios.tcgetattr(master_fd)[3] & termios.ECHO)
+        os.set_blocking(master_fd, False)
         try:
             while True:
                 chunk = os.read(master_fd, 4096)
@@ -8323,6 +8958,12 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             output += pipe_stdout
         if pipe_stderr:
             output += pipe_stderr
+        if report_echo_after:
+            output += (
+                b'PTY_ECHO_AFTER_PROCESS=true\n'
+                if echo_after
+                else b'PTY_ECHO_AFTER_PROCESS=false\n'
+            )
         result = subprocess.CompletedProcess(
             process.args,
             process.returncode,
@@ -12482,7 +13123,20 @@ openbao_remote_home_create() { OPENBAO_REMOTE_HOME=$TEST_REMOTE_PATH; }
 openbao_apply_configuration() { echo FORBIDDEN-configuration; }
 openbao_root_session_revoke() { echo FORBIDDEN-revoke; }
 openbao_remote_session_cleanup() { :; }
-kubectl_run() { while [[ "$1" != -- ]]; do shift; done; shift; "$@"; }
+TEST_KUBECTL_PID=
+kubectl_isolated_start() {
+  while [[ "$1" != -- ]]; do shift; done
+  shift
+  "$@" <&0 >&1 2>&2 &
+  TEST_KUBECTL_PID=$!
+  KUBE_RUNNER_ACTIVE=1
+}
+kubectl_isolated_wait_interruptibly() {
+  local rc=0
+  wait "$TEST_KUBECTL_PID" || rc=$?
+  KUBE_RUNNER_ACTIVE=0
+  return "$rc"
+}
 openbao_apply_configuration_with_root
 '''
         result = self.run_synthetic_hidden_cli(['/bin/bash', '-c', script,
@@ -13429,7 +14083,22 @@ openbao_apply_configuration_with_root
         self,
     ) -> None:
         result, command_log = self.run_stage180_function_in_pty(
-            'openbao_unseal_interactively; openbao_root_session_start',
+            textwrap.dedent(r'''
+                kubectl_isolated_start() {
+                  {
+                    printf '%s' "$1"
+                    shift
+                    printf ' %s' "$@"
+                    printf '\n'
+                  } >>"$TEST_COMMAND_LOG"
+                  KUBE_RUNNER_ACTIVE=1
+                }
+                kubectl_isolated_wait_interruptibly() {
+                  KUBE_RUNNER_ACTIVE=0
+                }
+                openbao_unseal_interactively
+                openbao_root_session_start
+                ''')
         )
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn('exec --stdin --tty pod/openbao-0', command_log)
@@ -13469,12 +14138,17 @@ openbao_apply_configuration_with_root
         bao.chmod(0o755)
         bridge = temporary / 'remote-pty.py'
         bridge.write_text(textwrap.dedent('''\
+            #!/usr/bin/python3
             import errno
             import os
             import pty
             import sys
 
             arguments = sys.argv[1:]
+            assert arguments[0] == '--kubeconfig'
+            assert arguments[1].startswith('/dev/fd/')
+            assert arguments[2] == '--cache-dir=/dev/null'
+            arguments = arguments[3:]
             assert arguments[:6] == [
                 '--namespace=openbao', 'exec', '--stdin', '--tty',
                 'pod/openbao-0', '--',
@@ -13497,19 +14171,22 @@ openbao_apply_configuration_with_root
                 os.close(master)
                 _, status = os.waitpid(pid, 0)
             raise SystemExit(os.waitstatus_to_exitcode(status))
-            '''), encoding='utf-8')
+            ''').lstrip(), encoding='utf-8')
+        bridge.chmod(0o755)
         for cli_exit, expected_prompts, expected_exit in ((0, 3, 0), (23, 1, 1)):
             with self.subTest(cli_exit=cli_exit):
                 script = (
                     f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
                     f'export FIXTURE_UNSEAL_EXIT_CODE={cli_exit}\n'
-                    f'fixture_bridge={shlex.quote(str(bridge))}\n'
+                    f'kubectl_binary={shlex.quote(str(bridge))}\n'
                     + textwrap.dedent(r'''
+                        ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                        admin_conf_is_safe() { :; }
                         kubectl_run() {
                           if [[ "$*" == '--namespace=openbao exec pod/openbao-0 -- env BAO_ADDR=https://openbao.openbao.svc:8200 BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt bao operator unseal -reset -format=json' ]]; then
                             return 0
                           fi
-                          python3 "$fixture_bridge" "$@"
+                          return 99
                         }
                         openbao_unseal_interactively
                         ''')
@@ -13535,16 +14212,24 @@ openbao_apply_configuration_with_root
             [[ -t 0 && -t 2 ]] || exit 97
             terminal_flags=" $(stty -a | tr ';\\n' '  ') "
             [[ "$terminal_flags" == *' -echo '* ]] || exit 96
+            exit "$FIXTURE_BAO_EXIT_CODE"
             '''), encoding='utf-8')
         bao.chmod(0o755)
         bridge = temporary / 'remote-pty.py'
         bridge.write_text(textwrap.dedent('''\
+            #!/usr/bin/python3
             import errno
             import os
             import pty
             import sys
+            import termios
 
             arguments = sys.argv[1:]
+            assert not termios.tcgetattr(0)[3] & termios.ECHO
+            assert arguments[0] == '--kubeconfig'
+            assert arguments[1].startswith('/dev/fd/')
+            assert arguments[2] == '--cache-dir=/dev/null'
+            arguments = arguments[3:]
             assert arguments[:6] == [
                 '--namespace=openbao', 'exec', '--stdin', '--tty',
                 'pod/openbao-0', '--',
@@ -13567,7 +14252,8 @@ openbao_apply_configuration_with_root
                 os.close(master)
                 _, status = os.waitpid(pid, 0)
             raise SystemExit(os.waitstatus_to_exitcode(status))
-            '''), encoding='utf-8')
+            ''').lstrip(), encoding='utf-8')
+        bridge.chmod(0o755)
         cases = (
             (
                 'openbao_bao_tty_public unseal-share-1 operator unseal '
@@ -13583,39 +14269,301 @@ openbao_apply_configuration_with_root
             ),
         )
         for function_call, expected_command, ready_marker in cases:
-            with self.subTest(function_call=function_call):
-                script = (
-                    f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
-                    f'export FIXTURE_EXPECTED_BAO_COMMAND='
-                    f'{shlex.quote(expected_command)}\n'
-                    f'fixture_bridge={shlex.quote(str(bridge))}\n'
-                    + textwrap.dedent(r'''
-                        kubectl_run() {
-                          local terminal_flags
-                          terminal_flags=" $(stty -a | tr ';\n' '  ') "
-                          [[ "$terminal_flags" == *' -echo '* ]] || return 95
-                          python3 "$fixture_bridge" "$@"
-                        }
-                        '''
+            for cli_exit in (0, 23):
+                with self.subTest(
+                    function_call=function_call,
+                    cli_exit=cli_exit,
+                ):
+                    script = (
+                        f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
+                        f'export FIXTURE_EXPECTED_BAO_COMMAND='
+                        f'{shlex.quote(expected_command)}\n'
+                        f'export FIXTURE_BAO_EXIT_CODE={cli_exit}\n'
+                        f'kubectl_binary={shlex.quote(str(bridge))}\n'
+                        + textwrap.dedent(r'''
+                            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                            admin_conf_is_safe() { :; }
+                            openbao_initialize_traps_install
+                            '''
+                        )
+                        + function_call
+                        + textwrap.dedent(r'''
+                            rc=$?
+                            OPENBAO_REMOTE_HOME=
+                            terminal_flags=" $(stty -a | tr ';\n' '  ') "
+                            [[ "$terminal_flags" == *' -echo '* ]] && exit 94
+                            [[ "$(trap -p HUP)" == *'openbao_initialize_trap HUP 129'* ]] || exit 93
+                            [[ "$(trap -p INT)" == *'openbao_initialize_trap INT 130'* ]] || exit 92
+                            [[ "$(trap -p TERM)" == *'openbao_initialize_trap TERM 143'* ]] || exit 91
+                            printf 'HOST_ECHO_RESTORED=true\n'
+                            exit "$rc"
+                            ''')
                     )
-                    + function_call
+                    result, _ = self.run_stage180_function_in_pty(
+                        script,
+                        initial_echo=True,
+                        pty_input=None,
+                    )
+                    self.assertEqual(result.returncode, cli_exit, result.stdout)
+                    self.assertIn(ready_marker, result.stdout)
+                    self.assertIn('HOST_ECHO_RESTORED=true', result.stdout)
+                    self.assertNotIn('synthetic-share-', result.stdout)
+
+    def hidden_tty_signal_fixture(self) -> Path:
+        fixture = self.temporary_directory() / 'signal-kubectl'
+        fixture.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            printf 'PID=%s\n' "$BASHPID" >>"$TEST_COMMAND_LOG"
+            spawn_late_descendant() {
+              /bin/sleep 30 &
+              printf 'LATE_PID=%s\n' "$!" >>"$TEST_COMMAND_LOG"
+              exit 0
+            }
+            trap spawn_late_descendant HUP INT TERM
+            (
+              printf 'PID=%s\n' "$BASHPID" >>"$TEST_COMMAND_LOG"
+              /bin/sleep 30 &
+              printf 'PID=%s\n' "$!" >>"$TEST_COMMAND_LOG"
+              wait
+            ) &
+            for _ in {1..100}; do
+              pid_count=0
+              while IFS= read -r logged_line; do
+                [[ "$logged_line" == PID=* ]] && pid_count=$((pid_count + 1))
+              done <"$TEST_COMMAND_LOG"
+              ((pid_count >= 3)) && break
+              /bin/sleep 0.01
+            done
+            ((pid_count >= 3)) || exit 98
+            if [[ "${TEST_STARTUP_SIGNAL:-false}" == self-hup ]]; then
+              printf 'STARTUP_SIGNAL_FIXTURE_READY\n'
+              kill -STOP "$TEST_PARENT_PID"
+              kill -HUP "$TEST_PARENT_PID"
+              kill -CONT "$TEST_PARENT_PID"
+            elif [[ "${TEST_STARTUP_SIGNAL:-false}" == marker ]]; then
+              printf 'STARTUP_SIGNAL_FIXTURE_READY\n'
+            else
+              printf 'SIGNAL_FIXTURE_READY\n'
+            fi
+            wait
+            ''').lstrip(), encoding='utf-8')
+        fixture.chmod(0o755)
+        return fixture
+
+    def test_hidden_tty_restores_echo_when_runner_teardown_fails(self) -> None:
+        script = textwrap.dedent(r'''
+            kubectl_isolated_start() {
+              KUBE_RUNNER_ACTIVE=1
+            }
+            kubectl_isolated_wait_interruptibly() {
+              return 1
+            }
+            kubectl_isolated_terminate() {
+              return 1
+            }
+            rc=0
+            openbao_run_hidden_tty unseal-share-1 --fixture || rc=$?
+            terminal_flags=" $(stty -a | tr ';\n' '  ') "
+            [[ "$terminal_flags" != *' -echo '* ]] || exit 91
+            [[ -z "$(trap -p HUP)$(trap -p INT)$(trap -p TERM)" ]] || exit 92
+            printf 'RC=%s\nACTIVE_AFTER=%s\nECHO_RESTORED=true\n' \
+              "$rc" "$KUBE_RUNNER_ACTIVE"
+            ''')
+        result, _ = self.run_stage180_function_in_pty(
+            script,
+            initial_echo=True,
+            pty_input=None,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            'RC=1\nACTIVE_AFTER=1\nECHO_RESTORED=true\n',
+            result.stdout,
+        )
+
+    def assert_hidden_tty_fixture_pids_are_gone(
+        self,
+        logged: str,
+        *,
+        minimum: int = 4,
+        require_late: bool = True,
+    ) -> None:
+        pid_lines = re.findall(r'^(?:PID|LATE_PID)=(\d+)$', logged, re.MULTILINE)
+        self.assertGreaterEqual(len(pid_lines), minimum, logged)
+        if require_late:
+            self.assertIsNotNone(
+                re.search(r'^LATE_PID=\d+$', logged, re.MULTILINE),
+            )
+        for process_id_text in pid_lines:
+            process_id = int(process_id_text)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(process_id, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                try:
+                    os.kill(process_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail(f'hidden TTY descendant survived: {process_id}')
+
+    def test_hidden_tty_supervises_signals_and_restores_echo(self) -> None:
+        fake_kubectl = self.hidden_tty_signal_fixture()
+        cases = (
+            ('HUP', signal.SIGHUP, 129, False, 'none', None),
+            ('INT', signal.SIGINT, 130, False, 'none', None),
+            ('TERM', signal.SIGTERM, 143, False, 'none', None),
+            ('INT-process-group', signal.SIGINT, 130, True, 'none', None),
+            (
+                'TERM-then-INT', signal.SIGTERM, 143, True, 'none',
+                signal.SIGINT,
+            ),
+            (
+                'TERM-cleanup-failure', signal.SIGTERM, 30, False, 'remote',
+                None,
+            ),
+        )
+        for (
+            name, signal_number, expected_exit, process_group, failure,
+            second_signal,
+        ) in cases:
+            with self.subTest(signal=name):
+                script = (
+                    f'kubectl_binary={shlex.quote(str(fake_kubectl))}\n'
+                    f'TEST_CLEANUP_FAILURE={failure}\n'
+                    f'TEST_SECOND_SIGNAL={str(second_signal is not None).lower()}\n'
                     + textwrap.dedent(r'''
-                        rc=$?
-                        terminal_flags=" $(stty -a | tr ';\n' '  ') "
-                        [[ "$terminal_flags" == *' -echo '* ]] && exit 94
-                        printf 'HOST_ECHO_RESTORED=true\n'
-                        exit "$rc"
+                        ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                        export TEST_COMMAND_LOG
+                        admin_conf_is_safe() { :; }
+                        openbao_rotation_temp_cleanup() {
+                          [[ -z ${OPENBAO_SECRET_INPUT+x} ]] || return 1
+                          if [[ "$TEST_SECOND_SIGNAL" == true ]]; then
+                            printf 'CLEANUP_WINDOW_READY\n'
+                            /bin/sleep 0.3
+                          fi
+                          printf 'CLEANUP=rotation\n' >>"$TEST_COMMAND_LOG"
+                          [[ "$TEST_CLEANUP_FAILURE" != rotation ]]
+                        }
+                        openbao_recover_probe_cleanup() {
+                          printf 'CLEANUP=probe\n' >>"$TEST_COMMAND_LOG"
+                          [[ "$TEST_CLEANUP_FAILURE" != probe ]]
+                        }
+                        openbao_remote_session_cleanup() {
+                          printf 'CLEANUP=remote\n' >>"$TEST_COMMAND_LOG"
+                          [[ "$TEST_CLEANUP_FAILURE" != remote ]]
+                        }
+                        finish_phase() {
+                          printf 'UNKNOWN_STATE=%s|%s|%s|%s\n' \
+                            "$1" "$2" "$3" "$4"
+                        }
+                        OPENBAO_SECRET_INPUT=synthetic-hidden-input
+                        openbao_initialize_traps_install
+                        openbao_run_hidden_tty unseal-share-1 --fixture
+                        printf 'FORBIDDEN_CONTINUATION=true\n'
                         ''')
                 )
-                result, _ = self.run_stage180_function_in_pty(
+                result, logged = self.run_stage180_function_in_pty(
                     script,
                     initial_echo=True,
                     pty_input=None,
+                    signal_after_output=(
+                        b'SIGNAL_FIXTURE_READY', signal_number, process_group,
+                    ),
+                    second_signal=second_signal,
+                    second_signal_after_output=(
+                        b'CLEANUP_WINDOW_READY'
+                        if second_signal is not None
+                        else None
+                    ),
+                    report_echo_after=True,
                 )
-                self.assertEqual(result.returncode, 0, result.stdout)
-                self.assertIn(ready_marker, result.stdout)
-                self.assertIn('HOST_ECHO_RESTORED=true', result.stdout)
-                self.assertNotIn('synthetic-share-', result.stdout)
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertIn('PTY_ECHO_AFTER_PROCESS=true', result.stdout)
+                self.assertNotIn('FORBIDDEN_CONTINUATION', result.stdout)
+                cleanup_calls = re.findall(r'^CLEANUP=(\w+)$', logged, re.MULTILINE)
+                self.assertEqual(cleanup_calls, ['rotation', 'probe', 'remote'])
+                if failure == 'none':
+                    self.assertNotIn('UNKNOWN_STATE=', result.stdout)
+                else:
+                    self.assertIn(
+                        'UNKNOWN_STATE=STOP_UNKNOWN_STATE|'
+                        'remote-session-cleanup-failed|30|NONE',
+                        result.stdout,
+                    )
+                self.assert_hidden_tty_fixture_pids_are_gone(logged)
+
+    def test_hidden_tty_defers_startup_signal_until_group_is_registered(
+        self,
+    ) -> None:
+        fake_kubectl = self.hidden_tty_signal_fixture()
+        cases = (
+            ('HUP', 129, False),
+            ('INT', 130, True),
+        )
+        for signal_name, expected_exit, process_group in cases:
+            with self.subTest(signal_name=signal_name):
+                script = (
+                    f'kubectl_binary={shlex.quote(str(fake_kubectl))}\n'
+                    f'TEST_STARTUP_SIGNAL={signal_name}\n'
+                    + textwrap.dedent(r'''
+                        ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                        export TEST_COMMAND_LOG
+                        admin_conf_is_safe() { :; }
+                        openbao_rotation_temp_cleanup() {
+                          printf 'CLEANUP=rotation\n' >>"$TEST_COMMAND_LOG"
+                        }
+                        openbao_recover_probe_cleanup() {
+                          printf 'CLEANUP=probe\n' >>"$TEST_COMMAND_LOG"
+                        }
+                        openbao_remote_session_cleanup() {
+                          printf 'CLEANUP=remote\n' >>"$TEST_COMMAND_LOG"
+                        }
+                        OPENBAO_SECRET_INPUT=synthetic-hidden-input
+                        openbao_initialize_traps_install
+                        eval "$(
+                          declare -f kubectl_isolated_start |
+                            sed '1s/kubectl_isolated_start/kubectl_isolated_start_real/'
+                        )"
+                        kubectl_isolated_start() {
+                          kubectl_isolated_start_real "$@" || return
+                          printf 'PID=%s\nPID=%s\n' \
+                            "$KUBE_RUNNER_PID" "$KUBE_RUNNER_GROUP" \
+                            >>"$TEST_COMMAND_LOG"
+                          printf 'STARTUP_SIGNAL_INJECTED=%s\n' \
+                            "$TEST_STARTUP_SIGNAL"
+                          if [[ "$TEST_STARTUP_SIGNAL" == INT ]]; then
+                            kill -INT -- "-$BASHPID"
+                          else
+                            kill -HUP "$BASHPID"
+                          fi
+                        }
+                        openbao_run_hidden_tty unseal-share-1 --fixture
+                        printf 'FORBIDDEN_CONTINUATION=true\n'
+                        ''')
+                )
+                result, logged = self.run_stage180_function_in_pty(
+                    script,
+                    initial_echo=True,
+                    pty_input=None,
+                    foreground_process_group=process_group,
+                    report_echo_after=True,
+                )
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertIn(
+                    f'STARTUP_SIGNAL_INJECTED={signal_name}', result.stdout,
+                )
+                self.assertIn('PTY_ECHO_AFTER_PROCESS=true', result.stdout)
+                self.assertNotIn('FORBIDDEN_CONTINUATION', result.stdout)
+                self.assertEqual(
+                    re.findall(r'^CLEANUP=(\w+)$', logged, re.MULTILINE),
+                    ['rotation', 'probe', 'remote'],
+                )
+                self.assert_hidden_tty_fixture_pids_are_gone(
+                    logged, minimum=2, require_late=False,
+                )
 
     def test_unseal_tty_wrapper_rejects_unexpected_commands(self) -> None:
         for command in (
@@ -13628,6 +14576,21 @@ openbao_apply_configuration_with_root
             with self.subTest(command=command):
                 result, logged = self.run_stage180_function_in_pty(
                     f'openbao_bao_tty_public {command}',
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(logged, '')
+
+    def test_root_tty_wrapper_rejects_unexpected_commands(self) -> None:
+        for command in (
+            'unseal-share-1 login -no-print',
+            'root-token token lookup',
+            'root-token login',
+            'root-token login -no-print synthetic-root-token',
+        ):
+            with self.subTest(command=command):
+                result, logged = self.run_stage180_function_in_pty(
+                    f'openbao_bao_tty {command}',
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, '')

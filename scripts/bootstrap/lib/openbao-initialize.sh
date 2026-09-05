@@ -1697,21 +1697,94 @@ openbao_hidden_input_label_is_valid() {
   esac
 }
 
+openbao_hidden_tty_handle_signal() {
+  local signal_name=$1 signal_status=$2 terminal_state=$3
+  local termination_ok=true
+  # Keep teardown atomic: a repeated Ctrl-C/HUP/TERM must not bypass process
+  # reaping, terminal restoration, or the single global cleanup path.
+  trap '' HUP INT TERM
+  if [[ "$KUBE_RUNNER_ACTIVE" == 1 ]]; then
+    kubectl_isolated_terminate "$signal_name" || termination_ok=false
+  fi
+  /bin/stty "$terminal_state" || termination_ok=false
+  if [[ "$termination_ok" != true ]]; then
+    trap - EXIT
+    if [[ "$OPENBAO_INITIALIZE_TRAPS_ACTIVE" == true ]]; then
+      OPENBAO_INITIALIZE_TRAPS_ACTIVE=false
+      openbao_initialize_cleanup || true
+      finish_phase STOP_UNKNOWN_STATE "$OPENBAO_REASON_REMOTE_CLEANUP" \
+        "$EXIT_UNKNOWN_STATE" NONE || true
+    fi
+    exit "$EXIT_UNKNOWN_STATE"
+  fi
+  if [[ "$OPENBAO_INITIALIZE_TRAPS_ACTIVE" == true ]]; then
+    openbao_initialize_trap "$signal_name" "$signal_status"
+  fi
+  exit "$signal_status"
+}
+
+openbao_hidden_tty_restore_traps() {
+  local previous_hup=$1 previous_int=$2 previous_term=$3
+  trap - HUP INT TERM
+  # These values come only from Bash's own `trap -p` serialization.
+  # shellcheck disable=SC2294
+  [[ -z "$previous_hup" ]] || eval "$previous_hup"
+  # shellcheck disable=SC2294
+  [[ -z "$previous_int" ]] || eval "$previous_int"
+  # shellcheck disable=SC2294
+  [[ -z "$previous_term" ]] || eval "$previous_term"
+}
+
 openbao_run_hidden_tty() {
-  local input_label=$1
+  local input_label=$1 terminal_state rc=0 pending_signal='' pending_status=''
+  local previous_hup previous_int previous_term start_ok=true
   shift
   openbao_hidden_input_label_is_valid "$input_label" || return 1
   openbao_require_interactive_tty || return 1
-  (
-    local terminal_state
-    terminal_state=$(/bin/stty -g) || exit 1
-    trap '/bin/stty "$terminal_state"' EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    /bin/stty -echo || exit 1
-    "$@"
-  )
+  terminal_state=$(/bin/stty -g) || return 1
+  previous_hup=$(trap -p HUP)
+  previous_int=$(trap -p INT)
+  previous_term=$(trap -p TERM)
+  trap 'if [[ -z "$pending_signal" ]]; then pending_signal=HUP; pending_status=129; fi' HUP
+  trap 'if [[ -z "$pending_signal" ]]; then pending_signal=INT; pending_status=130; fi' INT
+  trap 'if [[ -z "$pending_signal" ]]; then pending_signal=TERM; pending_status=143; fi' TERM
+  if ! /bin/stty -echo; then
+    openbao_hidden_tty_restore_traps \
+      "$previous_hup" "$previous_int" "$previous_term"
+    return 1
+  fi
+  if [[ -n "$pending_signal" ]]; then
+    openbao_hidden_tty_handle_signal \
+      "$pending_signal" "$pending_status" "$terminal_state"
+  fi
+  kubectl_isolated_start "$@" || start_ok=false
+  trap 'openbao_hidden_tty_handle_signal HUP 129 "$terminal_state"' HUP
+  trap 'openbao_hidden_tty_handle_signal INT 130 "$terminal_state"' INT
+  trap 'openbao_hidden_tty_handle_signal TERM 143 "$terminal_state"' TERM
+  if [[ -n "$pending_signal" ]]; then
+    openbao_hidden_tty_handle_signal \
+      "$pending_signal" "$pending_status" "$terminal_state"
+  fi
+  if [[ "$start_ok" != true ]]; then
+    /bin/stty "$terminal_state" || rc=1
+    openbao_hidden_tty_restore_traps \
+      "$previous_hup" "$previous_int" "$previous_term"
+    return 1
+  fi
+  if kubectl_isolated_wait_interruptibly; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ "$KUBE_RUNNER_ACTIVE" == 1 ]]; then
+    kubectl_isolated_terminate TERM || rc=1
+  fi
+  [[ "$KUBE_RUNNER_ACTIVE" == 0 ]] || rc=1
+  /bin/stty "$terminal_state" || rc=1
+  openbao_hidden_tty_restore_traps \
+    "$previous_hup" "$previous_int" "$previous_term"
+  [[ "$KUBE_RUNNER_ACTIVE" == 0 ]] || return 1
+  return "$rc"
 }
 
 openbao_bao_tty_public() {
@@ -1725,7 +1798,7 @@ openbao_bao_tty_public() {
   # inside the container before the remote PTY merges stdout and stderr.
   # shellcheck disable=SC2016
   openbao_run_hidden_tty "$input_label" \
-    kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
+    --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     /bin/sh -c '
@@ -1749,7 +1822,7 @@ openbao_bao_tty() {
   [[ "$input_label" == root-token && "$*" == 'login -no-print' ]] || return 1
   # shellcheck disable=SC2016
   openbao_run_hidden_tty "$input_label" \
-    kubectl_run --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
+    --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     HOME="$OPENBAO_REMOTE_HOME" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
@@ -2050,7 +2123,8 @@ openbao_initialize_cleanup() {
 
 openbao_initialize_trap() {
   local event=$1 prior_status=$2 final_status
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
   if [[ "$OPENBAO_INITIALIZE_TRAPS_ACTIVE" != true ]]; then
     exit "$prior_status"
   fi
