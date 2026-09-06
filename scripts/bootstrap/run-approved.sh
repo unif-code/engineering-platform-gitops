@@ -50,6 +50,8 @@ esac
 script_dir=$(cd "${script_source%/*}" && pwd -P)
 # shellcheck disable=SC1091
 source "${script_dir}/lib/run-approved-args.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/run-approved-lock.sh"
 run_approved_parse_arguments "$mode" "$@" || usage
 target=$RUN_APPROVED_TARGET
 if [[ -n "$approved_sha" && ! "$approved_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -67,6 +69,14 @@ repo=$(cd "${script_dir}/../.." && pwd -P)
   echo 'STOP: repository is missing or unsafe'
   exit 92
 }
+if ! run_approved_acquire_directory_lock "$repo" /usr/bin/flock 8; then
+  if [[ "$RUN_APPROVED_LOCK_REASON" == concurrent-run ]]; then
+    echo 'STOP: another run-approved command is running'
+    exit 105
+  fi
+  printf 'STOP: run-approved lock failed: %s\n' "$RUN_APPROVED_LOCK_REASON"
+  exit 106
+fi
 origin_url=$(/usr/bin/git -C "$repo" remote get-url origin)
 case "$origin_url" in
   *unif-code/engineering-platform-gitops.git) ;;
@@ -86,6 +96,18 @@ worktree=$(/usr/bin/git -C "$repo" status --porcelain=v1 --untracked-files=all)
   printf '%s\n' "$worktree"
   exit 95
 }
+
+if [[ "$target:$mode" == openbao-initialize:--apply ]]; then
+  lock_file=/run/lock/engineering-platform-bootstrap.lock
+  if ! run_approved_acquire_lock "$lock_file" 0 1777 /usr/bin/flock 9; then
+    if [[ "$RUN_APPROVED_LOCK_REASON" == concurrent-run ]]; then
+      echo 'STOP: another bootstrap or Stage 180 apply is running'
+      exit 103
+    fi
+    printf 'STOP: Stage 180 lock failed: %s\n' "$RUN_APPROVED_LOCK_REASON"
+    exit 104
+  fi
+fi
 
 /usr/bin/git -C "$repo" fetch --prune origin main
 if [[ -n "$approved_sha" ]]; then

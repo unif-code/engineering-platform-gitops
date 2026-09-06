@@ -29,6 +29,7 @@ readonly OPENBAO_REASON_SOURCE_REQUIRED=source-recovery-sha-required
 readonly OPENBAO_REASON_SOURCE_INVALID=source-recovery-sha-invalid
 readonly OPENBAO_REASON_SOURCE_UNSAFE=source-recovery-bundle-unsafe
 readonly OPENBAO_REASON_REMOTE_CLEANUP=remote-session-cleanup-failed
+readonly OPENBAO_REASON_LEGACY_SESSION_ACTIVE=legacy-stage180-session-active
 
 OPENBAO_OPERATION=CHECK
 OPENBAO_SOURCE_RECOVERY_SHA=
@@ -1365,6 +1366,7 @@ trap '\''exit 143'\'' TERM
 error=$(mktemp /tmp/openbao-root-resume.XXXXXX)
 status=$(mktemp /tmp/openbao-root-resume-status.XXXXXX)
 env HOME="$home" \
+  BAO_TOKEN_PATH="$home/.bao-token" \
   BAO_ADDR=https://openbao.openbao.svc:8200 \
   BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
   bao login -no-print lookup=false >/dev/null
@@ -1378,6 +1380,7 @@ lookup() {
   (
     set +e
     env HOME="$home" \
+      BAO_TOKEN_PATH="$home/.bao-token" \
       BAO_ADDR=https://openbao.openbao.svc:8200 \
       BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
       bao token lookup -format=json >/dev/null
@@ -1396,6 +1399,7 @@ exact_denial() {
 }
 if lookup; then
   env HOME="$home" \
+    BAO_TOKEN_PATH="$home/.bao-token" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     bao token revoke -self >/dev/null 2>&1 || exit 1
@@ -1684,6 +1688,7 @@ openbao_bao_public() {
 openbao_bao() {
   kubectl_run --namespace=openbao exec pod/openbao-0 -- env \
     HOME="$OPENBAO_REMOTE_HOME" \
+    BAO_TOKEN_PATH="$OPENBAO_REMOTE_HOME/.bao-token" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     bao "$@"
@@ -1824,6 +1829,7 @@ openbao_bao_tty() {
   openbao_run_hidden_tty "$input_label" \
     --namespace=openbao exec --stdin --tty pod/openbao-0 -- env \
     HOME="$OPENBAO_REMOTE_HOME" \
+    BAO_TOKEN_PATH="$OPENBAO_REMOTE_HOME/.bao-token" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     /bin/sh -c '
@@ -1842,6 +1848,7 @@ bao login -no-print >/dev/null
 openbao_bao_stdin() {
   kubectl_run --namespace=openbao exec -i pod/openbao-0 -- env \
     HOME="$OPENBAO_REMOTE_HOME" \
+    BAO_TOKEN_PATH="$OPENBAO_REMOTE_HOME/.bao-token" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     bao "$@"
@@ -1895,6 +1902,7 @@ cat >"$key"
 chmod 600 "$key"
 pgp_keys=$(printf '\''%s,%s,%s,%s,%s'\'' "$key" "$key" "$key" "$key" "$key")
 env HOME="$1" \
+  BAO_TOKEN_PATH="$1/.bao-token" \
   BAO_ADDR=https://openbao.openbao.svc:8200 \
   BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
   bao operator rotate-keys -format=json -init -verify -backup \
@@ -1993,6 +2001,133 @@ openbao_rotation_candidate_nonce_matches_live() {
   openbao_rotation_candidate_is_valid "$cluster_digest" "$live_nonce"
 }
 
+openbao_legacy_stage180_processes_absent() {
+  local proc_root expected_mode expected_uid stage_entrypoint
+  local process pid grep_rc
+  [[ $# -eq 1 ]] || return 1
+  proc_root=$1
+  if [[ "$proc_root" == /proc ]]; then
+    expected_mode=555
+    expected_uid=0
+  elif [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 &&
+          "$proc_root" =~ ^/tmp/[A-Za-z0-9._/-]+$ &&
+          -d "$proc_root" && ! -L "$proc_root" &&
+          "$(cd "$proc_root" && pwd -P)" == "$proc_root" ]]; then
+    expected_mode=700
+    expected_uid=$EUID
+  else
+    return 1
+  fi
+  [[ -d "$proc_root" && ! -L "$proc_root" ]] || return 1
+  [[ "$(stat -c %a "$proc_root")" == "$expected_mode" ]] || return 1
+  [[ "$(stat -c %u "$proc_root")" == "$expected_uid" ]] || return 1
+  stage_entrypoint=${OPENBAO_REPO_ROOT}/scripts/bootstrap/stages/180-openbao-initialize/run.sh
+  [[ "$stage_entrypoint" == /* ]] || return 1
+  for process in "$proc_root"/[0-9]*; do
+    [[ -d "$process" && ! -L "$process" ]] || continue
+    pid=${process##*/}
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$proc_root" == /proc && "$pid" == "$$" ]]; then
+      continue
+    fi
+    if grep -Fzqx -- "$stage_entrypoint" "$process/cmdline" 2>/dev/null; then
+      return 1
+    else
+      grep_rc=$?
+    fi
+    if (( grep_rc > 1 )) && [[ -e "$process" ]]; then
+      return 1
+    fi
+  done
+}
+
+openbao_legacy_default_token_helpers_cleanup() {
+  local helper_root expected_mode expected_uid
+  [[ $# -eq 1 ]] || return 1
+  helper_root=$1
+  if [[ "$helper_root" == /tmp ]]; then
+    expected_mode=1777
+    expected_uid=0
+  elif [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 &&
+          "$helper_root" =~ ^/tmp/[A-Za-z0-9._/-]+$ &&
+          -d "$helper_root" && ! -L "$helper_root" &&
+          "$(cd "$helper_root" && pwd -P)" == "$helper_root" ]]; then
+    expected_mode=700
+    expected_uid=$EUID
+  else
+    return 1
+  fi
+  # OpenBao defaults to $HOME/.vault-token unless BAO_TOKEN_PATH is pinned.
+  # A previous interrupted run may therefore have left exactly that file in a
+  # stage-180 helper directory. The caller holds the shared bootstrap lock.
+  # Capture one stable batch, validate it twice, and never delete a later glob.
+  # shellcheck disable=SC2016
+  kubectl_run --namespace=openbao exec pod/openbao-0 -- /bin/sh -c '
+set -eu
+uid=$(id -u)
+root=$1
+expected_mode=$2
+expected_uid=$3
+[ -d "$root" ] && [ ! -L "$root" ]
+[ "$(stat -c %a "$root")" = "$expected_mode" ]
+[ "$(stat -c %u "$root")" = "$expected_uid" ]
+validate_candidate() {
+  path=$1
+  prefix=${root}/openbao-stage180.
+  suffix=${path#"$prefix"}
+  [ "${#suffix}" -eq 6 ]
+  case "$suffix" in *[!A-Za-z0-9]*) return 1 ;; esac
+  [ -d "$path" ] && [ ! -L "$path" ]
+  [ "$(stat -c %a "$path")" = 700 ]
+  [ "$(stat -c %u "$path")" = "$uid" ]
+  count=0
+  for entry in "$path"/.[!.]* "$path"/..?* "$path"/*; do
+    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+      continue
+    fi
+    [ "$entry" = "$path/.vault-token" ] || return 1
+    count=$((count + 1))
+  done
+  [ "$count" -eq 1 ]
+  [ -f "$path/.vault-token" ] && [ ! -L "$path/.vault-token" ]
+  [ "$(stat -c %a "$path/.vault-token")" = 600 ]
+  [ "$(stat -c %u "$path/.vault-token")" = "$uid" ]
+}
+candidate_snapshot() {
+  observed=
+  for path in "$root"/openbao-stage180.??????; do
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      continue
+    fi
+    observed="${observed}|${path}"
+  done
+  printf "%s\n" "$observed"
+}
+set -- "$root"/openbao-stage180.??????
+if [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then
+  set --
+fi
+snapshot=
+for path in "$@"; do
+  snapshot="${snapshot}|${path}"
+  validate_candidate "$path"
+done
+[ "$(candidate_snapshot)" = "$snapshot" ]
+for path in "$@"; do
+  validate_candidate "$path"
+done
+[ "$(candidate_snapshot)" = "$snapshot" ]
+for path in "$@"; do
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    exit 1
+  fi
+  rm -f -- "$path/.vault-token"
+  rmdir -- "$path"
+done
+' cleanup-legacy-token-helpers "$helper_root" "$expected_mode" \
+    "$expected_uid" >/dev/null 2>&1 || return 1
+}
+
 openbao_remote_session_cleanup() {
   local path=$OPENBAO_REMOTE_HOME kind=$OPENBAO_REMOTE_SESSION_KIND
   if [[ -z "$path" ]]; then
@@ -2002,6 +2137,7 @@ openbao_remote_session_cleanup() {
   [[ "$path" =~ ^/tmp/openbao-stage180\.[A-Za-z0-9]{6}$ ]] || return 1
   if [[ "$kind" == probe ]]; then
     kubectl_run --namespace=openbao exec pod/openbao-0 -- env HOME="$path" \
+      BAO_TOKEN_PATH="$path/.bao-token" \
       BAO_ADDR=https://openbao.openbao.svc:8200 \
       BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
       bao token revoke -self >/dev/null 2>&1 || return 1
@@ -2033,6 +2169,7 @@ openbao_recover_probe_home_create() {
 openbao_bao_recover_probe() {
   kubectl_run --namespace=openbao exec pod/openbao-0 -- env \
     HOME="$OPENBAO_RECOVER_PROBE_HOME" \
+    BAO_TOKEN_PATH="$OPENBAO_RECOVER_PROBE_HOME/.bao-token" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     bao "$@"
@@ -2041,6 +2178,7 @@ openbao_bao_recover_probe() {
 openbao_bao_recover_probe_stdin() {
   kubectl_run --namespace=openbao exec -i pod/openbao-0 -- env \
     HOME="$OPENBAO_RECOVER_PROBE_HOME" \
+    BAO_TOKEN_PATH="$OPENBAO_RECOVER_PROBE_HOME/.bao-token" \
     BAO_ADDR=https://openbao.openbao.svc:8200 \
     BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
     bao "$@"
@@ -2381,6 +2519,7 @@ status=$(mktemp /tmp/openbao-root-revoke-status.XXXXXX)
 (
   set +e
   env HOME="$1" \
+      BAO_TOKEN_PATH="$1/.bao-token" \
       BAO_ADDR=https://openbao.openbao.svc:8200 \
       BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
       bao token lookup -format=json >/dev/null
@@ -2974,6 +3113,12 @@ openbao_stage_180_recover_start() {
   openbao_require_interactive_tty ||
     openbao_recover_start_fail STOP_PRECONDITION interactive-tty-required \
       "$EXIT_PRECONDITION"
+  openbao_legacy_stage180_processes_absent /proc ||
+    openbao_recover_start_fail STOP_UNKNOWN_STATE \
+      "$OPENBAO_REASON_LEGACY_SESSION_ACTIVE" "$EXIT_UNKNOWN_STATE"
+  openbao_legacy_default_token_helpers_cleanup /tmp ||
+    openbao_recover_start_fail STOP_UNKNOWN_STATE \
+      "$OPENBAO_REASON_REMOTE_CLEANUP" "$EXIT_UNKNOWN_STATE"
 
   state=$(openbao_state_flags) ||
     openbao_recover_start_fail STOP_UNKNOWN_STATE unexpected-openbao-state \
