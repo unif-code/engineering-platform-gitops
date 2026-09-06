@@ -68,6 +68,7 @@ FLUX_PHASE_A = ROOT / STAGE_SCRIPTS['100']
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
 RUN_APPROVED_ARGS = ROOT / 'scripts/bootstrap/lib/run-approved-args.sh'
+RUN_APPROVED_LOCK = ROOT / 'scripts/bootstrap/lib/run-approved-lock.sh'
 OPENBAO_RUNTIME = ROOT / STAGE_SCRIPTS['170']
 OPENBAO_RUNTIME_LIB = ROOT / 'scripts/bootstrap/lib/openbao-runtime.sh'
 OPENBAO_INITIALIZE = (
@@ -3953,9 +3954,18 @@ class RunApprovedTest(BootstrapTestCase):
             args_parser.parent.mkdir(parents=True, exist_ok=True)
             args_parser.write_bytes(RUN_APPROVED_ARGS.read_bytes())
             args_parser.chmod(0o755)
+        lock_library = scripts / 'lib/run-approved-lock.sh'
+        if RUN_APPROVED_LOCK.is_file():
+            lock_library.parent.mkdir(parents=True, exist_ok=True)
+            lock_library.write_bytes(RUN_APPROVED_LOCK.read_bytes())
+            lock_library.chmod(0o755)
         self.write_executable(
             scripts / 'bootstrap-all.sh',
             '#!/bin/bash\n'
+            f'if [[ -e {shlex.quote(str(directory / "run-approved-hold"))} ]]; then\n'
+            f'  touch {shlex.quote(str(directory / "run-approved-ready"))}\n'
+            f'  while [[ ! -e {shlex.quote(str(directory / "run-approved-release"))} ]]; do sleep 0.05; done\n'
+            'fi\n'
             'printf \'FAKE_MODE=%s\\n\' "$1"\n'
             'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
             'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
@@ -4038,6 +4048,135 @@ class RunApprovedTest(BootstrapTestCase):
             capture_output=True, text=True, check=False,
             env=self.sanitized_environment(),
         )
+
+    def test_wrapper_and_stage180_apply_use_ordered_exclusive_locks(self) -> None:
+        body = RUN_APPROVED.read_text(encoding='utf-8')
+        self.assertIn('source "${script_dir}/lib/run-approved-lock.sh"', body)
+        wrapper_lock = 'run_approved_acquire_directory_lock "$repo" /usr/bin/flock 8'
+        self.assertIn(wrapper_lock, body)
+        self.assertLess(body.index(wrapper_lock), body.index('origin_url='))
+        self.assertIn(
+            'lock_file=/run/lock/engineering-platform-bootstrap.lock', body,
+        )
+        self.assertIn(
+            'run_approved_acquire_lock "$lock_file" 0 1777 /usr/bin/flock 9',
+            body,
+        )
+        self.assertIn(
+            '[[ "$target:$mode" == openbao-initialize:--apply ]]', body,
+        )
+
+    def test_run_approved_lock_serializes_and_rejects_symlink(self) -> None:
+        temporary = self.temporary_directory()
+        lock_parent = temporary / 'lock-parent'
+        lock_parent.mkdir(mode=0o700)
+        lock_path = lock_parent / 'bootstrap.lock'
+        holder_script = textwrap.dedent(
+            r'''
+            source "$1"
+            run_approved_acquire_lock "$2" "$EUID" 700 /usr/bin/flock 9 || exit 91
+            printf 'READY\n'
+            read -r _
+            '''
+        )
+        holder = subprocess.Popen(
+            [
+                '/bin/bash', '-c', holder_script, 'lock-holder',
+                str(RUN_APPROVED_LOCK), str(lock_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.sanitized_environment(),
+        )
+        try:
+            self.assertEqual(holder.stdout.readline(), 'READY\n')
+            contender = self.run_command(
+                [
+                    '/bin/bash', '-c',
+                    'source "$1"\n'
+                    'if run_approved_acquire_lock "$2" "$EUID" 700 '
+                    '/usr/bin/flock 9; then exit 92; fi\n'
+                    'printf "%s\\n" "$RUN_APPROVED_LOCK_REASON"\n',
+                    'lock-contender', str(RUN_APPROVED_LOCK), str(lock_path),
+                ],
+                env=self.sanitized_environment(),
+            )
+            self.assertEqual(contender.returncode, 0, contender.stderr)
+            self.assertEqual(contender.stdout, 'concurrent-run\n')
+        finally:
+            if holder.stdin is not None:
+                holder.stdin.write('\n')
+                holder.stdin.flush()
+                holder.stdin.close()
+            holder.wait(timeout=5)
+        holder_stderr = holder.stderr.read()
+        holder.stdout.close()
+        holder.stderr.close()
+        self.assertEqual(holder.returncode, 0, holder_stderr)
+
+        unsafe_parent = temporary / 'unsafe-parent'
+        unsafe_parent.mkdir(mode=0o700)
+        target = unsafe_parent / 'target'
+        target.write_text('not-a-lock\n', encoding='ascii')
+        target.chmod(0o600)
+        unsafe_lock = unsafe_parent / 'bootstrap.lock'
+        unsafe_lock.symlink_to(target)
+        rejected = self.run_command(
+            [
+                '/bin/bash', '-c',
+                'source "$1"\n'
+                'if run_approved_acquire_lock "$2" "$EUID" 700 '
+                '/usr/bin/flock 9; then exit 92; fi\n'
+                'printf "%s\\n" "$RUN_APPROVED_LOCK_REASON"\n',
+                'unsafe-lock', str(RUN_APPROVED_LOCK), str(unsafe_lock),
+            ],
+            env=self.sanitized_environment(),
+        )
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(rejected.stdout, 'unsafe-lock-target\n')
+        self.assertTrue(unsafe_lock.is_symlink())
+
+    def test_wrapper_lock_is_held_through_the_target_process(self) -> None:
+        clone, approved_sha, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved_sha)
+        hold = clone.parent / 'run-approved-hold'
+        ready = clone.parent / 'run-approved-ready'
+        release = clone.parent / 'run-approved-release'
+        hold.touch()
+        holder = subprocess.Popen(
+            [
+                '/bin/bash', str(clone / 'scripts/bootstrap/run-approved.sh'),
+                approved_sha, '--check',
+            ],
+            cwd=clone,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.sanitized_environment(),
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(ready.exists(), 'holder did not reach target process')
+            contender = self.run_wrapper(clone, approved_sha, '--check')
+            self.assertEqual(contender.returncode, 105, contender.stderr)
+            self.assertIn(
+                'STOP: another run-approved command is running',
+                contender.stdout,
+            )
+        finally:
+            release.touch()
+            holder.wait(timeout=5)
+        holder_stdout = holder.stdout.read()
+        holder_stderr = holder.stderr.read()
+        holder.stdout.close()
+        holder.stderr.close()
+        self.assertEqual(holder.returncode, 0, holder_stderr)
+        self.assertIn('FAKE_MODE=--check', holder_stdout)
 
     def run_openbao_operation_parser(
         self, *arguments: str
@@ -6660,8 +6799,9 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
             RUN_APPROVED, gated_dir, wrapper=True
         )
         self.assertEqual(
-            wrapper_names, ['run-approved-args.sh'],
-            'wrapper must source only its parser library',
+            wrapper_names,
+            ['run-approved-args.sh', 'run-approved-lock.sh'],
+            'wrapper must source only its parser and lock libraries',
         )
         sourced.update(wrapper_names)
         self.assertEqual(
@@ -6696,7 +6836,10 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         )
         for tamper, expected_guard in (
             ('source-escape', '门禁覆盖之外'),
-            ('wrong-parser', 'wrapper must source only its parser library'),
+            (
+                'wrong-parser',
+                'wrapper must source only its parser and lock libraries',
+            ),
             ('extra-library', '被 source 的文件集合必须与门禁目录内容一致'),
         ):
             with self.subTest(tamper=tamper):
@@ -9026,6 +9169,14 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             openbao_require_interactive_tty() {
               log_call tty-check
               [[ "$TEST_FAILURE" != tty ]]
+            }
+            openbao_legacy_default_token_helpers_cleanup() {
+              log_call legacy-token-helper-cleanup
+              [[ "$TEST_FAILURE" != legacy-cleanup ]]
+            }
+            openbao_legacy_stage180_processes_absent() {
+              log_call legacy-stage180-process-check
+              [[ "$TEST_FAILURE" != legacy-stage180-process ]]
             }
             openbao_state_flags() { printf '%s\n' "$TEST_STATE"; }
             openbao_unseal_interactively() {
@@ -11862,6 +12013,8 @@ else:
             'preflight',
             'source-validate',
             'tty-check',
+            'legacy-stage180-process-check',
+            'legacy-token-helper-cleanup',
             'unseal',
             'root-login',
             'configure',
@@ -11991,6 +12144,8 @@ else:
             ('candidate-write', 'rotation-candidate-write-failed'),
             ('candidate-validate', 'rotation-candidate-state-unsafe'),
             ('nonce-drift', 'rotation-candidate-state-unsafe'),
+            ('legacy-stage180-process', 'legacy-stage180-session-active'),
+            ('legacy-cleanup', 'remote-session-cleanup-failed'),
             ('temp-cleanup', 'remote-session-cleanup-failed'),
             ('cleanup', 'remote-session-cleanup-failed'),
         )
@@ -14212,6 +14367,9 @@ openbao_apply_configuration_with_root
             [[ -t 0 && -t 2 ]] || exit 97
             terminal_flags=" $(stty -a | tr ';\\n' '  ') "
             [[ "$terminal_flags" == *' -echo '* ]] || exit 96
+            if [[ "$*" == 'login -no-print' ]]; then
+              [[ "${BAO_TOKEN_PATH:-}" == "$HOME/.bao-token" ]] || exit 95
+            fi
             exit "$FIXTURE_BAO_EXIT_CODE"
             '''), encoding='utf-8')
         bao.chmod(0o755)
@@ -14892,6 +15050,267 @@ openbao_apply_configuration_with_root
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
         self.assertNotEqual(blocked.returncode, 0)
+
+    def test_authenticated_cli_sessions_pin_the_cleanup_token_path(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        fake_bao = binary_directory / 'bao'
+        fake_bao.write_text(textwrap.dedent(
+            '''
+            #!/bin/bash
+            [[ "${BAO_TOKEN_PATH:-}" == "$HOME/.bao-token" ]] || exit 95
+            [[ "$*" == 'token lookup -format=json' ]] || exit 94
+            '''
+        ).lstrip(), encoding='utf-8')
+        fake_bao.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            export PATH="$2:$PATH"
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            OPENBAO_RECOVER_PROBE_HOME=/tmp/openbao-stage180-probe.ABC123
+            OPENBAO_RECOVER_PROBE_SESSION_KIND=authenticated
+            openbao_bao token lookup -format=json
+            openbao_bao_recover_probe token lookup -format=json
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'pinned-token-path',
+                str(OPENBAO_INITIALIZE_LIB), str(binary_directory),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_every_authenticated_home_pins_the_cleanup_token_path(self) -> None:
+        lines = self.implementation().splitlines()
+        bindings: list[tuple[str, str]] = []
+        for index, line in enumerate(lines[:-1]):
+            matched = re.match(r'^\s*(?:env )?HOME="(\$[^"/]+)" \\$', line)
+            if matched is not None:
+                bindings.append((matched.group(1), lines[index + 1].strip()))
+        self.assertEqual(len(bindings), 10)
+        for home, token_binding in bindings:
+            with self.subTest(home=home):
+                self.assertEqual(
+                    token_binding,
+                    f'BAO_TOKEN_PATH="{home}/.bao-token" \\',
+                )
+        self.assertIn(
+            'env HOME="$path" \\\n'
+            '      BAO_TOKEN_PATH="$path/.bao-token" \\',
+            self.implementation(),
+        )
+
+    def test_legacy_default_token_helper_cleanup_removes_valid_orphan(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            helper_root=$2
+            chmod 700 "$helper_root"
+            path=$(mktemp -d "$helper_root/openbao-stage180.XXXXXX")
+            trap 'rm -f -- "$path/.vault-token"; rmdir -- "$path" 2>/dev/null || true' EXIT
+            printf 'synthetic-token\n' >"$path/.vault-token"
+            chmod 600 "$path/.vault-token"
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            set +e
+            openbao_legacy_default_token_helpers_cleanup "$helper_root"
+            rc=$?
+            set -e
+            if [[ -e "$path" || -L "$path" ]]; then present=true; else present=false; fi
+            printf 'RC=%s\nPRESENT=%s\n' "$rc" "$present"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'legacy-helper-cleanup',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=0\nPRESENT=false\n')
+
+    def test_legacy_stage180_process_check_rejects_an_old_runner(self) -> None:
+        temporary = self.temporary_directory()
+        proc_root = temporary / 'proc'
+        proc_root.mkdir(mode=0o700)
+        old_process = proc_root / '4242'
+        old_process.mkdir(mode=0o700)
+        repo_root = '/opt/uni-code/engineering-platform-gitops'
+        stage_entrypoint = (
+            f'{repo_root}/scripts/bootstrap/stages/'
+            '180-openbao-initialize/run.sh'
+        )
+        (old_process / 'cmdline').write_bytes(
+            b'/bin/bash\0' + stage_entrypoint.encode('ascii') +
+            b'\0--recover-start\0'
+        )
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_REPO_ROOT=$2
+            proc_root=$3
+            set +e
+            openbao_legacy_stage180_processes_absent "$proc_root"
+            active_rc=$?
+            rm -f -- "$proc_root/4242/cmdline"
+            rmdir -- "$proc_root/4242"
+            openbao_legacy_stage180_processes_absent "$proc_root"
+            empty_rc=$?
+            set -e
+            printf 'ACTIVE_RC=%s\nEMPTY_RC=%s\n' "$active_rc" "$empty_rc"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'legacy-process-check',
+                str(OPENBAO_INITIALIZE_LIB), repo_root, str(proc_root),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'ACTIVE_RC=1\nEMPTY_RC=0\n')
+
+    def test_legacy_default_token_helper_cleanup_rejects_unsafe_batch(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            helper_root=$2
+            chmod 700 "$helper_root"
+            safe=$(mktemp -d "$helper_root/openbao-stage180.XXXXXX")
+            unsafe=$(mktemp -d "$helper_root/openbao-stage180.XXXXXX")
+            cleanup_fixture() {
+              rm -f -- "$safe/.vault-token" "$unsafe/.vault-token" "$unsafe/extra"
+              rmdir -- "$safe" "$unsafe" 2>/dev/null || true
+            }
+            trap cleanup_fixture EXIT
+            printf 'synthetic-token\n' >"$safe/.vault-token"
+            printf 'synthetic-token\n' >"$unsafe/.vault-token"
+            printf 'unexpected\n' >"$unsafe/extra"
+            chmod 600 "$safe/.vault-token" "$unsafe/.vault-token" "$unsafe/extra"
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            set +e
+            openbao_legacy_default_token_helpers_cleanup "$helper_root"
+            rc=$?
+            set -e
+            if [[ -f "$safe/.vault-token" && -f "$unsafe/.vault-token" &&
+                  -f "$unsafe/extra" ]]; then
+              preserved=true
+            else
+              preserved=false
+            fi
+            printf 'RC=%s\nPRESERVED=%s\n' "$rc" "$preserved"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'unsafe-legacy-helper-cleanup',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=1\nPRESERVED=true\n')
+
+    def test_legacy_cleanup_second_pass_drift_deletes_nothing(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        fake_stat = binary_directory / 'stat'
+        fake_stat.write_text(textwrap.dedent(
+            r'''
+            #!/bin/bash
+            set -eu
+            last=${!#}
+            if [[ "$last" == "$TEST_MUTATE_PATH" ]]; then
+              count=0
+              [[ ! -e "$TEST_STAT_COUNT" ]] || read -r count <"$TEST_STAT_COUNT"
+              count=$((count + 1))
+              printf '%s\n' "$count" >"$TEST_STAT_COUNT"
+              if (( count == 3 )); then
+                printf 'unexpected\n' >"$TEST_MUTATE_PATH/extra"
+                chmod 600 "$TEST_MUTATE_PATH/extra"
+              fi
+            fi
+            exec /usr/bin/stat "$@"
+            '''
+        ).lstrip(), encoding='utf-8')
+        fake_stat.chmod(0o755)
+        helper_root = temporary / 'helpers'
+        helper_root.mkdir(mode=0o700)
+        first = helper_root / 'openbao-stage180.ABC123'
+        second = helper_root / 'openbao-stage180.XYZ789'
+        first.mkdir(mode=0o700)
+        second.mkdir(mode=0o700)
+        for directory in (first, second):
+            token = directory / '.vault-token'
+            token.write_text('synthetic-token\n', encoding='ascii')
+            token.chmod(0o600)
+        count_file = temporary / 'stat-count'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            export PATH="$2:$PATH"
+            export TEST_MUTATE_PATH=$3
+            export TEST_STAT_COUNT=$4
+            helper_root=$5
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            set +e
+            openbao_legacy_default_token_helpers_cleanup "$helper_root"
+            rc=$?
+            set -e
+            if [[ -f "$helper_root/openbao-stage180.ABC123/.vault-token" &&
+                  -f "$helper_root/openbao-stage180.XYZ789/.vault-token" &&
+                  -f "$helper_root/openbao-stage180.XYZ789/extra" ]]; then
+              preserved=true
+            else
+              preserved=false
+            fi
+            printf 'RC=%s\nPRESERVED=%s\n' "$rc" "$preserved"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'legacy-second-pass-drift',
+                str(OPENBAO_INITIALIZE_LIB), str(binary_directory),
+                str(second), str(count_file), str(helper_root),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=1\nPRESERVED=true\n')
 
     def test_unseal_progress_uses_independent_public_readback(self) -> None:
         script = textwrap.dedent(

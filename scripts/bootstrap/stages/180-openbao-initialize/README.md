@@ -58,6 +58,7 @@ candidate 包的清理不是本操作的一部分，必须另列精确路径并�
 - `source-recovery-bundle-unsafe`
 - `interactive-tty-required`
 - `openbao-root-login-failed`
+- `legacy-stage180-session-active`
 - `remote-session-cleanup-failed`
 - `openbao-cluster-identity-invalid`
 - `openbao-rotation-state-unsafe`
