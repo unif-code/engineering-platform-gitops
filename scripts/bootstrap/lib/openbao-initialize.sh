@@ -346,14 +346,15 @@ try:
             and document['t'] == 0
             and document['n'] == 0
             and document['progress'] == 0
-            and document['required'] == 0
+            # required is the current seal threshold even without a rotation.
+            and document['required'] == 3
             and document['pgp_fingerprints'] is None
             and document['backup'] is False
             and document['verification_required'] is False
             and verification_nonce == ''
         )
         if idle:
-            fields = ('IDLE', '', '0', '0', '')
+            fields = ('IDLE', '', '0', '3', '')
         else:
             fingerprints = document['pgp_fingerprints']
             if (
@@ -407,8 +408,8 @@ try:
         idle = (
             document['started'] is False
             and document['nonce'] == ''
-            and document['t'] == 0
-            and document['n'] == 0
+            and document['t'] == 3
+            and document['n'] == 5
             and document['progress'] == 0
         )
         if idle:
@@ -441,7 +442,7 @@ PY
 }
 
 openbao_rotation_status() {
-  local kind=$1
+  local kind=$1 status_rc=0
   local -a fields=()
   case "$kind" in
     normal)
@@ -479,10 +480,25 @@ openbao_rotation_status() {
       OPENBAO_ROTATION_VERIFICATION_PROGRESS=
       openbao_rotation_response_file_prepare \
         "$OPENBAO_ROTATION_VERIFICATION_RESPONSE" || return 1
-      openbao_bao operator rotate-keys -status -verify -format=json \
-        >"$OPENBAO_ROTATION_VERIFICATION_RESPONSE" || return 1
       openbao_rotation_response_file_prepare \
         "$OPENBAO_ROTATION_VERIFICATION_STATE" || return 1
+      # Reuse the private transient state file for stderr; never print it.
+      openbao_bao operator rotate-keys -status -verify -format=json \
+        >"$OPENBAO_ROTATION_VERIFICATION_RESPONSE" \
+        2>"$OPENBAO_ROTATION_VERIFICATION_STATE" || status_rc=$?
+      if (( status_rc != 0 )); then
+        [[ "$status_rc" == 2 ]] || return 1
+        openbao_rotation_verification_configuration_absent || return 1
+        # A final verification submission removes the configuration. Cached
+        # normal status may still say COMPLETE, so require a fresh idle read.
+        openbao_rotation_status normal || return 1
+        [[ "$OPENBAO_ROTATION_PHASE" == IDLE ]] || return 1
+        : >"$OPENBAO_ROTATION_VERIFICATION_STATE" || return 1
+        OPENBAO_ROTATION_VERIFICATION_PHASE=IDLE
+        OPENBAO_ROTATION_VERIFICATION_PROGRESS=0
+        return 0
+      fi
+      [[ ! -s "$OPENBAO_ROTATION_VERIFICATION_STATE" ]] || return 1
       openbao_rotation_status_parse verification \
         "$OPENBAO_ROTATION_VERIFICATION_RESPONSE" \
         "$OPENBAO_ROTATION_VERIFICATION_STATE" || return 1
@@ -492,9 +508,45 @@ openbao_rotation_status() {
       OPENBAO_ROTATION_VERIFICATION_PHASE=${fields[0]}
       OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=${fields[1]}
       OPENBAO_ROTATION_VERIFICATION_PROGRESS=${fields[2]}
+      if [[ "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE ]]; then
+        # A successful not-started verification response has the configured
+        # 5/3 parameters and is valid only while old-share quorum is pending.
+        openbao_rotation_status normal || return 1
+        [[ "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_PENDING ]] || return 1
+      fi
       ;;
     *) return 1 ;;
   esac
+}
+
+openbao_rotation_verification_configuration_absent() {
+  "$PYTHON_BINARY" -I -B - "$OPENBAO_ROTATION_VERIFICATION_RESPONSE" \
+    "$OPENBAO_ROTATION_VERIFICATION_STATE" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    response_path, error_path = sys.argv[1:]
+    for path in (response_path, error_path):
+        metadata = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4096:
+            raise ValueError
+    if open(response_path, 'rb').read():
+        raise ValueError
+    error = open(error_path, 'rb').read()
+    expected = (
+        b'Error reading rotate status: Error making API request.\n\n'
+        b'URL: GET https://openbao.openbao.svc:8200/v1/sys/rotate/root/verify\n'
+        b'Code: 400. Errors:\n\n* no rotation configuration found\n'
+    )
+    if error not in (
+        expected, expected + b'command terminated with exit code 2\n',
+    ):
+        raise ValueError
+except Exception:
+    raise SystemExit(1)
+PY
 }
 
 openbao_recovery_root_is_safe() {
@@ -2725,7 +2777,7 @@ openbao_incident_live_rotation_is_idle() {
   openbao_rotation_status verification || rc=1
   [[ "$OPENBAO_ROTATION_PHASE" == IDLE &&
      "$OPENBAO_ROTATION_PROGRESS" == 0 &&
-     "$OPENBAO_ROTATION_REQUIRED" == 0 &&
+     "$OPENBAO_ROTATION_REQUIRED" == 3 &&
      -z "$OPENBAO_ROTATION_NONCE" &&
      -z "$OPENBAO_ROTATION_VERIFICATION_NONCE" &&
      "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
@@ -3324,7 +3376,7 @@ openbao_recover_verify_fail() {
 openbao_rotation_live_fields_are_idle() {
   [[ "$OPENBAO_ROTATION_PHASE" == IDLE &&
      "$OPENBAO_ROTATION_PROGRESS" == 0 &&
-     "$OPENBAO_ROTATION_REQUIRED" == 0 &&
+     "$OPENBAO_ROTATION_REQUIRED" == 3 &&
      -z "$OPENBAO_ROTATION_NONCE" &&
      -z "$OPENBAO_ROTATION_VERIFICATION_NONCE" &&
      "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
