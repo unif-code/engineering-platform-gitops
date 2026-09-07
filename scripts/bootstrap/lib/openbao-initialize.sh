@@ -363,7 +363,7 @@ try:
                 or document['t'] != 3
                 or document['n'] != 5
                 or document['required'] != 3
-                or document['progress'] not in (0, 1, 2, 3)
+                or document['progress'] not in (0, 1, 2)
                 or not isinstance(fingerprints, list)
                 or len(fingerprints) != 5
                 or any(
@@ -376,14 +376,14 @@ try:
                 or document['verification_required'] is not True
             ):
                 raise ValueError
-            if document['progress'] < 3:
-                if verification_nonce != '':
-                    raise ValueError
+            if verification_nonce == '':
                 phase = 'OLD_QUORUM_PENDING'
             else:
+                # v2.6.1 clears RotationProgress after combining old shares.
+                # Completion is identified by the verification nonce, not 3.
                 if (
-                    verification_nonce != ''
-                    and nonce_pattern.fullmatch(verification_nonce) is None
+                    document['progress'] != 0
+                    or nonce_pattern.fullmatch(verification_nonce) is None
                 ):
                     raise ValueError
                 phase = 'OLD_QUORUM_COMPLETE'
@@ -1867,6 +1867,7 @@ trap '\''exit 130'\'' INT
 trap '\''exit 143'\'' TERM
 stty -echo
 printf '\''OPENBAO_HIDDEN_INPUT_READY=%s\n'\'' "$1" >&2
+printf '\''[解封 OpenBao · 第 %s/3 份旧份额] 等待下一行隐藏提示；粘贴旧恢复包中本轮尚未使用的一份解密值。\n'\'' "${1##*-}" >&2
 bao operator unseal -format=json >/dev/null
 ' openbao-hidden-input "$input_label"
 }
@@ -1893,6 +1894,7 @@ trap '\''exit 130'\'' INT
 trap '\''exit 143'\'' TERM
 stty -echo
 printf '\''OPENBAO_HIDDEN_INPUT_READY=%s\n'\'' "$1" >&2
+printf '\''%s\n'\'' '\''[root 登录] 等待下一行 Token 隐藏提示；粘贴旧恢复包中 root 的解密值，不是份额，也不是 GPG 口令。'\'' >&2
 bao login -no-print >/dev/null
 ' openbao-hidden-input "$input_label"
 }
@@ -1965,12 +1967,14 @@ env HOME="$1" \
 }
 
 openbao_rotation_submit_share() {
-  local rotation_nonce=$1 response=$2 rc
+  [[ $# -eq 3 ]] || return 1
+  local rotation_nonce=$1 response=$2 attempt=$3 rc prompt
   set +x
-  [[ "$rotation_nonce" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || return 1
+  [[ "$rotation_nonce" =~ ^[A-Za-z0-9_-]{8,128}$ &&
+     "$attempt" =~ ^[123]$ ]] || return 1
   openbao_rotation_response_file_prepare "$response" || return 1
-  if ! openbao_prompt_secret \
-      'Paste one of the three other old unseal shares (hidden): '; then
+  printf -v prompt '[旧份额轮换授权 · 第 %s/3 份] 粘贴旧恢复包中本轮尚未使用的一份解密值（可复用解封时的份额；此处隐藏输入）: ' "$attempt"
+  if ! openbao_prompt_secret "$prompt"; then
     OPENBAO_SECRET_INPUT=
     unset OPENBAO_SECRET_INPUT
     return 1
@@ -1993,12 +1997,14 @@ openbao_rotation_submit_share() {
 }
 
 openbao_rotation_verification_submit_share() {
-  local verification_nonce=$1 response=$2 rc
+  [[ $# -eq 3 ]] || return 1
+  local verification_nonce=$1 response=$2 attempt=$3 rc prompt
   set +x
-  [[ "$verification_nonce" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || return 1
+  [[ "$verification_nonce" =~ ^[A-Za-z0-9_-]{8,128}$ &&
+     "$attempt" =~ ^[123]$ ]] || return 1
   openbao_rotation_response_file_prepare "$response" || return 1
-  if ! openbao_prompt_secret \
-      'Paste one new unseal share for rotation verification (hidden): '; then
+  printf -v prompt '[新份额验证 · 第 %s/3 份] 粘贴新候选恢复包中本轮尚未使用的一份解密值（不要使用旧包；此处隐藏输入）: ' "$attempt"
+  if ! openbao_prompt_secret "$prompt"; then
     OPENBAO_SECRET_INPUT=
     unset OPENBAO_SECRET_INPUT
     return 1
@@ -2394,6 +2400,7 @@ openbao_unseal_interactively() {
     openbao_bao_tty_public "unseal-share-${attempt}" operator unseal \
       -format=json || return 1
     openbao_unseal_progress_is_safe "$attempt" || return 1
+    printf '[解封 OpenBao] %s/3 已由服务器回读确认。\n' "$attempt" >&2
   done
   [[ "$(openbao_state_flags)" == 'true|false' ]]
 }
@@ -3274,10 +3281,10 @@ openbao_stage_180_recover_start() {
   if [[ "$artifact_state" == MISSING &&
         "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_PENDING ]]; then
     expected_rotation_nonce=$OPENBAO_ROTATION_NONCE
-    while (( OPENBAO_ROTATION_PROGRESS < OPENBAO_ROTATION_REQUIRED )); do
+    while [[ "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_PENDING ]]; do
       expected_progress=$((OPENBAO_ROTATION_PROGRESS + 1))
       openbao_rotation_submit_share "$expected_rotation_nonce" \
-        "$OPENBAO_ROTATION_RESPONSE" ||
+        "$OPENBAO_ROTATION_RESPONSE" "$expected_progress" ||
         openbao_recover_start_fail STOP_APPLY_FAILED \
           openbao-rotation-share-submit-failed "$EXIT_APPLY_FAILED"
       openbao_rotation_status normal ||
@@ -3291,9 +3298,10 @@ openbao_stage_180_recover_start() {
            "$OPENBAO_ROTATION_PROGRESS" == "$expected_progress" ]] ||
           openbao_recover_start_fail STOP_UNKNOWN_STATE \
             openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+        printf '[旧份额轮换授权] %s/3 已由服务器回读确认。\n' "$expected_progress" >&2
       else
         [[ "$OPENBAO_ROTATION_PHASE" == OLD_QUORUM_COMPLETE &&
-           "$OPENBAO_ROTATION_PROGRESS" == 3 ]] ||
+           "$OPENBAO_ROTATION_PROGRESS" == 0 ]] ||
           openbao_recover_start_fail STOP_UNKNOWN_STATE \
             openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
         submitted_final_response=true
@@ -3312,6 +3320,7 @@ openbao_stage_180_recover_start() {
     [[ "$submitted_final_response" == true ]] ||
       openbao_recover_start_fail STOP_UNKNOWN_STATE \
         openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
+    printf '%s\n' '[旧份额轮换授权] 3/3 已由服务器回读确认；下一阶段验证新份额，旧份额尚未失效。' >&2
     response_kind=direct
   fi
 
@@ -3564,7 +3573,8 @@ openbao_stage_180_recover_verify() {
       while (( OPENBAO_ROTATION_VERIFICATION_PROGRESS < 3 )); do
         expected_progress=$((OPENBAO_ROTATION_VERIFICATION_PROGRESS + 1))
         openbao_rotation_verification_submit_share \
-          "$expected_verification_nonce" "$OPENBAO_ROTATION_RESPONSE" ||
+          "$expected_verification_nonce" "$OPENBAO_ROTATION_RESPONSE" \
+          "$expected_progress" ||
           openbao_recover_verify_fail STOP_APPLY_FAILED \
             rotation-verification-failed "$EXIT_APPLY_FAILED"
         openbao_rotation_status verification ||
@@ -3585,6 +3595,7 @@ openbao_stage_180_recover_verify() {
               openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
           OPENBAO_ROTATION_VERIFICATION_PROGRESS=3
         fi
+        printf '[新份额验证] %s/3 已由服务器回读确认。\n' "$expected_progress" >&2
       done
     fi
 

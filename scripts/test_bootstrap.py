@@ -9180,13 +9180,38 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         artifact_state: str = 'MISSING',
         failure: str = '',
         preserve_final_response: bool = False,
+        real_status: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         """Run the real recover-start state machine over controlled live facts."""
         temporary = self.temporary_directory()
         call_log = temporary / 'recover-start-calls.log'
+        if real_status:
+            fingerprint = self.PUBLIC_KEY_FINGERPRINT
+            (temporary / 'fingerprint').write_text(fingerprint + '\n', encoding='ascii')
+            idle = {
+                'nonce': '', 'started': False, 't': 0, 'n': 0, 'progress': 0,
+                'required': 3, 'pgp_fingerprints': None, 'backup': False,
+                'verification_required': False, 'verification_nonce': '',
+            }
+            for progress in (-1, 0, 1, 2, 3):
+                normal = idle if progress == -1 else {
+                    **idle, 'nonce': 'synthetic-old-rotation-nonce',
+                    'started': True, 't': 3, 'n': 5,
+                    'progress': progress if progress < 3 else 0,
+                    'pgp_fingerprints': [fingerprint] * 5, 'backup': True,
+                    'verification_required': True,
+                    'verification_nonce': 'synthetic-verification-nonce' if progress == 3 else '',
+                }
+                verification = {
+                    'nonce': 'synthetic-verification-nonce' if progress == 3 else '',
+                    'started': progress == 3, 't': 3, 'n': 5, 'progress': 0,
+                }
+                for kind, payload in (('normal', normal), ('verification', verification)):
+                    (temporary / f'{kind}-{progress}.json').write_text(json.dumps(payload))
         script = textwrap.dedent(
             r'''
             source "$1"
+            TEST_REAL_ROTATION_STATUS=$(declare -f openbao_rotation_status)
             TEST_CALL_LOG=$2
             TEST_STATE=$3
             TEST_ROTATION_PROGRESS=$4
@@ -9196,6 +9221,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             OPENBAO_SOURCE_RECOVERY_SHA=$8
             OPENBAO_RECOVERY_ID=$9
             TEST_PRESERVE_FINAL_RESPONSE=${10}
+            TEST_REAL_STATUS=${11}
             OPENBAO_ROTATION_CANDIDATE_ARCHIVE=/root/openbao-recovery/candidate.tar.gz
             OPENBAO_ROTATION_CANDIDATE_SIDECAR=/root/openbao-recovery/candidate.tar.gz.sha256
             if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
@@ -9281,6 +9307,9 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                     OPENBAO_ROTATION_NONCE=synthetic-drifted-rotation-nonce
                   fi
                   OPENBAO_ROTATION_PROGRESS=$TEST_ROTATION_PROGRESS
+                  if (( TEST_ROTATION_PROGRESS == 3 )); then
+                    OPENBAO_ROTATION_PROGRESS=0
+                  fi
                   OPENBAO_ROTATION_REQUIRED=3
                   ;;
                 verification)
@@ -9310,6 +9339,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             }
             openbao_rotation_submit_share() {
               [[ "$1" == synthetic-old-rotation-nonce ]] || return 1
+              [[ "$3" == "$((TEST_ROTATION_PROGRESS + 1))" ]] || return 1
               TEST_ROTATION_PROGRESS=$((TEST_ROTATION_PROGRESS + 1))
               if (( TEST_ROTATION_PROGRESS == 3 )); then
                 TEST_VERIFICATION_PROGRESS=0
@@ -9370,6 +9400,30 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
               exit "$3"
             }
 
+            if [[ "$TEST_REAL_STATUS" == true ]]; then
+              eval "$TEST_REAL_ROTATION_STATUS"
+              TEST_FIXTURES=${TEST_CALL_LOG%/*}
+              PYTHON_BINARY=/usr/bin/python3
+              OPENBAO_PUBLIC_KEY_FINGERPRINT=$TEST_FIXTURES/fingerprint
+              OPENBAO_ROTATION_STATUS_RESPONSE=$TEST_FIXTURES/status.json
+              OPENBAO_ROTATION_STATUS_STATE=$TEST_FIXTURES/status.state
+              OPENBAO_ROTATION_VERIFICATION_RESPONSE=$TEST_FIXTURES/verification.json
+              OPENBAO_ROTATION_VERIFICATION_STATE=$TEST_FIXTURES/verification.state
+              openbao_bao() {
+                local kind=normal
+                if [[ " $* " == *' -verify '* ]]; then
+                  kind=verification
+                  if (( TEST_ROTATION_PROGRESS == -1 )); then
+                    printf '%s\n' \
+                      'Error reading rotate status: Error making API request.' '' \
+                      'URL: GET https://openbao.openbao.svc:8200/v1/sys/rotate/root/verify' \
+                      'Code: 400. Errors:' '' '* no rotation configuration found' >&2
+                    return 2
+                  fi
+                fi
+                cat "$TEST_FIXTURES/${kind}-${TEST_ROTATION_PROGRESS}.json"
+              }
+            fi
             openbao_stage_180_recover_start
             '''
         )
@@ -9380,6 +9434,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                 str(rotation_progress), str(verification_progress),
                 artifact_state, failure, self.SOURCE_SHA, self.CURRENT_SHA,
                 str(preserve_final_response).lower(),
+                str(real_status).lower(),
             ],
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
@@ -12137,6 +12192,26 @@ else:
         self.assertLess(calls.index('old-share-3'), calls.index('candidate-write'))
         self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
 
+    def test_recover_start_replays_real_status_through_quorum_and_resume(self) -> None:
+        for progress in (-1, 1, 3):
+            with self.subTest(progress=progress):
+                result, calls = self.run_recover_start(
+                    state='true|false', rotation_progress=progress,
+                    verification_progress=0 if progress == 3 else -1,
+                    real_status=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('RESULT=PASS_OPENBAO_RECOVERY_STARTED', result.stdout)
+                self.assertEqual(
+                    [call for call in calls if call.startswith('old-share-')],
+                    [f'old-share-{n}' for n in range(max(0, progress) + 1, 4)],
+                )
+                self.assertEqual(calls.count('rotation-init-5-3-pgp-verify-backup'), int(progress == -1))
+                self.assertEqual(calls.count('backup-retrieve'), int(progress == 3))
+                if progress < 3:
+                    self.assertIn('[旧份额轮换授权] 3/3 已由服务器回读确认', result.stderr)
+                self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
     def test_recover_start_rejects_rotation_nonce_drift_before_next_share(
         self,
     ) -> None:
@@ -12786,6 +12861,7 @@ else:
             OPENBAO_ROTATION_RESPONSE=$3
             export OPENBAO_SECRET_INPUT=preexisting-exported-value
             openbao_prompt_secret() {
+              printf '%s' "$1" >"${TEST_COMMAND_LOG}.prompt"
               OPENBAO_SECRET_INPUT=synthetic-new-share
             }
             openbao_bao_stdin() {
@@ -12798,7 +12874,7 @@ else:
             }
             openbao_rotation_response_file_prepare "$OPENBAO_ROTATION_RESPONSE"
             openbao_rotation_verification_submit_share \
-              synthetic-verification-nonce "$OPENBAO_ROTATION_RESPONSE"
+              synthetic-verification-nonce "$OPENBAO_ROTATION_RESPONSE" 2
             [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
             '''
         )
@@ -12811,11 +12887,32 @@ else:
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
+        self.assertIn('[新份额验证 · 第 2/3 份]', Path(str(command_log) + '.prompt').read_text())
         self.assertEqual(
             command_log.read_text(encoding='utf-8'),
             'operator rotate-keys -format=json -verify '
             '-nonce=synthetic-verification-nonce -\n',
         )
+
+    def test_rotation_share_rejects_invalid_attempt_before_input_or_write(self) -> None:
+        script = textwrap.dedent(r'''
+            source "$1"
+            openbao_rotation_response_file_prepare() { echo FORBIDDEN-write; }
+            openbao_prompt_secret() { echo FORBIDDEN-input; }
+            openbao_bao_stdin() { echo FORBIDDEN-submit; }
+            "$2" synthetic-rotation-nonce unused-response "$3"
+            ''')
+        for function in ('openbao_rotation_submit_share',
+                         'openbao_rotation_verification_submit_share'):
+            for attempt in ('', '0', '4', '1x', '01'):
+                with self.subTest(function=function, attempt=attempt):
+                    result = self.run_command(
+                        ['/bin/bash', '-c', script, 'invalid-attempt',
+                         str(OPENBAO_INITIALIZE_LIB), function, attempt],
+                        env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout + result.stderr, '')
 
     def test_rotation_backup_delete_uses_the_authenticated_session(self) -> None:
         command_log = self.temporary_directory() / 'backup-delete.log'
@@ -13392,7 +13489,9 @@ openbao_apply_configuration_with_root
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             result.stderr,
-            'OPENBAO_HIDDEN_INPUT_READY=root-token\r\nSynthetic hidden: ',
+            'OPENBAO_HIDDEN_INPUT_READY=root-token\r\n'
+            '[root 登录] 等待下一行 Token 隐藏提示；粘贴旧恢复包中 root 的解密值，'
+            '不是份额，也不是 GPG 口令。\r\nSynthetic hidden: ',
         )
 
     def run_synthetic_hidden_cli(self, arguments, *, env):
@@ -13805,6 +13904,7 @@ openbao_apply_configuration_with_root
             TEST_COMMAND_LOG=$3
             export OPENBAO_SECRET_INPUT=preexisting-exported-value
             openbao_prompt_secret() {
+              printf '%s' "$1" >"${TEST_COMMAND_LOG}.prompt"
               OPENBAO_SECRET_INPUT=synthetic-test-share
             }
             openbao_bao_stdin() {
@@ -13819,7 +13919,7 @@ openbao_apply_configuration_with_root
             }
             openbao_rotation_response_file_prepare "$OPENBAO_ROTATION_RESPONSE"
             openbao_rotation_submit_share synthetic-rotation-nonce \
-              "$OPENBAO_ROTATION_RESPONSE"
+              "$OPENBAO_ROTATION_RESPONSE" 1
             if [[ ${OPENBAO_SECRET_INPUT+x} == x ]]; then
               printf 'SECRET_VARIABLE_PRESENT=true\n'
             else
@@ -13836,6 +13936,7 @@ openbao_apply_configuration_with_root
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('[旧份额轮换授权 · 第 1/3 份]', Path(str(command_log) + '.prompt').read_text())
         self.assertEqual(
             result.stdout,
             'SECRET_VARIABLE_PRESENT=false\nRESPONSE_MODE=600\n',
@@ -13939,7 +14040,8 @@ openbao_apply_configuration_with_root
         }
         complete = {
             **valid,
-            'progress': 3,
+            'progress': 0,
+            'verification_nonce': 'synthetic-verification-nonce',
         }
         idle = {
             'nonce': '', 'started': False, 't': 0, 'n': 0,
@@ -13987,7 +14089,10 @@ openbao_apply_configuration_with_root
             ('normal', {**idle, 'required': 0}, 1, ''),
             ('normal', {**idle, 'required': True}, 1, ''),
             ('normal', valid, 0, 'PHASE=OLD_QUORUM_PENDING\nPROGRESS=2\nNONCE_SET=true\n'),
-            ('normal', complete, 0, 'PHASE=OLD_QUORUM_COMPLETE\nPROGRESS=3\nNONCE_SET=true\n'),
+            ('normal', complete, 0, 'PHASE=OLD_QUORUM_COMPLETE\nPROGRESS=0\nNONCE_SET=true\n'),
+            ('normal', {**complete, 'progress': 1}, 1, ''),
+            ('normal', {**complete, 'progress': 3}, 1, ''),
+            ('normal', {**valid, 'progress': 3}, 1, ''),
             ('verification', verification, 0, 'PHASE=PENDING\nPROGRESS=0\nNONCE_SET=true\n'),
             ('normal', {
                 key: value for key, value in valid.items()
@@ -14468,8 +14573,14 @@ openbao_apply_configuration_with_root
         self.assertIn('bao login -no-print', command_log)
         unseal = self.openbao_function_source('openbao_unseal_interactively')
         root_start = self.openbao_function_source('openbao_root_session_start')
+        progress_notice = (
+            "    printf '[解封 OpenBao] %s/3 已由服务器回读确认。\\n' "
+            '\"$attempt\" >&2'
+        )
+        self.assertEqual(unseal.count(progress_notice), 1)
+        unseal_without_notice = unseal.replace(progress_notice, '')
         for forbidden in ('OPENBAO_SECRET_INPUT', 'read ', 'printf'):
-            self.assertNotIn(forbidden, unseal)
+            self.assertNotIn(forbidden, unseal_without_notice)
             self.assertNotIn(forbidden, root_start)
         for forbidden in ('>/dev/null', '2>&1'):
             self.assertNotIn(forbidden, root_start)
@@ -14562,6 +14673,15 @@ openbao_apply_configuration_with_root
                 )
                 self.assertNotIn('synthetic-unseal-status', result.stdout)
                 self.assertNotIn('synthetic-share-', result.stdout)
+                for attempt in range(1, expected_prompts + 1):
+                    self.assertIn(
+                        f'[解封 OpenBao · 第 {attempt}/3 份旧份额]',
+                        result.stdout,
+                    )
+                self.assertEqual(
+                    result.stdout.count('已由服务器回读确认。'),
+                    3 if cli_exit == 0 else 0,
+                )
 
     def test_hidden_tty_is_noecho_before_ready_marker_and_restored(self) -> None:
         temporary = self.temporary_directory()
