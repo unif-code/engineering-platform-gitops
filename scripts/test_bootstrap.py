@@ -9001,6 +9001,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         second_signal_after_output: bytes | None = None,
         foreground_process_group: bool = False,
         report_echo_after: bool = False,
+        timeout: float = 10,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         temporary = self.temporary_directory()
         command_log = temporary / 'kubectl-argv.log'
@@ -9084,13 +9085,15 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         signal_sent = False
         second_signal_sent = False
         second_signal_at: float | None = None
-        deadline = time.monotonic() + 10
+        terminal_closed = False
+        deadline = time.monotonic() + timeout
         while process.poll() is None and time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
             if readable:
                 try:
                     pty_output.extend(os.read(master_fd, 4096))
                 except OSError:
+                    terminal_closed = True
                     break
             if (
                 signal_after_output is not None
@@ -9121,6 +9124,32 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                 os.kill(process.pid, second_signal)
                 second_signal_sent = True
         if process.poll() is None:
+            # EOF/EIO on the PTY can precede waitpid visibility. Keep the
+            # original deadline; an early terminal close is not a timeout.
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None:
+            # Only scoped process state, never argv/environ/PTY contents.
+            process_states = []
+            pending_pids = [process.pid]
+            seen_pids = set()
+            while pending_pids and len(seen_pids) < 16:
+                pid = pending_pids.pop()
+                if pid in seen_pids:
+                    continue
+                seen_pids.add(pid)
+                proc = Path('/proc') / str(pid)
+                try:
+                    children = (proc / 'task' / str(pid) / 'children').read_text().split()
+                    pending_pids.extend(int(child) for child in children)
+                    state = (proc / 'stat').read_text().rsplit(') ', 1)[1].split()[0]
+                    wait_channel = (proc / 'wchan').read_text().strip()
+                    if re.fullmatch(r'[A-Za-z0-9_]+', wait_channel):
+                        process_states.append((pid, state, wait_channel))
+                except (OSError, ValueError, IndexError):
+                    continue
             if command_log.exists():
                 pid_log = command_log.read_text(
                     encoding='utf-8', errors='replace',
@@ -9134,7 +9163,12 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                         pass
             process.kill()
             process.wait()
-            self.fail('Stage 180 PTY harness timed out')
+            os.close(master_fd)
+            self.fail(
+                'Stage 180 PTY harness timed out; '
+                f'terminal_closed={terminal_closed}; '
+                f'output_bytes={len(pty_output)}; processes={process_states}'
+            )
         if signal_after_output is not None and not signal_sent:
             self.fail('Stage 180 PTY harness did not observe signal marker')
         if second_signal is not None and not second_signal_sent:
@@ -14545,6 +14579,42 @@ openbao_apply_configuration_with_root
                     call_log.read_text(encoding='utf-8').splitlines(),
                     ['temp-cleanup', 'remote-cleanup'],
                 )
+
+    def test_stage180_pty_waits_for_exit_after_terminal_closes(self) -> None:
+        # The terminal closing is not process completion or a timeout.
+        # Preserve the delayed child's real nonzero exit status.
+        result, _ = self.run_stage180_function_in_pty(
+            'exec 0<&- 1>&- 2>&-; /bin/sleep 0.1; exit 23',
+            pty_input=None,
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, '')
+
+    def test_stage180_pty_closed_terminal_still_enforces_deadline(self) -> None:
+        descriptor_count = len(os.listdir('/proc/self/fd'))
+        started = time.monotonic()
+        with self.assertRaisesRegex(AssertionError, 'PTY harness timed out'):
+            self.run_stage180_function_in_pty(
+                'exec 0<&- 1>&- 2>&-; exec /bin/sleep 30',
+                pty_input=None,
+                timeout=0.2,
+            )
+        self.assertGreaterEqual(time.monotonic() - started, 0.2)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(os.listdir('/proc/self/fd')), descriptor_count)
+
+    def test_stage180_pty_timeout_diagnostics_exclude_terminal_contents(self) -> None:
+        with self.assertRaisesRegex(AssertionError, 'PTY harness timed out') as raised:
+            self.run_stage180_function_in_pty(
+                "printf 'synthetic-private-output\\n'; exec /bin/sleep 30",
+                pty_input=None,
+                timeout=0.2,
+            )
+        message = str(raised.exception)
+        self.assertIn('terminal_closed=False', message)
+        self.assertRegex(message, r'output_bytes=[1-9][0-9]*; processes=\[\(')
+        self.assertNotIn('synthetic-private-output', message)
+        self.assertNotIn('/bin/sleep', message)
 
     def test_unseal_and_root_login_use_true_tty_without_outer_capture(
         self,
