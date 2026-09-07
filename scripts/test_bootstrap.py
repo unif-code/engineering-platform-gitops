@@ -2011,6 +2011,58 @@ class KubectlLibraryTest(BootstrapTestCase):
         self.assertIn('FIRST_STATUS=2\nFIRST_BUFFER=S\n', result.stdout)
         self.assertIn('MESSAGE=STOPPED|OK\n', result.stdout)
 
+    def test_isolated_control_reader_keeps_delimiters_at_timeout_boundary(self) -> None:
+        # Force the real Bash read to report timeout after consuming data.
+        # Losing its delimiter must not concatenate two protocol messages.
+        script = textwrap.dedent(r'''
+            source "$1"
+            read() {
+              local boundary_status=0 boundary_target=${!#}
+              builtin read "$@" || boundary_status=$?
+              [[ -n "${!boundary_target}" ]] && return 142
+              return "$boundary_status"
+            }
+            exec {control_fd}< <(printf 'DONE|23\nSTOPPED|OK\n')
+            KUBE_RUNNER_CONTROL_READ_FD=$control_fd
+            for _ in 1 2; do
+              status=0
+              kubectl_isolated_read_control 0.01 || status=$?
+              printf 'STATUS=%s MESSAGE=%s\n' "$status" "$KUBE_RUNNER_CONTROL_MESSAGE"
+            done
+            ''')
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'control-boundary', str(KUBECTL_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'STATUS=0 MESSAGE=DONE|23', 'STATUS=0 MESSAGE=STOPPED|OK',
+        ])
+        self.assertEqual(result.stderr, '')
+
+    def test_isolated_control_reader_drains_complete_lines_before_eof(self) -> None:
+        script = textwrap.dedent(r'''
+            source "$1"
+            exec {control_fd}< <(printf 'DONE|23\nSTOPPED|OK\nunfinished')
+            KUBE_RUNNER_CONTROL_READ_FD=$control_fd
+            for _ in 1 2 3; do
+              status=0
+              kubectl_isolated_read_control 0.01 || status=$?
+              printf 'STATUS=%s MESSAGE=%s\n' "$status" "$KUBE_RUNNER_CONTROL_MESSAGE"
+            done
+            printf 'BUFFER=%s\n' "$KUBE_RUNNER_CONTROL_BUFFER"
+            ''')
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'control-eof', str(KUBECTL_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'STATUS=0 MESSAGE=DONE|23', 'STATUS=0 MESSAGE=STOPPED|OK',
+            'STATUS=1 MESSAGE=', 'BUFFER=',
+        ])
+        self.assertEqual(result.stderr, '')
+
     def test_isolated_supervisor_never_reuses_reaped_leader_group(self) -> None:
         body = KUBECTL_LIB.read_text(encoding='utf-8')
         helper = body.split(
@@ -14578,6 +14630,32 @@ openbao_apply_configuration_with_root
                 self.assertEqual(
                     call_log.read_text(encoding='utf-8').splitlines(),
                     ['temp-cleanup', 'remote-cleanup'],
+                )
+
+    def test_supervisor_completion_survives_control_timeout_boundary(self) -> None:
+        for binary, expected_exit in (('/bin/true', 0), ('/bin/false', 1)):
+            with self.subTest(expected_exit=expected_exit):
+                script = f'kubectl_binary={binary}\n' + textwrap.dedent(r'''
+                    read() {
+                      local boundary_status=0 boundary_target=${!#}
+                      builtin read "$@" || boundary_status=$?
+                      [[ "${!boundary_target}" == DONE\|* ]] && return 142
+                      return "$boundary_status"
+                    }
+                    ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                    admin_conf_is_safe() { :; }
+                    kubectl_isolated_start --synthetic || exit 97
+                    printf 'PID=%s\nPID=%s\n' \
+                      "$KUBE_RUNNER_PID" "$KUBE_RUNNER_GROUP" >>"$TEST_COMMAND_LOG"
+                    kubectl_isolated_wait_interruptibly
+                    ''')
+                result, logged = self.run_stage180_function_in_pty(
+                    script, pty_input=None,
+                )
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertEqual(result.stdout, '')
+                self.assert_hidden_tty_fixture_pids_are_gone(
+                    logged, minimum=2, require_late=False,
                 )
 
     def test_stage180_pty_waits_for_exit_after_terminal_closes(self) -> None:

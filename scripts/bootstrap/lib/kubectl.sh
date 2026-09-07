@@ -93,19 +93,22 @@ kubectl_isolated_state_clear() {
 }
 
 kubectl_isolated_read_control() {
-  local timeout=$1 fragment='' read_status
+  local timeout=$1 fragment='' read_status=0
   [[ "$timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   [[ "$KUBE_RUNNER_CONTROL_READ_FD" =~ ^[0-9]+$ ]] || return 1
   KUBE_RUNNER_CONTROL_MESSAGE=
-  if IFS= read -r -t "$timeout" \
-    -u "$KUBE_RUNNER_CONTROL_READ_FD" fragment; then
-    KUBE_RUNNER_CONTROL_MESSAGE=${KUBE_RUNNER_CONTROL_BUFFER}${fragment}
-    KUBE_RUNNER_CONTROL_BUFFER=
-    return 0
-  else
-    read_status=$?
+  # A timed line read can consume its newline yet report a timeout. Keep
+  # delimiters in the payload so completion never depends on that exit race.
+  if [[ "$KUBE_RUNNER_CONTROL_BUFFER" != *$'\n'* ]]; then
+    IFS= read -r -N 4096 -t "$timeout" \
+      -u "$KUBE_RUNNER_CONTROL_READ_FD" fragment || read_status=$?
+    KUBE_RUNNER_CONTROL_BUFFER+=${fragment}
   fi
-  KUBE_RUNNER_CONTROL_BUFFER+=${fragment}
+  if [[ "$KUBE_RUNNER_CONTROL_BUFFER" == *$'\n'* ]]; then
+    KUBE_RUNNER_CONTROL_MESSAGE=${KUBE_RUNNER_CONTROL_BUFFER%%$'\n'*}
+    KUBE_RUNNER_CONTROL_BUFFER=${KUBE_RUNNER_CONTROL_BUFFER#*$'\n'}
+    return 0
+  fi
   if [[ "$read_status" == 1 ]]; then
     KUBE_RUNNER_CONTROL_BUFFER=
     return 1
