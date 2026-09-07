@@ -8666,6 +8666,61 @@ class OpenBaoInitializationStageTest(BootstrapTestCase):
     ) + b'\n'
     PUBLIC_KEY_SHA256 = hashlib.sha256(PUBLIC_KEY_BYTES).hexdigest()
 
+    def test_live_cluster_identity_accepts_openbao_random_uuid_shape(self) -> None:
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+openbao_status_json() {
+  printf '%s\n' '{"cluster_id":"b9cdd046-df21-f31b-cab3-5052d87769ab","cluster_name":"openbao.labs.killercoda"}'
+}
+openbao_live_cluster_identity || exit $?
+printf 'CLUSTER_ID=%s\nCLUSTER_NAME=%s\n' \
+  "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME"
+'''
+        result = self.run_command([
+            '/bin/bash', '-c', script, 'live-cluster-identity',
+            str(OPENBAO_INITIALIZE_LIB),
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'CLUSTER_ID=b9cdd046-df21-f31b-cab3-5052d87769ab\n'
+            'CLUSTER_NAME=openbao.labs.killercoda\n',
+        )
+
+    def test_live_cluster_identity_rejects_malformed_fields(self) -> None:
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+status_json=$2
+openbao_status_json() { printf '%s\n' "$status_json"; }
+openbao_live_cluster_identity
+'''
+        cases = (
+            {
+                'cluster_id': 'B9CDD046-df21-f31b-cab3-5052d87769ab',
+                'cluster_name': 'openbao-cluster-dev',
+            },
+            {
+                'cluster_id': 'b9cdd046-df21-f31b-cab3-5052d87769a',
+                'cluster_name': 'openbao-cluster-dev',
+            },
+            {
+                'cluster_id': 'b9cdd046-df21-f31b-cab3-5052d87769ab',
+                'cluster_name': 'openbao cluster dev',
+            },
+        )
+        for document in cases:
+            with self.subTest(document=document):
+                result = self.run_command([
+                    '/bin/bash', '-c', script, 'live-cluster-identity-invalid',
+                    str(OPENBAO_INITIALIZE_LIB), json.dumps(document),
+                ])
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
+
     def test_failed_configuration_never_revokes_but_always_cleans(self) -> None:
         script = r'''
 source "$1"
