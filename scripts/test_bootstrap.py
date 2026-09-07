@@ -10667,6 +10667,8 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         current_sha: str,
         recovery_root: Path,
         source_sha: str = '',
+        *,
+        state: str = 'true|true',
     ) -> subprocess.CompletedProcess[str]:
         config = recovery_root.parent / 'config-check'
         config.mkdir(exist_ok=True)
@@ -10689,8 +10691,9 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             OPENBAO_PUBLIC_KEY_FINGERPRINT=$7
             PYTHON_BINARY=/usr/bin/python3
             EXPECTED_PLATFORM_FINGERPRINT=$8
+            TEST_OPENBAO_STATE=$9
             openbao_stage_180_preflight() { :; }
-            openbao_state_flags() { printf 'true|true\\n'; }
+            openbao_state_flags() { printf '%s\\n' "$TEST_OPENBAO_STATE"; }
             openbao_recovery_state() { printf 'MISSING\\n'; }
             openbao_platform_secret_fingerprint() {
               printf '%s\\n' "$EXPECTED_PLATFORM_FINGERPRINT"
@@ -10708,6 +10711,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                 str(OPENBAO_INITIALIZE_LIB), str(repository), current_sha,
                 source_sha, str(recovery_root), str(public_key),
                 str(public_fingerprint), self.PLATFORM_SECRET_FINGERPRINT,
+                state,
             ],
             env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
         )
@@ -11166,6 +11170,39 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             f'--source-recovery-sha={source}',
             adopted.stdout,
         )
+
+    def test_unsealed_recovery_check_requires_verified_source(self) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        archive, _ = self.make_source_bundle(directory=recovery_root, source_sha=source)
+
+        for supplied_source, expected_code, reason in (
+            ('', 10, 'source-recovery-sha-required'),
+            ('invalid', 10, 'source-recovery-sha-invalid'),
+            (source, 0, 'recover-start-required'),
+        ):
+            with self.subTest(source=supplied_source):
+                result = self.run_source_check(
+                    repository, current, recovery_root, supplied_source,
+                    state='true|false',
+                )
+                self.assertEqual(result.returncode, expected_code, result.stdout)
+                self.assertIn(f'REASON={reason}', result.stdout)
+                if expected_code == 0:
+                    self.assertIn('RESULT=PASS_OPENBAO_RECOVERY_CHECK', result.stdout)
+                    self.assertIn(
+                        'NEXT=stages/180-openbao-initialize/run.sh --recover-start '
+                        f'--source-recovery-sha={source}', result.stdout,
+                    )
+
+        archive.write_bytes(b'synthetic-corrupt-bundle')
+        rejected = self.run_source_check(
+            repository, current, recovery_root, source, state='true|false',
+        )
+        self.assertEqual(rejected.returncode, 30, rejected.stdout)
+        self.assertIn('REASON=source-recovery-bundle-unsafe', rejected.stdout)
+        self.assertNotIn('PASS_', rejected.stdout)
 
     def test_stage_180_is_interactive_and_never_orchestrated(self) -> None:
         self.assertTrue(OPENBAO_INITIALIZE.is_file())

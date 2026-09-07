@@ -2988,7 +2988,7 @@ openbao_stage_180_check() {
       complete PASS_OPENBAO_INITIALIZATION_CHECK recovery-finalization-required 0 \
         'stages/180-openbao-initialize/run.sh --initialize'
       ;;
-    'true|true:MISSING')
+    'true|true:MISSING'|'true|false:MISSING')
       [[ -n "$OPENBAO_SOURCE_RECOVERY_SHA" ]] ||
         complete STOP_PRECONDITION "$OPENBAO_REASON_SOURCE_REQUIRED" \
           "$EXIT_PRECONDITION" NONE

@@ -179,6 +179,8 @@ rc=$?; printf '\nCOMMAND_EXIT_CODE=%s\n' "$rc"; (exit "$rc")
 
 预期 `RESULT=PASS_OPENBAO_RECOVERY_CHECK`、`REASON=recover-start-required`，并在 `NEXT` 中回显
 同一 source SHA 的 `--recover-start`。该检查不 unseal、不读取隐藏值、不写 evidence。
+中断后实例已经解封时也可走此检查：仍须验证同一旧恢复包及 source SHA；后续
+`recover-start` 会依据实时封存状态决定是否需要输入 unseal 份额，不会要求重新初始化。
 
 ### 7.2 启动 rotation 并生成候选包
 
