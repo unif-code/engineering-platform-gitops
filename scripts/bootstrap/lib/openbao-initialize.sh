@@ -1865,10 +1865,12 @@ import sys
 document = json.load(sys.stdin)
 cluster_id = document.get("cluster_id")
 cluster_name = document.get("cluster_name")
+# OpenBao cluster IDs are UUID-shaped opaque values; their version and variant
+# nibbles are not constrained to RFC 4122 assignments.
 if (
     not isinstance(cluster_id, str)
     or re.fullmatch(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         cluster_id,
     ) is None
     or not isinstance(cluster_name, str)
