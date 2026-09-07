@@ -9473,7 +9473,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
                     OPENBAO_ROTATION_PHASE=IDLE
                     OPENBAO_ROTATION_NONCE=
                     OPENBAO_ROTATION_PROGRESS=0
-                    OPENBAO_ROTATION_REQUIRED=0
+                    OPENBAO_ROTATION_REQUIRED=3
                     OPENBAO_ROTATION_VERIFICATION_NONCE=
                   else
                     OPENBAO_ROTATION_PHASE=OLD_QUORUM_COMPLETE
@@ -13941,6 +13941,12 @@ openbao_apply_configuration_with_root
             **valid,
             'progress': 3,
         }
+        idle = {
+            'nonce': '', 'started': False, 't': 0, 'n': 0,
+            'progress': 0, 'required': 3, 'pgp_fingerprints': None,
+            'backup': False, 'verification_required': False,
+            'verification_nonce': '',
+        }
         verification = {
             'nonce': 'synthetic-verification-nonce',
             'started': True,
@@ -13977,6 +13983,9 @@ openbao_apply_configuration_with_root
         )
 
         cases = (
+            ('normal', idle, 0, 'PHASE=IDLE\nPROGRESS=0\nNONCE_SET=false\n'),
+            ('normal', {**idle, 'required': 0}, 1, ''),
+            ('normal', {**idle, 'required': True}, 1, ''),
             ('normal', valid, 0, 'PHASE=OLD_QUORUM_PENDING\nPROGRESS=2\nNONCE_SET=true\n'),
             ('normal', complete, 0, 'PHASE=OLD_QUORUM_COMPLETE\nPROGRESS=3\nNONCE_SET=true\n'),
             ('verification', verification, 0, 'PHASE=PENDING\nPROGRESS=0\nNONCE_SET=true\n'),
@@ -14010,6 +14019,112 @@ openbao_apply_configuration_with_root
                 self.assertEqual(result.returncode, expected_rc, result.stderr)
                 self.assertEqual(result.stdout, expected_stdout)
                 self.assertEqual(result.stderr, '')
+
+    def test_rotation_verification_idle_uses_exact_cli_and_fresh_normal_status(
+        self,
+    ) -> None:
+        # OpenBao v2.6.1 logical_system_rotate.go + CLI JSON serialization:
+        # no configuration is HTTP 400, not a successful all-zero status;
+        # before old-share quorum, verification is not started but has n=5/t=3.
+        temporary = self.temporary_directory()
+        fingerprint = temporary / 'fingerprint'
+        fingerprint.write_text(self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii')
+        fingerprint.chmod(0o600)
+        idle = {
+            'nonce': '', 'started': False, 't': 0, 'n': 0,
+            'progress': 0, 'required': 3, 'pgp_fingerprints': None,
+            'backup': False, 'verification_required': False,
+            'verification_nonce': '',
+        }
+        active = {
+            **idle, 'nonce': 'synthetic-old-rotation-nonce', 'started': True,
+            't': 3, 'n': 5, 'pgp_fingerprints': [self.PUBLIC_KEY_FINGERPRINT] * 5,
+            'backup': True, 'verification_required': True,
+        }
+        waiting = {'nonce': '', 'started': False, 't': 3, 'n': 5, 'progress': 0}
+        absent = (
+            'Error reading rotate status: Error making API request.\n\n'
+            'URL: GET https://openbao.openbao.svc:8200/v1/sys/rotate/root/verify\n'
+            'Code: 400. Errors:\n\n* no rotation configuration found\n'
+        )
+        transport_suffix = 'command terminated with exit code 2\n'
+        cases = [
+            ('absent', 2, '', absent, idle, 0),
+            ('absent-kubectl', 2, '', absent + transport_suffix, idle, 0),
+            ('waiting', 0, json.dumps(waiting), '', active, 0),
+            ('absent-active', 2, '', absent, active, 1),
+            ('absent-bad-normal', 2, '', absent, {**idle, 'required': 0}, 1),
+            ('waiting-without-config', 0, json.dumps(waiting), '', idle, 1),
+            ('waiting-complete', 0, json.dumps(waiting), '', {**active, 'progress': 3}, 1),
+            ('zero-status', 0, json.dumps({**waiting, 't': 0, 'n': 0}), '', idle, 1),
+            ('wrong-exit', 1, '', absent, idle, 1),
+            ('unexpected-stdout', 2, '{}', absent, idle, 1),
+            ('forbidden', 2, '', absent.replace('400', '403'), idle, 1),
+            ('server-error', 2, '', absent.replace('400', '500'), idle, 1),
+            ('different-error', 2, '', absent.replace('no rotation configuration found', 'permission denied'), idle, 1),
+            ('different-path', 2, '', absent.replace('/root/verify', '/root/init'), idle, 1),
+            ('extra-error', 2, '', absent + '* another failure\n', idle, 1),
+            ('transport-error', 2, '', absent + 'error: connection closed\n', idle, 1),
+            ('timeout', 2, '', 'error: timeout\n', idle, 1),
+        ]
+        script = textwrap.dedent(r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$2/fingerprint
+            PYTHON_BINARY=/usr/bin/python3
+            openbao_rotation_temp_create || exit 90
+            # Simulate cached completion from immediately before the final
+            # verification submission. Only a NEW live normal read can win.
+            OPENBAO_ROTATION_PHASE=OLD_QUORUM_COMPLETE
+            OPENBAO_ROTATION_REQUIRED=3
+            TEST_DIRECTORY=$2
+            TEST_VERIFY_EXIT=$3
+            openbao_bao() {
+              if [[ " $* " == *' -verify '* ]]; then
+                cat "$TEST_DIRECTORY/stdout"
+                cat "$TEST_DIRECTORY/stderr" >&2
+                return "$TEST_VERIFY_EXIT"
+              fi
+              printf 'normal-read\n' >>"$TEST_DIRECTORY/calls"
+              cat "$TEST_DIRECTORY/normal.json"
+            }
+            rc=0
+            openbao_rotation_status verification || rc=$?
+            if (( rc == 0 )); then
+              [[ "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
+                 "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" == 0 &&
+                 -z "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ]] || exit 91
+              if [[ "$OPENBAO_ROTATION_PHASE" == IDLE ]]; then
+                openbao_rotation_live_fields_are_idle || exit 92
+                # The incident preflight must share the same idle contract.
+                openbao_rotation_temp_cleanup || exit 93
+                openbao_probe_session_start() { :; }
+                openbao_remote_session_cleanup() { :; }
+                openbao_incident_live_rotation_is_idle || exit 94
+              fi
+              printf 'VERIFICATION_IDLE=true\n'
+            fi
+            openbao_rotation_temp_cleanup || exit 95
+            exit "$rc"
+        ''')
+        for name, status, stdout, stderr, normal, expected in cases:
+            with self.subTest(name=name):
+                for leaf, content in (
+                    ('stdout', stdout), ('stderr', stderr),
+                    ('normal.json', json.dumps(normal)), ('calls', ''),
+                ):
+                    (temporary / leaf).write_text(content, encoding='utf-8')
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'verification-status',
+                     str(OPENBAO_INITIALIZE_LIB), str(temporary), str(status)],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertEqual(result.stdout, 'VERIFICATION_IDLE=true\n' if expected == 0 else '')
+                if expected == 0:
+                    self.assertIn('normal-read\n', (temporary / 'calls').read_text())
+                self.assertEqual(list(temporary.glob('.openbao-rotation.*')), [])
 
     def test_rotation_nonce_globals_never_retain_inherited_export_attributes(
         self,
