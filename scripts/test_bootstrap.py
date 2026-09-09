@@ -15792,7 +15792,7 @@ openbao_apply_configuration_with_root
             matched = re.match(r'^\s*(?:env )?HOME="(\$[^"/]+)" \\$', line)
             if matched is not None:
                 bindings.append((matched.group(1), lines[index + 1].strip()))
-        self.assertEqual(len(bindings), 10)
+        self.assertEqual(len(bindings), 11)
         for home, token_binding in bindings:
             with self.subTest(home=home):
                 self.assertEqual(
@@ -16040,6 +16040,88 @@ openbao_apply_configuration_with_root
                 )
                 self.assertEqual(result.stdout, '')
 
+    def test_probe_login_consumes_stdin_without_exposing_cli_output(self) -> None:
+        # Removing the explicit stdin selector must fail before the probe is
+        # authenticated. Execute the real wrappers; fake only the remote CLI.
+        script = r'''
+set -o pipefail
+source "$1"
+OPENBAO_TEST_PROBE_HOME=$2
+OPENBAO_TEST_PROBE_CASE=$3
+export OPENBAO_TEST_PROBE_CASE
+openbao_remote_home_create() {
+  [[ "$1" == probe-pending ]] || return 1
+  OPENBAO_REMOTE_HOME=$OPENBAO_TEST_PROBE_HOME
+  OPENBAO_REMOTE_SESSION_KIND=$1
+}
+kubectl_run() {
+  if [[ "$*" == '--namespace=openbao create token openbao-runtime-probe --audience=openbao --duration=10m' ]]; then
+    printf 'synthetic-jwt'
+    [[ "$OPENBAO_TEST_PROBE_CASE" != create-failure ]]
+    return
+  fi
+  [[ "$1 $2 $3 $4 $5" == '--namespace=openbao exec -i pod/openbao-0 --' ]] || return 90
+  shift 5
+  [[ "$1" == env ]] || return 91
+  # Real remote shell/env execution, including the production redirections.
+  "$@"
+}
+rc=0
+openbao_probe_session_start || rc=$?
+printf 'RC=%s\nKIND=%s\n' "$rc" "$OPENBAO_REMOTE_SESSION_KIND"
+'''
+        fake_bao = r'''#!/bin/sh
+set -eu
+test "${BAO_TOKEN_PATH:-}" = "$HOME/.bao-token"
+test "${BAO_ADDR:-}" = https://openbao.openbao.svc:8200
+test "${BAO_CACERT:-}" = /openbao/userconfig/openbao-server-tls/ca.crt
+test -z "${BAO_TOKEN:-}"
+test ! -t 0
+case "$*" in
+  'write -field=token auth/kubernetes/login role=openbao-runtime-probe jwt=-')
+    test "$(cat)" = synthetic-jwt
+    if [ "$OPENBAO_TEST_PROBE_CASE" = empty-exchange ]; then exit 0; fi
+    printf 'synthetic-probe-token'
+    test "$OPENBAO_TEST_PROBE_CASE" != exchange-failure
+    ;;
+  'login -no-print -')
+    test "$(cat)" = synthetic-probe-token
+    # The pinned CLI can output token details if its token helper cannot store.
+    printf 'synthetic-probe-token\n'
+    printf 'synthetic-probe-token\n' >&2
+    test "$OPENBAO_TEST_PROBE_CASE" != login-failure
+    printf 'stored\n' >"$HOME/login-completed"
+    ;;
+  *) exit 92 ;;
+esac
+'''
+        for case in ('success', 'create-failure', 'exchange-failure',
+                     'empty-exchange', 'login-failure'):
+            with self.subTest(case=case):
+                directory = self.temporary_directory()
+                (directory / 'bao').write_text(fake_bao, encoding='utf-8')
+                (directory / 'bao').chmod(0o755)
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'probe-stdin',
+                     str(OPENBAO_INITIALIZE_LIB), str(directory), case],
+                    env=self.sanitized_environment(
+                        BOOTSTRAP_TEST_MODE='1',
+                        PATH=f'{directory}:/usr/bin:/bin',
+                    ),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertNotIn('synthetic-', result.stdout)
+                if case == 'success':
+                    self.assertEqual(result.stdout, 'RC=0\nKIND=probe\n')
+                    self.assertEqual(
+                        (directory / 'login-completed').read_text(), 'stored\n',
+                    )
+                else:
+                    self.assertRegex(result.stdout, r'^RC=[1-9][0-9]*\nKIND=probe-pending\n$')
+                    if case in ('empty-exchange', 'login-failure'):
+                        self.assertFalse((directory / 'login-completed').exists())
+
     def test_probe_cleanup_failure_blocks_probe_success(self) -> None:
         script = textwrap.dedent(
             '''
@@ -16098,7 +16180,7 @@ openbao_apply_configuration_with_root
                   printf 'exchange\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                   printf 'synthetic-session-token\n'
                   ;;
-                *' bao login -no-print '*)
+                *'bao login -no-print - >/dev/null 2>&1'*)
                   cat >/dev/null
                   printf 'login\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                   ;;
