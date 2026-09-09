@@ -36,9 +36,10 @@ GIT_SHA = re.compile(r'[0-9a-f]{40}')
 PUBLIC_FINGERPRINT = re.compile(r'(?:[0-9A-F]{40}|[0-9A-F]{64})')
 TOKEN_SHAPE = re.compile(rb'(?i)(?:hvs|hvb|hvr|s)\.[A-Za-z0-9_-]{8,}')
 SAFE_NONCE = re.compile(r'[A-Za-z0-9_-]{8,128}')
+# Match live status: OpenBao IDs are UUID-shaped opaque values, not RFC 4122
+# version/variant assignments. Keep exact lowercase hexadecimal framing.
 CLUSTER_ID = re.compile(
-    r'[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
-    r'[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 )
 CLUSTER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 UTC_TIMESTAMP = re.compile(
