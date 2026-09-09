@@ -2302,7 +2302,7 @@ openbao_recover_auth_probe() {
       --audience=openbao --duration=10m |
       openbao_bao_recover_probe_stdin write -field=token \
         auth/kubernetes/login role=openbao-runtime-probe jwt=- |
-      openbao_bao_recover_probe_stdin login -no-print >/dev/null; then
+      openbao_probe_login_stdin "$OPENBAO_RECOVER_PROBE_HOME"; then
     OPENBAO_RECOVER_PROBE_SESSION_KIND=authenticated
   else
     openbao_recover_probe_cleanup || true
@@ -2640,13 +2640,26 @@ openbao_apply_configuration_with_root() {
   (( rc == 0 ))
 }
 
+openbao_probe_login_stdin() {
+  local path=$1
+  # The token method requires an explicit '-' to consume a pipe instead of
+  # prompting on a TTY. Suppress login output inside the container: even with
+  # -no-print, a token-helper Store failure can print the authenticated token.
+  kubectl_run --namespace=openbao exec -i pod/openbao-0 -- env \
+    HOME="$path" \
+    BAO_TOKEN_PATH="$path/.bao-token" \
+    BAO_ADDR=https://openbao.openbao.svc:8200 \
+    BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt \
+    /bin/sh -c 'bao login -no-print - >/dev/null 2>&1'
+}
+
 openbao_probe_session_start() {
   openbao_remote_home_create probe-pending || return 1
   kubectl_run --namespace=openbao create token openbao-runtime-probe \
     --audience=openbao --duration=10m |
     openbao_bao_stdin write -field=token auth/kubernetes/login \
       role=openbao-runtime-probe jwt=- |
-    openbao_bao_stdin login -no-print >/dev/null || return 1
+    openbao_probe_login_stdin "$OPENBAO_REMOTE_HOME" || return 1
   OPENBAO_REMOTE_SESSION_KIND=probe
 }
 

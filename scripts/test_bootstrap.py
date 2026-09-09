@@ -8773,6 +8773,54 @@ openbao_live_cluster_identity
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual((result.stdout, result.stderr), ('', ''))
 
+    def test_live_cluster_identity_flows_into_real_digest_helper(self) -> None:
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+status_json=$2
+openbao_status_json() { printf '%s\n' "$status_json"; }
+openbao_live_cluster_identity || exit $?
+openbao_cluster_identity_sha256 "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME"
+'''
+        # Literal canonical inputs are independent of the production serializer.
+        identities = (
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab","cluster_name":"openbao-cluster-dev"}',
+            b'{"cluster_id":"12345678-1234-fabc-8def-1234567890ab","cluster_name":"openbao-cluster-dev"}',
+            b'{"cluster_id":"12345678-1234-4abc-cdef-1234567890ab","cluster_name":"openbao-cluster-dev"}',
+            b'{"cluster_id":"b9cdd046-df21-f31b-cab3-5052d87769ab","cluster_name":"openbao.labs.killercoda"}',
+        )
+        for canonical in identities:
+            with self.subTest(identity=canonical):
+                result = self.run_command([
+                    '/bin/bash', '-c', script, 'live-cluster-digest',
+                    str(OPENBAO_INITIALIZE_LIB), canonical.decode('ascii'),
+                ])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, hashlib.sha256(canonical).hexdigest() + '\n')
+                self.assertEqual(result.stderr, '')
+
+    def test_cluster_digest_helper_rejects_malformed_identity_silently(self) -> None:
+        cases = (
+            ('B9CDD046-df21-f31b-cab3-5052d87769ab', self.CLUSTER_NAME),
+            ('b9cdd046-df21-f31b-cab3-5052d87769a', self.CLUSTER_NAME),
+            ('b9cdd046df21f31bcab35052d87769ab', self.CLUSTER_NAME),
+            ('b9cdd046-df21-f31b-cab3-5052d87769ag', self.CLUSTER_NAME),
+            (self.CLUSTER_ID + '\n', self.CLUSTER_NAME),
+            ('', self.CLUSTER_NAME),
+            (self.CLUSTER_ID, 'openbao cluster dev'),
+            (self.CLUSTER_ID, '../openbao'),
+            (self.CLUSTER_ID, 'x' * 129),
+            (self.CLUSTER_ID, ''),
+        )
+        for cluster_id, cluster_name in cases:
+            with self.subTest(cluster_id=cluster_id, cluster_name=cluster_name):
+                result = self.run_artifact_helper(
+                    'cluster-identity-sha256', '--cluster-id', cluster_id,
+                    '--cluster-name', cluster_name,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
+
     def test_failed_configuration_never_revokes_but_always_cleans(self) -> None:
         script = r'''
 source "$1"
@@ -10318,6 +10366,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         key_shares: int = 5,
         key_threshold: int = 3,
         raw_response: str | None = None,
+        cluster_id: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         directory.mkdir(parents=True, exist_ok=True)
         response_path = self.write_rotation_response(
@@ -10348,7 +10397,7 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
             '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
             '--public-key', public_key,
             '--public-key-fingerprint-file', fingerprint,
-            '--cluster-id', self.CLUSTER_ID,
+            '--cluster-id', self.CLUSTER_ID if cluster_id is None else cluster_id,
             '--cluster-name', self.CLUSTER_NAME,
             '--key-shares', key_shares,
             '--key-threshold', key_threshold,
@@ -11397,6 +11446,37 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
         self.assertNotIn('operator init', body.split('openbao_stage_180_check() {', 1)[1].split(
             'openbao_stage_180_initialize() {', 1
         )[0])
+
+    def test_candidate_build_accepts_opaque_cluster_id_for_both_sources(self) -> None:
+        canonical = (
+            b'{"cluster_id":"b9cdd046-df21-f31b-cab3-5052d87769ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        )
+        expected_digest = hashlib.sha256(canonical).hexdigest()
+        for response_kind in ('direct', 'backup'):
+            with self.subTest(response_kind=response_kind):
+                built, candidate, sidecar = self.build_candidate_artifact(
+                    self.temporary_directory(), response_kind=response_kind,
+                    verification_nonce=(
+                        self.VERIFICATION_NONCE if response_kind == 'backup' else None
+                    ),
+                    cluster_id='b9cdd046-df21-f31b-cab3-5052d87769ab',
+                )
+                self.assertEqual(built.returncode, 0, built.stderr)
+                self.assertEqual((built.stdout, built.stderr), ('', ''))
+                _, metadata = self.archive_documents(candidate)
+                self.assertEqual(metadata['cluster_identity_sha256'], expected_digest)
+                validated = self.run_artifact_helper(
+                    'validate-candidate', '--archive', candidate, '--sidecar', sidecar,
+                    '--current-sha', self.CURRENT_SHA,
+                    '--source-sha', self.SOURCE_SHA,
+                    '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+                    '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+                    '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+                    '--cluster-identity-sha256', expected_digest,
+                )
+                self.assertEqual(validated.returncode, 0, validated.stderr)
+                self.assertEqual((validated.stdout, validated.stderr), ('', ''))
 
     def test_candidate_and_v2_final_have_exact_safe_contents(self) -> None:
         temporary = self.temporary_directory() / 'direct'
@@ -15712,7 +15792,7 @@ openbao_apply_configuration_with_root
             matched = re.match(r'^\s*(?:env )?HOME="(\$[^"/]+)" \\$', line)
             if matched is not None:
                 bindings.append((matched.group(1), lines[index + 1].strip()))
-        self.assertEqual(len(bindings), 10)
+        self.assertEqual(len(bindings), 11)
         for home, token_binding in bindings:
             with self.subTest(home=home):
                 self.assertEqual(
@@ -15960,6 +16040,88 @@ openbao_apply_configuration_with_root
                 )
                 self.assertEqual(result.stdout, '')
 
+    def test_probe_login_consumes_stdin_without_exposing_cli_output(self) -> None:
+        # Removing the explicit stdin selector must fail before the probe is
+        # authenticated. Execute the real wrappers; fake only the remote CLI.
+        script = r'''
+set -o pipefail
+source "$1"
+OPENBAO_TEST_PROBE_HOME=$2
+OPENBAO_TEST_PROBE_CASE=$3
+export OPENBAO_TEST_PROBE_CASE
+openbao_remote_home_create() {
+  [[ "$1" == probe-pending ]] || return 1
+  OPENBAO_REMOTE_HOME=$OPENBAO_TEST_PROBE_HOME
+  OPENBAO_REMOTE_SESSION_KIND=$1
+}
+kubectl_run() {
+  if [[ "$*" == '--namespace=openbao create token openbao-runtime-probe --audience=openbao --duration=10m' ]]; then
+    printf 'synthetic-jwt'
+    [[ "$OPENBAO_TEST_PROBE_CASE" != create-failure ]]
+    return
+  fi
+  [[ "$1 $2 $3 $4 $5" == '--namespace=openbao exec -i pod/openbao-0 --' ]] || return 90
+  shift 5
+  [[ "$1" == env ]] || return 91
+  # Real remote shell/env execution, including the production redirections.
+  "$@"
+}
+rc=0
+openbao_probe_session_start || rc=$?
+printf 'RC=%s\nKIND=%s\n' "$rc" "$OPENBAO_REMOTE_SESSION_KIND"
+'''
+        fake_bao = r'''#!/bin/sh
+set -eu
+test "${BAO_TOKEN_PATH:-}" = "$HOME/.bao-token"
+test "${BAO_ADDR:-}" = https://openbao.openbao.svc:8200
+test "${BAO_CACERT:-}" = /openbao/userconfig/openbao-server-tls/ca.crt
+test -z "${BAO_TOKEN:-}"
+test ! -t 0
+case "$*" in
+  'write -field=token auth/kubernetes/login role=openbao-runtime-probe jwt=-')
+    test "$(cat)" = synthetic-jwt
+    if [ "$OPENBAO_TEST_PROBE_CASE" = empty-exchange ]; then exit 0; fi
+    printf 'synthetic-probe-token'
+    test "$OPENBAO_TEST_PROBE_CASE" != exchange-failure
+    ;;
+  'login -no-print -')
+    test "$(cat)" = synthetic-probe-token
+    # The pinned CLI can output token details if its token helper cannot store.
+    printf 'synthetic-probe-token\n'
+    printf 'synthetic-probe-token\n' >&2
+    test "$OPENBAO_TEST_PROBE_CASE" != login-failure
+    printf 'stored\n' >"$HOME/login-completed"
+    ;;
+  *) exit 92 ;;
+esac
+'''
+        for case in ('success', 'create-failure', 'exchange-failure',
+                     'empty-exchange', 'login-failure'):
+            with self.subTest(case=case):
+                directory = self.temporary_directory()
+                (directory / 'bao').write_text(fake_bao, encoding='utf-8')
+                (directory / 'bao').chmod(0o755)
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'probe-stdin',
+                     str(OPENBAO_INITIALIZE_LIB), str(directory), case],
+                    env=self.sanitized_environment(
+                        BOOTSTRAP_TEST_MODE='1',
+                        PATH=f'{directory}:/usr/bin:/bin',
+                    ),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertNotIn('synthetic-', result.stdout)
+                if case == 'success':
+                    self.assertEqual(result.stdout, 'RC=0\nKIND=probe\n')
+                    self.assertEqual(
+                        (directory / 'login-completed').read_text(), 'stored\n',
+                    )
+                else:
+                    self.assertRegex(result.stdout, r'^RC=[1-9][0-9]*\nKIND=probe-pending\n$')
+                    if case in ('empty-exchange', 'login-failure'):
+                        self.assertFalse((directory / 'login-completed').exists())
+
     def test_probe_cleanup_failure_blocks_probe_success(self) -> None:
         script = textwrap.dedent(
             '''
@@ -16018,7 +16180,7 @@ openbao_apply_configuration_with_root
                   printf 'exchange\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                   printf 'synthetic-session-token\n'
                   ;;
-                *' bao login -no-print '*)
+                *'bao login -no-print - >/dev/null 2>&1'*)
                   cat >/dev/null
                   printf 'login\n' >>"$OPENBAO_TEST_COMMAND_LOG"
                   ;;
