@@ -9360,7 +9360,9 @@ complete() { printf '%s\n' "$1" "$2"; exit 0; }
               [[ "$TEST_FAILURE" != configure ]]
             }
             openbao_live_cluster_identity() { :; }
-            openbao_rotation_temp_create() { :; }
+            openbao_rotation_temp_create() {
+              [[ "$TEST_FAILURE" != temp-create ]]
+            }
             openbao_rotation_temp_cleanup() {
               [[ "$TEST_FAILURE" != temp-cleanup ]]
             }
@@ -12428,6 +12430,134 @@ else:
                     call.startswith('FORBIDDEN-') for call in calls
                 ))
 
+    def test_candidate_diagnostics_identify_failure_without_changing_stop_or_cleanup(self) -> None:
+        # Missing or misplaced diagnostics must not hide which boundary failed.
+        for failure, step in (
+            ('temp-create', 'prepare-temp'),
+            ('backup', 'retrieve-encrypted-backup'),
+            ('candidate-write', 'capture-backup'),
+        ):
+            with self.subTest(failure=failure):
+                result, calls = self.run_recover_start(
+                    state='true|false', rotation_progress=3,
+                    verification_progress=0, artifact_state='MISSING',
+                    failure=failure,
+                )
+                self.assertEqual(result.returncode, 40)
+                self.assertIn('REASON=rotation-candidate-write-failed\n', result.stdout)
+                self.assertIn(f'OPENBAO_CANDIDATE_STEP={step} STATUS=FAIL\n', result.stderr)
+                self.assertNotIn(f'OPENBAO_CANDIDATE_STEP={step} STATUS=PASS\n', result.stderr)
+                self.assertEqual(calls[-1], 'root-helper-cleanup')
+                self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
+    def test_candidate_step_diagnostic_preserves_status_and_hides_arguments(self) -> None:
+        # Printing argv, accepting arbitrary labels, or swallowing an exit fails this.
+        script = r'''
+source "$1"
+private_argument='synthetic-private-argument'
+operation() { [[ "$1" == "$private_argument" ]] || return 99; return "$2"; }
+openbao_candidate_step capture-backup operation "$private_argument" "$2"
+'''
+        for code, status in ((0, 'PASS'), (7, 'FAIL')):
+            with self.subTest(code=code):
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'candidate-diagnostic',
+                     str(OPENBAO_INITIALIZE_LIB), str(code)],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr,
+                    'OPENBAO_CANDIDATE_STEP=capture-backup STATUS=START\n'
+                    f'OPENBAO_CANDIDATE_STEP=capture-backup STATUS={status}\n')
+        rejected = self.run_command(
+            ['/bin/bash', '-c',
+             'source "$1"; openbao_candidate_step "synthetic-private-label" printf FORBIDDEN',
+             'candidate-label-rejection', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout + rejected.stderr, '')
+
+    def test_candidate_diagnostic_write_failure_does_not_change_operation(self) -> None:
+        script = r'''
+source "$1"
+set -e
+operation() { printf 'operation-executed\n'; return "$1"; }
+openbao_candidate_step capture-backup operation "$2" 2>&-
+'''
+        for code in (0, 7):
+            with self.subTest(code=code):
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'candidate-closed-stderr',
+                     str(OPENBAO_INITIALIZE_LIB), str(code)],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stdout, 'operation-executed\n')
+                self.assertEqual(result.stderr, '')
+
+    def test_candidate_build_diagnostics_locate_each_gate_for_both_response_kinds(self) -> None:
+        # Keep real Bash routing; substitute only validation/IO boundaries.
+        script = r'''
+source "$1"
+TEST_FAILURE=$2
+PYTHON_BINARY=synthetic_python
+OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+OPENBAO_SOURCE_RECOVERY_SHA=1111111111111111111111111111111111111111
+OPENBAO_SOURCE_RECOVERY_ARCHIVE=/synthetic/source.tar.gz
+OPENBAO_PUBLIC_KEY=/synthetic/public-key
+OPENBAO_PUBLIC_KEY_FINGERPRINT=/synthetic/fingerprint
+OPENBAO_RECOVERY_ROOT=/synthetic/recovery
+openbao_source_recovery_bundle_is_valid() { [[ "$TEST_FAILURE" != validate-source ]]; }
+safe_file() { [[ "$TEST_FAILURE" != validate-response-file ]]; }
+openbao_cluster_identity_sha256() {
+  [[ "$TEST_FAILURE" != derive-cluster-digest ]] || return 1
+  printf '%064d\n' 0
+}
+sha256_file() {
+  [[ "$TEST_FAILURE" != derive-source-digest ]] || return 1
+  printf '%064d\n' 0
+}
+synthetic_python() {
+  if [[ "$3" == -c ]]; then IFS= read -r private_nonce; fi
+  [[ "$TEST_FAILURE" != normalize-publish ]]
+}
+openbao_rotation_candidate_is_valid() { [[ "$TEST_FAILURE" != validate-published-candidate ]]; }
+if [[ "$3" == backup ]]; then
+  openbao_build_rotation_candidate /synthetic/response backup \
+    synthetic-cluster synthetic-name synthetic-private-nonce
+else
+  openbao_build_rotation_candidate /synthetic/response direct \
+    synthetic-cluster synthetic-name
+fi
+'''
+        for kind in ('direct', 'backup'):
+            steps = (
+                'validate-source', 'validate-response-file', 'derive-cluster-digest',
+                'derive-source-digest', f'normalize-publish-{kind}',
+                'validate-published-candidate',
+            )
+            for failed_step in (*steps, None):
+                with self.subTest(kind=kind, failed_step=failed_step):
+                    failure = ('normalize-publish' if failed_step == f'normalize-publish-{kind}'
+                               else failed_step or 'none')
+                    result = self.run_command(
+                        ['/bin/bash', '-c', script, 'candidate-build-diagnostic',
+                         str(OPENBAO_INITIALIZE_LIB), failure, kind],
+                        env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                    )
+                    self.assertEqual(result.returncode, int(failed_step is not None))
+                    self.assertEqual(result.stdout, '')
+                    expected = []
+                    for step in steps:
+                        expected.append(f'OPENBAO_CANDIDATE_STEP={step} STATUS=START')
+                        expected.append(f'OPENBAO_CANDIDATE_STEP={step} STATUS='
+                                        + ('FAIL' if step == failed_step else 'PASS'))
+                        if step == failed_step:
+                            break
+                    self.assertEqual(result.stderr.splitlines(), expected)
+
     def test_recover_start_rejects_unsafe_status_and_artifact_states(
         self,
     ) -> None:
@@ -14096,7 +14226,15 @@ openbao_apply_configuration_with_root
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
-        self.assertEqual(result.stderr, '')
+        self.assertEqual(result.stderr.splitlines(), [
+            f'OPENBAO_CANDIDATE_STEP={step} STATUS={status}'
+            for step in (
+                'validate-source', 'validate-response-file', 'derive-cluster-digest',
+                'derive-source-digest', 'normalize-publish-backup',
+                'validate-published-candidate',
+            )
+            for status in ('START', 'PASS')
+        ])
         self.assertEqual(
             audit_log.read_text(encoding='utf-8'),
             'STDIN_PRESENT=true\nARGV_LEAK=false\nENV_LEAK=false\n',
