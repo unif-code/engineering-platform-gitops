@@ -628,21 +628,47 @@ openbao_rotation_candidate_is_valid() {
     openbao_fsync_directory "$OPENBAO_RECOVERY_ROOT"
 }
 
+openbao_candidate_step() {
+  [[ $# -ge 2 ]] || return 1
+  local diagnostic_step=$1 diagnostic_rc
+  shift
+  # Only fixed labels are printable. Never expand command arguments or payloads.
+  case "$diagnostic_step" in
+    prepare-temp|retrieve-encrypted-backup|capture-direct|capture-backup) ;;
+    validate-source|validate-response-file|derive-cluster-digest|derive-source-digest) ;;
+    normalize-publish-direct|normalize-publish-backup|validate-published-candidate) ;;
+    *) return 1 ;;
+  esac
+  printf 'OPENBAO_CANDIDATE_STEP=%s STATUS=START\n' "$diagnostic_step" >&2 || :
+  if "$@"; then
+    printf 'OPENBAO_CANDIDATE_STEP=%s STATUS=PASS\n' "$diagnostic_step" >&2 || :
+    return 0
+  else
+    diagnostic_rc=$?
+    printf 'OPENBAO_CANDIDATE_STEP=%s STATUS=FAIL\n' "$diagnostic_step" >&2 || :
+    return "$diagnostic_rc"
+  fi
+}
+
 openbao_build_rotation_candidate() {
   local response=$1 response_kind=$2 cluster_id=$3 cluster_name=$4
   local verification_nonce=${5:-} cluster_digest source_digest rc
   export -n verification_nonce 2>/dev/null || true
   openbao_rotation_artifact_paths || return 1
-  openbao_source_recovery_bundle_is_valid || return 1
-  safe_file "$response" 600 || return 1
+  openbao_candidate_step validate-source \
+    openbao_source_recovery_bundle_is_valid || return 1
+  openbao_candidate_step validate-response-file safe_file "$response" 600 || return 1
   cluster_digest=$(
-    openbao_cluster_identity_sha256 "$cluster_id" "$cluster_name"
+    openbao_candidate_step derive-cluster-digest \
+      openbao_cluster_identity_sha256 "$cluster_id" "$cluster_name"
   ) || return 1
-  source_digest=$(sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
+  source_digest=$(openbao_candidate_step derive-source-digest \
+    sha256_file "$OPENBAO_SOURCE_RECOVERY_ARCHIVE") || return 1
   case "$response_kind" in
     direct)
       [[ -z "$verification_nonce" ]] || return 1
-      "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" build-candidate \
+      openbao_candidate_step normalize-publish-direct \
+        "$PYTHON_BINARY" -I -B "$OPENBAO_RECOVERY_HELPER" build-candidate \
         --response "$response" --response-kind direct \
         --archive "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
         --sidecar "$OPENBAO_ROTATION_CANDIDATE_SIDECAR" \
@@ -660,7 +686,8 @@ openbao_build_rotation_candidate() {
       # The isolated bridge reads exactly one private stdin line, then calls the
       # already allowlisted Task 4 normalizer directly.
       if printf '%s\n' "$verification_nonce" |
-          "$PYTHON_BINARY" -I -B -c '
+          openbao_candidate_step normalize-publish-backup \
+            "$PYTHON_BINARY" -I -B -c '
 import importlib.util
 import pathlib
 import sys
@@ -729,7 +756,8 @@ module.build_candidate(
       ;;
     *) return 1 ;;
   esac
-  openbao_rotation_candidate_is_valid "$cluster_digest"
+  openbao_candidate_step validate-published-candidate \
+    openbao_rotation_candidate_is_valid "$cluster_digest"
 }
 
 openbao_rotation_final_paths_are_valid() {
@@ -3205,7 +3233,7 @@ openbao_stage_180_recover_start() {
   openbao_live_cluster_identity ||
     openbao_recover_start_fail STOP_UNKNOWN_STATE \
       openbao-cluster-identity-invalid "$EXIT_UNKNOWN_STATE"
-  openbao_rotation_temp_create ||
+  openbao_candidate_step prepare-temp openbao_rotation_temp_create ||
     openbao_recover_start_fail STOP_APPLY_FAILED \
       rotation-candidate-write-failed "$EXIT_APPLY_FAILED"
 
@@ -3240,7 +3268,8 @@ openbao_stage_180_recover_start() {
       openbao_recover_start_fail STOP_UNKNOWN_STATE \
         openbao-rotation-state-unsafe "$EXIT_UNKNOWN_STATE"
     if [[ "$artifact_state" == PARTIAL_CANDIDATE ]]; then
-      openbao_rotation_backup_retrieve "$OPENBAO_ROTATION_RESPONSE" ||
+      openbao_candidate_step retrieve-encrypted-backup \
+        openbao_rotation_backup_retrieve "$OPENBAO_ROTATION_RESPONSE" ||
         openbao_recover_start_fail STOP_APPLY_FAILED \
           rotation-candidate-write-failed "$EXIT_APPLY_FAILED"
       response_kind=backup
@@ -3269,7 +3298,8 @@ openbao_stage_180_recover_start() {
           "$OPENBAO_ROTATION_VERIFICATION_PHASE" == PENDING &&
           ( -z "$OPENBAO_ROTATION_VERIFICATION_NONCE" ||
             "$OPENBAO_ROTATION_VERIFICATION_NONCE" == "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ) ]]; then
-    openbao_rotation_backup_retrieve "$OPENBAO_ROTATION_RESPONSE" ||
+    openbao_candidate_step retrieve-encrypted-backup \
+      openbao_rotation_backup_retrieve "$OPENBAO_ROTATION_RESPONSE" ||
       openbao_recover_start_fail STOP_APPLY_FAILED \
         rotation-candidate-write-failed "$EXIT_APPLY_FAILED"
     response_kind=backup
@@ -3327,13 +3357,15 @@ openbao_stage_180_recover_start() {
   if [[ "$artifact_state" == MISSING || "$artifact_state" == PARTIAL_CANDIDATE ]]; then
     case "$response_kind" in
       direct)
-        openbao_rotation_capture_candidate "$OPENBAO_ROTATION_RESPONSE" direct \
+        openbao_candidate_step capture-direct \
+          openbao_rotation_capture_candidate "$OPENBAO_ROTATION_RESPONSE" direct \
           "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME" '' ||
           openbao_recover_start_fail STOP_APPLY_FAILED \
             rotation-candidate-write-failed "$EXIT_APPLY_FAILED"
         ;;
       backup)
-        openbao_rotation_capture_candidate "$OPENBAO_ROTATION_RESPONSE" backup \
+        openbao_candidate_step capture-backup \
+          openbao_rotation_capture_candidate "$OPENBAO_ROTATION_RESPONSE" backup \
           "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME" \
           "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ||
           openbao_recover_start_fail STOP_APPLY_FAILED \
