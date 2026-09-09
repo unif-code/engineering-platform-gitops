@@ -1,0 +1,194 @@
+global:
+  enabled: true
+  tlsDisable: false
+injector:
+  affinity: ''
+  agentDefaults:
+    cpuLimit: 200m
+    cpuRequest: 25m
+    memLimit: 128Mi
+    memRequest: 64Mi
+  agentImage:
+    pullPolicy: IfNotPresent
+    registry: quay.io
+    repository: openbao/openbao
+    tag: 2.6.1@sha256:15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0
+  certs:
+    secretName: openbao-injector-tls
+  enabled: true
+  externalBaoAddr: https://openbao.openbao.svc:8200
+  image:
+    pullPolicy: IfNotPresent
+    registry: docker.io
+    repository: hashicorp/vault-k8s
+    tag: 1.7.2@sha256:3dd30a9ac5909d17555480f51be734dfb719a323409f06cffe8b48cdaf6237d2
+  leaderElector:
+    enabled: false
+  replicas: 1
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 128Mi
+  revokeOnShutdown: true
+  webhook:
+    annotations:
+      cert-manager.io/inject-ca-from: openbao/openbao-injector-tls
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        openbao.unif.internal/injection: enabled
+    timeoutSeconds: 10
+server:
+  affinity: ''
+  auditStorage:
+    accessMode: ReadWriteOnce
+    enabled: true
+    mountPath: /openbao/audit
+    size: 5Gi
+    storageClass: stateful-rwo-lowlatency
+  authDelegator:
+    enabled: true
+  dataStorage:
+    accessMode: ReadWriteOnce
+    enabled: true
+    mountPath: /openbao/data
+    size: 10Gi
+    storageClass: stateful-rwo-lowlatency
+  dev:
+    enabled: false
+  enabled: true
+  extraSecretEnvironmentVars: []
+  extraVolumes:
+    - name: openbao-server-tls
+      type: secret
+  gateway:
+    httpRoute:
+      enabled: false
+    tlsRoute:
+      enabled: false
+  ha:
+    disruptionBudget:
+      enabled: false
+    enabled: true
+    raft:
+      config: |
+        ui = false
+        disable_mlock = true
+        api_addr = "https://openbao.openbao.svc:8200"
+        cluster_addr = "https://openbao-0.openbao-internal.openbao.svc.cluster.local:8201"
+
+        listener "tcp" {
+          address = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_disable = 0
+          tls_cert_file = "/openbao/userconfig/openbao-server-tls/tls.crt"
+          tls_key_file = "/openbao/userconfig/openbao-server-tls/tls.key"
+        }
+
+        storage "raft" {
+          path = "/openbao/data"
+        }
+
+        service_registration "kubernetes" {}
+
+        audit "file" "to-file" {
+          description = "Persistent DEV OpenBao audit log."
+          options {
+            file_path = "/openbao/audit/openbao-audit.log"
+            hmac_accessor = "true"
+            log_raw = "false"
+            mode = "0600"
+          }
+        }
+
+        audit "file" "to-stdout" {
+          description = "Container stdout OpenBao audit stream."
+          options {
+            file_path = "stdout"
+            hmac_accessor = "true"
+            log_raw = "false"
+          }
+        }
+      enabled: true
+      setNodeId: true
+    replicas: 1
+  image:
+    pullPolicy: IfNotPresent
+    registry: quay.io
+    repository: openbao/openbao
+    tag: 2.6.1@sha256:15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0
+  ingress:
+    enabled: false
+  livenessProbe:
+    enabled: true
+    failureThreshold: 3
+    initialDelaySeconds: 30
+    path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+    periodSeconds: 10
+    port: 8200
+    successThreshold: 1
+    timeoutSeconds: 3
+  logFormat: json
+  logLevel: info
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  readinessProbe:
+    enabled: true
+    failureThreshold: 3
+    initialDelaySeconds: 10
+    path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+    periodSeconds: 5
+    port: 8200
+    successThreshold: 1
+    timeoutSeconds: 3
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  route:
+    enabled: false
+  service:
+    active:
+      enabled: true
+    enabled: true
+    instanceSelector:
+      enabled: true
+    standby:
+      enabled: false
+    type: ClusterIP
+  serviceAccount:
+    create: true
+    createSecret: false
+    serviceDiscovery:
+      enabled: true
+  standalone:
+    enabled: false
+  statefulSet:
+    securityContext:
+      container:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+      pod:
+        fsGroup: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 100
+        seccompProfile:
+          type: RuntimeDefault
+snapshotAgent:
+  enabled: false
+csi:
+  enabled: false
+ui:
+  enabled: false
+  serviceType: ClusterIP

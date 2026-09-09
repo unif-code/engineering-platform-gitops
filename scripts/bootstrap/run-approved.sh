@@ -1,6 +1,14 @@
 #!/bin/bash
-# 运维一行入口：校验已批准的提交与仓库状态后，在干净环境中执行 bootstrap-all。
+# 运维一行入口：校验已批准的提交与仓库状态后，在干净环境中执行 bootstrap-all
+# 或显式的 Stage 180 OpenBao 人工仪式入口。
 # 用法：scripts/bootstrap/run-approved.sh [<approved-sha>] --check|--apply
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --check --stage=180 \
+#         [--source-recovery-sha=<40-lowercase-hex>]
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
+#         --operation=initialize|configure|accept
+#       scripts/bootstrap/run-approved.sh [<approved-sha>] --apply --stage=180 \
+#         --operation=recover-start|recover-verify \
+#         --source-recovery-sha=<40-lowercase-hex>
 # 不带 SHA 时使用 CI 在 validation-gate 全绿后发布的 origin/validated；它必须仍在
 # origin/main 历史上，否则 fail-closed，杜绝部署未经门禁或已被回滚的提交。
 # 门禁与既往人工粘贴的脚本一致（SHA、origin、main、干净树、ff-only、helm 残留、
@@ -12,23 +20,40 @@ umask 022
 
 usage() {
   printf 'usage: %s [<approved-sha>] --check|--apply\n' "${0##*/}" >&2
+  printf '       %s [<approved-sha>] --check --stage=180 ' "${0##*/}" >&2
+  printf '%s\n' '[--source-recovery-sha=<40-lowercase-hex>]' >&2
+  printf '       %s [<approved-sha>] --apply --stage=180 ' "${0##*/}" >&2
+  printf '%s\n' '--operation=initialize|configure|accept' >&2
+  printf '       %s [<approved-sha>] --apply --stage=180 ' "${0##*/}" >&2
+  printf '%s\n' '--operation=recover-start|recover-verify --source-recovery-sha=<40-lowercase-hex>' >&2
   printf '  省略 SHA 时使用 CI 发布的 origin/validated\n' >&2
   exit 2
 }
 
 approved_sha=
-case $# in
-  1) mode=$1 ;;
-  2)
-    approved_sha=$1
-    mode=$2
-    ;;
-  *) usage ;;
-esac
+if (( $# > 0 )) && [[ "$1" != --* ]]; then
+  approved_sha=$1
+  shift
+fi
+(( $# > 0 )) || usage
+mode=$1
+shift
 case "$mode" in
   --check|--apply) ;;
   *) usage ;;
 esac
+script_source=${BASH_SOURCE[0]}
+case "$script_source" in
+  /*) ;;
+  *) script_source="$PWD/$script_source" ;;
+esac
+script_dir=$(cd "${script_source%/*}" && pwd -P)
+# shellcheck disable=SC1091
+source "${script_dir}/lib/run-approved-args.sh"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/run-approved-lock.sh"
+run_approved_parse_arguments "$mode" "$@" || usage
+target=$RUN_APPROVED_TARGET
 if [[ -n "$approved_sha" && ! "$approved_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo 'STOP: invalid approved SHA'
   exit 90
@@ -38,18 +63,20 @@ if [[ "$mode" == --apply && "$EUID" -ne 0 ]]; then
   exit 91
 fi
 
-script_source=${BASH_SOURCE[0]}
-case "$script_source" in
-  /*) ;;
-  *) script_source="$PWD/$script_source" ;;
-esac
-script_dir=$(cd "${script_source%/*}" && pwd -P)
 repo=$(cd "${script_dir}/../.." && pwd -P)
 
 [[ -d "$repo/.git" && ! -L "$repo" ]] || {
   echo 'STOP: repository is missing or unsafe'
   exit 92
 }
+if ! run_approved_acquire_directory_lock "$repo" /usr/bin/flock 8; then
+  if [[ "$RUN_APPROVED_LOCK_REASON" == concurrent-run ]]; then
+    echo 'STOP: another run-approved command is running'
+    exit 105
+  fi
+  printf 'STOP: run-approved lock failed: %s\n' "$RUN_APPROVED_LOCK_REASON"
+  exit 106
+fi
 origin_url=$(/usr/bin/git -C "$repo" remote get-url origin)
 case "$origin_url" in
   *unif-code/engineering-platform-gitops.git) ;;
@@ -69,6 +96,18 @@ worktree=$(/usr/bin/git -C "$repo" status --porcelain=v1 --untracked-files=all)
   printf '%s\n' "$worktree"
   exit 95
 }
+
+if [[ "$target:$mode" == openbao-initialize:--apply ]]; then
+  lock_file=/run/lock/engineering-platform-bootstrap.lock
+  if ! run_approved_acquire_lock "$lock_file" 0 1777 /usr/bin/flock 9; then
+    if [[ "$RUN_APPROVED_LOCK_REASON" == concurrent-run ]]; then
+      echo 'STOP: another bootstrap or Stage 180 apply is running'
+      exit 103
+    fi
+    printf 'STOP: Stage 180 lock failed: %s\n' "$RUN_APPROVED_LOCK_REASON"
+    exit 104
+  fi
+fi
 
 /usr/bin/git -C "$repo" fetch --prune origin main
 if [[ -n "$approved_sha" ]]; then
@@ -94,6 +133,23 @@ else
   }
   approved_source=origin/validated
 fi
+if [[ "$target" == openbao-initialize ]]; then
+  /usr/bin/git -C "$repo" fetch --force origin \
+    'refs/heads/main:refs/remotes/origin/main' \
+    'refs/heads/validated:refs/remotes/origin/validated' >/dev/null 2>&1 || {
+    echo 'STOP: validated ref unavailable (CI publishes it after validation-gate)'
+    exit 99
+  }
+  [[ "$(/usr/bin/git -C "$repo" rev-parse origin/main)" == "$approved_sha" &&
+     "$(/usr/bin/git -C "$repo" rev-parse --verify --quiet \
+       'refs/remotes/origin/validated^{commit}')" == "$approved_sha" ]] || {
+    echo 'STOP: Stage 180 requires main and validated to match approved SHA'
+    exit 102
+  }
+fi
+# shellcheck disable=SC2034
+# Kept as the reviewed wrapper output alongside the parser globals above.
+RUN_APPROVED_SHA=$approved_sha
 printf 'APPROVED_SHA=%s (source=%s)\n' "$approved_sha" "$approved_source"
 /usr/bin/git -C "$repo" merge --ff-only "$approved_sha"
 [[ "$(/usr/bin/git -C "$repo" rev-parse HEAD)" == "$approved_sha" ]] || {
@@ -110,9 +166,19 @@ if [[ "$EUID" -eq 0 ]]; then
   done
 fi
 
+case "$target" in
+  bootstrap) target_script="$repo/scripts/bootstrap/bootstrap-all.sh" ;;
+  openbao-initialize)
+    target_script="$repo/scripts/bootstrap/stages/180-openbao-initialize/run.sh"
+    ;;
+  *)
+    echo 'STOP: invalid approved target'
+    exit 101
+    ;;
+esac
 set +e
 /usr/bin/env -i HOME="${HOME:-/root}" PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-  /bin/bash -p "$repo/scripts/bootstrap/bootstrap-all.sh" "$mode"
+  /bin/bash -p "$target_script" "${RUN_APPROVED_TARGET_ARGUMENTS[@]}"
 rc=$?
 set -e
 printf 'COMMAND_EXIT_CODE=%s\n' "$rc"

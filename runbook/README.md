@@ -4,6 +4,8 @@
 
 > **DEV-002 ACTIVE（仅单用户 DEV）**：完整功能与 7 天保留不变；平台稳态实际磁盘目标不超过 100Gi、恢复峰值不超过 130Gi，根盘 80% 告警、90% Stop Gate。canonical 记录位于 `engineering-platform-docs/architecture/deviations.md`。
 
+> **DEV-005 ACTIVE（Runtime-Only）**：OpenBao 可先于 cluster 外备份资源部署；其运行验收不代表 Backup/Restore 或 Release Gate 通过。ciphertext recovery bundle 由运维上传受控 cloud，MinIO 与所有备份任务继续不执行。canonical 记录位于 `engineering-platform-docs/architecture/deviations.md`。
+
 所有标记为【运维】的命令只能由获准人员在目标服务器执行。执行前记录 Git commit，执行后保留 UTC 时间、完整命令、关键 stdout/stderr、退出码与判定；Secret 值、Token、私钥、kubeconfig 不得写入本目录。
 
 bootstrap 使用固定的 07～14 顺序：`07 preflight`、`08 artifact staging`、
@@ -25,5 +27,6 @@ bootstrap 使用固定的 07～14 顺序：`07 preflight`、`08 artifact staging
 | `08-capacity.md` | 稳态 CPU、内存与磁盘容量 |
 | `09-acceptance.md` | V0.1 六条验收标准对照 |
 | `10-image-owner-handoff.md` | frontend/backend owner 制品回执与应用 Desired State 阻塞 |
+| `11-openbao-runtime.md` | OpenBao Runtime-Only 安装、PGP/Shamir 初始化、Kubernetes Auth/Audit 验收与恢复边界 |
 
 `examples/` 仅保存人工恢复/验证时使用的瞬态资源，不属于 Flux Desired State，禁止加入任何 Kustomization。

@@ -65,7 +65,7 @@ if [[ "${BOOTSTRAP_TEST_MODE:-0}" == 1 ]]; then
 fi
 readonly TAR_BINARY
 readonly DESIRED_ROOT="${repo_root}/clusters/dev/flux-system/phase-a"
-readonly RAW_RENDERED_SHA256=7d27a43f17ba425def1b454ca31dbdecfd2370d1e13207be0c28700c8f73d69a
+readonly RAW_RENDERED_SHA256=e94f6dc99ff9ed9cee4f2b6458fd9d99e05f314daa1026fb98303009175840de
 readonly FIELD_MANAGER=engineering-platform-flux-phase-a
 readonly FLUX_VERSION=2.9.3
 readonly FLUX_ARCHIVE_SHA256=eae4e8608c0ade2bf4e8dec1669dbb6b0c28b5822b252d97feccfb4fb1181fd2
@@ -76,8 +76,8 @@ readonly EXPECTED_CRDS=$'customresourcedefinition.apiextensions.k8s.io/alerts.no
 readonly EXPECTED_DEPLOYMENTS=$'deployment.apps/helm-controller\ndeployment.apps/kustomize-controller\ndeployment.apps/notification-controller\ndeployment.apps/source-controller'
 readonly EXPECTED_CLUSTER_RBAC=$'clusterrole.rbac.authorization.k8s.io/flux-controller-api-health\nclusterrolebinding.rbac.authorization.k8s.io/flux-controller-api-health'
 readonly FLUX_CUSTOM_RESOURCE_TYPES=alerts.notification.toolkit.fluxcd.io,buckets.source.toolkit.fluxcd.io,externalartifacts.source.toolkit.fluxcd.io,gitrepositories.source.toolkit.fluxcd.io,helmcharts.source.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io,helmrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,ocirepositories.source.toolkit.fluxcd.io,providers.notification.toolkit.fluxcd.io,receivers.notification.toolkit.fluxcd.io
-readonly EXPECTED_BUSINESS_NAMESPACES=$'namespace/cert-manager\nnamespace/cnpg-system\nnamespace/local-path-storage\nnamespace/platform'
-readonly EXPECTED_BUSINESS_SYNC=$'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cert-manager-config\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cert-manager-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cnpg-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/infrastructure-foundation\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-apps\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-database\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-migration'
+readonly EXPECTED_BUSINESS_NAMESPACES=$'namespace/cert-manager\nnamespace/cnpg-system\nnamespace/local-path-storage\nnamespace/openbao\nnamespace/platform'
+readonly EXPECTED_BUSINESS_SYNC=$'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\nhelmchart.source.toolkit.fluxcd.io/flux-system/flux-system-openbao\nhelmrelease.helm.toolkit.fluxcd.io/flux-system/openbao\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cert-manager-config\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cert-manager-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/cnpg-controller\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/infrastructure-foundation\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/openbao-runtime\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-apps\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-database\nkustomization.kustomize.toolkit.fluxcd.io/flux-system/platform-migration'
 
 namespace_json_is_exact() {
   python_isolated -c '

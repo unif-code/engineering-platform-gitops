@@ -20,6 +20,27 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_PCS = ROOT / 'pcs/candidate-2.md'
 CURRENT_DOCS_ARCHITECTURE_COMMIT = '541b186878d1e28e1aa9308111a2962cdfefb91b'
+OPENBAO_DOCS_ARCHITECTURE_COMMIT = (
+    '0039d697237eb3f3a4a6238f47d4b971974a031e'
+)
+OPENBAO_CHART_VERSION = '0.28.6'
+OPENBAO_APP_VERSION = '2.6.1'
+OPENBAO_CHART_PACKAGE_SHA256 = (
+    'sha256:175c5cea2d36b68d348eca872044656bd8740c4dbe26b7dc8eb7c7438474a8b3'
+)
+OPENBAO_CHART_REGISTRY_DIGEST = (
+    'sha256:b3a8d99a56ffa36174b3848917ca849311f890d3bc2214245c88c270a54d0795'
+)
+OPENBAO_SERVER_AMD64_DIGEST = (
+    'sha256:15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0'
+)
+OPENBAO_INJECTOR_AMD64_DIGEST = (
+    'sha256:3dd30a9ac5909d17555480f51be734dfb719a323409f06cffe8b48cdaf6237d2'
+)
+OPENBAO_AGENT_AMD64_DIGEST = OPENBAO_SERVER_AMD64_DIGEST
+OPENBAO_RENDERED_CANONICAL_SHA256 = (
+    'ee07429197a8ca7644343d0d66b52e3dc7941a8a608fc6db00da3b4184dcc180'
+)
 CURRENT_DOCS_ARCHITECTURE_PLAN = (
     'docs/superpowers/plans/2026-08-23-pcs-runtime-reconciliation.md'
 )
@@ -295,10 +316,10 @@ FLUX_PHASE_A_COMPONENTS_SHA256 = (
     'c6e84495c3b611978d053adc40aca1e2a12af38f6e239c44a6b6c1224e01cab7'
 )
 FLUX_PHASE_A_CANONICAL_RENDERED_SHA256 = (
-    'c048e900c7b516d63fa74a3e8b585807023d8a5a571dc1acff7ad46100384175'
+    'bb63c76f698c52d92869a4ddb524fb5c97b6934855059d903fdd3395b53559dd'
 )
 FLUX_PHASE_A_RAW_RENDERED_SHA256 = (
-    '7d27a43f17ba425def1b454ca31dbdecfd2370d1e13207be0c28700c8f73d69a'
+    'e94f6dc99ff9ed9cee4f2b6458fd9d99e05f314daa1026fb98303009175840de'
 )
 FLUX_PHASE_A_ROLLOUT_STRATEGY = {
     'rollingUpdate': {'maxSurge': 1, 'maxUnavailable': 0},
@@ -675,7 +696,20 @@ FLUX_PHASE_A_ROLE_RULES = {
         },
         {
             'apiGroups': ['source.toolkit.fluxcd.io'],
-            'resources': ['helmcharts', 'ocirepositories'],
+            'resources': ['helmcharts'],
+            'verbs': [
+                'create',
+                'delete',
+                'get',
+                'list',
+                'patch',
+                'update',
+                'watch',
+            ],
+        },
+        {
+            'apiGroups': ['source.toolkit.fluxcd.io'],
+            'resources': ['ocirepositories'],
             'verbs': ['get', 'list', 'watch'],
         },
         {

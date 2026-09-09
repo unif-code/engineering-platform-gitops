@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import io
 import json
 import os
+import pty
 import re
+import select
+import signal
 import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
+import termios
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +54,7 @@ STAGE_SCRIPTS = {
     '140': 'scripts/bootstrap/stages/140-platform-migration/run.sh',
     '150': 'scripts/bootstrap/stages/150-platform-apps/run.sh',
     '160': 'scripts/bootstrap/stages/160-business-ready-evidence/run.sh',
+    '170': 'scripts/bootstrap/stages/170-openbao-runtime/run.sh',
 }
 PREFLIGHT = ROOT / STAGE_SCRIPTS['00']
 STAGE_ARTIFACTS = ROOT / STAGE_SCRIPTS['10']
@@ -56,6 +67,16 @@ FINAL_VERIFY = ROOT / STAGE_SCRIPTS['90']
 FLUX_PHASE_A = ROOT / STAGE_SCRIPTS['100']
 BOOTSTRAP_ALL = ROOT / 'scripts/bootstrap/bootstrap-all.sh'
 RUN_APPROVED = ROOT / 'scripts/bootstrap/run-approved.sh'
+RUN_APPROVED_ARGS = ROOT / 'scripts/bootstrap/lib/run-approved-args.sh'
+RUN_APPROVED_LOCK = ROOT / 'scripts/bootstrap/lib/run-approved-lock.sh'
+OPENBAO_RUNTIME = ROOT / STAGE_SCRIPTS['170']
+OPENBAO_RUNTIME_LIB = ROOT / 'scripts/bootstrap/lib/openbao-runtime.sh'
+OPENBAO_INITIALIZE = (
+    ROOT / 'scripts/bootstrap/stages/180-openbao-initialize/run.sh'
+)
+OPENBAO_INITIALIZE_LIB = ROOT / 'scripts/bootstrap/lib/openbao-initialize.sh'
+OPENBAO_RECOVERY_HELPER = ROOT / 'scripts/bootstrap/lib/openbao_recovery.py'
+OPENBAO_RECOVERY_WIZARD = ROOT / 'scripts/openbao/recovery-ceremony-wizard.sh'
 
 # 命令位置的完整枚举：行首、分隔符之后、复合命令关键字之后，再加上 `!`/`command`/
 # `builtin` 这类可叠加的命令前缀。少一种写法就等于失败开放——那条 source 既不会被
@@ -648,7 +669,7 @@ class CommonLibraryTest(BootstrapTestCase):
             sorted(STAGE_SCRIPTS, key=int),
             [
                 '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                '110', '120', '130', '140', '150', '160',
+                '110', '120', '130', '140', '150', '160', '170',
             ],
         )
         for number in STAGE_SCRIPTS:
@@ -707,16 +728,19 @@ class CommonLibraryTest(BootstrapTestCase):
 
         # 走表而非通配：迁移后 `[0-9]*.sh` 只剩尚未迁移的那几个，枚举会静默变少。
         stages = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stages), 15, [str(s) for s in stages])
+        self.assertEqual(len(stages), 16, [str(s) for s in stages])
         for stage in stages:
             with self.subTest(stage=stage.name):
                 body = stage.read_text(encoding='utf-8')
                 for declaration in ('host_path()', 'complete()'):
                     self.assertNotIn(declaration + ' {', body, declaration)
-                expected_library = (
-                    'business-ready.sh' if int(stage.parent.name.split('-', 1)[0]) >= 110
-                    else 'common.sh'
-                )
+                stage_number = int(stage.parent.name.split('-', 1)[0])
+                if stage_number == 170:
+                    expected_library = 'openbao-runtime.sh'
+                elif stage_number >= 110:
+                    expected_library = 'business-ready.sh'
+                else:
+                    expected_library = 'common.sh'
                 self.assertRegex(
                     body, self.library_source_pattern(expected_library)
                 )
@@ -1691,6 +1715,11 @@ class KubectlLibraryTest(BootstrapTestCase):
         'capture_admin_conf()',
         'admin_conf_is_safe()',
         'kubectl_run()',
+        'kubectl_isolated_read_control()',
+        'kubectl_isolated_start()',
+        'kubectl_isolated_wait()',
+        'kubectl_isolated_wait_interruptibly()',
+        'kubectl_isolated_terminate()',
         'kubectl_query_is_empty()',
     )
 
@@ -1745,6 +1774,610 @@ class KubectlLibraryTest(BootstrapTestCase):
         self.assertIn('--kubeconfig <(printf', run_body)
         self.assertNotIn('--kubeconfig "$admin_conf"', run_body)
         self.assertEqual(run_body.count('admin_conf_is_safe || return 1'), 2)
+
+    def test_isolated_runner_terminates_its_complete_process_group(self) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'isolated-pids.log'
+        fake_kubectl = temporary / 'fake-kubectl'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            printf 'PID=%s\n' "$BASHPID" >>"$TEST_PID_LOG"
+            (
+              printf 'PID=%s\n' "$BASHPID" >>"$TEST_PID_LOG"
+              /bin/sleep 30 &
+              printf 'PID=%s\n' "$!" >>"$TEST_PID_LOG"
+              wait
+            ) &
+            wait
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_PID_LOG=$3
+            export TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" &&
+                 $(wc -l <"$TEST_PID_LOG") -ge 3 ]] && break
+              /bin/sleep 0.01
+            done
+            [[ $(wc -l <"$TEST_PID_LOG") -eq 3 ]] || exit 97
+            printf 'SUPERVISOR_PID=%s\n' "$KUBE_RUNNER_PID"
+            printf 'ACTIVE_BEFORE=%s\n' "$KUBE_RUNNER_ACTIVE"
+            kubectl_isolated_terminate TERM
+            printf 'ACTIVE_AFTER=%s\n' "$KUBE_RUNNER_ACTIVE"
+            printf 'ADMIN_CALLS=%s\n' "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl',
+                str(KUBECTL_LIB), str(fake_kubectl), str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ACTIVE_BEFORE=1', result.stdout)
+        self.assertIn('ACTIVE_AFTER=0', result.stdout)
+        self.assertIn('ADMIN_CALLS=2', result.stdout)
+        supervisor = re.search(r'SUPERVISOR_PID=(\d+)', result.stdout)
+        self.assertIsNotNone(supervisor, result.stdout)
+        pids = [int(supervisor.group(1))]
+        pids.extend(
+            int(line.removeprefix('PID='))
+            for line in pid_log.read_text(encoding='utf-8').splitlines()
+        )
+        self.assertEqual(len(set(pids)), 4)
+        for process_id in pids:
+            with self.subTest(process_id=process_id):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process_id, 0)
+
+    def test_isolated_runner_terminates_group_after_leader_exits(self) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'leader-exit-pids.log'
+        fake_kubectl = temporary / 'leader-exits'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            /bin/sleep 30 &
+            printf 'PID=%s\n' "$!" >"$TEST_PID_LOG"
+            exit 0
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_PID_LOG=$3
+            export TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            group_leader=$KUBE_RUNNER_GROUP
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" && ! -e "/proc/$group_leader" ]] && break
+              /bin/sleep 0.01
+            done
+            [[ -f "$TEST_PID_LOG" && ! -e "/proc/$group_leader" ]] || exit 97
+            printf 'SUPERVISOR_PID=%s\nGROUP_LEADER=%s\n' \
+              "$KUBE_RUNNER_PID" "$group_leader"
+            kubectl_isolated_terminate TERM
+            printf 'ACTIVE_AFTER=%s\nADMIN_CALLS=%s\n' \
+              "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-leader-exit',
+                str(KUBECTL_LIB), str(fake_kubectl), str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ACTIVE_AFTER=0\nADMIN_CALLS=2\n', result.stdout)
+        pids = [int(pid_log.read_text(encoding='utf-8').removeprefix('PID='))]
+        pids.extend(
+            int(value)
+            for value in re.findall(
+                r'^(?:SUPERVISOR_PID|GROUP_LEADER)=(\d+)$',
+                result.stdout,
+                re.MULTILINE,
+            )
+        )
+        for process_id in pids:
+            with self.subTest(process_id=process_id):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process_id, 0)
+
+    def test_isolated_runner_reaps_descendant_that_escapes_original_group(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'escaped-pid.log'
+        detached = temporary / 'detached.py'
+        detached.write_text(textwrap.dedent('''\
+            import os
+            import pathlib
+            import sys
+            import time
+
+            os.setsid()
+            pathlib.Path(sys.argv[1]).write_text(
+                str(os.getpid()), encoding='ascii',
+            )
+            time.sleep(30)
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl = temporary / 'escaping-kubectl'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            /usr/bin/python3 "$TEST_DETACHED" "$TEST_PID_LOG" &
+            exit 0
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_DETACHED=$3
+            TEST_PID_LOG=$4
+            export TEST_DETACHED TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" ]] && break
+              /bin/sleep 0.01
+            done
+            [[ -f "$TEST_PID_LOG" ]] || exit 97
+            leader_reaped=false
+            for _ in {1..100}; do
+              if ! kubectl_process_identity "$KUBE_RUNNER_GROUP" \
+                >/dev/null 2>&1; then
+                leader_reaped=true
+                break
+              fi
+              /bin/sleep 0.01
+            done
+            [[ "$leader_reaped" == true ]] || exit 96
+            printf 'SUPERVISOR_PID=%s\nGROUP_LEADER=%s\n' \
+              "$KUBE_RUNNER_PID" "$KUBE_RUNNER_GROUP"
+            kubectl_isolated_terminate TERM
+            printf 'ACTIVE_AFTER=%s\nADMIN_CALLS=%s\n' \
+              "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-escaped-descendant',
+                str(KUBECTL_LIB), str(fake_kubectl), str(detached),
+                str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ACTIVE_AFTER=0\nADMIN_CALLS=2\n', result.stdout)
+        escaped_pid = int(pid_log.read_text(encoding='ascii'))
+        escaped_survived = True
+        try:
+            os.kill(escaped_pid, 0)
+        except ProcessLookupError:
+            escaped_survived = False
+        finally:
+            if escaped_survived:
+                os.kill(escaped_pid, signal.SIGKILL)
+        self.assertFalse(
+            escaped_survived,
+            f'escaped hidden-TTY descendant survived: {escaped_pid}',
+        )
+
+    def test_isolated_control_reader_preserves_partial_timeout(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            exec {control_fd}< <(
+              printf 'S'
+              /bin/sleep 0.05
+              printf 'TOPPED|OK\n'
+            )
+            KUBE_RUNNER_CONTROL_READ_FD=$control_fd
+            first_status=0
+            kubectl_isolated_read_control 0.01 || first_status=$?
+            printf 'FIRST_STATUS=%s\nFIRST_BUFFER=%s\n' \
+              "$first_status" "$KUBE_RUNNER_CONTROL_BUFFER"
+            for _ in {1..20}; do
+              if kubectl_isolated_read_control 0.01; then
+                printf 'MESSAGE=%s\n' "$KUBE_RUNNER_CONTROL_MESSAGE"
+                exit 0
+              fi
+            done
+            exit 1
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'partial-control', str(KUBECTL_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FIRST_STATUS=2\nFIRST_BUFFER=S\n', result.stdout)
+        self.assertIn('MESSAGE=STOPPED|OK\n', result.stdout)
+
+    def test_isolated_control_reader_keeps_delimiters_at_timeout_boundary(self) -> None:
+        # Force the real Bash read to report timeout after consuming data.
+        # Losing its delimiter must not concatenate two protocol messages.
+        script = textwrap.dedent(r'''
+            source "$1"
+            read() {
+              local boundary_status=0 boundary_target=${!#}
+              builtin read "$@" || boundary_status=$?
+              [[ -n "${!boundary_target}" ]] && return 142
+              return "$boundary_status"
+            }
+            exec {control_fd}< <(printf 'DONE|23\nSTOPPED|OK\n')
+            KUBE_RUNNER_CONTROL_READ_FD=$control_fd
+            for _ in 1 2; do
+              status=0
+              kubectl_isolated_read_control 0.01 || status=$?
+              printf 'STATUS=%s MESSAGE=%s\n' "$status" "$KUBE_RUNNER_CONTROL_MESSAGE"
+            done
+            ''')
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'control-boundary', str(KUBECTL_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'STATUS=0 MESSAGE=DONE|23', 'STATUS=0 MESSAGE=STOPPED|OK',
+        ])
+        self.assertEqual(result.stderr, '')
+
+    def test_isolated_control_reader_drains_complete_lines_before_eof(self) -> None:
+        script = textwrap.dedent(r'''
+            source "$1"
+            exec {control_fd}< <(printf 'DONE|23\nSTOPPED|OK\nunfinished')
+            KUBE_RUNNER_CONTROL_READ_FD=$control_fd
+            for _ in 1 2 3; do
+              status=0
+              kubectl_isolated_read_control 0.01 || status=$?
+              printf 'STATUS=%s MESSAGE=%s\n' "$status" "$KUBE_RUNNER_CONTROL_MESSAGE"
+            done
+            printf 'BUFFER=%s\n' "$KUBE_RUNNER_CONTROL_BUFFER"
+            ''')
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'control-eof', str(KUBECTL_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'STATUS=0 MESSAGE=DONE|23', 'STATUS=0 MESSAGE=STOPPED|OK',
+            'STATUS=1 MESSAGE=', 'BUFFER=',
+        ])
+        self.assertEqual(result.stderr, '')
+
+    def test_isolated_supervisor_never_reuses_reaped_leader_group(self) -> None:
+        body = KUBECTL_LIB.read_text(encoding='utf-8')
+        helper = body.split(
+            'def signal_original_group(signal_number):\n', 1,
+        )[1].split('\n\ndef ', 1)[0]
+        self.assertTrue(
+            helper.startswith(
+                '    if main_status is not None:\n'
+                '        return\n',
+            ),
+            helper,
+        )
+
+    def test_isolated_done_stop_race_preserves_protocol_and_postcheck(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        fake_kubectl = temporary / 'fast-kubectl'
+        fake_kubectl.write_text('#!/bin/bash\nexit 23\n', encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            POSTCHECK_FAIL=$3
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() {
+              ADMIN_CALLS=$((ADMIN_CALLS + 1))
+              [[ "$POSTCHECK_FAIL" != true || "$ADMIN_CALLS" -lt 2 ]]
+            }
+            eval "$(
+              declare -f kubectl_isolated_read_control |
+                sed '1s/kubectl_isolated_read_control/kubectl_isolated_read_control_real/'
+            )"
+            eval "$(
+              declare -f kubectl_isolated_wait |
+                sed '1s/kubectl_isolated_wait/kubectl_isolated_wait_real/'
+            )"
+            kubectl_isolated_wait() {
+              local wait_status=0
+              printf 'WAIT_ARG=%s\n' "$1"
+              kubectl_isolated_wait_real "$@" || wait_status=$?
+              printf 'WAIT_STATUS=%s\n' "$wait_status"
+              return "$wait_status"
+            }
+            kubectl_isolated_start --fixture || exit 97
+            queued_done=
+            for _ in {1..100}; do
+              if kubectl_isolated_read_control_real 0.01; then
+                queued_done=$KUBE_RUNNER_CONTROL_MESSAGE
+                break
+              fi
+            done
+            [[ "$queued_done" == 'DONE|23' ]] || exit 96
+            kubectl_isolated_read_control() {
+              if [[ -n "$queued_done" ]]; then
+                KUBE_RUNNER_CONTROL_MESSAGE=$queued_done
+                queued_done=
+                printf 'CONTROL_SHIM=host-done-branch\n'
+                return 0
+              fi
+              kubectl_isolated_read_control_real "$@"
+            }
+            terminate_status=0
+            kubectl_isolated_terminate TERM || terminate_status=$?
+            printf 'TERMINATE_STATUS=%s\nACTIVE_AFTER=%s\nADMIN_CALLS=%s\n' \
+              "$terminate_status" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            ''')
+        for postcheck_fail, expected_status in (('false', 0), ('true', 1)):
+            with self.subTest(postcheck_fail=postcheck_fail):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'done-stop-race',
+                        str(KUBECTL_LIB), str(fake_kubectl), postcheck_fail,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr,
+                )
+                self.assertIn(
+                    'CONTROL_SHIM=host-done-branch\n', result.stdout,
+                )
+                self.assertIn('WAIT_ARG=0\n', result.stdout)
+                self.assertIn(
+                    f'WAIT_STATUS={expected_status}\n'
+                    f'TERMINATE_STATUS={expected_status}\n'
+                    'ACTIVE_AFTER=0\nADMIN_CALLS=2\n',
+                    result.stdout,
+                )
+
+    def test_isolated_terminate_uses_control_after_persistent_identity_error(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        pid_log = temporary / 'identity-error-pids.log'
+        fake_kubectl = temporary / 'identity-error-kubectl'
+        fake_kubectl.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            printf 'PID=%s\n' "$BASHPID" >"$TEST_PID_LOG"
+            /bin/sleep 30
+            ''').lstrip(), encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            TEST_PID_LOG=$3
+            export TEST_PID_LOG
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            for _ in {1..100}; do
+              [[ -f "$TEST_PID_LOG" ]] && break
+              /bin/sleep 0.01
+            done
+            [[ -f "$TEST_PID_LOG" ]] || exit 97
+            printf 'SUPERVISOR_PID=%s\n' "$KUBE_RUNNER_PID"
+            kubectl_process_identity() { return 1; }
+            if kubectl_isolated_terminate TERM; then
+              observed=0
+            else
+              observed=$?
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-identity-error',
+                str(KUBECTL_LIB), str(fake_kubectl), str(pid_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            'OBSERVED=0\nACTIVE=0\nADMIN_CALLS=2\n', result.stdout,
+        )
+        pids = [int(pid_log.read_text(encoding='utf-8').removeprefix('PID='))]
+        supervisor = re.search(
+            r'^SUPERVISOR_PID=(\d+)$', result.stdout, re.MULTILINE,
+        )
+        self.assertIsNotNone(supervisor, result.stdout)
+        pids.append(int(supervisor.group(1)))
+        for process_id in pids:
+            with self.subTest(process_id=process_id):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process_id, 0)
+
+    def test_isolated_runner_preserves_fast_exit_and_postchecks_admin_conf(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            if kubectl_isolated_wait_interruptibly; then
+              observed=0
+            else
+              observed=$?
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        for exit_code in (0, 23):
+            with self.subTest(exit_code=exit_code):
+                fake_kubectl = temporary / f'fast-exit-{exit_code}'
+                fake_kubectl.write_text(
+                    f'#!/bin/sh\nexit {exit_code}\n', encoding='utf-8',
+                )
+                fake_kubectl.chmod(0o755)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'isolated-kubectl-exit',
+                        str(KUBECTL_LIB), str(fake_kubectl),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr,
+                )
+                self.assertEqual(
+                    result.stdout,
+                    f'OBSERVED={exit_code}\nACTIVE=0\nADMIN_CALLS=2\n',
+                )
+
+    def test_isolated_runner_reports_exec_failure_and_postchecks(self) -> None:
+        missing_kubectl = self.temporary_directory() / 'missing-kubectl'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            kubectl_isolated_start --fixture
+            if kubectl_isolated_wait_interruptibly; then
+              observed=0
+            else
+              observed=$?
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl-exec-failure',
+                str(KUBECTL_LIB), str(missing_kubectl),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'OBSERVED=127\nACTIVE=0\nADMIN_CALLS=2\n',
+        )
+
+    def test_isolated_runner_rejects_post_launch_admin_conf_drift(self) -> None:
+        temporary = self.temporary_directory()
+        fake_kubectl = temporary / 'fast-success'
+        fake_kubectl.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() {
+              ADMIN_CALLS=$((ADMIN_CALLS + 1))
+              (( ADMIN_CALLS == 1 ))
+            }
+            kubectl_isolated_start --fixture
+            start_rc=$?
+            if [[ "$start_rc" == 0 ]]; then
+              kubectl_isolated_wait_interruptibly
+              observed=$?
+            else
+              observed=$start_rc
+            fi
+            printf 'OBSERVED=%s\nACTIVE=%s\nADMIN_CALLS=%s\n' \
+              "$observed" "$KUBE_RUNNER_ACTIVE" "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl-admin-drift',
+                str(KUBECTL_LIB), str(fake_kubectl),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'OBSERVED=1\nACTIVE=0\nADMIN_CALLS=2\n',
+        )
+
+    def test_isolated_runner_can_be_reused_sequentially(self) -> None:
+        temporary = self.temporary_directory()
+        fake_kubectl = temporary / 'sequential-kubectl'
+        fake_kubectl.write_text(
+            '#!/bin/sh\nexit "$4"\n', encoding='utf-8',
+        )
+        fake_kubectl.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            kubectl_binary=$2
+            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+            ADMIN_CALLS=0
+            admin_conf_is_safe() { ADMIN_CALLS=$((ADMIN_CALLS + 1)); }
+            for expected in 0 17 0 23; do
+              kubectl_isolated_start "$expected"
+              if kubectl_isolated_wait_interruptibly; then
+                observed=0
+              else
+                observed=$?
+              fi
+              printf 'EXPECTED=%s OBSERVED=%s ACTIVE=%s\n' \
+                "$expected" "$observed" "$KUBE_RUNNER_ACTIVE"
+            done
+            printf 'ADMIN_CALLS=%s\n' "$ADMIN_CALLS"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'isolated-kubectl-sequential',
+                str(KUBECTL_LIB), str(fake_kubectl),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'EXPECTED=0 OBSERVED=0 ACTIVE=0\n'
+            'EXPECTED=17 OBSERVED=17 ACTIVE=0\n'
+            'EXPECTED=0 OBSERVED=0 ACTIVE=0\n'
+            'EXPECTED=23 OBSERVED=23 ACTIVE=0\n'
+            'ADMIN_CALLS=8\n',
+        )
 
 
 class HelmLibraryTest(BootstrapTestCase):
@@ -1883,6 +2516,10 @@ class StageReadmeTest(BootstrapTestCase):
     def actual_stop_reasons(self, directory: Path) -> list[str]:
         if int(directory.name.split('-', 1)[0]) < 110:
             source = (directory / 'run.sh').read_text(encoding='utf-8')
+            return sorted(set(self.REASON.findall(source)))
+
+        if directory.name.startswith('170-'):
+            source = OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
             return sorted(set(self.REASON.findall(source)))
 
         source = (
@@ -3329,6 +3966,11 @@ class BootstrapEntrySecurityTest(BootstrapTestCase):
 class RunApprovedTest(BootstrapTestCase):
     """一行式运维入口：门禁 + 干净环境启动 bootstrap-all。"""
 
+    def test_fresh_stage180_check_keeps_exact_argv(self) -> None:
+        result = self.run_argument_parser('--check', '--stage=180')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'TARGET=openbao-initialize\nMODE=--check\nARG[0]=--check\n')
+
     def write_executable(self, path: Path, source: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(source).lstrip(), encoding='utf-8')
@@ -3359,10 +4001,36 @@ class RunApprovedTest(BootstrapTestCase):
         scripts.mkdir(parents=True)
         (scripts / 'run-approved.sh').write_bytes(RUN_APPROVED.read_bytes())
         (scripts / 'run-approved.sh').chmod(0o755)
+        args_parser = scripts / 'lib/run-approved-args.sh'
+        if RUN_APPROVED_ARGS.is_file():
+            args_parser.parent.mkdir(parents=True, exist_ok=True)
+            args_parser.write_bytes(RUN_APPROVED_ARGS.read_bytes())
+            args_parser.chmod(0o755)
+        lock_library = scripts / 'lib/run-approved-lock.sh'
+        if RUN_APPROVED_LOCK.is_file():
+            lock_library.parent.mkdir(parents=True, exist_ok=True)
+            lock_library.write_bytes(RUN_APPROVED_LOCK.read_bytes())
+            lock_library.chmod(0o755)
         self.write_executable(
             scripts / 'bootstrap-all.sh',
             '#!/bin/bash\n'
+            f'if [[ -e {shlex.quote(str(directory / "run-approved-hold"))} ]]; then\n'
+            f'  touch {shlex.quote(str(directory / "run-approved-ready"))}\n'
+            f'  while [[ ! -e {shlex.quote(str(directory / "run-approved-release"))} ]]; do sleep 0.05; done\n'
+            'fi\n'
             'printf \'FAKE_MODE=%s\\n\' "$1"\n'
+            'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
+            'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
+        )
+        self.write_executable(
+            scripts / 'stages/180-openbao-initialize/run.sh',
+            '#!/bin/bash\n'
+            'printf \'FAKE_OPENBAO_OPERATION=%s\\n\' "$1"\n'
+            'index=0\n'
+            'for argument in "$@"; do\n'
+            '  printf \'FAKE_OPENBAO_ARG[%s]=%s\\n\' "$index" "$argument"\n'
+            '  index=$((index + 1))\n'
+            'done\n'
             'printf \'KUBECACHEDIR_SEEN=%s\\n\' "${KUBECACHEDIR:-ABSENT}"\n'
             'printf \'PYTHON_SEEN=%s\\n\' "${PYTHONDONTWRITEBYTECODE:-ABSENT}"\n',
         )
@@ -3414,6 +4082,352 @@ class RunApprovedTest(BootstrapTestCase):
             env=environment,
         )
 
+    def run_argument_parser(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                '/bin/bash', '-c',
+                'source "$1" || exit $?\n'
+                'shift\n'
+                'run_approved_parse_arguments "$@" || exit $?\n'
+                'printf \'TARGET=%s\\n\' "$RUN_APPROVED_TARGET"\n'
+                'printf \'MODE=%s\\n\' "$RUN_APPROVED_MODE"\n'
+                'for index in "${!RUN_APPROVED_TARGET_ARGUMENTS[@]}"; do\n'
+                '  printf \'ARG[%s]=%s\\n\' "$index" '
+                '"${RUN_APPROVED_TARGET_ARGUMENTS[$index]}"\n'
+                'done\n',
+                'run-approved-parser-test', str(RUN_APPROVED_ARGS), *arguments,
+            ],
+            capture_output=True, text=True, check=False,
+            env=self.sanitized_environment(),
+        )
+
+    def test_wrapper_and_stage180_apply_use_ordered_exclusive_locks(self) -> None:
+        body = RUN_APPROVED.read_text(encoding='utf-8')
+        self.assertIn('source "${script_dir}/lib/run-approved-lock.sh"', body)
+        wrapper_lock = 'run_approved_acquire_directory_lock "$repo" /usr/bin/flock 8'
+        self.assertIn(wrapper_lock, body)
+        self.assertLess(body.index(wrapper_lock), body.index('origin_url='))
+        self.assertIn(
+            'lock_file=/run/lock/engineering-platform-bootstrap.lock', body,
+        )
+        self.assertIn(
+            'run_approved_acquire_lock "$lock_file" 0 1777 /usr/bin/flock 9',
+            body,
+        )
+        self.assertIn(
+            '[[ "$target:$mode" == openbao-initialize:--apply ]]', body,
+        )
+
+    def test_run_approved_lock_serializes_and_rejects_symlink(self) -> None:
+        temporary = self.temporary_directory()
+        lock_parent = temporary / 'lock-parent'
+        lock_parent.mkdir(mode=0o700)
+        lock_path = lock_parent / 'bootstrap.lock'
+        holder_script = textwrap.dedent(
+            r'''
+            source "$1"
+            run_approved_acquire_lock "$2" "$EUID" 700 /usr/bin/flock 9 || exit 91
+            printf 'READY\n'
+            read -r _
+            '''
+        )
+        holder = subprocess.Popen(
+            [
+                '/bin/bash', '-c', holder_script, 'lock-holder',
+                str(RUN_APPROVED_LOCK), str(lock_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.sanitized_environment(),
+        )
+        try:
+            self.assertEqual(holder.stdout.readline(), 'READY\n')
+            contender = self.run_command(
+                [
+                    '/bin/bash', '-c',
+                    'source "$1"\n'
+                    'if run_approved_acquire_lock "$2" "$EUID" 700 '
+                    '/usr/bin/flock 9; then exit 92; fi\n'
+                    'printf "%s\\n" "$RUN_APPROVED_LOCK_REASON"\n',
+                    'lock-contender', str(RUN_APPROVED_LOCK), str(lock_path),
+                ],
+                env=self.sanitized_environment(),
+            )
+            self.assertEqual(contender.returncode, 0, contender.stderr)
+            self.assertEqual(contender.stdout, 'concurrent-run\n')
+        finally:
+            if holder.stdin is not None:
+                holder.stdin.write('\n')
+                holder.stdin.flush()
+                holder.stdin.close()
+            holder.wait(timeout=5)
+        holder_stderr = holder.stderr.read()
+        holder.stdout.close()
+        holder.stderr.close()
+        self.assertEqual(holder.returncode, 0, holder_stderr)
+
+        unsafe_parent = temporary / 'unsafe-parent'
+        unsafe_parent.mkdir(mode=0o700)
+        target = unsafe_parent / 'target'
+        target.write_text('not-a-lock\n', encoding='ascii')
+        target.chmod(0o600)
+        unsafe_lock = unsafe_parent / 'bootstrap.lock'
+        unsafe_lock.symlink_to(target)
+        rejected = self.run_command(
+            [
+                '/bin/bash', '-c',
+                'source "$1"\n'
+                'if run_approved_acquire_lock "$2" "$EUID" 700 '
+                '/usr/bin/flock 9; then exit 92; fi\n'
+                'printf "%s\\n" "$RUN_APPROVED_LOCK_REASON"\n',
+                'unsafe-lock', str(RUN_APPROVED_LOCK), str(unsafe_lock),
+            ],
+            env=self.sanitized_environment(),
+        )
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(rejected.stdout, 'unsafe-lock-target\n')
+        self.assertTrue(unsafe_lock.is_symlink())
+
+    def test_wrapper_lock_is_held_through_the_target_process(self) -> None:
+        clone, approved_sha, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved_sha)
+        hold = clone.parent / 'run-approved-hold'
+        ready = clone.parent / 'run-approved-ready'
+        release = clone.parent / 'run-approved-release'
+        hold.touch()
+        holder = subprocess.Popen(
+            [
+                '/bin/bash', str(clone / 'scripts/bootstrap/run-approved.sh'),
+                approved_sha, '--check',
+            ],
+            cwd=clone,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.sanitized_environment(),
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(ready.exists(), 'holder did not reach target process')
+            contender = self.run_wrapper(clone, approved_sha, '--check')
+            self.assertEqual(contender.returncode, 105, contender.stderr)
+            self.assertIn(
+                'STOP: another run-approved command is running',
+                contender.stdout,
+            )
+        finally:
+            release.touch()
+            holder.wait(timeout=5)
+        holder_stdout = holder.stdout.read()
+        holder_stderr = holder.stderr.read()
+        holder.stdout.close()
+        holder.stderr.close()
+        self.assertEqual(holder.returncode, 0, holder_stderr)
+        self.assertIn('FAKE_MODE=--check', holder_stdout)
+
+    def run_openbao_operation_parser(
+        self, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                '/bin/bash', '-c',
+                'source "$1"\n'
+                'shift\n'
+                'openbao_parse_operation "$@" || exit $?\n'
+                'printf \'OPERATION=%s\\n\' "$OPENBAO_OPERATION"\n'
+                'printf \'SOURCE=%s\\n\' "$OPENBAO_SOURCE_RECOVERY_SHA"\n',
+                'openbao-operation-parser-test', str(OPENBAO_INITIALIZE_LIB), *arguments,
+            ],
+            capture_output=True, text=True, check=False,
+            env=self.sanitized_environment(),
+        )
+
+    def test_incident_operations_require_exact_source_sha_argv(self) -> None:
+        source = 'a' * 40
+        accepted = (
+            ('--check', '--stage=180', f'--source-recovery-sha={source}'),
+            ('--apply', '--stage=180', '--operation=recover-start',
+             f'--source-recovery-sha={source}'),
+            ('--apply', '--stage=180', '--operation=recover-verify',
+             f'--source-recovery-sha={source}'),
+        )
+        rejected = (
+            ('--apply', '--stage=180', '--operation=recover-start'),
+            ('--apply', '--stage=180', '--operation=accept',
+             f'--source-recovery-sha={source}'),
+            ('--apply', '--stage=180', '--operation=recover-start',
+             '--source-recovery-sha=' + 'A' * 40),
+            ('--apply', '--stage=180', '--operation=recover-start',
+             f'--source-recovery-sha={source}', '--extra'),
+            ('--apply', '--stage=180',
+             '--operation=recover-start:--source-recovery-sha=junk',
+             f'--source-recovery-sha={source}'),
+        )
+        expected = (
+            ('openbao-initialize', '--check'),
+            ('openbao-initialize', '--recover-start'),
+            ('openbao-initialize', '--recover-verify'),
+        )
+
+        for arguments, (target, operation) in zip(accepted, expected):
+            with self.subTest(arguments=arguments):
+                result = self.run_argument_parser(*arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        f'TARGET={target}',
+                        f'MODE={arguments[0]}',
+                        f'ARG[0]={operation}',
+                        f'ARG[1]=--source-recovery-sha={source}',
+                    ],
+                )
+
+        for arguments in rejected:
+            with self.subTest(arguments=arguments):
+                result = self.run_argument_parser(*arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_openbao_operation_parser_revalidates_incident_source_sha(self) -> None:
+        source = 'a' * 40
+        accepted = (
+            ('--check', f'--source-recovery-sha={source}', 'CHECK'),
+            ('--recover-start', f'--source-recovery-sha={source}', 'RECOVER_START'),
+            ('--recover-verify', f'--source-recovery-sha={source}', 'RECOVER_VERIFY'),
+        )
+
+        for operation, source_argument, expected_operation in accepted:
+            with self.subTest(operation=operation):
+                result = self.run_openbao_operation_parser(operation, source_argument)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        f'OPERATION={expected_operation}',
+                        f'SOURCE={source}',
+                    ],
+                )
+
+        rejected = (
+            ('--recover-start', '--source-recovery-sha=' + 'A' * 40),
+            ('--recover-start:--source-recovery-sha=junk',
+             f'--source-recovery-sha={source}'),
+            ('--check:--source-recovery-sha=junk',
+             f'--source-recovery-sha={source}'),
+        )
+        for arguments in rejected:
+            with self.subTest(arguments=arguments):
+                result = self.run_openbao_operation_parser(*arguments)
+                self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+
+    def test_stage_180_check_forwards_only_the_validated_incident_argv(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        source = 'a' * 40
+
+        result = self.run_wrapper(
+            clone, '--check', '--stage=180', f'--source-recovery-sha={source}',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAKE_OPENBAO_ARG[0]=--check', result.stdout)
+        self.assertIn(
+            f'FAKE_OPENBAO_ARG[1]=--source-recovery-sha={source}', result.stdout,
+        )
+        self.assertNotIn('FAKE_OPENBAO_ARG[2]=', result.stdout)
+
+    def test_stage_180_requires_main_and_validated_to_match_before_launch(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        (seed / 'unvalidated.txt').write_text('later\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'not yet validated', cwd=seed)
+        self.git('push', '-q', 'origin', 'main', cwd=seed)
+
+        result = self.run_wrapper(
+            clone, '--check', '--stage=180',
+            '--source-recovery-sha=' + 'a' * 40,
+        )
+
+        self.assertEqual(result.returncode, 102, result.stdout + result.stderr)
+        self.assertIn('STOP: Stage 180 requires main and validated to match', result.stdout)
+        self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
+
+    def test_stage_180_ref_gate_fetches_main_and_validated_as_one_snapshot(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        (seed / 'unvalidated.txt').write_text('later\n', encoding='utf-8')
+        self.git('add', '-A', cwd=seed)
+        self.git('commit', '-q', '-m', 'not yet validated', cwd=seed)
+        later = subprocess.run(
+            ['/usr/bin/git', 'rev-parse', 'HEAD'], cwd=seed,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        directory = self.temporary_directory()
+        count_file = directory / 'upload-pack-count'
+        release_file = directory / 'release-second-fetch'
+        upload_pack = directory / 'upload-pack'
+        self.write_executable(
+            upload_pack,
+            '''
+            #!/bin/bash
+            set -eu
+            if [[ -e "$RACE_UPLOAD_PACK_COUNT" ]]; then
+              while [[ ! -e "$RACE_RELEASE_SECOND_FETCH" ]]; do
+                sleep 0.01
+              done
+            fi
+            /usr/bin/git-upload-pack "$@"
+            if [[ ! -e "$RACE_UPLOAD_PACK_COUNT" ]]; then
+              : >"$RACE_UPLOAD_PACK_COUNT"
+            fi
+            ''',
+        )
+        self.git('config', 'remote.origin.uploadpack', str(upload_pack), cwd=clone)
+        errors: list[str] = []
+
+        def advance_main_after_first_fetch() -> None:
+            deadline = time.monotonic() + 5
+            while not count_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not count_file.exists():
+                errors.append('first fetch did not use the configured upload-pack')
+                release_file.touch()
+                return
+            pushed = subprocess.run(
+                ['/usr/bin/git', 'push', '-q', 'origin', f'{later}:refs/heads/main'],
+                cwd=seed, capture_output=True, text=True, check=False,
+            )
+            if pushed.returncode:
+                errors.append(pushed.stderr)
+            release_file.touch()
+
+        updater = threading.Thread(target=advance_main_after_first_fetch)
+        updater.start()
+        try:
+            result = self.run_wrapper(
+                clone, approved, '--check', '--stage=180',
+                '--source-recovery-sha=' + 'a' * 40,
+                extra_env={
+                    'RACE_UPLOAD_PACK_COUNT': str(count_file),
+                    'RACE_RELEASE_SECOND_FETCH': str(release_file),
+                },
+            )
+        finally:
+            release_file.touch()
+            updater.join(timeout=5)
+
+        self.assertFalse(errors, errors)
+        self.assertFalse(updater.is_alive(), 'main advancement watcher did not finish')
+        self.assertEqual(result.returncode, 102, result.stdout + result.stderr)
+        self.assertIn('STOP: Stage 180 requires main and validated to match', result.stdout)
+        self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
+
     def test_gates_then_launches_bootstrap_in_clean_environment(self) -> None:
         clone, approved, _ = self.make_gated_repo()
 
@@ -3432,6 +4446,50 @@ class RunApprovedTest(BootstrapTestCase):
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         self.assertEqual(head, approved)
+
+    def test_routes_stage_180_check_through_the_same_gates(self) -> None:
+        clone, approved, seed = self.make_gated_repo()
+        self.publish_validated(seed, approved)
+        source = 'a' * 40
+
+        result = self.run_wrapper(
+            clone, approved, '--check', '--stage=180',
+            f'--source-recovery-sha={source}',
+            extra_env={'KUBECACHEDIR': '/dev/null', 'PYTHONDONTWRITEBYTECODE': '1'},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAKE_OPENBAO_OPERATION=--check', result.stdout)
+        self.assertIn(
+            f'FAKE_OPENBAO_ARG[1]=--source-recovery-sha={source}', result.stdout,
+        )
+        self.assertNotIn('FAKE_MODE=', result.stdout)
+        self.assertIn('KUBECACHEDIR_SEEN=ABSENT', result.stdout)
+        self.assertIn('PYTHON_SEEN=ABSENT', result.stdout)
+        self.assertIn('COMMAND_EXIT_CODE=0', result.stdout)
+
+    def test_stage_180_mutations_are_explicit_and_root_gated(self) -> None:
+        clone, approved, _ = self.make_gated_repo()
+        for operation in ('initialize', 'configure', 'accept'):
+            with self.subTest(operation=operation):
+                result = self.run_wrapper(
+                    clone, approved, '--apply', '--stage=180',
+                    f'--operation={operation}',
+                )
+                self.assertEqual(result.returncode, 91, result.stdout + result.stderr)
+                self.assertIn('STOP: --apply must run as root', result.stdout)
+                self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
+
+        for arguments in (
+            (approved, '--apply', '--stage=180'),
+            (approved, '--check', '--stage=180', '--operation=initialize'),
+            (approved, '--apply', '--stage=180', '--operation=check'),
+            (approved, '--check', '--stage=170'),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_wrapper(clone, *arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertNotIn('FAKE_OPENBAO_OPERATION=', result.stdout)
 
     def test_defaults_to_ci_published_validated_ref(self) -> None:
         """不带 SHA 时使用 CI 发布的 origin/validated，运维无需手工转述 40 位字符。"""
@@ -3681,6 +4739,10 @@ class BootstrapOrchestratorMixin:
                 check_result=PASS_BUSINESS_READY_EVIDENCE_CHECK
                 apply_result=PASS_BUSINESS_READY
                 ;;
+              170)
+                check_result=PASS_OPENBAO_RUNTIME_CHECK
+                apply_result=PASS_OPENBAO_RUNTIME_INSTALLED
+                ;;
               *) exit 30 ;;
             esac
 
@@ -3894,6 +4956,8 @@ class BootstrapOrchestratorMixin:
             (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150'),
              'PASS_BOOTSTRAP_CHECK', '160'),
             (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150', '160'),
+             'PASS_BOOTSTRAP_CHECK', '170'),
+            (('10', '20', '30', '40', '50', '60', '100', '110', '120', '130', '140', '150', '160', '170'),
              'PASS_BOOTSTRAP_ALL_CHECK', 'NONE'),
         )
         for completed, expected_result, expected_next in cases:
@@ -3909,7 +4973,7 @@ class BootstrapOrchestratorMixin:
                 self.assertIn(f'NEXT_STAGE={expected_next}', result.stdout)
                 expected_checks = [
                     '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                    '110', '120', '130', '140', '150', '160',
+                    '110', '120', '130', '140', '150', '160', '170',
                 ]
                 if expected_next != 'NONE':
                     expected_checks = expected_checks[
@@ -3923,7 +4987,7 @@ class BootstrapOrchestratorMixin:
     def test_apply_on_fully_complete_state_performs_no_stage_apply(self) -> None:
         for stage in (
             '10', '20', '30', '40', '50', '60', '100',
-            '110', '120', '130', '140', '150', '160',
+            '110', '120', '130', '140', '150', '160', '170',
         ):
             (self.state_dir / stage).touch()
 
@@ -3939,7 +5003,7 @@ class BootstrapOrchestratorMixin:
                 f'{stage} --check'
                 for stage in (
                     '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                    '110', '120', '130', '140', '150', '160',
+                    '110', '120', '130', '140', '150', '160', '170',
                 )
             ],
         )
@@ -4024,20 +5088,20 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in (
-            '[1/15] stage 00 check ...',
-            '[1/15] stage 00 check -> PASS_PREFLIGHT',
-            '[5/15] stage 40 check -> PASS_KUBERNETES_CHECK',
-            '[5/15] stage 40 apply ...',
-            '[5/15] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
-            '[5/15] stage 40 postcheck -> ALREADY_COMPLIANT',
-            '[8/15] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
-            '[9/15] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
-            '[15/15] stage 160 check -> PASS_BUSINESS_READY_EVIDENCE_CHECK',
+            '[1/16] stage 00 check ...',
+            '[1/16] stage 00 check -> PASS_PREFLIGHT',
+            '[5/16] stage 40 check -> PASS_KUBERNETES_CHECK',
+            '[5/16] stage 40 apply ...',
+            '[5/16] stage 40 apply -> PASS_KUBERNETES_INSTALLED',
+            '[5/16] stage 40 postcheck -> ALREADY_COMPLIANT',
+            '[8/16] stage 90 check -> PASS_BOOTSTRAP_VERIFIED',
+            '[9/16] stage 100 check -> PASS_FLUX_PHASE_A_CHECK',
+            '[16/16] stage 170 check -> PASS_OPENBAO_RUNTIME_CHECK',
         ):
             self.assertIn(line, result.stderr)
         # 进度行一旦漏进 stdout，下游解析与既有逐字段断言都会被打乱。
-        for index in range(1, 16):
-            self.assertNotIn(f'[{index}/15]', result.stdout)
+        for index in range(1, 17):
+            self.assertNotIn(f'[{index}/16]', result.stdout)
         # 进度行只回显编排器自己掌握的事实，不含 stage 自由文本与终端控制序列。
         self.assertNotIn(self.canary, result.stdout + result.stderr)
         self.assertNotIn('\x1b', result.stdout + result.stderr)
@@ -4055,18 +5119,18 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(
-            result.stderr, r'\[5/15\] stage 40 check \.\.\. \d+s elapsed'
+            result.stderr, r'\[5/16\] stage 40 check \.\.\. \d+s elapsed'
         )
         # 结束行带累计耗时，事后也能看出哪个 stage 慢。
         self.assertRegex(
             result.stderr,
-            r'\[5/15\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
+            r'\[5/16\] stage 40 check -> PASS_KUBERNETES_CHECK \(\d+s\)',
         )
         # 心跳必须随 stage 结束而停。没被 kill 掉的话它会变成孤儿，一路刷进
         # 后续 stage——行数会远超该 stage 的实际时长。这条才是真正的区分点：
         # 「有心跳」很容易，「心跳能停」才是并发代码的难处。
         beats = re.findall(
-            r'\[5/15\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/16\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertTrue(beats)
         self.assertLessEqual(len(beats), 6, result.stderr)
@@ -4089,7 +5153,7 @@ class BootstrapOrchestratorMixin:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         beats = re.findall(
-            r'\[5/15\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
+            r'\[5/16\] stage 40 check \.\.\. (\d+)s elapsed', result.stderr
         )
         self.assertEqual(beats, ['5'], result.stderr)
 
@@ -4215,7 +5279,7 @@ class BootstrapOrchestratorMixin:
     def test_check_all_complete_reaches_final_verify(self) -> None:
         for stage in (
             '10', '20', '30', '40', '50', '60', '100', '110', '120',
-            '130', '140', '150', '160',
+            '130', '140', '150', '160', '170',
         ):
             (self.state_dir / stage).touch()
 
@@ -4230,7 +5294,7 @@ class BootstrapOrchestratorMixin:
                 f'{stage} --check'
                 for stage in (
                     '00', '10', '20', '30', '40', '50', '60', '90', '100',
-                    '110', '120', '130', '140', '150', '160',
+                    '110', '120', '130', '140', '150', '160', '170',
                 )
             ],
         )
@@ -4959,6 +6023,67 @@ class FluxPhaseAStageTest(BootstrapTestCase):
                     command_log.read_text(encoding='utf-8'),
                 )
 
+    def test_check_accepts_openbao_runtime_checkpoint_for_phase_a_upgrade(
+        self,
+    ) -> None:
+        environment, command_log, _ = self.make_environment()
+        environment['FAKE_FLUX_STATE'] = 'COMPLIANT'
+        environment['FAKE_DESIRED_DRIFT'] = '1'
+        environment['FAKE_DOWNSTREAM_INVENTORY'] = (
+            'namespace/platform\n'
+            'namespace/openbao\n'
+            'namespace/cert-manager\n'
+            'namespace/cnpg-system\n'
+            'namespace/local-path-storage\n'
+        )
+        environment['FAKE_SYNC_INVENTORY'] = (
+            'gitrepository.source.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'helmchart.source.toolkit.fluxcd.io/flux-system/flux-system-openbao\n'
+            'helmrelease.helm.toolkit.fluxcd.io/flux-system/openbao\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/cert-manager-config\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/cert-manager-controller\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/cnpg-controller\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/flux-system/flux-system\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/infrastructure-foundation\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/openbao-runtime\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/platform-apps\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/platform-database\n'
+            'kustomization.kustomize.toolkit.fluxcd.io/'
+            'flux-system/platform-migration\n'
+        )
+
+        result = self.run_stage(environment, '--check')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RESULT=PASS_FLUX_PHASE_A_CHECK', result.stdout)
+        self.assertIn('REASON=upgrade-apply-required', result.stdout)
+        self.assertNotIn(
+            ' apply --server-side', command_log.read_text(encoding='utf-8')
+        )
+
+    def test_readme_names_the_exact_openbao_runtime_checkpoint_boundary(
+        self,
+    ) -> None:
+        readme = FLUX_PHASE_A.with_name('README.md').read_text(encoding='utf-8')
+
+        self.assertIn('Stage `110`～`170`', readme)
+        for identity in (
+            '`namespace/openbao`',
+            '`flux-system/openbao-runtime` Kustomization',
+            '`flux-system/openbao` HelmRelease',
+            '`flux-system/flux-system-openbao` HelmChart',
+        ):
+            self.assertIn(identity, readme)
+        for excluded in ('MinIO', '监控', 'Backup/Snapshot/Restore'):
+            self.assertIn(excluded, readme)
+
     def test_check_rejects_unapproved_downstream_checkpoint_inventory(
         self,
     ) -> None:
@@ -5641,7 +6766,7 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         return result.stdout
 
     def sourced_names_inside_gate(
-        self, script: Path, gated_dir: str
+        self, script: Path, gated_dir: str, *, wrapper: bool = False
     ) -> list[str]:
         """逐字展开脚本里每条 source 的目标，钉在门禁目录内，返回文件名。"""
         body = script.read_text(encoding='utf-8')
@@ -5651,11 +6776,19 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
             )
             for line in shell_directory_assignments(body)
         ]
+        if wrapper:
+            source_binding = 'script_source=${BASH_SOURCE[0]}'
+            self.assertIn(source_binding, body.splitlines())
+            assignments.insert(
+                0, source_binding.replace(
+                    '${BASH_SOURCE[0]}', '${BOOTSTRAP_REAL_SCRIPT_SOURCE}'
+                ),
+            )
         # 允许两类目标：被门禁覆盖的 lib 目录，以及 stage 自己目录下的 gates.sh。
         # 后者由 bootstrap-all.sh 的 stage 目录**逐条目**门禁覆盖（属主、权限、
         # 非符号链接），与 lib 同级保护；判定族拆出去是为了让"事实是什么"能被单独
         # 阅读，而不是为了绕开门禁。除这两处之外一律判死。
-        allowed = {gated_dir, str(script.parent)}
+        allowed = {gated_dir} if wrapper else {gated_dir, str(script.parent)}
         names: list[str] = []
         for word in shell_source_words(body):
             target = Path(
@@ -5703,8 +6836,10 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
         # 出现的「测试恒绿、生产必停」形态（账本 R5）。改从表枚举并钉住数量；
         # 表本身与编排器 stage_path() 的一致性由
         # CommonLibraryTest.test_stage_paths_come_from_one_table 交叉校验。
-        stage_scripts = sorted(ROOT / path for path in STAGE_SCRIPTS.values())
-        self.assertEqual(len(stage_scripts), 15, [str(s) for s in stage_scripts])
+        stage_scripts = sorted(
+            [*(ROOT / path for path in STAGE_SCRIPTS.values()), OPENBAO_INITIALIZE]
+        )
+        self.assertEqual(len(stage_scripts), 17, [str(s) for s in stage_scripts])
         for script in stage_scripts:
             self.assertTrue(script.is_file(), script)
         sourced: set[str] = set()
@@ -5712,6 +6847,15 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
             names = self.sourced_names_inside_gate(script, gated_dir)
             self.assertTrue(names, f'{script.name} 没有 source 任何文件')
             sourced.update(names)
+        wrapper_names = self.sourced_names_inside_gate(
+            RUN_APPROVED, gated_dir, wrapper=True
+        )
+        self.assertEqual(
+            wrapper_names,
+            ['run-approved-args.sh', 'run-approved-lock.sh'],
+            'wrapper must source only its parser and lock libraries',
+        )
+        sourced.update(wrapper_names)
         self.assertEqual(
             sorted(sourced),
             sorted(path.name for path in real_library_dir.glob('*.sh')),
@@ -5734,6 +6878,61 @@ class BootstrapOrchestratorTest(BootstrapOrchestratorMixin, BootstrapTestCase):
             library_sourced, '放宽后的断言需要真实的跨 lib 依赖来喂，否则空转'
         )
 
+    def test_wrapper_source_contract_rejects_escape_and_extra_library(self) -> None:
+        from validation_catalog import selectors_for_profile
+
+        self.assertIn(
+            'test_bootstrap.BootstrapOrchestratorTest.'
+            'test_real_stages_source_only_files_under_the_gated_library_dir',
+            selectors_for_profile('fast'),
+        )
+        for tamper, expected_guard in (
+            ('source-escape', '门禁覆盖之外'),
+            (
+                'wrong-parser',
+                'wrapper must source only its parser and lock libraries',
+            ),
+            ('extra-library', '被 source 的文件集合必须与门禁目录内容一致'),
+        ):
+            with self.subTest(tamper=tamper):
+                root = self.temporary_directory()
+                bootstrap = root / 'scripts/bootstrap'
+                shutil.copytree(ROOT / 'scripts/bootstrap', bootstrap)
+                wrapper = bootstrap / 'run-approved.sh'
+                mutation_log = root / 'must-not-execute'
+                with mock.patch.multiple(
+                    sys.modules[__name__],
+                    ROOT=root,
+                    BOOTSTRAP_ALL=bootstrap / 'bootstrap-all.sh',
+                    RUN_APPROVED=wrapper,
+                    OPENBAO_INITIALIZE=bootstrap / 'stages/180-openbao-initialize/run.sh',
+                ):
+                    # Every single mutation starts from a valid real-source control.
+                    self.test_real_stages_source_only_files_under_the_gated_library_dir()
+                    if tamper == 'extra-library':
+                        (bootstrap / 'lib/extra-library.sh').write_text(
+                            f'printf executed >{shlex.quote(str(mutation_log))}\n',
+                            encoding='utf-8',
+                        )
+                    else:
+                        original = 'source "${script_dir}/lib/run-approved-args.sh"'
+                        replacement = (
+                            'source "${script_dir}/../escape.sh"'
+                            if tamper == 'source-escape' else
+                            'source "${script_dir}/lib/common.sh"'
+                        )
+                        body = wrapper.read_text(encoding='utf-8')
+                        self.assertEqual(body.count(original), 1)
+                        wrapper.write_text(body.replace(original, replacement), encoding='utf-8')
+                        if tamper == 'source-escape':
+                            (bootstrap.parent / 'escape.sh').write_text(
+                                f'printf executed >{shlex.quote(str(mutation_log))}\n',
+                                encoding='utf-8',
+                            )
+                    with self.assertRaisesRegex(AssertionError, expected_guard):
+                        self.test_real_stages_source_only_files_under_the_gated_library_dir()
+                    self.assertFalse(mutation_log.exists())
+
 
 class BusinessReadyStageTest(BootstrapTestCase):
     """Stages 110-160 keep the business-ready boundary fail closed."""
@@ -5747,7 +6946,7 @@ class BusinessReadyStageTest(BootstrapTestCase):
     def test_orchestrator_has_exact_business_ready_order_and_results(self) -> None:
         orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
         self.assertIn(
-            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160)',
+            'readonly -a STAGES=(00 10 20 30 40 50 60 90 100 110 120 130 140 150 160 170)',
             orchestrator,
         )
         contracts = {
@@ -6250,6 +7449,8674 @@ class BusinessReadyStageTest(BootstrapTestCase):
             '16-business-ready-*.txt',
         ):
             self.assertIn(required, self.source)
+
+
+class OpenBaoRuntimeStageTest(BootstrapTestCase):
+    HELM_MISSING_ROLLBACK_MESSAGE = (
+        'Failed to perform remediation: missing target release for rollback: '
+        'cannot remediate failed release'
+    )
+    INVENTORY_IDENTITIES = (
+        '|namespace|openbao',
+        'flux-system|kustomization.kustomize.toolkit.fluxcd.io|openbao-runtime',
+        'flux-system|helmrelease.helm.toolkit.fluxcd.io|openbao',
+        'flux-system|serviceaccount|flux-openbao-reconciler',
+        'flux-system|serviceaccount|helm-openbao-reconciler',
+        'flux-system|role.rbac.authorization.k8s.io|flux-openbao-control-plane',
+        'openbao|statefulset.apps|openbao',
+        'openbao|deployment.apps|openbao-agent-injector',
+        'openbao|persistentvolumeclaim|data-openbao-0',
+        'openbao|persistentvolumeclaim|audit-openbao-0',
+        'openbao|certificate.cert-manager.io|openbao-server-tls',
+        'openbao|certificate.cert-manager.io|openbao-injector-tls',
+        'openbao|certificate.cert-manager.io|openbao-transport-ca',
+        'openbao|secret|openbao-server-tls',
+        'openbao|secret|openbao-injector-tls',
+        'openbao|secret|openbao-transport-ca',
+        'openbao|service|openbao',
+        'openbao|serviceaccount|openbao-runtime-probe',
+        'openbao|networkpolicy.networking.k8s.io|default-deny',
+        '|clusterrole.rbac.authorization.k8s.io|openbao-agent-injector-clusterrole',
+        '|clusterrole.rbac.authorization.k8s.io|helm-openbao-reconciler',
+        '|clusterrolebinding.rbac.authorization.k8s.io|helm-openbao-reconciler',
+        '|mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg',
+    )
+
+    @staticmethod
+    def implementation() -> str:
+        return OPENBAO_RUNTIME.read_text(encoding='utf-8') + (
+            OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
+        )
+
+    @classmethod
+    def helm_rbac_document(
+        cls,
+        message: str,
+        generation: int = 7,
+    ) -> dict[str, object]:
+        return {
+            'metadata': {'generation': generation},
+            'status': {
+                'observedGeneration': generation,
+                'conditions': [
+                    {
+                        'type': 'Stalled',
+                        'status': 'True',
+                        'reason': 'MissingRollbackTarget',
+                        'message': cls.HELM_MISSING_ROLLBACK_MESSAGE,
+                        'observedGeneration': generation,
+                    },
+                    {
+                        'type': 'Ready',
+                        'status': 'False',
+                        'reason': 'UpgradeFailed',
+                        'message': message,
+                        'observedGeneration': generation,
+                    },
+                    {
+                        'type': 'Released',
+                        'status': 'False',
+                        'reason': 'UpgradeFailed',
+                        'message': message,
+                        'observedGeneration': generation,
+                    },
+                ],
+            },
+        }
+
+    def inventory_state(
+        self,
+        present: tuple[str, ...],
+        *,
+        failed_identity: str = '',
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the real classifier against semantic identity membership."""
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    present=$1
+                    failed_identity=$2
+                    openbao_query_exists() {
+                      local identity="${1}|${2}|${3}"
+                      [[ "$identity" != "$failed_identity" ]] || return 2
+                      grep -Fxq -- "$identity" <<<"$present"
+                    }
+                    openbao_inventory_state
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                '\n'.join(present),
+                failed_identity,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def resume_surface_gate(self, failed: str) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    failed=$1
+                    kubectl_query_is_empty() {
+                      [[ -z "$failed" || "$*" != *"$failed"* ]]
+                    }
+                    openbao_optional_resource_is_empty() {
+                      [[ -z "$failed" || "$2" != "$failed" ]]
+                    }
+                    openbao_resume_surface_is_safe
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                failed,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def apply_inventory_race(
+        self,
+        observed: str,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    observed=$1
+                    after_wait=0
+                    openbao_verify_assets() { :; }
+                    openbao_client_dry_run() { :; }
+                    openbao_capacity_is_safe() { :; }
+                    openbao_inventory_state() {
+                      if (( after_wait == 0 )); then
+                        printf 'RESUMABLE_RETAINED_PVCS\n'
+                      else
+                        printf '%s\n' "$observed"
+                      fi
+                    }
+                    openbao_resume_checkpoint_is_safe() { :; }
+                    business_apps_ready() { :; }
+                    business_https_smoke() { :; }
+                    openbao_platform_secret_fingerprint() { printf 'stable\n'; }
+                    openbao_wait_flux_source() { after_wait=1; }
+                    openbao_apply_namespace() { printf 'MUTATION=namespace\n'; }
+                    openbao_apply_bootstrap() { printf 'MUTATION=bootstrap\n'; }
+                    openbao_apply_runtime() { printf 'MUTATION=runtime\n'; }
+                    openbao_wait_runtime() { :; }
+                    openbao_runtime_is_compliant() { :; }
+                    openbao_state_is_known() { :; }
+                    complete() {
+                      printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\n' \
+                        "$1" "$2" "$3"
+                      exit "$3"
+                    }
+                    openbao_stage_170_apply
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                observed,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def helm_rbac_failure_gate(
+        self,
+        document: dict[str, object],
+        permissions: str = 'absent',
+        gate: str = 'upgrade_failure',
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    fixture=$1
+                    permissions=$2
+                    gate=$3
+                    PYTHON_BINARY=/usr/bin/python3
+                    business_resource_json() { printf '%s\n' "$fixture"; }
+                    kubectl_run() {
+                      if [[ "$*" == *'auth can-i'* ]]; then
+                        args=("$@")
+                        verb=
+                        for ((index = 0; index < ${#args[@]} - 1; index++)); do
+                          if [[ "${args[index]}" == can-i ]]; then
+                            verb=${args[index + 1]}
+                            break
+                          fi
+                        done
+                        [[ " ${args[*]} " == *' --request-timeout=5s '* ]] ||
+                          return 2
+                        case "$permissions" in
+                          missing-*)
+                            missing=${permissions#missing-}
+                            case "$verb" in
+                              get|list|watch|update|patch)
+                                if [[ "$verb" == "$missing" ]]; then
+                                  printf 'no\n'
+                                  return 1
+                                fi
+                                printf 'yes\n'
+                                return 0
+                                ;;
+                              *)
+                                printf 'no\n'
+                                return 1
+                                ;;
+                            esac
+                            ;;
+                          extra-*)
+                            extra=${permissions#extra-}
+                            case "$verb" in
+                              get|list|watch|update|patch)
+                                printf 'yes\n'
+                                return 0
+                                ;;
+                              *)
+                                if [[ "$verb" == "$extra" ]]; then
+                                  printf 'yes\n'
+                                  return 0
+                                fi
+                                printf 'no\n'
+                                return 1
+                                ;;
+                            esac
+                            ;;
+                          absent)
+                            printf 'no\n'
+                            return 1
+                            ;;
+                          create-only)
+                            if [[ "$verb" == create ]]; then
+                              printf 'yes\n'
+                              return 0
+                            fi
+                            printf 'no\n'
+                            return 1
+                            ;;
+                          error)
+                            return 2
+                            ;;
+                          granted)
+                            printf 'yes\n'
+                            return 0
+                            ;;
+                          exact)
+                            case "$verb" in
+                              get|list|watch|update|patch)
+                                printf 'yes\n'
+                                return 0
+                                ;;
+                              *)
+                                printf 'no\n'
+                                return 1
+                                ;;
+                            esac
+                            ;;
+                        esac
+                        return 2
+                      fi
+                      return 2
+                    }
+                    "openbao_helm_rbac_${gate}_is_exact"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                json.dumps(document, separators=(',', ':')),
+                permissions,
+                gate,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def pod_image_status_gate(
+        self,
+        expected_image: str,
+        status_image: str,
+        image_id: str,
+    ) -> subprocess.CompletedProcess[str]:
+        digest = (
+            'sha256:'
+            '15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0'
+        )
+        document = {
+            'items': [{
+                'status': {
+                    'phase': 'Running',
+                    'containerStatuses': [{
+                        'ready': True,
+                        'image': status_image,
+                        'imageID': image_id,
+                    }],
+                },
+            }],
+        }
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    fixture=$1
+                    expected_image=$2
+                    expected_digest=$3
+                    PYTHON_BINARY=/usr/bin/python3
+                    kubectl_run() { printf '%s\n' "$fixture"; }
+                    openbao_pod_image_id_is_exact selector \
+                      "$expected_image" "$expected_digest"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                json.dumps(document, separators=(',', ':')),
+                expected_image,
+                digest,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def pod_delegation_gate(
+        self,
+        function: str,
+        permissions: str,
+        errexit: str = 'off',
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    function=$1
+                    permissions=$2
+                    errexit=$3
+                    kubectl_run() {
+                      args=("$@")
+                      verb=
+                      for ((index = 0; index < ${#args[@]} - 1; index++)); do
+                        if [[ "${args[index]}" == can-i ]]; then
+                          verb=${args[index + 1]}
+                          break
+                        fi
+                      done
+                      [[ " ${args[*]} " == *' --request-timeout=5s '* ]] ||
+                        return 2
+                      case "$permissions" in
+                        missing-*)
+                          missing=${permissions#missing-}
+                          case "$verb" in
+                            get|list|watch|update|patch)
+                              if [[ "$verb" == "$missing" ]]; then
+                                printf 'no\n'
+                                return 1
+                              fi
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        extra-*)
+                          extra=${permissions#extra-}
+                          case "$verb" in
+                            get|list|watch|update|patch)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              if [[ "$verb" == "$extra" ]]; then
+                                printf 'yes\n'
+                                return 0
+                              fi
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        absent)
+                          printf 'no\n'
+                          return 1
+                          ;;
+                        exact)
+                          case "$verb" in
+                            get|list|watch|update|patch)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        extra)
+                          case "$verb" in
+                            get|list|watch|create|update|patch)
+                              printf 'yes\n'
+                              return 0
+                              ;;
+                            *)
+                              printf 'no\n'
+                              return 1
+                              ;;
+                          esac
+                          ;;
+                        create-only)
+                          if [[ "$verb" == create ]]; then
+                            printf 'yes\n'
+                            return 0
+                          fi
+                          printf 'no\n'
+                          return 1
+                          ;;
+                        error)
+                          return 2
+                          ;;
+                      esac
+                      return 2
+                    }
+                    if [[ "$errexit" == on ]]; then
+                      set -e
+                    else
+                      set +e
+                    fi
+                    before=$-
+                    if "openbao_helm_pod_delegation_is_${function}"; then
+                      rc=0
+                    else
+                      rc=$?
+                    fi
+                    after=$-
+                    [[ "$before" == "$after" ]] || exit 90
+                    exit "$rc"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                function,
+                permissions,
+                errexit,
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def pod_delegation_wait(
+        self,
+        ready_after: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    ready_after=$1
+                    checks=0
+                    openbao_helm_pod_delegation_is_exact() {
+                      checks=$((checks + 1))
+                      (( checks >= ready_after ))
+                    }
+                    openbao_wait_helm_pod_delegation
+                    rc=$?
+                    printf 'CHECKS=%s\n' "$checks"
+                    exit "$rc"
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                str(ready_after),
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def present_recovery_check(
+        self,
+        safe: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    safe=$1
+                    openbao_verify_assets() { :; }
+                    openbao_client_dry_run() { :; }
+                    openbao_capacity_is_safe() { :; }
+                    business_apps_ready() { :; }
+                    business_https_smoke() { :; }
+                    openbao_flux_source_matches_head() { :; }
+                    openbao_inventory_state() { printf 'PRESENT\n'; }
+                    openbao_runtime_is_compliant() { return 1; }
+                    openbao_present_recovery_checkpoint_is_safe() {
+                      [[ "$safe" == 1 ]]
+                    }
+                    complete() {
+                      printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\n' \
+                        "$1" "$2" "$3"
+                      exit "$3"
+                    }
+                    openbao_stage_170_check
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                '1' if safe else '0',
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def present_recovery_apply(
+        self,
+        safe_after_wait: bool,
+        delegation_ready: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command(
+            [
+                '/bin/bash',
+                '-c',
+                textwrap.dedent(
+                    r'''
+                    set -u
+                    source "$0"
+                    safe_after_wait=$1
+                    delegation_ready=$2
+                    after_wait=0
+                    openbao_verify_assets() { :; }
+                    openbao_client_dry_run() { :; }
+                    openbao_capacity_is_safe() { :; }
+                    openbao_inventory_state() { printf 'PRESENT\n'; }
+                    openbao_present_recovery_checkpoint_is_safe() {
+                      (( after_wait == 0 )) || [[ "$safe_after_wait" == 1 ]]
+                    }
+                    business_apps_ready() { :; }
+                    business_https_smoke() { :; }
+                    openbao_platform_secret_fingerprint() { printf 'stable\n'; }
+                    openbao_wait_flux_source() { after_wait=1; }
+                    openbao_apply_namespace() { printf 'MUTATION=namespace\n'; }
+                    openbao_apply_bootstrap() { printf 'MUTATION=bootstrap\n'; }
+                    openbao_helm_pod_permission_is() {
+                      expected=$1
+                      verb=$2
+                      request_timeout=$3
+                      [[ "$request_timeout" == 1s ]] || return 2
+                      if [[ "$delegation_ready" != 1 ]]; then
+                        SECONDS=$((SECONDS + 61))
+                        return 1
+                      fi
+                      case "${expected}:${verb}" in
+                        yes:get|yes:list|yes:watch|yes:update|yes:patch|\
+                        no:create|no:delete|no:deletecollection)
+                          return 0
+                          ;;
+                      esac
+                      return 1
+                    }
+                    openbao_apply_runtime() { printf 'MUTATION=runtime\n'; }
+                    openbao_wait_runtime() { :; }
+                    openbao_runtime_is_compliant() { :; }
+                    openbao_state_is_known() { :; }
+                    complete() {
+                      printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\n' \
+                        "$1" "$2" "$3"
+                      exit "$3"
+                    }
+                    openbao_stage_170_apply
+                    '''
+                ).strip(),
+                str(OPENBAO_RUNTIME_LIB),
+                '1' if safe_after_wait else '0',
+                '1' if delegation_ready else '0',
+            ],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        )
+
+    def test_inventory_classifier_whitelists_only_exact_resume_states(
+        self,
+    ) -> None:
+        pvc_identities = {
+            'openbao|persistentvolumeclaim|data-openbao-0',
+            'openbao|persistentvolumeclaim|audit-openbao-0',
+        }
+        runtime_identities = {
+            'openbao|statefulset.apps|openbao',
+            'openbao|deployment.apps|openbao-agent-injector',
+            *pvc_identities,
+            'openbao|service|openbao',
+            '|clusterrole.rbac.authorization.k8s.io|openbao-agent-injector-clusterrole',
+            '|mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg',
+        }
+        bootstrap = tuple(
+            identity for identity in self.INVENTORY_IDENTITIES
+            if identity not in runtime_identities
+        )
+        retained_pvcs = tuple(
+            identity for identity in self.INVENTORY_IDENTITIES
+            if identity not in runtime_identities - pvc_identities
+        )
+        cases = (
+            ((), '', 'MISSING'),
+            (self.INVENTORY_IDENTITIES, '', 'PRESENT'),
+            (bootstrap, '', 'RESUMABLE_BOOTSTRAP'),
+            (retained_pvcs, '', 'RESUMABLE_RETAINED_PVCS'),
+            (retained_pvcs + ('openbao|service|openbao',), '', 'PARTIAL'),
+            (
+                retained_pvcs + (
+                    '|mutatingwebhookconfiguration.admissionregistration.k8s.io|openbao-agent-injector-cfg',
+                ),
+                '',
+                'PARTIAL',
+            ),
+            (
+                retained_pvcs,
+                '|clusterrole.rbac.authorization.k8s.io|helm-openbao-reconciler',
+                'UNKNOWN',
+            ),
+        )
+        for present, failed_identity, expected in cases:
+            with self.subTest(expected=expected, present=present):
+                result = self.inventory_state(
+                    present,
+                    failed_identity=failed_identity,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_resume_states_are_safety_gated_in_check_and_apply(self) -> None:
+        body = self.implementation()
+        check = body.split('openbao_stage_170_check() {', 1)[1].split(
+            'openbao_stage_170_apply() {', 1
+        )[0]
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        guard = body.split('openbao_resume_checkpoint_is_safe() {', 1)[1].split(
+            'openbao_stage_170_check() {', 1
+        )[0]
+
+        for state in ('RESUMABLE_BOOTSTRAP', 'RESUMABLE_RETAINED_PVCS'):
+            self.assertIn(state, check)
+            self.assertIn(state, apply)
+        self.assertIn('openbao_resume_checkpoint_is_safe "$inventory"', check)
+        self.assertIn('openbao_resume_checkpoint_is_safe "$inventory"', apply)
+        self.assertIn('openbao_pvcs_are_exact', guard)
+        self.assertIn('openbao_secret_inventory_is_safe', guard)
+        self.assertIn('openbao_resume_surface_is_safe', guard)
+        self.assertIn('openbao_full_server_validation', guard)
+
+    def test_resume_surface_rejects_external_and_backup_resources(self) -> None:
+        self.assertEqual(self.resume_surface_gate('').returncode, 0)
+        for forbidden in (
+            'service',
+            'ingress,cronjob',
+            'gateways',
+            'httproutes',
+            'tlsroutes',
+            'volumesnapshots',
+            'backups',
+            'scheduledbackups',
+        ):
+            with self.subTest(forbidden=forbidden):
+                result = self.resume_surface_gate(forbidden)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+
+    def test_apply_rechecks_checkpoint_after_flux_wait_before_first_write(
+        self,
+    ) -> None:
+        body = self.implementation()
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        wait = apply.index('openbao_wait_flux_source')
+        recheck = apply.index(
+            'openbao_apply_checkpoint_is_unchanged "$inventory"'
+        )
+        first_write = apply.index('openbao_apply_namespace')
+        guard = body.split(
+            'openbao_apply_checkpoint_is_unchanged() {', 1
+        )[1].split('openbao_stage_170_check() {', 1)[0]
+
+        self.assertLess(wait, recheck)
+        self.assertLess(recheck, first_write)
+        self.assertIn('observed=$(openbao_inventory_state)', guard)
+        self.assertIn('[[ "$observed" == "$expected" ]]', guard)
+        self.assertIn('openbao_resume_checkpoint_is_safe "$observed"', guard)
+
+    def test_apply_inventory_race_stops_without_mutation(self) -> None:
+        for observed in ('PRESENT', 'UNKNOWN', 'PARTIAL'):
+            with self.subTest(observed=observed):
+                result = self.apply_inventory_race(observed)
+                self.assertEqual(result.returncode, 30, result.stderr)
+                self.assertIn('RESULT=STOP_UNKNOWN_STATE', result.stdout)
+                self.assertIn(
+                    'REASON=openbao-apply-checkpoint-raced',
+                    result.stdout,
+                )
+                self.assertNotIn('MUTATION=', result.stdout)
+
+    def test_present_drift_only_allows_exact_rbac_recovery_checkpoint(
+        self,
+    ) -> None:
+        body = self.implementation()
+        check = body.split('openbao_stage_170_check() {', 1)[1].split(
+            'openbao_stage_170_apply() {', 1
+        )[0]
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        guard = body.split(
+            'openbao_present_recovery_checkpoint_is_safe() {', 1
+        )[1].split('openbao_apply_checkpoint_is_unchanged() {', 1)[0]
+
+        self.assertIn('openbao_present_recovery_checkpoint_is_safe', check)
+        self.assertIn('openbao-runtime-rbac-recovery-required', check)
+        self.assertIn('openbao_present_recovery_checkpoint_is_safe', apply)
+        for required in (
+            'openbao_helm_rbac_recovery_checkpoint_is_exact',
+            'openbao_workload_is_ready',
+            'openbao_pod_image_id_is_exact',
+            'openbao_pvcs_are_exact',
+            'openbao_services_are_private',
+            'openbao_secret_inventory_is_safe',
+            'openbao_state_is_known fresh',
+            'openbao_full_server_validation',
+        ):
+            self.assertIn(required, guard)
+
+        allowed = self.present_recovery_check(True)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn('RESULT=PASS_OPENBAO_RUNTIME_CHECK', allowed.stdout)
+        self.assertIn(
+            'REASON=openbao-runtime-rbac-recovery-required',
+            allowed.stdout,
+        )
+
+        rejected = self.present_recovery_check(False)
+        self.assertEqual(rejected.returncode, 30, rejected.stderr)
+        self.assertIn('REASON=openbao-runtime-drift', rejected.stdout)
+
+    def test_known_helm_rbac_failure_gate_is_exact(self) -> None:
+        exact_message = (
+            'Helm upgrade failed for release openbao/openbao with chart '
+            'openbao@0.28.6+476e15855aec: failed to create resource: '
+            'server-side apply failed for object '
+            'openbao/openbao-discovery-role '
+            'rbac.authorization.k8s.io/v1, Kind=Role: '
+            'roles.rbac.authorization.k8s.io '
+            '"openbao-discovery-role" is forbidden: user '
+            '"system:serviceaccount:flux-system:helm-openbao-reconciler" '
+            '(groups=["system:serviceaccounts" '
+            '"system:serviceaccounts:flux-system" '
+            '"system:authenticated"]) '
+            'is attempting to grant RBAC permissions not currently held:'
+            '\n{APIGroups:[""], Resources:["pods"], '
+            'Verbs:["get" "watch" "list" "update" "patch"]'
+            '}'
+        )
+
+        def document(message: str = exact_message) -> dict[str, object]:
+            return self.helm_rbac_document(message)
+
+        accepted = self.helm_rbac_failure_gate(document())
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for changed in (
+            exact_message.replace('openbao-discovery-role', 'another-role'),
+            exact_message.replace('helm-openbao-reconciler', 'another-sa'),
+            exact_message.replace('"patch"]', '"patch" "delete"]'),
+            exact_message.replace('"patch"]', '"patch" "patch"]'),
+            exact_message.replace('Resources:["pods"]', 'Resources:["secrets"]'),
+            exact_message.replace(
+                '"openbao-discovery-role"',
+                '"openbao-discovery-role-copy"',
+            ),
+            exact_message.replace(
+                'helm-openbao-reconciler"',
+                'helm-openbao-reconciler-copy"',
+            ),
+            exact_message + (
+                ', APIGroups:[""], Resources:["secrets"], Verbs:["get"]'
+            ),
+            exact_message + (
+                '; secrets "another" is forbidden: user "another"'
+            ),
+        ):
+            with self.subTest(changed=changed):
+                rejected = self.helm_rbac_failure_gate(document(changed))
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        generation_variants = []
+        missing_status_generation = document()
+        del missing_status_generation['status']['observedGeneration']
+        generation_variants.append(missing_status_generation)
+        stale_status_generation = document()
+        stale_status_generation['status']['observedGeneration'] = 6
+        generation_variants.append(stale_status_generation)
+
+        for condition_type in ('Ready', 'Released', 'Stalled'):
+            missing = document()
+            condition = next(
+                item for item in missing['status']['conditions']
+                if item['type'] == condition_type
+            )
+            del condition['observedGeneration']
+            generation_variants.append(missing)
+
+            stale = document()
+            condition = next(
+                item for item in stale['status']['conditions']
+                if item['type'] == condition_type
+            )
+            condition['observedGeneration'] = 6
+            generation_variants.append(stale)
+
+        invalid_generation = document()
+        invalid_generation['metadata']['generation'] = 0
+        generation_variants.append(invalid_generation)
+        deleting = document()
+        deleting['metadata']['deletionTimestamp'] = '2026-08-28T00:00:00Z'
+        generation_variants.append(deleting)
+
+        for changed in generation_variants:
+            with self.subTest(generation=changed):
+                rejected = self.helm_rbac_failure_gate(changed)
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        condition_variants = []
+        for condition_type in ('Ready', 'Released', 'Stalled'):
+            missing = document()
+            missing['status']['conditions'] = [
+                item for item in missing['status']['conditions']
+                if item['type'] != condition_type
+            ]
+            condition_variants.append(missing)
+
+        duplicate = document()
+        duplicate['status']['conditions'].append(
+            dict(duplicate['status']['conditions'][0])
+        )
+        condition_variants.append(duplicate)
+        extra = document()
+        extra['status']['conditions'].append({
+            'type': 'Reconciling',
+            'status': 'True',
+            'reason': 'Progressing',
+            'message': 'another failure',
+            'observedGeneration': 7,
+        })
+        condition_variants.append(extra)
+
+        for condition_type, field, value in (
+            ('Ready', 'status', 'True'),
+            ('Ready', 'reason', 'InstallFailed'),
+            ('Released', 'status', 'True'),
+            ('Released', 'reason', 'InstallFailed'),
+            ('Released', 'message', 'another failure'),
+            ('Stalled', 'status', 'False'),
+            ('Stalled', 'reason', 'RetriesExceeded'),
+            ('Stalled', 'message', 'another failure'),
+        ):
+            changed = document()
+            condition = next(
+                item for item in changed['status']['conditions']
+                if item['type'] == condition_type
+            )
+            condition[field] = value
+            condition_variants.append(changed)
+
+        for changed in condition_variants:
+            with self.subTest(conditions=changed):
+                rejected = self.helm_rbac_failure_gate(changed)
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        for permissions in ('create-only', 'granted', 'error'):
+            with self.subTest(permissions=permissions):
+                rejected = self.helm_rbac_failure_gate(
+                    document(), permissions
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+    def test_rbac_recovery_accepts_only_absent_or_exact_delegation(self) -> None:
+        message = (
+            'Helm upgrade failed for release openbao/openbao with chart '
+            'openbao@0.28.6+ebd8bd7b6c01: failed to create resource: '
+            'server-side apply failed for object '
+            'openbao/openbao-discovery-role '
+            'rbac.authorization.k8s.io/v1, Kind=Role: '
+            'roles.rbac.authorization.k8s.io '
+            '"openbao-discovery-role" is forbidden: user '
+            '"system:serviceaccount:flux-system:helm-openbao-reconciler" '
+            '(groups=["system:serviceaccounts" '
+            '"system:serviceaccounts:flux-system" '
+            '"system:authenticated"]) '
+            'is attempting to grant RBAC permissions not currently held:'
+            '\n{APIGroups:[""], Resources:["pods"], '
+            'Verbs:["get" "watch" "list" "update" "patch"]'
+            '}'
+        )
+        document = self.helm_rbac_document(message, 8)
+
+        for permissions in ('absent', 'exact'):
+            with self.subTest(permissions=permissions):
+                accepted = self.helm_rbac_failure_gate(
+                    document,
+                    permissions,
+                    'recovery_checkpoint',
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        invalid_permissions = ['create-only', 'granted', 'error']
+        invalid_permissions.extend(
+            f'missing-{verb}'
+            for verb in ('get', 'list', 'watch', 'update', 'patch')
+        )
+        invalid_permissions.extend(
+            f'extra-{verb}'
+            for verb in ('create', 'delete', 'deletecollection')
+        )
+        for permissions in invalid_permissions:
+            with self.subTest(permissions=permissions):
+                rejected = self.helm_rbac_failure_gate(
+                    document,
+                    permissions,
+                    'recovery_checkpoint',
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+    def test_pod_delegation_requires_exact_effective_permissions(self) -> None:
+        for function, permissions in (
+            ('absent', 'absent'),
+            ('exact', 'exact'),
+        ):
+            with self.subTest(function=function, permissions=permissions):
+                accepted = self.pod_delegation_gate(function, permissions)
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        rejected_delegations = [
+            ('absent', 'create-only'),
+            ('absent', 'error'),
+            ('exact', 'absent'),
+            ('exact', 'error'),
+        ]
+        rejected_delegations.extend(
+            ('exact', f'missing-{verb}')
+            for verb in ('get', 'list', 'watch', 'update', 'patch')
+        )
+        rejected_delegations.extend(
+            ('exact', f'extra-{verb}')
+            for verb in ('create', 'delete', 'deletecollection')
+        )
+        for function, permissions in rejected_delegations:
+            with self.subTest(function=function, permissions=permissions):
+                rejected = self.pod_delegation_gate(function, permissions)
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        body = self.implementation()
+        compliant = body.split('openbao_runtime_is_compliant() {', 1)[1].split(
+            'openbao_full_server_validation() {', 1
+        )[0]
+        self.assertIn('openbao_helm_pod_delegation_is_exact', compliant)
+
+    def test_pod_delegation_permission_probe_preserves_errexit(self) -> None:
+        for errexit in ('off', 'on'):
+            with self.subTest(errexit=errexit):
+                result = self.pod_delegation_gate(
+                    'absent', 'absent', errexit
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        permission = self.implementation().split(
+            'openbao_helm_pod_permission_is() {', 1
+        )[1].split('openbao_helm_pod_delegation_is_absent() {', 1)[0]
+        self.assertIn('request_timeout=${3:-5s}', permission)
+        self.assertIn('--request-timeout="$request_timeout"', permission)
+
+    def test_pod_delegation_wait_is_bounded_and_retries(self) -> None:
+        body = self.implementation()
+        wait = body.split(
+            'openbao_wait_helm_pod_delegation() {', 1
+        )[1].split('openbao_helm_rbac_upgrade_failure_is_exact() {', 1)[0]
+        self.assertIn('local deadline=$((SECONDS + 60))', wait)
+        self.assertIn('while :; do', wait)
+        self.assertIn(
+            'openbao_helm_pod_delegation_is_exact "$deadline" && return 0',
+            wait,
+        )
+        self.assertIn('(( SECONDS < deadline )) || return 1', wait)
+        self.assertIn('/bin/sleep 1', wait)
+
+        delayed = self.pod_delegation_wait(2)
+        self.assertEqual(delayed.returncode, 0, delayed.stderr)
+        self.assertIn('CHECKS=2', delayed.stdout)
+
+    def test_pod_status_accepts_only_exact_containerd_readback(self) -> None:
+        digest = (
+            'sha256:'
+            '15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0'
+        )
+        config_id = f'sha256:{"a" * 64}'
+        expected_image = f'quay.io/openbao/openbao:2.6.1@{digest}'
+        canonical = f'quay.io/openbao/openbao@{digest}'
+        accepted = self.pod_image_status_gate(
+            expected_image,
+            config_id,
+            canonical,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for status_image, image_id in (
+            (f'quay.io/openbao/openbao:2.6.1@{digest}', canonical),
+            (canonical, canonical),
+            ('quay.io/openbao/openbao@sha256:wrong', canonical),
+            (f'{config_id}-suffix', canonical),
+            (config_id, f'quay.io/another/openbao@{digest}'),
+            (config_id, f'{canonical}-suffix'),
+            (config_id, f'docker-pullable://{canonical}'),
+            (config_id, 'quay.io/openbao/openbao@sha256:wrong'),
+        ):
+            with self.subTest(
+                status_image=status_image,
+                image_id=image_id,
+            ):
+                rejected = self.pod_image_status_gate(
+                    expected_image,
+                    status_image,
+                    image_id,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+        port_image = f'registry.example:5000/ns/openbao:2.6.1@{digest}'
+        port_image_id = f'registry.example:5000/ns/openbao@{digest}'
+        accepted_port = self.pod_image_status_gate(
+            port_image,
+            config_id,
+            port_image_id,
+        )
+        self.assertEqual(accepted_port.returncode, 0, accepted_port.stderr)
+
+        for malformed_image in (
+            f'registry.example:5000/ns/openbao@{digest}',
+            f'registry.example:5000/ns/openbao:2.6.1:extra@{digest}',
+            f':2.6.1@{digest}',
+            f'quay.io/openbao/openbao:2.6.1@extra@{digest}',
+        ):
+            with self.subTest(malformed_image=malformed_image):
+                rejected = self.pod_image_status_gate(
+                    malformed_image,
+                    config_id,
+                    canonical,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stderr)
+
+    def test_present_recovery_rechecks_exact_failure_before_mutation(self) -> None:
+        allowed = self.present_recovery_apply(True)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn('RESULT=PASS_OPENBAO_RUNTIME_INSTALLED', allowed.stdout)
+        self.assertIn('MUTATION=bootstrap', allowed.stdout)
+
+        raced = self.present_recovery_apply(False)
+        self.assertEqual(raced.returncode, 30, raced.stderr)
+        self.assertIn('REASON=openbao-apply-checkpoint-raced', raced.stdout)
+        self.assertNotIn('MUTATION=', raced.stdout)
+
+    def test_stage_170_waits_for_exact_delegation_before_runtime(self) -> None:
+        blocked = self.present_recovery_apply(True, False)
+        self.assertEqual(blocked.returncode, 50, blocked.stderr)
+        self.assertIn('REASON=openbao-rbac-delegation-not-effective', blocked.stdout)
+        self.assertIn('MUTATION=bootstrap', blocked.stdout)
+        self.assertNotIn('MUTATION=runtime', blocked.stdout)
+
+    def test_stage_170_is_the_final_automatic_stage(self) -> None:
+        orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        self.assertRegex(
+            orchestrator,
+            r'readonly -a STAGES=\([^)]*160 170\)',
+        )
+        self.assertRegex(
+            orchestrator,
+            r'readonly -a MUTATING_STAGES=\([^)]*160 170\)',
+        )
+        self.assertIn(
+            "170) printf '%s/stages/170-openbao-runtime/run.sh\\n'",
+            orchestrator,
+        )
+        self.assertIn('170:PASS_OPENBAO_RUNTIME_CHECK', orchestrator)
+        self.assertIn('170:PASS_OPENBAO_RUNTIME_INSTALLED', orchestrator)
+        self.assertIn('170:ALREADY_COMPLIANT', orchestrator)
+        self.assertNotIn('180-openbao', orchestrator)
+
+    def test_runtime_stage_pins_inputs_and_preserves_dormancy(self) -> None:
+        body = self.implementation()
+        for expected in (
+            '52890177117a1bf16b4b340472643adef4718616a02f8aec2a331bf950283a20',
+            'c5bfd003cabb8a3350942cc4cb17025228f79300b1acda5c434c3003aab6720a',
+            '175c5cea2d36b68d348eca872044656bd8740c4dbe26b7dc8eb7c7438474a8b3',
+            'ee07429197a8ca7644343d0d66b52e3dc7941a8a608fc6db00da3b4184dcc180',
+            '919745181a8b86b1af6f0af5d3d92c330c15e738beb66a851ef484f8557d893f',
+            '15e90b578c970ae57b596ed51295380cd54f93860fe36758f05b455d71aae0e0',
+            '3dd30a9ac5909d17555480f51be734dfb719a323409f06cffe8b48cdaf6237d2',
+        ):
+            self.assertIn(expected, body)
+        self.assertIn('clusters/dev/kustomization.yaml', body)
+        self.assertIn('openbao-bootstrap.yaml', body)
+        self.assertIn('openbao-runtime.yaml', body)
+        self.assertIn('infrastructure/openbao/rendered.yaml', body)
+        self.assertIn('vendor/charts/openbao-0.28.6.tgz', body)
+        self.assertIn('--no-cross-namespace-refs=true', body)
+
+    def test_helm_uses_gated_absolute_path_not_restricted_path_lookup(self) -> None:
+        library = OPENBAO_RUNTIME_LIB.read_text(encoding='utf-8')
+        stage_main = library.split('openbao_stage_main() {', 1)[1]
+
+        self.assertIn(
+            'OPENBAO_HELM_BINARY=$(host_path /usr/local/bin/helm)',
+            library,
+        )
+        self.assertNotRegex(
+            stage_main,
+            r'for required in [^;]*\bhelm\b',
+            '生产 PATH 刻意排除 /usr/local/bin；Helm 必须走绝对路径门禁',
+        )
+        self.assertNotRegex(
+            stage_main,
+            r'require_command ["\']?helm\b',
+            'Helm 可用性必须由受门禁保护的绝对路径决定',
+        )
+        self.assertIn(
+            'safe_file "$OPENBAO_HELM_BINARY" 755',
+            library,
+        )
+        self.assertIn(
+            '"$OPENBAO_HELM_BINARY" template openbao',
+            library,
+        )
+
+    def test_check_is_read_only_and_server_validation_is_dependency_aware(
+        self,
+    ) -> None:
+        body = self.implementation()
+        check = body.split('openbao_stage_170_check() {', 1)[1].split(
+            'openbao_stage_170_apply() {', 1
+        )[0]
+        self.assertNotRegex(check, r'kubectl_run\s+apply')
+        self.assertNotIn('open_evidence', check)
+        self.assertIn('openbao_client_dry_run', check)
+        self.assertIn('openbao_server_validate_safe_subset', check)
+        self.assertIn('PASS_OPENBAO_RUNTIME_CHECK', check)
+        self.assertIn('namespace-dependent-server-validation-deferred', check)
+        self.assertNotIn('--force-conflicts', body)
+        self.assertNotRegex(body, r'kubectl_run\s+create\s+namespace')
+
+    def test_apply_uses_exact_manifests_and_never_initializes(self) -> None:
+        body = self.implementation()
+        apply = body.split('openbao_stage_170_apply() {', 1)[1]
+        namespace_apply = apply.index('openbao_apply_namespace')
+        bootstrap_apply = apply.index('openbao_apply_bootstrap')
+        delegation_wait = apply.index('openbao_wait_helm_pod_delegation')
+        runtime_apply = apply.index('openbao_apply_runtime')
+        self.assertLess(namespace_apply, bootstrap_apply)
+        self.assertLess(bootstrap_apply, delegation_wait)
+        self.assertLess(delegation_wait, runtime_apply)
+        self.assertIn('kubectl_run apply --server-side', body)
+        self.assertIn('clusters/dev/openbao-bootstrap.yaml', body)
+        self.assertIn('clusters/dev/openbao-runtime.yaml', body)
+        self.assertIn('statefulset/openbao', body)
+        self.assertIn('deployment/openbao-agent-injector', body)
+        self.assertIn('initialized', body)
+        self.assertIn('sealed', body)
+        for forbidden in (
+            'operator init',
+            'operator unseal',
+            '/v1/sys/unseal',
+            'bao audit enable',
+            'kubectl_run delete persistentvolumeclaim',
+            'kubectl_run delete pvc',
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_status_readback_uses_a_certificate_dns_name(self) -> None:
+        body = self.implementation()
+        status = body.split('openbao_status_json() {', 1)[1].split(
+            'openbao_state_is_known() {', 1
+        )[0]
+        self.assertIn('BAO_ADDR=https://openbao.openbao.svc:8200', status)
+        self.assertNotIn('BAO_ADDR=https://127.0.0.1:8200', status)
+
+    def test_runtime_readme_names_the_deferred_capabilities(self) -> None:
+        readme = OPENBAO_RUNTIME.with_name('README.md').read_text(
+            encoding='utf-8'
+        )
+        for expected in (
+            'MinIO',
+            'Snapshot',
+            'Backup',
+            'Restore',
+            'Secret migration',
+            'Stage 180',
+            'uninitialized',
+            'sealed',
+        ):
+            self.assertIn(expected, readme)
+
+
+class OpenBaoInitializationStageTest(BootstrapTestCase):
+    SOURCE_SHA = '1' * 40
+    CURRENT_SHA = '2' * 40
+    SOURCE_BUNDLE_SHA256 = 'c' * 64
+    CLUSTER_ID = '12345678-1234-4abc-8def-1234567890ab'
+    CLUSTER_NAME = 'openbao-cluster-dev'
+    VERIFICATION_NONCE = 'verification-nonce-1234'
+    DOCS_COMMIT = '0039d697237eb3f3a4a6238f47d4b971974a031e'
+    DOCS_BASELINE = '2026-08-28.2'
+    DEVIATION = 'DEV-005'
+    PLATFORM_SECRET_FINGERPRINT = 'b' * 64
+    _PUBLIC_RSA_MODULUS = b'\x80' + b'\x42' * 127
+    _PUBLIC_KEY_BODY = (
+        b'\x04\x00\x00\x00\x00\x01'
+        + b'\x04\x00'
+        + _PUBLIC_RSA_MODULUS
+        + b'\x00\x11\x01\x00\x01'
+    )
+    _PUBLIC_KEY_PACKET = (
+        bytes((0xC0 | 6, len(_PUBLIC_KEY_BODY))) + _PUBLIC_KEY_BODY
+    )
+    _PUBLIC_SUBKEY_BODY = (
+        b'\x04\x00\x00\x00\x01\x01'
+        + b'\x04\x00'
+        + b'\x80'
+        + b'\x24' * 127
+        + b'\x00\x11\x01\x00\x01'
+    )
+    _PUBLIC_SUBKEY_PACKET = (
+        bytes((0xC0 | 14, len(_PUBLIC_SUBKEY_BODY))) + _PUBLIC_SUBKEY_BODY
+    )
+    PUBLIC_KEY_FINGERPRINT = hashlib.sha1(
+        b'\x99' + len(_PUBLIC_KEY_BODY).to_bytes(2, 'big') + _PUBLIC_KEY_BODY
+    ).hexdigest().upper()
+    _PUBLIC_SUBKEY_FINGERPRINT = hashlib.sha1(
+        b'\x99'
+        + len(_PUBLIC_SUBKEY_BODY).to_bytes(2, 'big')
+        + _PUBLIC_SUBKEY_BODY
+    ).hexdigest().upper()
+    PUBLIC_KEY_BYTES = base64.b64encode(
+        _PUBLIC_KEY_PACKET + _PUBLIC_SUBKEY_PACKET
+    ) + b'\n'
+    PUBLIC_KEY_SHA256 = hashlib.sha256(PUBLIC_KEY_BYTES).hexdigest()
+
+    def test_live_cluster_identity_accepts_openbao_random_uuid_shape(self) -> None:
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+openbao_status_json() {
+  printf '%s\n' '{"cluster_id":"b9cdd046-df21-f31b-cab3-5052d87769ab","cluster_name":"openbao.labs.killercoda"}'
+}
+openbao_live_cluster_identity || exit $?
+printf 'CLUSTER_ID=%s\nCLUSTER_NAME=%s\n' \
+  "$OPENBAO_CLUSTER_ID" "$OPENBAO_CLUSTER_NAME"
+'''
+        result = self.run_command([
+            '/bin/bash', '-c', script, 'live-cluster-identity',
+            str(OPENBAO_INITIALIZE_LIB),
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'CLUSTER_ID=b9cdd046-df21-f31b-cab3-5052d87769ab\n'
+            'CLUSTER_NAME=openbao.labs.killercoda\n',
+        )
+
+    def test_live_cluster_identity_rejects_malformed_fields(self) -> None:
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+status_json=$2
+openbao_status_json() { printf '%s\n' "$status_json"; }
+openbao_live_cluster_identity
+'''
+        cases = (
+            {
+                'cluster_id': 'B9CDD046-df21-f31b-cab3-5052d87769ab',
+                'cluster_name': 'openbao-cluster-dev',
+            },
+            {
+                'cluster_id': 'b9cdd046-df21-f31b-cab3-5052d87769a',
+                'cluster_name': 'openbao-cluster-dev',
+            },
+            {
+                'cluster_id': 'b9cdd046-df21-f31b-cab3-5052d87769ab',
+                'cluster_name': 'openbao cluster dev',
+            },
+        )
+        for document in cases:
+            with self.subTest(document=document):
+                result = self.run_command([
+                    '/bin/bash', '-c', script, 'live-cluster-identity-invalid',
+                    str(OPENBAO_INITIALIZE_LIB), json.dumps(document),
+                ])
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
+
+    def test_failed_configuration_never_revokes_but_always_cleans(self) -> None:
+        script = r'''
+source "$1"
+openbao_root_session_start() { echo login; }
+openbao_apply_configuration() { echo configure; return "$2"; }
+openbao_root_session_revoke() { echo revoke; }
+openbao_remote_session_cleanup() { echo cleanup; return "$3"; }
+config_rc=$2 cleanup_rc=$3
+openbao_apply_configuration() { echo configure; return "$config_rc"; }
+openbao_remote_session_cleanup() { echo cleanup; return "$cleanup_rc"; }
+openbao_apply_configuration_with_root
+'''
+        for config_rc, cleanup_rc in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            with self.subTest(config=config_rc, cleanup=cleanup_rc):
+                result = self.run_command(['/bin/bash', '-c', script, 'config-failure',
+                    str(OPENBAO_INITIALIZE_LIB), str(config_rc), str(cleanup_rc)])
+                expected = ['login', 'configure']
+                if config_rc == 0:
+                    expected.append('revoke')
+                expected.append('cleanup')
+                self.assertEqual(result.stdout.splitlines(), expected)
+                self.assertEqual(result.returncode == 0, config_rc == cleanup_rc == 0)
+
+    def test_candidate_nonce_is_bound_to_archive_not_directory(self) -> None:
+        built, archive, sidecar = self.build_candidate_artifact(self.temporary_directory())
+        self.assertEqual(built.returncode, 0)
+        directory = archive.with_name(archive.name.removesuffix('.tar.gz'))
+        metadata = directory / 'metadata.json'
+        original = metadata.read_bytes()
+        document = json.loads(original)
+        document['verification_nonce'] = 'another-verification-nonce'
+        script = r'''
+source "$1"
+PYTHON_BINARY=/usr/bin/python3
+OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$3
+OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$4
+OPENBAO_ROTATION_CANDIDATE_SIDECAR=$5
+safe_file() { [[ -f "$1" && ! -L "$1" ]]; }
+safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+OPENBAO_RECOVERY_ROOT=${3%/*}
+openbao_rotation_artifact_paths() { :; }
+openbao_source_recovery_bundle_is_valid() { :; }
+OPENBAO_PUBLIC_KEY=${3%/*}/openbao-recovery-public-key.b64
+OPENBAO_PUBLIC_KEY_FINGERPRINT=${3%/*}/openbao-recovery-public-key.fingerprint
+OPENBAO_SOURCE_RECOVERY_ARCHIVE=synthetic-source
+OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+OPENBAO_SOURCE_RECOVERY_SHA=1111111111111111111111111111111111111111
+sha256_file() {
+  if [[ "$1" == synthetic-source ]]; then printf '%064d' 0 | tr 0 c
+  else sha256sum "$1" | cut -d ' ' -f 1; fi
+}
+openbao_rotation_candidate_nonce_matches_live "$6" "$7"
+'''
+        for contents, nonce, succeeds in (
+            (original, self.VERIFICATION_NONCE, True),
+            (json.dumps(document).encode(), document['verification_nonce'], False),
+            (json.dumps(document).encode(), self.VERIFICATION_NONCE, False),
+        ):
+            metadata.write_bytes(contents)
+            result = self.run_command(['/bin/bash', '-c', script, 'bound-nonce',
+                str(OPENBAO_INITIALIZE_LIB), str(OPENBAO_RECOVERY_HELPER),
+                str(directory), str(archive), str(sidecar), nonce,
+                hashlib.sha256(b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab","cluster_name":"openbao-cluster-dev"}').hexdigest()])
+            self.assertEqual(result.returncode == 0, succeeds)
+            self.assertEqual((result.stdout, result.stderr), ('', ''))
+
+    def test_api_lowercase_fingerprints_are_canonicalized_not_coerced(self) -> None:
+        for kind in ('direct', 'backup'):
+            response = self.rotation_response() if kind == 'direct' else self.backup_retrieve_response()
+            if kind == 'direct':
+                response['pgp_fingerprints'] = [self.PUBLIC_KEY_FINGERPRINT.lower()] * 5
+            else:
+                for field in ('keys', 'keys_base64'):
+                    values = response['data'][field].pop(self.PUBLIC_KEY_FINGERPRINT)
+                    response['data'][field][self.PUBLIC_KEY_FINGERPRINT.lower()] = values
+            with self.subTest(kind=kind):
+                result, archive, _ = self.build_candidate_artifact(self.temporary_directory(),
+                    response=response, response_kind=kind,
+                    verification_nonce=self.VERIFICATION_NONCE if kind == 'backup' else None)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with tarfile.open(archive) as stream:
+                    metadata = json.load(stream.extractfile(archive.name[:-7] + '/metadata.json'))
+                self.assertEqual(metadata['public_key_fingerprint'], self.PUBLIC_KEY_FINGERPRINT)
+        response = self.backup_retrieve_response()
+        for field in ('keys', 'keys_base64'):
+            response['data'][field][self.PUBLIC_KEY_FINGERPRINT.lower()] = response['data'][field][self.PUBLIC_KEY_FINGERPRINT]
+        result, _, _ = self.build_candidate_artifact(self.temporary_directory(), response=response,
+            response_kind='backup', verification_nonce=self.VERIFICATION_NONCE)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_candidate_publication_resumes_every_local_io_boundary(self) -> None:
+        # Fail once AFTER each durable/create/link/write primitive. Restart the
+        # actual builder from the same synthetic encrypted backup; no cleanup.
+        script = r'''
+import importlib.util, pathlib, sys
+from unittest import mock
+spec = importlib.util.spec_from_file_location('recovery_under_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+operation, fail_at = sys.argv[3], int(sys.argv[4])
+arguments = sys.argv[5:]
+target = module if operation == '_exclusive_file' else module.os
+original = getattr(target, operation)
+count = 0
+def interrupted(*args, **kwargs):
+    global count
+    if operation == '_exclusive_file' and count + 1 == fail_at:
+        count += 1
+        path, payload = args[:2]
+        with open(path, 'xb') as stream:
+            stream.write(payload[:max(1, len(payload) // 2)])
+        path.chmod(0o600)
+        raise OSError('synthetic partial private write')
+    result = original(*args, **kwargs)
+    count += 1
+    if count == fail_at:
+        raise OSError('synthetic crash boundary')
+    return result
+with mock.patch.object(target, operation, interrupted):
+    first = module.main(arguments)
+assert count >= fail_at, (operation, count, fail_at)
+assert first != 0, 'injected I/O failure must stop'
+second = module.main(arguments)
+assert second == 0, 'same encrypted backup must resume without artifact deletion'
+print('RESUMED')
+'''
+        # mkdir covers private/canonical empty-directory crash; fsync includes
+        # file, directory, archive and final sidecar publication durability.
+        for operation, boundaries in (('mkdir', range(1, 4)), ('fsync', range(1, 26)),
+            ('link', range(1, 7)), ('_exclusive_file', range(1, 8))):
+            for boundary in boundaries:
+                with self.subTest(operation=operation, boundary=boundary):
+                    root = self.temporary_directory()
+                    public, fingerprint = self.artifact_public_key_files(root)
+                    response = self.write_rotation_response(root, self.backup_retrieve_response())
+                    archive = root / f'openbao-recovery-rotation-candidate-{self.CURRENT_SHA}.tar.gz'
+                    result = self.run_command([sys.executable, '-I', '-B', '-c', script,
+                        str(OPENBAO_RECOVERY_HELPER), str(root), operation, str(boundary),
+                        'build-candidate', '--response', str(response), '--response-kind', 'backup',
+                        '--verification-nonce', self.VERIFICATION_NONCE,
+                        '--archive', str(archive), '--sidecar', str(archive) + '.sha256',
+                        '--current-sha', self.CURRENT_SHA, '--source-sha', self.SOURCE_SHA,
+                        '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+                        '--public-key', str(public), '--public-key-fingerprint-file', str(fingerprint),
+                        '--cluster-id', self.CLUSTER_ID, '--cluster-name', self.CLUSTER_NAME,
+                        '--key-shares', '5', '--key-threshold', '3'])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, 'RESUMED\n')
+
+    def test_candidate_validation_rejects_foreign_retained_staging(self) -> None:
+        for mutation in ('unexpected', 'intent', 'owner-mode'):
+            with self.subTest(mutation=mutation):
+                root = self.temporary_directory()
+                built, archive, sidecar = self.build_candidate_artifact(root)
+                self.assertEqual(built.returncode, 0)
+                staging = root / f'.openbao-candidate-staging-{self.CURRENT_SHA}'
+                if mutation == 'unexpected':
+                    (staging / 'foreign').write_bytes(b'foreign')
+                elif mutation == 'intent':
+                    (staging / 'intent.json').write_bytes(b'foreign')
+                else:
+                    staging.chmod(0o755)
+                before = archive.read_bytes()
+                result = self.run_artifact_helper('validate-candidate',
+                    '--archive', archive, '--sidecar', sidecar,
+                    '--directory', archive.with_name(archive.name[:-7]),
+                    '--current-sha', self.CURRENT_SHA, '--source-sha', self.SOURCE_SHA,
+                    '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+                    '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+                    '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+                    '--cluster-identity-sha256', hashlib.sha256(
+                        b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab","cluster_name":"openbao-cluster-dev"}').hexdigest())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
+                self.assertEqual(archive.read_bytes(), before)
+
+    def test_root_proof_tempfiles_cleanup_if_second_allocation_fails(self) -> None:
+        root = self.temporary_directory()
+        binary = root / 'bin'
+        binary.mkdir()
+        executable = binary / 'mktemp'
+        executable.write_text('''#!/bin/sh
+if [ -e "$TEST_ALLOC_ROOT/allocated" ]; then exit 1; fi
+: >"$TEST_ALLOC_ROOT/allocated"
+case "$*" in
+  '-d '*) /usr/bin/mktemp -d "$TEST_ALLOC_ROOT/resume.XXXXXX" ;;
+  *) /usr/bin/mktemp "$TEST_ALLOC_ROOT/proof.XXXXXX" ;;
+esac
+''')
+        executable.chmod(0o755)
+        script = r'''
+source "$1"
+openbao_require_interactive_tty() { :; }
+openbao_prompt_secret() { OPENBAO_SECRET_INPUT=synthetic-input; }
+OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+OPENBAO_REMOTE_SESSION_KIND=root
+kubectl_run() {
+  while [[ "$1" != -- ]]; do shift; done
+  shift
+  "$@"
+}
+"$2" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+'''
+        for function in ('openbao_root_session_revocation_is_proven',
+            'openbao_finalization_resume_root_revocation'):
+            allocation = self.temporary_directory()
+            result = self.run_command(['/bin/bash', '-c', script, 'allocation-failure',
+                str(OPENBAO_INITIALIZE_LIB), function], env=self.sanitized_environment(
+                    PATH=f'{binary}:/usr/bin:/bin', TEST_ALLOC_ROOT=str(allocation)))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(sorted(path.name for path in allocation.iterdir()), ['allocated'])
+
+    def test_ordinary_check_and_configure_reject_mixed_incident_artifacts(self) -> None:
+        script = r'''
+source "$1"
+OPENBAO_RECOVERY_ROOT=$2
+OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+openbao_rotation_artifact_paths
+openbao_stage_180_preflight() { :; }
+openbao_recovery_bundle_is_valid() { return 0; }
+openbao_recovery_state() { echo COMPLIANT; }
+openbao_state_flags() { echo 'true|true'; }
+openbao_platform_secrets_match_recovery_baseline() { :; }
+openbao_unseal_interactively() { echo MUTATION-unseal; }
+openbao_auth_probe() { echo MUTATION-auth; return 1; }
+openbao_apply_configuration_with_root() { echo MUTATION-root; }
+openbao_audit_runtime_is_exact() { :; }
+complete() { printf '%s\n' "$1" "$2"; exit 0; }
+"openbao_stage_180_$3"
+'''
+        suffixes = ('openbao-recovery-rotation-candidate-' + self.CURRENT_SHA + '.tar.gz',
+            'openbao-rotation-' + self.CURRENT_SHA + '.verified.json',
+            '.openbao-rotation-' + self.CURRENT_SHA + '.ready-to-revoke.json',
+            '.openbao-final-staging-' + self.CURRENT_SHA,
+            '.openbao-candidate-staging-' + self.CURRENT_SHA)
+        for suffix in suffixes:
+            for operation in ('check', 'configure'):
+                with self.subTest(suffix=suffix, operation=operation):
+                    root = self.temporary_directory()
+                    (root / suffix).write_text('foreign-state\n')
+                    result = self.run_command(['/bin/bash', '-c', script, 'ordinary-mixed',
+                        str(OPENBAO_INITIALIZE_LIB), str(root), operation])
+                    self.assertNotIn('MUTATION', result.stdout)
+                    self.assertIn('STOP_UNKNOWN_STATE', result.stdout)
+
+    @staticmethod
+    def implementation() -> str:
+        return OPENBAO_INITIALIZE.read_text(encoding='utf-8') + (
+            OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        )
+
+    @staticmethod
+    def openbao_function_source(name: str) -> str:
+        source = OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        match = re.search(
+            rf'^{re.escape(name)}\(\) \{{\n.*?^\}}$',
+            source,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise AssertionError(f'missing OpenBao function: {name}')
+        return match.group(0)
+
+    def run_stage180_function_in_pty(
+        self,
+        function_call: str,
+        *,
+        non_tty_fd: int | None = None,
+        initial_echo: bool = False,
+        pty_input: bytes | None = (
+            b'synthetic-share-one\nsynthetic-share-two\n'
+            b'synthetic-share-three\nsynthetic-root-token\n'
+        ),
+        signal_after_output: tuple[bytes, int, bool] | None = None,
+        second_signal: int | None = None,
+        second_signal_after_output: bytes | None = None,
+        foreground_process_group: bool = False,
+        report_echo_after: bool = False,
+        timeout: float = 10,
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        temporary = self.temporary_directory()
+        command_log = temporary / 'kubectl-argv.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            TEST_TEMP_ROOT=$3
+            PYTHON_BINARY=/usr/bin/python3
+            host_path() { printf '%s' "$TEST_TEMP_ROOT"; }
+            kubectl_run() {
+              {
+                printf '%s' "$1"
+                shift
+                printf ' %s' "$@"
+                printf '\n'
+              } >>"$TEST_COMMAND_LOG"
+              case " $* " in
+                *' mktemp -d /tmp/openbao-stage180.XXXXXX '*)
+                  printf '/tmp/openbao-stage180.ABC123\n'
+                  ;;
+              esac
+            }
+            openbao_unseal_progress_is_safe() { :; }
+            openbao_state_flags() { printf 'true|false\n'; }
+            '''
+        ) + function_call + '\n'
+        master_fd, slave_fd = pty.openpty()
+        terminal_attributes = termios.tcgetattr(slave_fd)
+        if initial_echo:
+            terminal_attributes[3] |= termios.ECHO
+        else:
+            terminal_attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_attributes)
+        descriptors: list[int | object] = [slave_fd, slave_fd, slave_fd]
+        if non_tty_fd is not None:
+            descriptors[non_tty_fd] = subprocess.PIPE
+        process_command = [
+            '/bin/bash', '-c', script, 'stage180-pty',
+            str(OPENBAO_INITIALIZE_LIB), str(command_log), str(temporary),
+        ]
+        if (
+            foreground_process_group
+            or (signal_after_output is not None and signal_after_output[2])
+        ):
+            process_command = [
+                sys.executable, '-c', textwrap.dedent(r'''
+                    import fcntl
+                    import os
+                    import signal
+                    import sys
+                    import termios
+
+                    os.setsid()
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                    os.tcsetpgrp(0, os.getpgrp())
+                    for signal_number in (
+                        signal.SIGHUP, signal.SIGINT, signal.SIGTERM,
+                    ):
+                        signal.signal(signal_number, signal.SIG_DFL)
+                    os.execv(sys.argv[1], sys.argv[1:])
+                    '''),
+                *process_command,
+            ]
+        process = subprocess.Popen(
+            process_command,
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+            stdin=descriptors[0],
+            stdout=descriptors[1],
+            stderr=descriptors[2],
+            text=False,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        if non_tty_fd == 0 and process.stdin is not None:
+            process.stdin.close()
+            process.stdin = None
+        if non_tty_fd != 0 and pty_input is not None:
+            os.write(master_fd, pty_input)
+        pty_output = bytearray()
+        signal_sent = False
+        second_signal_sent = False
+        second_signal_at: float | None = None
+        terminal_closed = False
+        deadline = time.monotonic() + timeout
+        while process.poll() is None and time.monotonic() < deadline:
+            readable, _, _ = select.select([master_fd], [], [], 0.1)
+            if readable:
+                try:
+                    pty_output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    terminal_closed = True
+                    break
+            if (
+                signal_after_output is not None
+                and not signal_sent
+                and signal_after_output[0] in pty_output
+            ):
+                if signal_after_output[2]:
+                    os.killpg(process.pid, signal_after_output[1])
+                else:
+                    os.kill(process.pid, signal_after_output[1])
+                signal_sent = True
+                if second_signal is not None and second_signal_after_output is None:
+                    second_signal_at = time.monotonic() + 0.05
+            if (
+                second_signal is not None
+                and not second_signal_sent
+                and (
+                    (
+                        second_signal_after_output is not None
+                        and second_signal_after_output in pty_output
+                    )
+                    or (
+                        second_signal_at is not None
+                        and time.monotonic() >= second_signal_at
+                    )
+                )
+            ):
+                os.kill(process.pid, second_signal)
+                second_signal_sent = True
+        if process.poll() is None:
+            # EOF/EIO on the PTY can precede waitpid visibility. Keep the
+            # original deadline; an early terminal close is not a timeout.
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None:
+            # Only scoped process state, never argv/environ/PTY contents.
+            process_states = []
+            pending_pids = [process.pid]
+            seen_pids = set()
+            while pending_pids and len(seen_pids) < 16:
+                pid = pending_pids.pop()
+                if pid in seen_pids:
+                    continue
+                seen_pids.add(pid)
+                proc = Path('/proc') / str(pid)
+                try:
+                    children = (proc / 'task' / str(pid) / 'children').read_text().split()
+                    pending_pids.extend(int(child) for child in children)
+                    state = (proc / 'stat').read_text().rsplit(') ', 1)[1].split()[0]
+                    wait_channel = (proc / 'wchan').read_text().strip()
+                    if re.fullmatch(r'[A-Za-z0-9_]+', wait_channel):
+                        process_states.append((pid, state, wait_channel))
+                except (OSError, ValueError, IndexError):
+                    continue
+            if command_log.exists():
+                pid_log = command_log.read_text(
+                    encoding='utf-8', errors='replace',
+                )
+                for process_id in re.findall(
+                    r'^(?:PID|LATE_PID)=(\d+)$', pid_log, re.MULTILINE,
+                ):
+                    try:
+                        os.kill(int(process_id), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            process.kill()
+            process.wait()
+            os.close(master_fd)
+            self.fail(
+                'Stage 180 PTY harness timed out; '
+                f'terminal_closed={terminal_closed}; '
+                f'output_bytes={len(pty_output)}; processes={process_states}'
+            )
+        if signal_after_output is not None and not signal_sent:
+            self.fail('Stage 180 PTY harness did not observe signal marker')
+        if second_signal is not None and not second_signal_sent:
+            self.fail('Stage 180 PTY harness did not send second signal')
+        echo_after = bool(termios.tcgetattr(master_fd)[3] & termios.ECHO)
+        os.set_blocking(master_fd, False)
+        try:
+            while True:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                pty_output.extend(chunk)
+        except OSError:
+            pass
+        os.close(master_fd)
+        pipe_stdout, pipe_stderr = process.communicate(timeout=1)
+        output = bytes(pty_output)
+        if pipe_stdout:
+            output += pipe_stdout
+        if pipe_stderr:
+            output += pipe_stderr
+        if report_echo_after:
+            output += (
+                b'PTY_ECHO_AFTER_PROCESS=true\n'
+                if echo_after
+                else b'PTY_ECHO_AFTER_PROCESS=false\n'
+            )
+        result = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            output.decode('utf-8', errors='replace').replace('\r\n', '\n'),
+            '',
+        )
+        logged = command_log.read_text(encoding='utf-8') if command_log.exists() else ''
+        return result, logged
+
+    def run_recover_start(
+        self,
+        *,
+        state: str = 'true|true',
+        rotation_progress: int = -1,
+        verification_progress: int = -1,
+        artifact_state: str = 'MISSING',
+        failure: str = '',
+        preserve_final_response: bool = False,
+        real_status: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run the real recover-start state machine over controlled live facts."""
+        temporary = self.temporary_directory()
+        call_log = temporary / 'recover-start-calls.log'
+        if real_status:
+            fingerprint = self.PUBLIC_KEY_FINGERPRINT
+            (temporary / 'fingerprint').write_text(fingerprint + '\n', encoding='ascii')
+            idle = {
+                'nonce': '', 'started': False, 't': 0, 'n': 0, 'progress': 0,
+                'required': 3, 'pgp_fingerprints': None, 'backup': False,
+                'verification_required': False, 'verification_nonce': '',
+            }
+            for progress in (-1, 0, 1, 2, 3):
+                normal = idle if progress == -1 else {
+                    **idle, 'nonce': 'synthetic-old-rotation-nonce',
+                    'started': True, 't': 3, 'n': 5,
+                    'progress': progress if progress < 3 else 0,
+                    'pgp_fingerprints': [fingerprint] * 5, 'backup': True,
+                    'verification_required': True,
+                    'verification_nonce': 'synthetic-verification-nonce' if progress == 3 else '',
+                }
+                verification = {
+                    'nonce': 'synthetic-verification-nonce' if progress == 3 else '',
+                    'started': progress == 3, 't': 3, 'n': 5, 'progress': 0,
+                }
+                for kind, payload in (('normal', normal), ('verification', verification)):
+                    (temporary / f'{kind}-{progress}.json').write_text(json.dumps(payload))
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_REAL_ROTATION_STATUS=$(declare -f openbao_rotation_status)
+            TEST_CALL_LOG=$2
+            TEST_STATE=$3
+            TEST_ROTATION_PROGRESS=$4
+            TEST_VERIFICATION_PROGRESS=$5
+            TEST_ARTIFACT_STATE=$6
+            TEST_FAILURE=$7
+            OPENBAO_SOURCE_RECOVERY_SHA=$8
+            OPENBAO_RECOVERY_ID=$9
+            TEST_PRESERVE_FINAL_RESPONSE=${10}
+            TEST_REAL_STATUS=${11}
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=/root/openbao-recovery/candidate.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=/root/openbao-recovery/candidate.tar.gz.sha256
+            if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
+              TEST_ROTATION_DIRECTORY=${TEST_CALL_LOG}.rotation
+              mkdir -p "$TEST_ROTATION_DIRECTORY"
+              OPENBAO_ROTATION_TEMP_DIRECTORY=$TEST_ROTATION_DIRECTORY
+            else
+              OPENBAO_ROTATION_TEMP_DIRECTORY=/root/openbao-recovery/.openbao-rotation.ABC123
+            fi
+            OPENBAO_ROTATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/response.json
+            OPENBAO_ROTATION_STATUS_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.json
+            OPENBAO_ROTATION_VERIFICATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/verification.json
+            if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
+              TEST_EXPECTED_RESPONSE=${TEST_ROTATION_DIRECTORY}/expected.bin
+              printf 'synthetic-final-response-bytes\n' >"$TEST_EXPECTED_RESPONSE"
+            fi
+            OPENBAO_CLUSTER_ID=12345678-1234-4abc-8def-1234567890ab
+            OPENBAO_CLUSTER_NAME=openbao-cluster-dev
+
+            log_call() { printf '%s\n' "$1" >>"$TEST_CALL_LOG"; }
+            openbao_stage_180_preflight() { log_call preflight; }
+            openbao_source_recovery_bundle_is_valid() {
+              log_call source-validate
+              [[ "$TEST_FAILURE" != source ]]
+            }
+            openbao_require_interactive_tty() {
+              log_call tty-check
+              [[ "$TEST_FAILURE" != tty ]]
+            }
+            openbao_legacy_default_token_helpers_cleanup() {
+              log_call legacy-token-helper-cleanup
+              [[ "$TEST_FAILURE" != legacy-cleanup ]]
+            }
+            openbao_legacy_stage180_processes_absent() {
+              log_call legacy-stage180-process-check
+              [[ "$TEST_FAILURE" != legacy-stage180-process ]]
+            }
+            openbao_state_flags() { printf '%s\n' "$TEST_STATE"; }
+            openbao_unseal_interactively() {
+              log_call unseal
+              [[ "$TEST_FAILURE" != unseal ]] || return 1
+              TEST_STATE='true|false'
+            }
+            openbao_root_session_start() {
+              log_call root-login
+              [[ "$TEST_FAILURE" != root-login ]]
+            }
+            openbao_apply_configuration() {
+              log_call configure
+              [[ "$TEST_FAILURE" != configure ]]
+            }
+            openbao_live_cluster_identity() { :; }
+            openbao_rotation_temp_create() { :; }
+            openbao_rotation_temp_cleanup() {
+              [[ "$TEST_FAILURE" != temp-cleanup ]]
+            }
+            openbao_rotation_artifact_presence_state() {
+              printf '%s\n' "$TEST_ARTIFACT_STATE"
+            }
+            openbao_rotation_status() {
+              case "$1" in
+                normal)
+                  if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
+                    printf 'synthetic-normal-status-bytes\n' \
+                      >"$OPENBAO_ROTATION_STATUS_RESPONSE"
+                    if (( TEST_ROTATION_PROGRESS == 3 )); then
+                      log_call normal-status-after-final-response
+                    fi
+                  fi
+                  if (( TEST_ROTATION_PROGRESS < 0 )); then
+                    OPENBAO_ROTATION_PHASE=IDLE
+                    OPENBAO_ROTATION_NONCE=
+                  elif (( TEST_ROTATION_PROGRESS < 3 )); then
+                    OPENBAO_ROTATION_PHASE=OLD_QUORUM_PENDING
+                    OPENBAO_ROTATION_NONCE=synthetic-old-rotation-nonce
+                  else
+                    OPENBAO_ROTATION_PHASE=OLD_QUORUM_COMPLETE
+                    OPENBAO_ROTATION_NONCE=synthetic-old-rotation-nonce
+                    OPENBAO_ROTATION_VERIFICATION_NONCE=synthetic-verification-nonce
+                  fi
+                  if [[ "$TEST_FAILURE" == rotation-nonce-drift &&
+                        "$TEST_ROTATION_PROGRESS" -ge 1 ]]; then
+                    OPENBAO_ROTATION_NONCE=synthetic-drifted-rotation-nonce
+                  fi
+                  OPENBAO_ROTATION_PROGRESS=$TEST_ROTATION_PROGRESS
+                  if (( TEST_ROTATION_PROGRESS == 3 )); then
+                    OPENBAO_ROTATION_PROGRESS=0
+                  fi
+                  OPENBAO_ROTATION_REQUIRED=3
+                  ;;
+                verification)
+                  if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
+                    printf 'synthetic-verification-status-bytes\n' \
+                      >"$OPENBAO_ROTATION_VERIFICATION_RESPONSE"
+                    if (( TEST_ROTATION_PROGRESS == 3 )); then
+                      log_call verification-status-after-final-response
+                    fi
+                  fi
+                  if (( TEST_VERIFICATION_PROGRESS < 0 )); then
+                    OPENBAO_ROTATION_VERIFICATION_PHASE=IDLE
+                    OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=
+                  else
+                    OPENBAO_ROTATION_VERIFICATION_PHASE=PENDING
+                    OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=synthetic-verification-nonce
+                  fi
+                  OPENBAO_ROTATION_VERIFICATION_PROGRESS=$TEST_VERIFICATION_PROGRESS
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            openbao_rotation_initialize() {
+              log_call rotation-init-5-3-pgp-verify-backup
+              [[ "$TEST_FAILURE" != init ]] || return 1
+              TEST_ROTATION_PROGRESS=0
+            }
+            openbao_rotation_submit_share() {
+              [[ "$1" == synthetic-old-rotation-nonce ]] || return 1
+              [[ "$3" == "$((TEST_ROTATION_PROGRESS + 1))" ]] || return 1
+              TEST_ROTATION_PROGRESS=$((TEST_ROTATION_PROGRESS + 1))
+              if (( TEST_ROTATION_PROGRESS == 3 )); then
+                TEST_VERIFICATION_PROGRESS=0
+                if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
+                  cp "$TEST_EXPECTED_RESPONSE" "$2"
+                fi
+              fi
+              log_call "old-share-${TEST_ROTATION_PROGRESS}"
+              [[ "$TEST_FAILURE" != "share-${TEST_ROTATION_PROGRESS}" ]]
+            }
+            openbao_rotation_backup_retrieve() {
+              log_call backup-retrieve
+              [[ "$TEST_FAILURE" != backup ]]
+            }
+            openbao_rotation_capture_candidate() {
+              if [[ "$TEST_PRESERVE_FINAL_RESPONSE" == true ]]; then
+                cmp -s "$1" "$TEST_EXPECTED_RESPONSE" || return 1
+                log_call exact-final-response-normalized
+              fi
+              log_call candidate-write
+              [[ "$TEST_FAILURE" != candidate-write ]] || return 1
+              TEST_ARTIFACT_STATE=CANDIDATE
+            }
+            openbao_cluster_identity_sha256() { printf '%064d\n' 0; }
+            openbao_rotation_candidate_is_valid() {
+              log_call candidate-validate
+              [[ "$TEST_FAILURE" != candidate-validate ]]
+            }
+            openbao_rotation_candidate_nonce_matches_live() {
+              [[ "$1" == synthetic-verification-nonce &&
+                 "$TEST_FAILURE" != nonce-drift ]]
+            }
+            openbao_remote_session_cleanup() {
+              log_call root-helper-cleanup
+              [[ "$TEST_FAILURE" != cleanup ]]
+            }
+            openbao_root_session_revoke() { log_call FORBIDDEN-root-revoke; return 1; }
+            openbao_rotation_verification_submit_share() {
+              log_call FORBIDDEN-verification-share
+              return 1
+            }
+            openbao_rotation_backup_delete() {
+              log_call FORBIDDEN-backup-delete
+              return 1
+            }
+            openbao_build_rotation_final() {
+              log_call FORBIDDEN-final-v2
+              return 1
+            }
+            openbao_rotation_verified_marker_create() {
+              log_call FORBIDDEN-verified-marker
+              return 1
+            }
+            openbao_stage_180_accept() { log_call FORBIDDEN-accept; return 1; }
+            complete() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+              exit "$3"
+            }
+
+            if [[ "$TEST_REAL_STATUS" == true ]]; then
+              eval "$TEST_REAL_ROTATION_STATUS"
+              TEST_FIXTURES=${TEST_CALL_LOG%/*}
+              PYTHON_BINARY=/usr/bin/python3
+              OPENBAO_PUBLIC_KEY_FINGERPRINT=$TEST_FIXTURES/fingerprint
+              OPENBAO_ROTATION_STATUS_RESPONSE=$TEST_FIXTURES/status.json
+              OPENBAO_ROTATION_STATUS_STATE=$TEST_FIXTURES/status.state
+              OPENBAO_ROTATION_VERIFICATION_RESPONSE=$TEST_FIXTURES/verification.json
+              OPENBAO_ROTATION_VERIFICATION_STATE=$TEST_FIXTURES/verification.state
+              openbao_bao() {
+                local kind=normal
+                if [[ " $* " == *' -verify '* ]]; then
+                  kind=verification
+                  if (( TEST_ROTATION_PROGRESS == -1 )); then
+                    printf '%s\n' \
+                      'Error reading rotate status: Error making API request.' '' \
+                      'URL: GET https://openbao.openbao.svc:8200/v1/sys/rotate/root/verify' \
+                      'Code: 400. Errors:' '' '* no rotation configuration found' >&2
+                    return 2
+                  fi
+                fi
+                cat "$TEST_FIXTURES/${kind}-${TEST_ROTATION_PROGRESS}.json"
+              }
+            fi
+            openbao_stage_180_recover_start
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-start',
+                str(OPENBAO_INITIALIZE_LIB), str(call_log), state,
+                str(rotation_progress), str(verification_progress),
+                artifact_state, failure, self.SOURCE_SHA, self.CURRENT_SHA,
+                str(preserve_final_response).lower(),
+                str(real_status).lower(),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        calls = (
+            call_log.read_text(encoding='utf-8').splitlines()
+            if call_log.exists() else []
+        )
+        return result, calls
+
+    def run_recover_verify(
+        self,
+        *,
+        verification_progress: int = 0,
+        artifact_state: str = 'CANDIDATE',
+        checkpoint_state: str = 'NONE',
+        failure: str = '',
+        recovery_root: Path | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run the real recover-verify state machine over controlled facts."""
+        temporary = self.temporary_directory()
+        call_log = temporary / 'recover-verify-calls.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            real_fsync_function=$(declare -f openbao_fsync_directory)
+            eval "${real_fsync_function/openbao_fsync_directory/real_fsync_directory}"
+            TEST_CALL_LOG=$2
+            TEST_VERIFICATION_PROGRESS=$3
+            TEST_ARTIFACT_STATE=$4
+            TEST_FAILURE=$5
+            OPENBAO_SOURCE_RECOVERY_SHA=$6
+            OPENBAO_RECOVERY_ID=$7
+            TEST_CHECKPOINT_STATE=$8
+            TEST_RECOVERY_ROOT=$9
+            OPENBAO_ROTATION_TEMP_DIRECTORY=/root/openbao-recovery/.openbao-rotation.ABC123
+            OPENBAO_ROTATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/response.json
+            OPENBAO_ROTATION_STATUS_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.json
+            OPENBAO_ROTATION_STATUS_STATE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/status.state
+            OPENBAO_ROTATION_VERIFICATION_RESPONSE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/verification.json
+            OPENBAO_ROTATION_VERIFICATION_STATE=${OPENBAO_ROTATION_TEMP_DIRECTORY}/verification.state
+            OPENBAO_CLUSTER_ID=12345678-1234-4abc-8def-1234567890ab
+            OPENBAO_CLUSTER_NAME=openbao-cluster-dev
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            TEST_CANDIDATE_VALIDATIONS=0
+
+            log_call() { printf '%s\n' "$1" >>"$TEST_CALL_LOG"; }
+            openbao_fsync_directory() {
+              [[ -z "$TEST_RECOVERY_ROOT" || "$1" == "$TEST_RECOVERY_ROOT" ]] || return 1
+              log_call recovery-root-fsync
+              [[ "$TEST_FAILURE" != ready-fsync ]] || return 1
+              if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
+                real_fsync_directory "$1" || return 1
+              fi
+              log_call recovery-root-durable
+            }
+            openbao_stage_180_preflight() { log_call preflight; }
+            openbao_source_recovery_bundle_is_valid() {
+              log_call source-validate
+              [[ "$TEST_FAILURE" != source ]]
+            }
+            openbao_require_interactive_tty() {
+              log_call tty-check
+              [[ "$TEST_FAILURE" != tty ]]
+            }
+            openbao_state_flags() { printf 'true|false\n'; }
+            openbao_root_session_start() {
+              log_call root-login
+              [[ "$TEST_FAILURE" != root-login ]]
+            }
+            openbao_live_cluster_identity() { log_call live-cluster; }
+            openbao_finalization_transaction_binding() { printf '%064d\n' 1; }
+            openbao_root_session_binding_create() { log_call root-helper-bind; }
+            openbao_rotation_temp_create() { log_call rotation-temp-create; }
+            openbao_rotation_temp_cleanup() {
+              log_call rotation-temp-cleanup
+              [[ "$TEST_FAILURE" != temp-cleanup ]]
+            }
+            openbao_rotation_artifact_presence_state() {
+              printf '%s\n' "$TEST_ARTIFACT_STATE"
+            }
+            openbao_rotation_status() {
+              local kind=$1
+              if [[ "$TEST_FAILURE" == status-read ]]; then
+                return 1
+              fi
+              case "$kind" in
+                normal)
+                  if (( TEST_VERIFICATION_PROGRESS >= 3 )); then
+                    log_call normal-status-idle
+                    OPENBAO_ROTATION_PHASE=IDLE
+                    OPENBAO_ROTATION_NONCE=
+                    OPENBAO_ROTATION_PROGRESS=0
+                    OPENBAO_ROTATION_REQUIRED=3
+                    OPENBAO_ROTATION_VERIFICATION_NONCE=
+                  else
+                    OPENBAO_ROTATION_PHASE=OLD_QUORUM_COMPLETE
+                    OPENBAO_ROTATION_NONCE=synthetic-old-rotation-nonce
+                    OPENBAO_ROTATION_PROGRESS=3
+                    OPENBAO_ROTATION_REQUIRED=3
+                    OPENBAO_ROTATION_VERIFICATION_NONCE=synthetic-verification-nonce
+                  fi
+                  ;;
+                verification)
+                  if (( TEST_VERIFICATION_PROGRESS >= 3 )); then
+                    log_call verification-status-idle
+                    OPENBAO_ROTATION_VERIFICATION_PHASE=IDLE
+                    OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=
+                    OPENBAO_ROTATION_VERIFICATION_PROGRESS=0
+                  else
+                    OPENBAO_ROTATION_VERIFICATION_PHASE=PENDING
+                    OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=synthetic-verification-nonce
+                    if [[ "$TEST_FAILURE" == verification-nonce-drift &&
+                          "$TEST_VERIFICATION_PROGRESS" -ge 1 ]]; then
+                      OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=synthetic-drifted-verification-nonce
+                    fi
+                    OPENBAO_ROTATION_VERIFICATION_PROGRESS=$TEST_VERIFICATION_PROGRESS
+                  fi
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            openbao_recover_verify_live_readback() {
+              log_call probe-live-readback
+              openbao_rotation_status normal &&
+                openbao_rotation_status verification
+            }
+            openbao_cluster_identity_sha256() { printf '%064d\n' 0; }
+            openbao_rotation_candidate_is_valid() {
+              TEST_CANDIDATE_VALIDATIONS=$((TEST_CANDIDATE_VALIDATIONS + 1))
+              if (( TEST_CANDIDATE_VALIDATIONS == 1 )); then
+                log_call candidate-validate-pre
+                [[ "$TEST_FAILURE" != candidate-pre ]]
+              else
+                log_call candidate-revalidate
+                [[ "$TEST_FAILURE" != candidate-revalidate ]]
+              fi
+            }
+            openbao_rotation_candidate_nonce_matches_live() {
+              log_call candidate-nonce
+              [[ "$1" == synthetic-verification-nonce &&
+                 "$TEST_FAILURE" != candidate-nonce ]]
+            }
+            openbao_rotation_verification_submit_share() {
+              [[ "$1" == synthetic-verification-nonce ]] || return 1
+              TEST_VERIFICATION_PROGRESS=$((TEST_VERIFICATION_PROGRESS + 1))
+              log_call "new-share-${TEST_VERIFICATION_PROGRESS}"
+              [[ "$TEST_FAILURE" != "share-${TEST_VERIFICATION_PROGRESS}" ]]
+            }
+            openbao_rotation_backup_delete() {
+              log_call backup-delete
+              [[ "$TEST_FAILURE" != backup-delete ]]
+            }
+            openbao_recover_runtime_readback() {
+              log_call runtime-readback
+              [[ "$TEST_FAILURE" != runtime-readback ]]
+            }
+            openbao_root_session_revoke_self() {
+              log_call root-revoke-self
+              [[ "$TEST_FAILURE" != root-revoke ]]
+            }
+            openbao_root_session_revocation_is_proven() {
+              case "$TEST_FAILURE" in
+                lookup-transport|lookup-still-valid) return 1 ;;
+              esac
+              log_call root-lookup-denied
+            }
+            openbao_root_token_sha256() {
+              log_call root-token-commitment
+              printf '%064d\n' 2
+            }
+            if [[ -z "$TEST_RECOVERY_ROOT" ]]; then
+              openbao_finalization_ready_checkpoint_create() {
+                log_call ready-checkpoint
+                [[ "$TEST_FAILURE" != ready-checkpoint ]] || return 1
+                TEST_CHECKPOINT_STATE=READY
+              }
+              openbao_finalization_checkpoint_state() {
+                log_call "checkpoint-${TEST_CHECKPOINT_STATE}"
+                printf '%s\n' "$TEST_CHECKPOINT_STATE"
+              }
+              openbao_finalization_ready_checkpoint_load() {
+                OPENBAO_FINALIZATION_ROOT_TOKEN_SHA256=$(printf '%064d' 2)
+                OPENBAO_FINALIZATION_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+                OPENBAO_FINALIZATION_REMOTE_BINDING=$(printf '%064d' 1)
+              }
+            fi
+            openbao_finalization_resume_root_revocation() {
+              log_call root-resume-proof
+              case "$TEST_FAILURE" in
+                resume-commitment|resume-transport|resume-still-valid) return 1 ;;
+              esac
+              if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
+                openbao_root_session_revoke_self
+              fi
+            }
+            openbao_finalization_revoked_checkpoint_create() {
+              log_call revoked-checkpoint
+              [[ "$TEST_FAILURE" != revoked-checkpoint ]] || return 1
+              TEST_CHECKPOINT_STATE=REVOKED
+            }
+            openbao_finalization_remote_helper_cleanup() {
+              log_call root-helper-cleanup
+              [[ "$TEST_FAILURE" != helper-cleanup ]]
+            }
+            openbao_finalization_checkpoint_cleanup() {
+              log_call checkpoint-cleanup
+              [[ "$TEST_FAILURE" != checkpoint-cleanup ]]
+            }
+            openbao_remote_session_cleanup() {
+              log_call root-helper-cleanup
+              [[ "$TEST_FAILURE" != helper-cleanup ]]
+            }
+            openbao_rotation_verified_at_utc() {
+              [[ "$TEST_FAILURE" != timestamp ]] || return 1
+              printf '2026-09-03T00:00:00Z\n'
+            }
+            openbao_build_rotation_final() {
+              log_call final-v2-build
+              [[ "$TEST_FAILURE" != final-build ]]
+            }
+            openbao_rotation_final_is_valid() {
+              log_call final-bundle-validate
+              [[ "$TEST_FAILURE" != final-validate ]]
+            }
+            openbao_rotation_partial_final_cleanup() {
+              log_call partial-final-cleanup
+              [[ "$TEST_FAILURE" != partial-final-cleanup ]] || return 1
+              TEST_ARTIFACT_STATE=CANDIDATE
+            }
+            openbao_rotation_final_staging_cleanup() {
+              log_call final-staging-cleanup
+              [[ "$TEST_FAILURE" != staging-cleanup ]]
+            }
+            openbao_rotation_verified_marker_is_valid() {
+              log_call final-marker-validate
+              [[ "$TEST_FAILURE" != marker-validate ]]
+            }
+            openbao_rotation_verified_marker_create() {
+              log_call verified-marker
+              [[ "$TEST_FAILURE" != marker ]]
+            }
+            openbao_stage_180_accept() { log_call FORBIDDEN-accept; return 1; }
+            complete() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+              exit "$3"
+            }
+
+            if [[ -n "$TEST_RECOVERY_ROOT" ]]; then
+              # Keep original sourced checkpoint functions intact: Bash 5.2
+              # declare -f/eval does not preserve their conditional heredocs.
+              PYTHON_BINARY=/usr/bin/python3
+              OPENBAO_RECOVERY_ROOT=$TEST_RECOVERY_ROOT
+              OPENBAO_SOURCE_RECOVERY_ARCHIVE=$TEST_RECOVERY_ROOT/source.tar.gz
+              OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$TEST_RECOVERY_ROOT/candidate.tar.gz
+              OPENBAO_ROTATION_READY_CHECKPOINT=$TEST_RECOVERY_ROOT/ready.json
+              OPENBAO_ROTATION_REVOKED_CHECKPOINT=$TEST_RECOVERY_ROOT/revoked.json
+              openbao_rotation_artifact_paths() { :; }
+              safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+              safe_file() {
+                [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+              }
+            fi
+            openbao_stage_180_recover_verify
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-verify',
+                str(OPENBAO_INITIALIZE_LIB), str(call_log),
+                str(verification_progress), artifact_state, failure,
+                self.SOURCE_SHA, self.CURRENT_SHA, checkpoint_state,
+                str(recovery_root) if recovery_root is not None else '',
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        calls = (
+            call_log.read_text(encoding='utf-8').splitlines()
+            if call_log.exists() else []
+        )
+        return result, calls
+
+    def run_incident_accept(
+        self, state: str
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run the real accept route with controlled incident gates."""
+        temporary = self.temporary_directory()
+        call_log = temporary / 'incident-accept-calls.log'
+        evidence = temporary / '17-openbao-runtime-test.txt'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_CALL_LOG=$2
+            TEST_EVIDENCE=$3
+            TEST_STATE=$4
+            TEST_ROOT=$9
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ID=$5
+            OPENBAO_SOURCE_RECOVERY_SHA=$6
+            OPENBAO_RECOVERY_ARCHIVE=$7
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$8
+            printf 'public-fingerprint\n' >"$OPENBAO_PUBLIC_KEY_FINGERPRINT"
+            printf 'public-final-bundle\n' >"$OPENBAO_RECOVERY_ARCHIVE"
+            chmod 600 "$OPENBAO_PUBLIC_KEY_FINGERPRINT" \
+              "$OPENBAO_RECOVERY_ARCHIVE"
+            log_call() { printf '%s\n' "$1" >>"$TEST_CALL_LOG"; }
+            openbao_stage_180_preflight() { log_call preflight; }
+            openbao_incident_acceptance_state() {
+              case "$TEST_STATE" in
+                normal-v1) printf 'NORMAL_V1\n' ;;
+                candidate-only|marker-only) printf 'AMBIGUOUS\n' ;;
+                *) printf 'INCIDENT_V2\n' ;;
+              esac
+            }
+            openbao_recovery_bundle_is_valid() {
+              [[ "$TEST_STATE" == normal-v1 ]]
+            }
+            openbao_incident_source_sha_load() { :; }
+            openbao_source_recovery_bundle_is_valid() { :; }
+            openbao_incident_artifacts_are_valid() {
+              log_call incident-artifacts
+              case "$TEST_STATE" in
+                checksum-drift) return 1 ;;
+                *) return 0 ;;
+              esac
+            }
+            openbao_incident_live_rotation_is_idle() {
+              log_call live-no-pending
+              [[ "$TEST_STATE" != live-pending ]]
+            }
+            openbao_state_flags() { printf 'true|false\n'; }
+            openbao_platform_secrets_match_recovery_baseline() { :; }
+            openbao_auth_probe() { log_call auth-probe; }
+            openbao_audit_runtime_is_exact() { log_call audit-readback; }
+            business_apps_ready() { log_call applications-ready; }
+            business_https_smoke() { log_call https-smoke; }
+            openbao_existing_evidence() { return 1; }
+            host_path() { printf '%s\n' "$TEST_ROOT"; }
+            openbao_write_acceptance_payload() {
+              local destination=$1 acceptance_state=${2:-NORMAL_V1}
+              (umask 077; printf 'GIT_COMMIT=%s\n' "$OPENBAO_RECOVERY_ID" \
+                >"$destination")
+              if [[ "$acceptance_state" == INCIDENT_V2 ]]; then
+                printf '%s\n' \
+                  'UNSEAL_KEY_ROTATION=PASS' \
+                  'COMPROMISED_SHARE_INVALIDATED=true' \
+                  'INITIAL_ROOT_TOKEN=REVOKED' \
+                  'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2' \
+                  'MINIO=NOT_EXECUTED' \
+                  'SNAPSHOT=NOT_EXECUTED' \
+                  'BACKUP=NOT_EXECUTED' \
+                  'RESTORE=NOT_EXECUTED' \
+                  'APP_SECRET_MIGRATION=NOT_EXECUTED' \
+                  >>"$destination"
+              fi
+              chmod 600 "$destination"
+            }
+            openbao_evidence_is_secret_free() { :; }
+            open_evidence() {
+              EVIDENCE_FILE=$TEST_EVIDENCE
+              (umask 077; : >"$EVIDENCE_FILE")
+              chmod 600 "$EVIDENCE_FILE"
+              log_call evidence-created
+            }
+            log_evidence() { printf '%s\n' "$1" >>"$EVIDENCE_FILE"; }
+            finish_phase() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+            }
+            sha256_file() { printf '%064d\n' 0; }
+            complete() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+              exit "$3"
+            }
+
+            openbao_stage_180_accept
+            '''
+        )
+        public_fingerprint = temporary / 'fingerprint'
+        final_bundle = temporary / 'final.tar.gz'
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'incident-accept',
+                str(OPENBAO_INITIALIZE_LIB), str(call_log), str(evidence),
+                state, self.CURRENT_SHA, self.SOURCE_SHA, str(final_bundle),
+                str(public_fingerprint), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        calls = (
+            call_log.read_text(encoding='utf-8').splitlines()
+            if call_log.exists() else []
+        )
+        return result, calls
+
+    @staticmethod
+    def openpgp_packet(tag: int, body: bytes) -> bytes:
+        if len(body) < 192:
+            header = bytes((0xC0 | tag, len(body)))
+        elif len(body) < 8384:
+            encoded = len(body) - 192
+            header = bytes(
+                (0xC0 | tag, 192 + (encoded >> 8), encoded & 0xFF)
+            )
+        else:
+            header = bytes((0xC0 | tag, 255)) + len(body).to_bytes(4, 'big')
+        return header + body
+
+    @staticmethod
+    def openpgp_stream_packet(tag: int, body: bytes) -> bytes:
+        encoded = bytearray((0xC0 | tag,))
+        offset = 0
+        while offset < len(body):
+            power = (len(body) - offset).bit_length() - 1
+            length = 1 << power
+            encoded.append(224 + power)
+            encoded.extend(body[offset : offset + length])
+            offset += length
+        encoded.append(0)
+        return bytes(encoded)
+
+    @classmethod
+    def synthetic_ciphertext(
+        cls, label: str, *, recipient_key_id: bytes | None = None
+    ) -> str:
+        recipient_key_id = recipient_key_id or bytes.fromhex(
+            cls._PUBLIC_SUBKEY_FINGERPRINT[-16:]
+        )
+        seed = hashlib.sha256(label.encode('ascii')).digest()
+        encrypted_mpi = b'\x80' + (seed * 4)[1:128]
+        pkesk = (
+            b'\x03' + recipient_key_id + b'\x01\x04\x00' + encrypted_mpi
+        )
+        encrypted_payload = b'\x01' + seed * 3
+        message = cls.openpgp_packet(1, pkesk) + cls.openpgp_stream_packet(
+            18, encrypted_payload
+        )
+        return base64.b64encode(message).decode('ascii')
+
+    @staticmethod
+    def wrapped_plaintext(label: str) -> str:
+        payload = (f'synthetic-unencrypted-{label}:'.encode('ascii') + b'x' * 160)
+        return base64.b64encode(payload).decode('ascii')
+
+    def make_source_bundle(
+        self,
+        *,
+        case: str = 'valid',
+        directory: Path | None = None,
+        source_sha: str | None = None,
+        recovery_fields: dict[str, object] | None = None,
+    ) -> tuple[Path, Path]:
+        directory = directory or self.temporary_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        source_sha = source_sha or self.SOURCE_SHA
+        prefix = f'openbao-recovery-{source_sha}'
+        metadata = {
+            'schema': 'engineering-platform/openbao-recovery/v1',
+            'git_commit': source_sha,
+            'docs_commit': self.DOCS_COMMIT,
+            'docs_baseline': self.DOCS_BASELINE,
+            'deviation': self.DEVIATION,
+            'public_key_sha256': self.PUBLIC_KEY_SHA256,
+            'public_key_fingerprint': self.PUBLIC_KEY_FINGERPRINT,
+            'platform_secret_fingerprint': self.PLATFORM_SECRET_FINGERPRINT,
+            'key_shares': 5,
+            'key_threshold': 3,
+            'plaintext_recovery_material': 'NOT_RECORDED',
+        }
+        encrypted_shares = [
+            self.synthetic_ciphertext(f'share-{index}')
+            for index in range(5)
+        ]
+        init_document = {
+            'unseal_shares': 5,
+            'unseal_threshold': 3,
+            'unseal_keys_b64': encrypted_shares,
+            'unseal_keys_hex': [
+                base64.b64decode(value).hex() for value in encrypted_shares
+            ],
+            'recovery_keys_b64': [],
+            'recovery_keys_hex': [],
+            'recovery_keys_shares': 0,
+            'recovery_keys_threshold': 0,
+            'root_token': self.synthetic_ciphertext('root-token'),
+        }
+        fingerprint = self.PUBLIC_KEY_FINGERPRINT
+        if case == 'wrong-schema':
+            metadata['schema'] = 'engineering-platform/openbao-recovery/v2'
+        elif case == 'wrong-source-sha':
+            metadata['git_commit'] = '2' * 40
+        elif case == 'wrong-docs-baseline':
+            metadata['docs_baseline'] = '2026-08-28.1'
+        elif case == 'wrong-docs-commit':
+            metadata['docs_commit'] = '4' * 40
+        elif case == 'wrong-deviation':
+            metadata['deviation'] = 'DEV-999'
+        elif case == 'wrong-platform-fingerprint':
+            metadata['platform_secret_fingerprint'] = 'c' * 64
+        elif case == 'wrong-public-fingerprint':
+            fingerprint = 'B' * 40
+            metadata['public_key_fingerprint'] = fingerprint
+        elif case == 'wrong-share-count':
+            init_document['unseal_shares'] = 4
+        elif case == 'wrong-share-array-count':
+            init_document['unseal_keys_b64'] = init_document[
+                'unseal_keys_b64'
+            ][:4]
+        elif case == 'missing-root-token':
+            del init_document['root_token']
+        elif case == 'threshold-drift':
+            init_document['unseal_threshold'] = 2
+        elif case == 'metadata-threshold-drift':
+            metadata['key_threshold'] = 2
+        elif case == 'duplicate-share':
+            init_document['unseal_keys_b64'][4] = init_document[
+                'unseal_keys_b64'
+            ][0]
+        elif case == 'base64-hex-mismatch':
+            init_document['unseal_keys_hex'][0] = '00' * 16
+        elif case == 'base64-wrapped-plaintext':
+            plaintext = self.wrapped_plaintext('share')
+            init_document['unseal_keys_b64'][0] = plaintext
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                plaintext
+            ).hex()
+        elif case == 'base64-wrapped-private-key-marker':
+            plaintext = base64.b64encode(
+                b'-----BEGIN PGP PRIVATE KEY BLOCK-----' + b'x' * 160
+            ).decode('ascii')
+            init_document['unseal_keys_b64'][0] = plaintext
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                plaintext
+            ).hex()
+        elif case == 'base64-wrapped-root-token':
+            init_document['root_token'] = self.wrapped_plaintext('root-token')
+        elif case == 'malformed-openpgp':
+            malformed = base64.b64encode(
+                b'\xc1\xff\x00\x00\x01\x00' + b'x' * 256
+            ).decode('ascii')
+            init_document['unseal_keys_b64'][0] = malformed
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                malformed
+            ).hex()
+        elif case == 'wrong-ciphertext-recipient':
+            ciphertext = self.synthetic_ciphertext(
+                'wrong-recipient', recipient_key_id=b'\x99' * 8
+            )
+            init_document['unseal_keys_b64'][0] = ciphertext
+            init_document['unseal_keys_hex'][0] = base64.b64decode(
+                ciphertext
+            ).hex()
+        elif case == 'unexpected-recovery-key-data':
+            init_document['recovery_keys_b64'] = [
+                self.synthetic_ciphertext('unexpected-recovery-key')
+            ]
+        elif case == 'null-recovery-keys':
+            # OpenBao v2.6.1 newMachineInit preserves nil Go slices as null.
+            init_document['recovery_keys_b64'] = None
+            init_document['recovery_keys_hex'] = None
+        elif case == 'absent-recovery-keys':
+            del init_document['recovery_keys_b64']
+            del init_document['recovery_keys_hex']
+        if recovery_fields is not None:
+            init_document.update(recovery_fields)
+
+        members: list[tuple[tarfile.TarInfo, bytes | None]] = []
+        root = tarfile.TarInfo(prefix)
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o700
+        root.uid = root.gid = 0
+        root_payload: bytes | None = None
+        if case == 'root-payload':
+            root_payload = b'x'
+        elif case == 'decompression-amplification':
+            root_payload = b'\0' * (3 * 1024 * 1024)
+        root.size = len(root_payload or b'')
+        members.append((root, root_payload))
+        files = {
+            f'{prefix}/init.json': json.dumps(
+                init_document, separators=(',', ':'), sort_keys=True
+            ).encode('utf-8') + b'\n',
+            f'{prefix}/metadata.json': json.dumps(
+                metadata, separators=(',', ':'), sort_keys=True
+            ).encode('utf-8') + b'\n',
+            f'{prefix}/openbao-recovery-public-key.b64': self.PUBLIC_KEY_BYTES,
+            f'{prefix}/openbao-recovery-public-key.fingerprint': (
+                fingerprint.encode('ascii') + b'\n'
+            ),
+        }
+        if case == 'missing-member':
+            del files[f'{prefix}/init.json']
+        for name, payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.mode = 0o600
+            member.uid = member.gid = 0
+            member.size = len(payload)
+            if case == 'noncanonical-pax' and name.endswith('/metadata.json'):
+                member.pax_headers = {'comment': 'unexpected-extension'}
+            members.append((member, payload))
+
+        hostile: tarfile.TarInfo | None = None
+        hostile_payload: bytes | None = b'hostile\n'
+        if case == 'absolute-path':
+            hostile = tarfile.TarInfo('/absolute-path')
+        elif case == 'dot-dot':
+            hostile = tarfile.TarInfo(f'{prefix}/../escape')
+        elif case == 'symlink':
+            hostile = tarfile.TarInfo(f'{prefix}/symlink')
+            hostile.type = tarfile.SYMTYPE
+            hostile.linkname = 'metadata.json'
+            hostile_payload = None
+        elif case == 'hardlink':
+            hostile = tarfile.TarInfo(f'{prefix}/hardlink')
+            hostile.type = tarfile.LNKTYPE
+            hostile.linkname = f'{prefix}/metadata.json'
+            hostile_payload = None
+        elif case == 'fifo':
+            hostile = tarfile.TarInfo(f'{prefix}/fifo')
+            hostile.type = tarfile.FIFOTYPE
+            hostile_payload = None
+        elif case == 'extra-member':
+            hostile = tarfile.TarInfo(f'{prefix}/extra.json')
+        elif case == 'device':
+            hostile = tarfile.TarInfo(f'{prefix}/device')
+            hostile.type = tarfile.CHRTYPE
+            hostile.devmajor = 1
+            hostile.devminor = 3
+            hostile_payload = None
+        if hostile is not None:
+            hostile.mode = 0o600
+            hostile.uid = hostile.gid = 0
+            hostile.size = len(hostile_payload or b'')
+            members.append((hostile, hostile_payload))
+        if case == 'duplicate-member':
+            duplicate_name = f'{prefix}/metadata.json'
+            duplicate_payload = files[duplicate_name]
+            duplicate = tarfile.TarInfo(duplicate_name)
+            duplicate.mode = 0o600
+            duplicate.uid = duplicate.gid = 0
+            duplicate.size = len(duplicate_payload)
+            members.append((duplicate, duplicate_payload))
+
+        archive = directory / f'{prefix}.tar.gz'
+        if root_payload is not None:
+            uncompressed = io.BytesIO()
+            for member, payload in [*members[1:], members[0]]:
+                uncompressed.write(member.tobuf(format=tarfile.PAX_FORMAT))
+                if payload is not None:
+                    uncompressed.write(payload)
+                    uncompressed.write(
+                        b'\0' * (-len(payload) % tarfile.BLOCKSIZE)
+                    )
+            uncompressed.write(b'\0' * (2 * tarfile.BLOCKSIZE))
+            uncompressed.write(
+                b'\0' * (-uncompressed.tell() % tarfile.RECORDSIZE)
+            )
+            archive.write_bytes(
+                self.canonical_python_gzip(uncompressed.getvalue())
+            )
+        else:
+            archive_format = (
+                tarfile.GNU_FORMAT
+                if case == 'valid-gnu'
+                else tarfile.PAX_FORMAT
+            )
+            compressed = io.BytesIO()
+            with tarfile.open(
+                fileobj=compressed, mode='w:gz', format=archive_format
+            ) as stream:
+                for member, payload in members:
+                    stream.addfile(
+                        member,
+                        None if payload is None else io.BytesIO(payload),
+                    )
+            archive.write_bytes(
+                self.canonical_python_gzip(
+                    gzip.decompress(compressed.getvalue())
+                )
+            )
+        if case == 'nonzero-trailing-data':
+            uncompressed = bytearray(gzip.decompress(archive.read_bytes()))
+            uncompressed[-1] = ord('x')
+            archive.write_bytes(self.canonical_python_gzip(uncompressed))
+        archive.chmod(0o600)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if case == 'checksum-drift':
+            digest = '0' * 64
+        sidecar = archive.with_name(archive.name + '.sha256')
+        sidecar.write_text(f'{digest}  {archive.name}\n', encoding='ascii')
+        sidecar.chmod(0o600)
+        return archive, sidecar
+
+    def run_recovery_helper(
+        self, operation: str, archive: Path, sidecar: Path
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command([
+            sys.executable,
+            '-I',
+            '-B',
+            str(OPENBAO_RECOVERY_HELPER),
+            operation,
+            str(archive),
+            str(sidecar),
+            self.SOURCE_SHA,
+            self.DOCS_COMMIT,
+            self.DOCS_BASELINE,
+            self.DEVIATION,
+            self.PUBLIC_KEY_SHA256,
+            self.PUBLIC_KEY_FINGERPRINT,
+            self.PLATFORM_SECRET_FINGERPRINT,
+        ])
+
+    def run_artifact_helper(
+        self, operation: str, *arguments: object
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_command([
+            sys.executable,
+            '-I',
+            '-B',
+            str(OPENBAO_RECOVERY_HELPER),
+            operation,
+            *(str(argument) for argument in arguments),
+        ])
+
+    def rotation_response(self) -> dict[str, object]:
+        ciphertexts = [
+            self.synthetic_ciphertext(f'rotated-share-{index}')
+            for index in range(1, 6)
+        ]
+        return {
+            'nonce': 'rotation-nonce-1234',
+            'complete': True,
+            'keys': [base64.b64decode(value).hex() for value in ciphertexts],
+            'keys_base64': ciphertexts,
+            'pgp_fingerprints': [self.PUBLIC_KEY_FINGERPRINT] * 5,
+            'backup': True,
+            'verification_required': True,
+            'verification_nonce': self.VERIFICATION_NONCE,
+        }
+
+    def backup_retrieve_response(self) -> dict[str, object]:
+        direct = self.rotation_response()
+        return {
+            'request_id': '',
+            'lease_id': '',
+            'lease_duration': 0,
+            'renewable': False,
+            'data': {
+                'nonce': direct['nonce'],
+                'keys': {
+                    self.PUBLIC_KEY_FINGERPRINT: direct['keys'],
+                },
+                'keys_base64': {
+                    self.PUBLIC_KEY_FINGERPRINT: direct['keys_base64'],
+                },
+            },
+            'warnings': None,
+        }
+
+    def artifact_public_key_files(self, directory: Path) -> tuple[Path, Path]:
+        public_key = directory / 'openbao-recovery-public-key.b64'
+        fingerprint = directory / 'openbao-recovery-public-key.fingerprint'
+        public_key.write_bytes(self.PUBLIC_KEY_BYTES)
+        fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        public_key.chmod(0o600)
+        fingerprint.chmod(0o600)
+        return public_key, fingerprint
+
+    def write_rotation_response(
+        self, directory: Path, document: dict[str, object]
+    ) -> Path:
+        response = directory / 'rotation-response.json'
+        response.write_text(
+            json.dumps(document, separators=(',', ':'), sort_keys=True) + '\n',
+            encoding='utf-8',
+        )
+        response.chmod(0o600)
+        return response
+
+    def build_candidate_artifact(
+        self,
+        directory: Path,
+        *,
+        response: dict[str, object] | None = None,
+        response_kind: str = 'direct',
+        verification_nonce: str | None = None,
+        key_shares: int = 5,
+        key_threshold: int = 3,
+        raw_response: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+        directory.mkdir(parents=True, exist_ok=True)
+        response_path = self.write_rotation_response(
+            directory,
+            response
+            if response is not None
+            else (
+                self.rotation_response()
+                if response_kind == 'direct'
+                else self.backup_retrieve_response()
+            ),
+        )
+        if raw_response is not None:
+            response_path.write_text(raw_response, encoding='utf-8')
+        public_key, fingerprint = self.artifact_public_key_files(directory)
+        archive = directory / (
+            'openbao-recovery-rotation-candidate-'
+            f'{self.CURRENT_SHA}.tar.gz'
+        )
+        sidecar = archive.with_name(archive.name + '.sha256')
+        arguments: list[object] = [
+            '--response', response_path,
+            '--response-kind', response_kind,
+            '--archive', archive,
+            '--sidecar', sidecar,
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key', public_key,
+            '--public-key-fingerprint-file', fingerprint,
+            '--cluster-id', self.CLUSTER_ID,
+            '--cluster-name', self.CLUSTER_NAME,
+            '--key-shares', key_shares,
+            '--key-threshold', key_threshold,
+        ]
+        if verification_nonce is not None:
+            arguments.extend(('--verification-nonce', verification_nonce))
+        result = self.run_artifact_helper('build-candidate', *arguments)
+        return result, archive, sidecar
+
+    def run_final_publish_crash_harness(
+        self,
+        corruption: str,
+        *,
+        fail_fsync_at: int = 0,
+        fail_link_at: int = 0,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            recovery_root
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        source = recovery_root / 'source.tar.gz'
+        source.write_text('public-source-bundle\n', encoding='ascii')
+        source.chmod(0o600)
+        public_key = recovery_root / 'openbao-recovery-public-key.b64'
+        fingerprint = recovery_root / 'openbao-recovery-public-key.fingerprint'
+        wrapper = recovery_root / 'python-wrapper'
+        wrapper.write_text(
+            textwrap.dedent(
+                r'''#!/bin/sh
+                set -eu
+                /usr/bin/python3 "$@"
+                [ "${4:-}" = build-final ] || exit 0
+                archive=
+                sidecar=
+                shift 4
+                while [ "$#" -gt 0 ]; do
+                  case "$1" in
+                    --archive) archive=$2; shift 2 ;;
+                    --sidecar) sidecar=$2; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                case "$OPENBAO_TEST_FINAL_CORRUPTION" in
+                  sidecar-zero) : >"$sidecar" ;;
+                  sidecar-partial) printf 'partial' >"$sidecar" ;;
+                  sidecar-truncated) printf '000000000000' >"$sidecar" ;;
+                  archive) printf 'corrupt' >>"$archive" ;;
+                  directory)
+                    root=${archive%.tar.gz}
+                    printf 'corrupt' >"$root/metadata.json"
+                    ;;
+                  none) exit 0 ;;
+                  *) exit 92 ;;
+                esac
+                exit 91
+                '''
+            ),
+            encoding='ascii',
+        )
+        wrapper.chmod(0o755)
+        fsync_log = recovery_root / 'fsync.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=$7
+            OPENBAO_PUBLIC_KEY=$8
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$9
+            PYTHON_BINARY=${10}
+            TEST_SOURCE_DIGEST=${11}
+            TEST_CLUSTER_DIGEST=${12}
+            TEST_FSYNC_LOG=${13}
+            TEST_FAIL_FSYNC_AT=${14}
+            TEST_FAIL_LINK_AT=${15}
+            TEST_FSYNC_COUNT=0
+            TEST_LINK_COUNT=0
+            openbao_source_recovery_bundle_is_valid() { :; }
+            sha256_file() {
+              if [[ "$1" == "$OPENBAO_SOURCE_RECOVERY_ARCHIVE" ]]; then
+                printf '%s\n' "$TEST_SOURCE_DIGEST"
+              else
+                sha256sum "$1" | awk '{print $1}'
+              fi
+            }
+            openbao_fsync_directory() {
+              TEST_FSYNC_COUNT=$((TEST_FSYNC_COUNT + 1))
+              printf '%s\n' "$1" >>"$TEST_FSYNC_LOG"
+              (( TEST_FSYNC_COUNT != TEST_FAIL_FSYNC_AT ))
+            }
+            ln() {
+              TEST_LINK_COUNT=$((TEST_LINK_COUNT + 1))
+              (( TEST_LINK_COUNT != TEST_FAIL_LINK_AT )) || return 18
+              command ln "$@"
+            }
+            set +e
+            openbao_build_rotation_final \
+              "$TEST_CLUSTER_DIGEST" 2026-08-31T01:02:03Z
+            rc=$?
+            set -e
+            printf 'RC=%s\nSTATE=%s\n' \
+              "$rc" "$(openbao_rotation_artifact_presence_state)"
+            '''
+        )
+        cluster_digest = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'final-publish-crash',
+                str(OPENBAO_INITIALIZE_LIB), str(recovery_root),
+                self.CURRENT_SHA, self.SOURCE_SHA, str(source),
+                str(candidate), str(candidate_sidecar), str(public_key),
+                str(fingerprint), str(wrapper), self.SOURCE_BUNDLE_SHA256,
+                cluster_digest, str(fsync_log),
+                str(fail_fsync_at),
+                str(fail_link_at),
+            ],
+            env=self.sanitized_environment(
+                BOOTSTRAP_TEST_MODE='1',
+                OPENBAO_TEST_FINAL_CORRUPTION=corruption,
+            ),
+        )
+        return result, recovery_root, fsync_log
+
+    def run_snapshot_replacement_harness(
+        self,
+        operation: str,
+        archive: Path,
+        sidecar: Path,
+        replacement_archive: Path,
+        replacement_sidecar: Path,
+        *arguments: object,
+    ) -> subprocess.CompletedProcess[str]:
+        script = textwrap.dedent(
+            r'''
+            import builtins
+            import importlib.util
+            import io
+            import os
+            import pathlib
+            import sys
+
+            (
+                helper, operation, archive, sidecar,
+                replacement_archive, replacement_sidecar, *arguments
+            ) = sys.argv[1:]
+            spec = importlib.util.spec_from_file_location(
+                'openbao_recovery_snapshot_test', helper
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+
+            original_builtin_open = builtins.open
+            original_io_open = io.open
+            original_os_open = os.open
+            targets = {
+                os.path.abspath(archive), os.path.abspath(sidecar)
+            }
+            replacements = {
+                os.path.abspath(archive): replacement_archive,
+                os.path.abspath(sidecar): replacement_sidecar,
+            }
+            opened = set()
+            open_counts = {target: 0 for target in targets}
+            replaced = False
+
+            def capture(path):
+                global replaced
+                try:
+                    normalized = os.path.abspath(os.fsdecode(path))
+                except TypeError:
+                    return
+                if normalized not in targets:
+                    return
+                open_counts[normalized] += 1
+                if open_counts[normalized] != 1:
+                    raise RuntimeError('artifact path reopened')
+                opened.add(normalized)
+                if opened == targets and not replaced:
+                    for destination, replacement in replacements.items():
+                        os.replace(replacement, destination)
+                    replaced = True
+
+            def intercepted_builtin_open(path, *args, **kwargs):
+                stream = original_builtin_open(path, *args, **kwargs)
+                capture(path)
+                return stream
+
+            def intercepted_io_open(path, *args, **kwargs):
+                stream = original_io_open(path, *args, **kwargs)
+                capture(path)
+                return stream
+
+            def intercepted_os_open(path, flags, mode=0o777, *, dir_fd=None):
+                if dir_fd is None:
+                    descriptor = original_os_open(path, flags, mode)
+                else:
+                    descriptor = original_os_open(
+                        path, flags, mode, dir_fd=dir_fd
+                    )
+                capture(path)
+                return descriptor
+
+            builtins.open = intercepted_builtin_open
+            io.open = intercepted_io_open
+            os.open = intercepted_os_open
+            try:
+                if operation == 'emit':
+                    value = module._emit_item(
+                        pathlib.Path(archive), pathlib.Path(sidecar), 'share1'
+                    )
+                    sys.stdout.write(value)
+                elif operation == 'build-final':
+                    module.build_final(
+                        candidate_archive=pathlib.Path(archive),
+                        candidate_sidecar=pathlib.Path(sidecar),
+                        archive=pathlib.Path(arguments[0]),
+                        sidecar=pathlib.Path(arguments[1]),
+                        current_sha=arguments[2],
+                        source_sha=arguments[3],
+                        source_bundle_sha256=arguments[4],
+                        public_key_sha256=arguments[5],
+                        public_key_fingerprint=arguments[6],
+                        cluster_identity_digest=arguments[7],
+                        verified_at_utc=arguments[8],
+                    )
+                else:
+                    raise ValueError('unsupported harness operation')
+            except Exception:
+                raise SystemExit(1)
+            if not replaced:
+                raise SystemExit(1)
+            '''
+        )
+        return self.run_command([
+            sys.executable, '-I', '-B', '-c', script,
+            str(OPENBAO_RECOVERY_HELPER), operation, str(archive), str(sidecar),
+            str(replacement_archive), str(replacement_sidecar),
+            *(str(argument) for argument in arguments),
+        ])
+
+    def build_distinct_candidate_pair(
+        self, directory: Path
+    ) -> tuple[Path, Path, Path, Path]:
+        first_result, first_archive, first_sidecar = (
+            self.build_candidate_artifact(directory / 'first')
+        )
+        self.assertEqual(first_result.returncode, 0, first_result.stderr)
+        second_response = self.rotation_response()
+        second_ciphertexts = [
+            self.synthetic_ciphertext(f'replacement-share-{index}')
+            for index in range(1, 6)
+        ]
+        second_response['keys_base64'] = second_ciphertexts
+        second_response['keys'] = [
+            base64.b64decode(value).hex() for value in second_ciphertexts
+        ]
+        second_result, second_archive, second_sidecar = (
+            self.build_candidate_artifact(
+                directory / 'second', response=second_response
+            )
+        )
+        self.assertEqual(second_result.returncode, 0, second_result.stderr)
+        return first_archive, first_sidecar, second_archive, second_sidecar
+
+    @staticmethod
+    def archive_files(archive: Path) -> dict[str, bytes]:
+        with tarfile.open(archive, 'r:gz') as stream:
+            return {
+                Path(member.name).name: stream.extractfile(member).read()
+                for member in stream.getmembers()
+                if member.isfile()
+            }
+
+    @staticmethod
+    def archive_documents(archive: Path) -> tuple[dict[str, object], dict[str, object]]:
+        files = OpenBaoInitializationStageTest.archive_files(archive)
+        return (
+            json.loads(files['shares.json']),
+            json.loads(files['metadata.json']),
+        )
+
+    @staticmethod
+    def canonical_ustar_bytes(archive: Path) -> bytes:
+        with tarfile.open(archive, 'r:gz') as source:
+            entries = [
+                (
+                    member,
+                    source.extractfile(member).read()
+                    if member.isfile()
+                    else None,
+                )
+                for member in source.getmembers()
+            ]
+        raw = io.BytesIO()
+        with tarfile.open(
+            fileobj=raw, mode='w:', format=tarfile.USTAR_FORMAT
+        ) as output:
+            for original, payload in entries:
+                member = tarfile.TarInfo(original.name)
+                member.type = original.type
+                member.mode = original.mode
+                member.uid = original.uid
+                member.gid = original.gid
+                member.size = original.size
+                member.mtime = original.mtime
+                output.addfile(
+                    member,
+                    None if payload is None else io.BytesIO(payload),
+                )
+        return raw.getvalue()
+
+    @staticmethod
+    def write_artifact_bytes(
+        directory: Path, archive_name: str, payload: bytes
+    ) -> tuple[Path, Path]:
+        directory.mkdir(parents=True)
+        archive = directory / archive_name
+        archive.write_bytes(payload)
+        archive.chmod(0o600)
+        digest = hashlib.sha256(payload).hexdigest()
+        sidecar = archive.with_name(archive.name + '.sha256')
+        sidecar.write_text(
+            f'{digest}  {archive.name}\n', encoding='ascii'
+        )
+        sidecar.chmod(0o600)
+        return archive, sidecar
+
+    @staticmethod
+    def canonical_python_gzip(payload: bytes) -> bytes:
+        compressed = io.BytesIO()
+        with gzip.GzipFile(
+            filename='', mode='wb', fileobj=compressed, mtime=0
+        ) as stream:
+            stream.write(payload)
+        return compressed.getvalue()
+
+    @staticmethod
+    def recalculate_tar_header_checksum(
+        raw: bytearray, header_offset: int
+    ) -> None:
+        header = bytearray(
+            raw[header_offset:header_offset + tarfile.BLOCKSIZE]
+        )
+        header[148:156] = b'        '
+        checksum = sum(header)
+        header[148:156] = f'{checksum:06o}\0 '.encode('ascii')
+        raw[header_offset:header_offset + tarfile.BLOCKSIZE] = header
+
+    @staticmethod
+    def pax_record(key: str, value: str) -> bytes:
+        body = f'{key}={value}\n'.encode('utf-8')
+        length = len(body) + 2
+        while True:
+            record = f'{length} '.encode('ascii') + body
+            if len(record) == length:
+                return record
+            length = len(record)
+
+    def make_git_ancestry(self) -> tuple[Path, str, str, str]:
+        repository = self.temporary_directory() / 'repository'
+        repository.mkdir()
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ['git', *arguments],
+                cwd=repository,
+                env=self.sanitized_environment(),
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git('init', '-q', '--initial-branch=main')
+        git('config', 'user.name', 'Synthetic Test')
+        git('config', 'user.email', 'synthetic@example.invalid')
+        (repository / 'state.txt').write_text('source\n', encoding='utf-8')
+        git('add', 'state.txt')
+        git('commit', '-q', '-m', 'source')
+        source = git('rev-parse', 'HEAD')
+        git('checkout', '-q', '--orphan', 'non-ancestor')
+        git('rm', '-q', '-f', 'state.txt')
+        (repository / 'other.txt').write_text('other\n', encoding='utf-8')
+        git('add', 'other.txt')
+        git('commit', '-q', '-m', 'non ancestor')
+        non_ancestor = git('rev-parse', 'HEAD')
+        git('checkout', '-q', 'main')
+        (repository / 'state.txt').write_text('current\n', encoding='utf-8')
+        git('commit', '-q', '-am', 'current')
+        current = git('rev-parse', 'HEAD')
+        return repository, source, current, non_ancestor
+
+    def run_source_gate(
+        self,
+        function: str,
+        repository: Path,
+        source_sha: str,
+        current_sha: str,
+        recovery_root: Path,
+        *,
+        owner_drift_path: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        config = recovery_root.parent / 'config'
+        config.mkdir(exist_ok=True)
+        public_key = config / 'openbao-recovery-public-key.b64'
+        public_fingerprint = config / 'openbao-recovery-public-key.fingerprint'
+        public_key.write_bytes(self.PUBLIC_KEY_BYTES)
+        public_fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        public_key.chmod(0o600)
+        public_fingerprint.chmod(0o600)
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_REPO_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ROOT=$5
+            OPENBAO_PUBLIC_KEY=$6
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$7
+            PYTHON_BINARY=/usr/bin/python3
+            EXPECTED_PLATFORM_FINGERPRINT=$8
+            openbao_platform_secret_fingerprint() {
+              printf '%s\\n' "$EXPECTED_PLATFORM_FINGERPRINT"
+            }
+            "$9"
+            '''
+        )
+        environment = self.sanitized_environment(BOOTSTRAP_TEST_MODE='1')
+        if owner_drift_path is not None:
+            environment['BOOTSTRAP_TEST_OWNER_DRIFT_PATH'] = str(
+                owner_drift_path
+            )
+        return self.run_command(
+            [
+                '/bin/bash', '-c', script, 'source-gate',
+                str(OPENBAO_INITIALIZE_LIB), str(repository), current_sha,
+                source_sha, str(recovery_root), str(public_key),
+                str(public_fingerprint), self.PLATFORM_SECRET_FINGERPRINT,
+                function,
+            ],
+            env=environment,
+        )
+
+    def run_source_check(
+        self,
+        repository: Path,
+        current_sha: str,
+        recovery_root: Path,
+        source_sha: str = '',
+        *,
+        state: str = 'true|true',
+    ) -> subprocess.CompletedProcess[str]:
+        config = recovery_root.parent / 'config-check'
+        config.mkdir(exist_ok=True)
+        public_key = config / 'openbao-recovery-public-key.b64'
+        public_fingerprint = config / 'openbao-recovery-public-key.fingerprint'
+        public_key.write_bytes(self.PUBLIC_KEY_BYTES)
+        public_fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        public_key.chmod(0o600)
+        public_fingerprint.chmod(0o600)
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_REPO_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ROOT=$5
+            OPENBAO_PUBLIC_KEY=$6
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$7
+            PYTHON_BINARY=/usr/bin/python3
+            EXPECTED_PLATFORM_FINGERPRINT=$8
+            TEST_OPENBAO_STATE=$9
+            openbao_stage_180_preflight() { :; }
+            openbao_state_flags() { printf '%s\\n' "$TEST_OPENBAO_STATE"; }
+            openbao_recovery_state() { printf 'MISSING\\n'; }
+            openbao_platform_secret_fingerprint() {
+              printf '%s\\n' "$EXPECTED_PLATFORM_FINGERPRINT"
+            }
+            complete() {
+              printf 'RESULT=%s\\nREASON=%s\\nNEXT=%s\\n' "$1" "$2" "$4"
+              exit "$3"
+            }
+            openbao_stage_180_check
+            '''
+        )
+        return self.run_command(
+            [
+                '/bin/bash', '-c', script, 'source-check',
+                str(OPENBAO_INITIALIZE_LIB), str(repository), current_sha,
+                source_sha, str(recovery_root), str(public_key),
+                str(public_fingerprint), self.PLATFORM_SECRET_FINGERPRINT,
+                state,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+
+    def test_source_v1_accepts_unused_null_recovery_arrays(self) -> None:
+        for case in ('null-recovery-keys', 'absent-recovery-keys', 'valid'):
+            with self.subTest(case=case):
+                archive, sidecar = self.make_source_bundle(case=case)
+                validated = self.run_recovery_helper('validate-source', archive, sidecar)
+                self.assertEqual(
+                    (validated.returncode, validated.stdout, validated.stderr),
+                    (0, '', ''),
+                )
+                schema = self.run_command([
+                    sys.executable, '-I', '-B', str(OPENBAO_RECOVERY_HELPER),
+                    'verified-schema', '--archive', str(archive),
+                    '--sidecar', str(sidecar),
+                ])
+                self.assertEqual(schema.returncode, 0, schema.stderr)
+                self.assertEqual(schema.stdout.strip(), 'engineering-platform/openbao-recovery/v1')
+                self.assertEqual(schema.stderr, '')
+
+    def test_unused_recovery_arrays_reject_nonempty_or_wrong_types(self) -> None:
+        for field in ('recovery_keys_b64', 'recovery_keys_hex'):
+            for value in (0, False, '', {}, ['unexpected'], [None]):
+                with self.subTest(field=field, value=value):
+                    archive, sidecar = self.make_source_bundle(
+                        case='null-recovery-keys', recovery_fields={field: value},
+                    )
+                    result = self.run_recovery_helper('validate-source', archive, sidecar)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (1, '', ''))
+        for field in ('recovery_keys_shares', 'recovery_keys_threshold'):
+            with self.subTest(field=field):
+                archive, sidecar = self.make_source_bundle(
+                    case='null-recovery-keys', recovery_fields={field: 1},
+                )
+                result = self.run_recovery_helper('validate-source', archive, sidecar)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (1, '', ''))
+
+    def test_source_v1_rejects_unsafe_members_and_metadata(self) -> None:
+        archive, sidecar = self.make_source_bundle()
+        accepted = self.run_recovery_helper('validate-source', archive, sidecar)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stdout, '')
+
+        gnu_archive, gnu_sidecar = self.make_source_bundle(case='valid-gnu')
+        accepted_gnu = self.run_recovery_helper(
+            'validate-source', gnu_archive, gnu_sidecar
+        )
+        self.assertEqual(
+            (accepted_gnu.returncode, accepted_gnu.stdout, accepted_gnu.stderr),
+            (0, '', ''),
+        )
+
+        actual_gnu_root = self.temporary_directory() / 'actual-gnu-v1'
+        staging = actual_gnu_root / 'staging'
+        prefix = f'openbao-recovery-{self.SOURCE_SHA}'
+        with tarfile.open(gnu_archive, 'r:gz') as source:
+            for member in source.getmembers():
+                target = staging / member.name
+                if member.isdir():
+                    target.mkdir(parents=True)
+                    target.chmod(0o700)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    payload = source.extractfile(member)
+                    self.assertIsNotNone(payload)
+                    target.write_bytes(payload.read())
+                    target.chmod(0o600)
+        actual_gnu = subprocess.run(
+            [
+                '/usr/bin/tar', '--format=gnu', '--owner=root',
+                '--group=root', '-C', str(staging), '-czf', '-', prefix,
+            ],
+            env=self.sanitized_environment(),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(actual_gnu.returncode, 0, actual_gnu.stderr)
+        self.assertEqual(
+            actual_gnu.stdout[:10],
+            b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03',
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(actual_gnu.stdout), mode='r:gz'
+        ) as stream:
+            actual_members = stream.getmembers()
+        self.assertTrue(
+            all(
+                member.uid == member.gid == 0
+                and member.uname == member.gname == 'root'
+                for member in actual_members
+            )
+        )
+        actual_archive, actual_sidecar = self.write_artifact_bytes(
+            actual_gnu_root / 'artifact', gnu_archive.name, actual_gnu.stdout
+        )
+        accepted_actual_gnu = self.run_recovery_helper(
+            'validate-source', actual_archive, actual_sidecar
+        )
+        self.assertEqual(
+            (
+                accepted_actual_gnu.returncode,
+                accepted_actual_gnu.stdout,
+                accepted_actual_gnu.stderr,
+            ),
+            (0, '', ''),
+        )
+
+        cases = (
+            'absolute-path', 'dot-dot', 'symlink', 'hardlink', 'fifo', 'device',
+            'duplicate-member', 'extra-member', 'missing-member', 'wrong-schema',
+            'wrong-source-sha', 'wrong-docs-baseline', 'wrong-docs-commit',
+            'wrong-deviation', 'wrong-platform-fingerprint',
+            'wrong-public-fingerprint', 'wrong-share-count',
+            'wrong-share-array-count', 'threshold-drift',
+            'metadata-threshold-drift', 'duplicate-share',
+            'base64-hex-mismatch',
+            'base64-wrapped-plaintext', 'base64-wrapped-private-key-marker',
+            'base64-wrapped-root-token', 'malformed-openpgp',
+            'wrong-ciphertext-recipient', 'unexpected-recovery-key-data',
+            'missing-root-token', 'checksum-drift', 'root-payload',
+            'decompression-amplification', 'noncanonical-pax',
+            'nonzero-trailing-data',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                archive, sidecar = self.make_source_bundle(case=case)
+                if case in ('root-payload', 'decompression-amplification'):
+                    with tarfile.open(archive, 'r:gz') as stream:
+                        root = next(
+                            member
+                            for member in stream.getmembers()
+                            if member.isdir()
+                        )
+                    expected_size = (
+                        1 if case == 'root-payload' else 3 * 1024 * 1024
+                    )
+                    self.assertEqual(root.size, expected_size)
+                    if case == 'decompression-amplification':
+                        self.assertLess(archive.stat().st_size, 16 * 1024)
+                result = self.run_recovery_helper(
+                    'validate-source', archive, sidecar
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.stdout, result.stderr), ('', ''))
+
+    def test_raw_recovery_archive_bytes_are_canonical(self) -> None:
+        directory = self.temporary_directory() / 'raw-archive'
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            directory / 'candidate'
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+
+        candidate_raw = self.canonical_ustar_bytes(candidate)
+        candidate_gzip = self.canonical_python_gzip(candidate_raw)
+        self.assertEqual(candidate_gzip[:4], b'\x1f\x8b\x08\x00')
+        legal_archive, legal_sidecar = self.write_artifact_bytes(
+            directory / 'legal-ustar', candidate.name, candidate_gzip
+        )
+        legal = self.run_artifact_helper(
+            'emit-item', '--archive', legal_archive, '--sidecar', legal_sidecar,
+            '--item', 'share1',
+        )
+        self.assertEqual(
+            (legal.returncode, legal.stdout, legal.stderr),
+            (0, self.rotation_response()['keys_base64'][0], ''),
+        )
+
+        with tarfile.open(
+            fileobj=io.BytesIO(candidate_raw), mode='r:'
+        ) as stream:
+            members = stream.getmembers()
+        long_member = next(
+            member
+            for member in members
+            if member.isfile() and len(member.name.encode('utf-8')) > 100
+        )
+        fingerprint_member = next(
+            member
+            for member in members
+            if member.name.endswith(
+                '/openbao-recovery-public-key.fingerprint'
+            )
+        )
+
+        def optional_gzip(flag: int, option: bytes) -> bytes:
+            return (
+                candidate_gzip[:3]
+                + bytes([flag])
+                + candidate_gzip[4:10]
+                + option
+                + candidate_gzip[10:]
+            )
+
+        duplicate_pax_raw = bytearray(candidate_raw)
+        record = self.pax_record('path', long_member.name)
+        pax_payload = record + record
+        pax_member = tarfile.TarInfo('././@PaxHeader')
+        pax_member.type = tarfile.XHDTYPE
+        pax_member.mode = 0o600
+        pax_member.uid = pax_member.gid = 0
+        pax_member.mtime = 0
+        pax_member.size = len(pax_payload)
+        pax_extension = (
+            pax_member.tobuf(format=tarfile.USTAR_FORMAT)
+            + pax_payload
+            + b'\0' * (-len(pax_payload) % tarfile.BLOCKSIZE)
+        )
+        duplicate_pax_raw = (
+            duplicate_pax_raw[:long_member.offset]
+            + pax_extension
+            + duplicate_pax_raw[long_member.offset:]
+        )
+
+        unused_field_raw = bytearray(candidate_raw)
+        link_field = fingerprint_member.offset + 157
+        marker = b'PRIVATE KEY'
+        unused_field_raw[link_field:link_field + 100] = (
+            marker + b'\0' * (100 - len(marker))
+        )
+        self.recalculate_tar_header_checksum(
+            unused_field_raw, fingerprint_member.offset
+        )
+
+        padding_raw = bytearray(candidate_raw)
+        padding_start = fingerprint_member.offset_data + fingerprint_member.size
+        padding_end = (
+            fingerprint_member.offset_data
+            + (fingerprint_member.size + tarfile.BLOCKSIZE - 1)
+            // tarfile.BLOCKSIZE
+            * tarfile.BLOCKSIZE
+        )
+        padding_marker = b's.abcdefgh'
+        self.assertGreaterEqual(padding_end - padding_start, len(padding_marker))
+        padding_raw[padding_start:padding_start + len(padding_marker)] = (
+            padding_marker
+        )
+
+        extra = b'root-token-hidden'
+        unapproved_xfl = bytearray(candidate_gzip)
+        unapproved_xfl[8] = 0
+        unapproved_os = bytearray(candidate_gzip)
+        unapproved_os[9] = 7
+        unapproved_gnu_mtime = bytearray(candidate_gzip)
+        unapproved_gnu_mtime[4:8] = (1).to_bytes(4, 'little')
+        unapproved_gnu_mtime[8] = 0
+        unapproved_gnu_mtime[9] = 3
+        unapproved_python_mtime = bytearray(candidate_gzip)
+        unapproved_python_mtime[4:8] = (1).to_bytes(4, 'little')
+        cases = {
+            'gzip-filename': optional_gzip(0x08, b'root-token-hidden\0'),
+            'gzip-comment': optional_gzip(0x10, b'PRIVATE KEY\0'),
+            'gzip-extra': optional_gzip(
+                0x04, len(extra).to_bytes(2, 'little') + extra
+            ),
+            'concatenated-gzip-member': (
+                candidate_gzip + self.canonical_python_gzip(b'')
+            ),
+            'gzip-unapproved-xfl': bytes(unapproved_xfl),
+            'gzip-unapproved-os': bytes(unapproved_os),
+            'gzip-unapproved-gnu-mtime': bytes(unapproved_gnu_mtime),
+            'gzip-unapproved-python-mtime': bytes(unapproved_python_mtime),
+            'duplicate-pax-record': self.canonical_python_gzip(
+                bytes(duplicate_pax_raw)
+            ),
+            'nonzero-unused-header-field': self.canonical_python_gzip(
+                bytes(unused_field_raw)
+            ),
+            'nonzero-file-padding': self.canonical_python_gzip(
+                bytes(padding_raw)
+            ),
+        }
+        for case, payload in cases.items():
+            with self.subTest(candidate_case=case):
+                archive, sidecar = self.write_artifact_bytes(
+                    directory / case, candidate.name, payload
+                )
+                rejected = self.run_artifact_helper(
+                    'emit-item', '--archive', archive, '--sidecar', sidecar,
+                    '--item', 'share1',
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(
+                    (rejected.stdout, rejected.stderr), ('', '')
+                )
+
+        cluster_digest = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        validation_arguments: list[object] = [
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+            '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+            '--cluster-identity-sha256', cluster_digest,
+        ]
+        final = directory / 'final' / (
+            f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        )
+        final.parent.mkdir()
+        final_sidecar = final.with_name(final.name + '.sha256')
+        final_built = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments,
+            '--verified-at-utc', '2026-08-31T01:02:03Z',
+        )
+        self.assertEqual(final_built.returncode, 0, final_built.stderr)
+
+        final_raw = self.canonical_ustar_bytes(final)
+        with tarfile.open(
+            fileobj=io.BytesIO(final_raw), mode='r:'
+        ) as stream:
+            final_fingerprint = next(
+                member
+                for member in stream.getmembers()
+                if member.name.endswith(
+                    '/openbao-recovery-public-key.fingerprint'
+                )
+            )
+        final_padding = bytearray(final_raw)
+        final_padding_start = final_fingerprint.offset_data + final_fingerprint.size
+        final_padding[
+            final_padding_start:final_padding_start + len(extra)
+        ] = extra
+        hostile_final, hostile_final_sidecar = self.write_artifact_bytes(
+            directory / 'v2-padding', final.name,
+            self.canonical_python_gzip(bytes(final_padding)),
+        )
+        rejected_final = self.run_artifact_helper(
+            'validate-final', '--archive', hostile_final,
+            '--sidecar', hostile_final_sidecar, *validation_arguments,
+        )
+        self.assertNotEqual(rejected_final.returncode, 0)
+        self.assertEqual(
+            (rejected_final.stdout, rejected_final.stderr), ('', '')
+        )
+
+        for label, archive in (('candidate', candidate), ('v2', final)):
+            with self.subTest(writer=label):
+                archive_bytes = archive.read_bytes()
+                self.assertEqual(
+                    archive_bytes[:10],
+                    b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff',
+                )
+                raw = gzip.decompress(archive_bytes)
+                with tarfile.open(
+                    fileobj=io.BytesIO(raw), mode='r:'
+                ) as stream:
+                    written_members = stream.getmembers()
+                self.assertTrue(
+                    all(
+                        not member.pax_headers
+                        and member.offset_data - member.offset
+                        == tarfile.BLOCKSIZE
+                        and raw[
+                            member.offset:member.offset + tarfile.BLOCKSIZE
+                        ] == member.tobuf(format=tarfile.USTAR_FORMAT)
+                        for member in written_members
+                    )
+                )
+
+    def test_source_sha_must_resolve_to_ancestor_commit(self) -> None:
+        repository, source, current, non_ancestor = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+
+        accepted = self.run_source_gate(
+            'openbao_source_recovery_sha_is_valid',
+            repository, source, current, recovery_root,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for rejected_source in ('f' * 40, non_ancestor):
+            with self.subTest(source=rejected_source):
+                rejected = self.run_source_gate(
+                    'openbao_source_recovery_sha_is_valid',
+                    repository, rejected_source, current, recovery_root,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, '')
+
+    def test_source_bundle_path_is_only_the_requested_sha(self) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        self.make_source_bundle(directory=recovery_root, source_sha=source)
+        requested = current
+
+        rejected = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, requested, current, recovery_root,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, '')
+
+    def test_source_bundle_requires_safe_owner_and_mode(self) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        archive, sidecar = self.make_source_bundle(
+            directory=recovery_root, source_sha=source
+        )
+
+        accepted = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, source, current, recovery_root,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stdout, '')
+
+        archive.chmod(0o640)
+        mode_drift = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, source, current, recovery_root,
+        )
+        self.assertNotEqual(mode_drift.returncode, 0)
+        self.assertEqual(mode_drift.stdout, '')
+        archive.chmod(0o600)
+
+        owner_drift = self.run_source_gate(
+            'openbao_source_recovery_bundle_is_valid',
+            repository, source, current, recovery_root,
+            owner_drift_path=sidecar,
+        )
+        self.assertNotEqual(owner_drift.returncode, 0)
+        self.assertEqual(owner_drift.stdout, '')
+
+    def test_initialized_missing_bundle_requires_or_adopts_exact_source(
+        self,
+    ) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        self.make_source_bundle(directory=recovery_root, source_sha=source)
+
+        missing = self.run_source_check(repository, current, recovery_root)
+        self.assertEqual(missing.returncode, 10, missing.stderr)
+        self.assertIn('RESULT=STOP_PRECONDITION', missing.stdout)
+        self.assertIn('REASON=source-recovery-sha-required', missing.stdout)
+
+        adopted = self.run_source_check(
+            repository, current, recovery_root, source
+        )
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        self.assertIn('RESULT=PASS_OPENBAO_RECOVERY_CHECK', adopted.stdout)
+        self.assertIn('REASON=recover-start-required', adopted.stdout)
+        self.assertIn(
+            'NEXT=stages/180-openbao-initialize/run.sh --recover-start '
+            f'--source-recovery-sha={source}',
+            adopted.stdout,
+        )
+
+    def test_unsealed_recovery_check_requires_verified_source(self) -> None:
+        repository, source, current, _ = self.make_git_ancestry()
+        recovery_root = self.temporary_directory() / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        archive, _ = self.make_source_bundle(directory=recovery_root, source_sha=source)
+
+        for supplied_source, expected_code, reason in (
+            ('', 10, 'source-recovery-sha-required'),
+            ('invalid', 10, 'source-recovery-sha-invalid'),
+            (source, 0, 'recover-start-required'),
+        ):
+            with self.subTest(source=supplied_source):
+                result = self.run_source_check(
+                    repository, current, recovery_root, supplied_source,
+                    state='true|false',
+                )
+                self.assertEqual(result.returncode, expected_code, result.stdout)
+                self.assertIn(f'REASON={reason}', result.stdout)
+                if expected_code == 0:
+                    self.assertIn('RESULT=PASS_OPENBAO_RECOVERY_CHECK', result.stdout)
+                    self.assertIn(
+                        'NEXT=stages/180-openbao-initialize/run.sh --recover-start '
+                        f'--source-recovery-sha={source}', result.stdout,
+                    )
+
+        archive.write_bytes(b'synthetic-corrupt-bundle')
+        rejected = self.run_source_check(
+            repository, current, recovery_root, source, state='true|false',
+        )
+        self.assertEqual(rejected.returncode, 30, rejected.stdout)
+        self.assertIn('REASON=source-recovery-bundle-unsafe', rejected.stdout)
+        self.assertNotIn('PASS_', rejected.stdout)
+
+    def test_stage_180_is_interactive_and_never_orchestrated(self) -> None:
+        self.assertTrue(OPENBAO_INITIALIZE.is_file())
+        self.assertTrue(OPENBAO_INITIALIZE_LIB.is_file())
+        body = self.implementation()
+        orchestrator = BOOTSTRAP_ALL.read_text(encoding='utf-8')
+        for operation in ('--check', '--initialize', '--configure', '--accept'):
+            self.assertIn(operation, body)
+        self.assertNotIn('--apply', body)
+        self.assertNotIn('180-openbao', orchestrator)
+
+    def test_public_key_and_recovery_targets_fail_closed(self) -> None:
+        body = self.implementation()
+        for expected in (
+            'openbao-recovery-public-key.b64',
+            'openbao-recovery-public-key.fingerprint',
+            'safe_file "$OPENBAO_PUBLIC_KEY" 600',
+            'safe_file "$OPENBAO_PUBLIC_KEY_FINGERPRINT" 600',
+            'safe_owned_directory "$OPENBAO_RECOVERY_ROOT" 0',
+            'set -o noclobber',
+            'chmod 600',
+            'sha256_file',
+        ):
+            self.assertIn(expected, body)
+
+    def test_initialize_uses_exact_pgp_shamir_contract(self) -> None:
+        body = self.implementation()
+        initialize = body.split('openbao_stage_180_initialize() {', 1)[1].split(
+            'openbao_stage_180_configure() {', 1
+        )[0]
+        for expected in (
+            'operator init',
+            '-format=json',
+            '-key-shares=5',
+            '-key-threshold=3',
+            '-pgp-keys=',
+            '-root-token-pgp-key=',
+            'unseal_keys_b64',
+            'root_token',
+            'openbao_recovery_bundle_is_valid',
+        ):
+            self.assertIn(expected, body)
+        self.assertIn('openbao_operator_initialize', initialize)
+        self.assertRegex(
+            body,
+            r"pgp_keys=\$\(printf .*%s,%s,%s,%s,%s.*"
+            r'\"\$key\" \"\$key\" \"\$key\" \"\$key\" \"\$key\"\)',
+        )
+        self.assertNotIn('operator init', body.split('openbao_stage_180_check() {', 1)[1].split(
+            'openbao_stage_180_initialize() {', 1
+        )[0])
+
+    def test_candidate_and_v2_final_have_exact_safe_contents(self) -> None:
+        temporary = self.temporary_directory() / 'direct'
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            temporary
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertEqual((built.stdout, built.stderr), ('', ''))
+        expected_candidate_root = (
+            'openbao-recovery-rotation-candidate-' + self.CURRENT_SHA
+        )
+        with tarfile.open(candidate, 'r:gz') as stream:
+            members = stream.getmembers()
+            self.assertEqual(
+                [member.name for member in members],
+                [
+                    expected_candidate_root,
+                    f'{expected_candidate_root}/shares.json',
+                    f'{expected_candidate_root}/metadata.json',
+                    f'{expected_candidate_root}/openbao-recovery-public-key.b64',
+                    f'{expected_candidate_root}/openbao-recovery-public-key.fingerprint',
+                ],
+            )
+            self.assertEqual(members[0].mode, 0o700)
+            self.assertTrue(all(member.mode == 0o600 for member in members[1:]))
+            self.assertTrue(all(member.uid == member.gid == 0 for member in members))
+        self.assertEqual(candidate.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(candidate_sidecar.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            (temporary / expected_candidate_root).stat().st_mode & 0o777,
+            0o700,
+        )
+
+        shares, metadata = self.archive_documents(candidate)
+        expected_ciphertexts = self.rotation_response()['keys_base64']
+        self.assertEqual(
+            shares,
+            {
+                'unseal_keys_b64': expected_ciphertexts,
+                'unseal_shares': 5,
+                'unseal_threshold': 3,
+            },
+        )
+        expected_cluster_identity = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        expected_share_digests = {
+            f'share{index}': hashlib.sha256(
+                base64.b64decode(ciphertext)
+            ).hexdigest()
+            for index, ciphertext in enumerate(expected_ciphertexts, start=1)
+        }
+        self.assertEqual(
+            metadata,
+            {
+                'schema': (
+                    'engineering-platform/'
+                    'openbao-recovery-rotation-candidate/v1'
+                ),
+                'git_commit': self.CURRENT_SHA,
+                'source_recovery_sha': self.SOURCE_SHA,
+                'source_bundle_sha256': self.SOURCE_BUNDLE_SHA256,
+                'public_key_sha256': self.PUBLIC_KEY_SHA256,
+                'public_key_fingerprint': self.PUBLIC_KEY_FINGERPRINT,
+                'cluster_identity_sha256': expected_cluster_identity,
+                'key_shares': 5,
+                'key_threshold': 3,
+                'rotation_state': 'pending_verification',
+                'verification_nonce': self.VERIFICATION_NONCE,
+                'share_ciphertext_sha256': expected_share_digests,
+            },
+        )
+        serialized_candidate = candidate.read_bytes()
+        self.assertNotIn(b'root_token', serialized_candidate)
+        self.assertNotIn(b'PRIVATE KEY', serialized_candidate.upper())
+
+        validation_arguments: list[object] = [
+            '--archive', candidate,
+            '--sidecar', candidate_sidecar,
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+            '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+            '--cluster-identity-sha256', expected_cluster_identity,
+        ]
+        validated = self.run_artifact_helper(
+            'validate-candidate', *validation_arguments
+        )
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+        self.assertEqual((validated.stdout, validated.stderr), ('', ''))
+        for mode_path in (candidate, candidate_sidecar):
+            with self.subTest(mode_path=mode_path.name):
+                mode_path.chmod(0o640)
+                mode_rejected = self.run_artifact_helper(
+                    'validate-candidate', *validation_arguments
+                )
+                self.assertNotEqual(mode_rejected.returncode, 0)
+                self.assertEqual(
+                    (mode_rejected.stdout, mode_rejected.stderr), ('', '')
+                )
+                mode_path.chmod(0o600)
+
+        backup_directory = self.temporary_directory() / 'backup'
+        backup_built, backup, _ = self.build_candidate_artifact(
+            backup_directory,
+            response_kind='backup',
+            verification_nonce=self.VERIFICATION_NONCE,
+        )
+        self.assertEqual(backup_built.returncode, 0, backup_built.stderr)
+        self.assertEqual(backup_built.stdout, '')
+        self.assertEqual(
+            self.archive_documents(backup),
+            self.archive_documents(candidate),
+        )
+
+        final = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_sidecar = final.with_name(final.name + '.sha256')
+        verified_at = '2026-08-31T01:02:03Z'
+        final_built = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments[4:],
+            '--verified-at-utc', verified_at,
+        )
+        self.assertEqual(final_built.returncode, 0, final_built.stderr)
+        self.assertEqual((final_built.stdout, final_built.stderr), ('', ''))
+        final_shares, final_metadata = self.archive_documents(final)
+        self.assertEqual(final_shares, shares)
+        self.assertEqual(
+            final_metadata,
+            {
+                **{
+                    key: value
+                    for key, value in metadata.items()
+                    if key not in ('schema', 'rotation_state', 'verification_nonce')
+                },
+                'schema': 'engineering-platform/openbao-recovery/v2',
+                'rotation_state': 'verified',
+                'rotation_verified_at_utc': verified_at,
+                'initial_root_token': 'revoked',
+            },
+        )
+        self.assertNotIn('verification_nonce', final_metadata)
+        self.assertNotIn('root_token', final_shares)
+        final_validated = self.run_artifact_helper(
+            'validate-final',
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments[4:],
+        )
+        self.assertEqual(final_validated.returncode, 0, final_validated.stderr)
+        self.assertEqual((final_validated.stdout, final_validated.stderr), ('', ''))
+
+        before = (
+            hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            hashlib.sha256(final.read_bytes()).hexdigest(),
+        )
+        candidate_rebuild, _, _ = self.build_candidate_artifact(temporary)
+        self.assertEqual(candidate_rebuild.returncode, 0, candidate_rebuild.stderr)
+        final_rebuild = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments[4:],
+            '--verified-at-utc', verified_at,
+        )
+        self.assertNotEqual(final_rebuild.returncode, 0)
+        self.assertEqual(
+            before,
+            (
+                hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                hashlib.sha256(final.read_bytes()).hexdigest(),
+            ),
+        )
+
+    def test_emit_item_stays_bound_to_one_validated_snapshot(self) -> None:
+        directory = self.temporary_directory() / 'emit-snapshot'
+        first, first_sidecar, replacement, replacement_sidecar = (
+            self.build_distinct_candidate_pair(directory)
+        )
+        expected_share = self.rotation_response()['keys_base64'][0]
+
+        emitted = self.run_snapshot_replacement_harness(
+            'emit', first, first_sidecar, replacement, replacement_sidecar
+        )
+
+        self.assertEqual(emitted.returncode, 0)
+        self.assertEqual(emitted.stdout, expected_share)
+        self.assertEqual(emitted.stderr, '')
+
+    def test_final_build_stays_bound_to_one_candidate_snapshot(self) -> None:
+        directory = self.temporary_directory() / 'final-snapshot'
+        first, first_sidecar, replacement, replacement_sidecar = (
+            self.build_distinct_candidate_pair(directory)
+        )
+        expected_shares, _ = self.archive_documents(first)
+        final = directory / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_sidecar = final.with_name(final.name + '.sha256')
+
+        built = self.run_snapshot_replacement_harness(
+            'build-final', first, first_sidecar, replacement,
+            replacement_sidecar, final, final_sidecar, self.CURRENT_SHA,
+            self.SOURCE_SHA, self.SOURCE_BUNDLE_SHA256,
+            self.PUBLIC_KEY_SHA256, self.PUBLIC_KEY_FINGERPRINT,
+            'abac3924a1218dcbf061892bebe08d08a5955222ece365564f356b39d10097c7',
+            '2026-08-31T01:02:03Z',
+        )
+
+        self.assertEqual(
+            (built.returncode, built.stdout, built.stderr), (0, '', '')
+        )
+        final_shares, _ = self.archive_documents(final)
+        self.assertEqual(final_shares, expected_shares)
+
+    def test_final_publish_never_exposes_invalid_three_of_three_crash_state(
+        self,
+    ) -> None:
+        for corruption in (
+            'sidecar-zero', 'sidecar-partial', 'sidecar-truncated',
+            'archive', 'directory',
+        ):
+            with self.subTest(corruption=corruption):
+                result, recovery_root, _ = (
+                    self.run_final_publish_crash_harness(corruption)
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('RC=1\n', result.stdout)
+                self.assertIn('STATE=CANDIDATE\n', result.stdout)
+                final = recovery_root / f'openbao-recovery-{self.CURRENT_SHA}'
+                archive = final.with_name(final.name + '.tar.gz')
+                sidecar = archive.with_name(archive.name + '.sha256')
+                self.assertFalse(final.exists() or final.is_symlink())
+                self.assertFalse(archive.exists() or archive.is_symlink())
+                self.assertFalse(sidecar.exists() or sidecar.is_symlink())
+
+    def test_final_publish_each_parent_fsync_failure_is_fail_closed(
+        self,
+    ) -> None:
+        for fsync_index in range(1, 21):
+            with self.subTest(fsync_index=fsync_index):
+                result, recovery_root, fsync_log = (
+                    self.run_final_publish_crash_harness(
+                        'none', fail_fsync_at=fsync_index
+                    )
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected_state = (
+                    'CANDIDATE' if fsync_index <= 5
+                    else 'PARTIAL_FINAL' if fsync_index <= 11
+                    else 'FINAL'
+                )
+                self.assertEqual(
+                    result.stdout, f'RC=1\nSTATE={expected_state}\n'
+                )
+                self.assertTrue(fsync_log.is_file())
+                self.assertEqual(
+                    len(
+                        fsync_log.read_text(
+                            encoding='utf-8'
+                        ).splitlines()
+                    ),
+                    fsync_index,
+                )
+
+    def test_final_publish_hard_link_failures_never_expose_final_state(
+        self,
+    ) -> None:
+        for link_index in range(1, 7):
+            with self.subTest(link_index=link_index):
+                result, recovery_root, _ = (
+                    self.run_final_publish_crash_harness(
+                        'none', fail_link_at=link_index
+                    )
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'RC=1\nSTATE=PARTIAL_FINAL\n')
+                final = recovery_root / f'openbao-recovery-{self.CURRENT_SHA}'
+                archive = final.with_name(final.name + '.tar.gz')
+                sidecar = archive.with_name(archive.name + '.sha256')
+                self.assertTrue(final.is_dir())
+                self.assertFalse(sidecar.exists() or sidecar.is_symlink())
+                if link_index <= 5:
+                    self.assertFalse(archive.exists() or archive.is_symlink())
+
+    def test_final_publish_fsyncs_each_changed_parent_and_cleans_staging(
+        self,
+    ) -> None:
+        result, recovery_root, fsync_log = (
+            self.run_final_publish_crash_harness('none')
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=0\nSTATE=FINAL\n')
+        staging_root = recovery_root / (
+            f'.openbao-final-staging-{self.CURRENT_SHA}'
+        )
+        staging_directory = staging_root / (
+            f'openbao-recovery-{self.CURRENT_SHA}'
+        )
+        final_directory = recovery_root / (
+            f'openbao-recovery-{self.CURRENT_SHA}'
+        )
+        self.assertFalse(staging_root.exists() or staging_root.is_symlink())
+        self.assertEqual(
+            fsync_log.read_text(encoding='utf-8').splitlines(),
+            [
+                str(recovery_root / f'openbao-recovery-rotation-candidate-{self.CURRENT_SHA}'),
+                str(recovery_root),
+                str(recovery_root),
+                str(staging_directory),
+                str(staging_root),
+                str(recovery_root),
+                *([str(final_directory)] * 4),
+                str(recovery_root),
+                str(recovery_root),
+                *([str(staging_directory)] * 4),
+                str(staging_root),
+                str(staging_root),
+                str(staging_root),
+                str(recovery_root),
+            ],
+        )
+
+    def test_final_staging_cleanup_is_scoped_and_reentry_safe(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            openbao_rotation_artifact_paths
+            set +e
+            openbao_rotation_final_staging_cleanup
+            rc=$?
+            set -e
+            staging_exists=false
+            if [[ -e "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ||
+                  -L "$OPENBAO_ROTATION_FINAL_STAGING_ROOT" ]]; then
+              staging_exists=true
+            fi
+            printf 'RC=%s\nSTATE=%s\nSTAGING_EXISTS=%s\n' \
+              "$rc" "$(openbao_rotation_artifact_presence_state)" \
+              "$staging_exists"
+            '''
+        )
+        for hostile, expected in (
+            (False, 'RC=0\nSTATE=CANDIDATE\nSTAGING_EXISTS=false\n'),
+            (True, 'RC=1\nSTATE=CANDIDATE\nSTAGING_EXISTS=true\n'),
+        ):
+            with self.subTest(hostile=hostile):
+                crashed, recovery_root, _ = (
+                    self.run_final_publish_crash_harness('sidecar-zero')
+                )
+                self.assertIn('RC=1\nSTATE=CANDIDATE\n', crashed.stdout)
+                staging_root = recovery_root / (
+                    f'.openbao-final-staging-{self.CURRENT_SHA}'
+                )
+                if hostile:
+                    unexpected = staging_root / 'unexpected'
+                    unexpected.write_text('public-unknown\n', encoding='ascii')
+                    unexpected.chmod(0o600)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'staging-cleanup',
+                        str(OPENBAO_INITIALIZE_LIB), str(recovery_root),
+                        self.CURRENT_SHA,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_rotation_response_and_artifact_rejection_matrix(self) -> None:
+        direct = self.rotation_response()
+        cases: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
+        for name in (
+            'incomplete', 'wrong-key-count', 'representation-mismatch',
+            'plaintext-like', 'missing-fingerprint', 'mixed-fingerprint',
+            'backup-disabled', 'verification-disabled', 'unsafe-nonce',
+            'unexpected-field', 'wrong-ciphertext-recipient',
+        ):
+            mutated = json.loads(json.dumps(direct))
+            options: dict[str, object] = {}
+            if name == 'incomplete':
+                mutated['complete'] = False
+            elif name == 'wrong-key-count':
+                mutated['keys_base64'] = mutated['keys_base64'][:4]
+                mutated['keys'] = mutated['keys'][:4]
+                mutated['pgp_fingerprints'] = mutated['pgp_fingerprints'][:4]
+            elif name == 'representation-mismatch':
+                mutated['keys'][0] = '00' * 128
+            elif name == 'plaintext-like':
+                plaintext = self.wrapped_plaintext('rotated-share')
+                mutated['keys_base64'][0] = plaintext
+                mutated['keys'][0] = base64.b64decode(plaintext).hex()
+            elif name == 'missing-fingerprint':
+                mutated['pgp_fingerprints'] = mutated['pgp_fingerprints'][:4]
+            elif name == 'mixed-fingerprint':
+                mutated['pgp_fingerprints'][4] = 'A' * 40
+            elif name == 'backup-disabled':
+                mutated['backup'] = False
+            elif name == 'verification-disabled':
+                mutated['verification_required'] = False
+            elif name == 'unsafe-nonce':
+                mutated['verification_nonce'] = 'bad nonce\n'
+            elif name == 'unexpected-field':
+                mutated['raw_rotation_response'] = mutated['keys_base64'][0]
+            elif name == 'wrong-ciphertext-recipient':
+                ciphertext = self.synthetic_ciphertext(
+                    'rotated-wrong-recipient', recipient_key_id=b'\x99' * 8
+                )
+                mutated['keys_base64'][0] = ciphertext
+                mutated['keys'][0] = base64.b64decode(ciphertext).hex()
+            cases[name] = (mutated, options)
+        cases['wrong-threshold'] = (direct, {'key_threshold': 2})
+
+        for name, (response, options) in cases.items():
+            with self.subTest(case=name):
+                result, archive, sidecar = self.build_candidate_artifact(
+                    self.temporary_directory() / name,
+                    response=response,
+                    **options,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertFalse(archive.exists())
+                self.assertFalse(sidecar.exists())
+
+        serialized = json.dumps(direct, separators=(',', ':'), sort_keys=True)
+        duplicate_field = serialized.replace(
+            '"complete":true', '"complete":true,"complete":true', 1
+        ) + '\n'
+        duplicate, _, _ = self.build_candidate_artifact(
+            self.temporary_directory() / 'duplicate-json-field',
+            raw_response=duplicate_field,
+        )
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertEqual(duplicate.stdout, '')
+
+        for name, nonce in (
+            ('missing-live-nonce', None),
+            ('unsafe-live-nonce', 'bad live nonce'),
+        ):
+            with self.subTest(case=name):
+                rejected, _, _ = self.build_candidate_artifact(
+                    self.temporary_directory() / name,
+                    response_kind='backup',
+                    verification_nonce=nonce,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, '')
+
+        backup = self.backup_retrieve_response()
+        backup['data']['unexpected'] = 'value'
+        rejected_backup, _, _ = self.build_candidate_artifact(
+            self.temporary_directory() / 'backup-unexpected-field',
+            response=backup,
+            response_kind='backup',
+            verification_nonce=self.VERIFICATION_NONCE,
+        )
+        self.assertNotEqual(rejected_backup.returncode, 0)
+        self.assertEqual(rejected_backup.stdout, '')
+
+        wrong_map = self.backup_retrieve_response()
+        wrong_map['data']['keys']['A' * 40] = wrong_map['data']['keys'].pop(
+            self.PUBLIC_KEY_FINGERPRINT
+        )
+        wrong_map['data']['keys_base64']['A' * 40] = wrong_map['data'][
+            'keys_base64'
+        ].pop(self.PUBLIC_KEY_FINGERPRINT)
+        rejected_map, _, _ = self.build_candidate_artifact(
+            self.temporary_directory() / 'backup-wrong-fingerprint-map',
+            response=wrong_map,
+            response_kind='backup',
+            verification_nonce=self.VERIFICATION_NONCE,
+        )
+        self.assertNotEqual(rejected_map.returncode, 0)
+        self.assertEqual(rejected_map.stdout, '')
+
+        valid_directory = self.temporary_directory() / 'archive-matrix'
+        built, archive, sidecar = self.build_candidate_artifact(valid_directory)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        original = archive.read_bytes()
+        digest = sidecar.read_text(encoding='ascii').split()[0]
+        sidecar.write_text(
+            f'{"0" * 64}  {archive.name}\n', encoding='ascii'
+        )
+        checksum_drift = self.run_artifact_helper(
+            'emit-item', '--archive', archive, '--sidecar', sidecar,
+            '--item', 'share1',
+        )
+        self.assertNotEqual(checksum_drift.returncode, 0)
+        self.assertEqual(checksum_drift.stdout, '')
+        sidecar.write_text(f'{digest}  {archive.name}\n', encoding='ascii')
+        self.assertEqual(hashlib.sha256(original).hexdigest(), digest)
+
+        with tarfile.open(archive, 'r:gz') as stream:
+            original_members = [
+                (
+                    member,
+                    stream.extractfile(member).read() if member.isfile() else None,
+                )
+                for member in stream.getmembers()
+            ]
+        for case in (
+            'canonical-control', 'extra-member', 'symlink', 'member-mode', 'mixed-schema',
+            'duplicate-json-field', 'root-token-field',
+        ):
+            with self.subTest(archive_case=case):
+                case_directory = self.temporary_directory() / case
+                case_directory.mkdir()
+                mutated_archive = case_directory / archive.name
+                control_archive, control_sidecar = self.write_artifact_bytes(
+                    case_directory / 'control', archive.name,
+                    self.canonical_python_gzip(self.canonical_ustar_bytes(archive)),
+                )
+                control = self.run_artifact_helper('emit-item', '--archive', control_archive,
+                    '--sidecar', control_sidecar, '--item', 'share1')
+                self.assertEqual(control.returncode, 0, control.stderr)
+                self.assertEqual(control.stdout.strip(), self.rotation_response()['keys_base64'][0])
+                raw_archive = io.BytesIO()
+                with tarfile.open(fileobj=raw_archive, mode='w:', format=tarfile.USTAR_FORMAT) as output:
+                    for original_member, original_payload in original_members:
+                        member = tarfile.TarInfo(original_member.name)
+                        member.type = original_member.type
+                        member.mode = original_member.mode
+                        member.uid = original_member.uid
+                        member.gid = original_member.gid
+                        member.size = original_member.size
+                        payload = original_payload
+                        if case == 'member-mode' and member.name.endswith(
+                            '/shares.json'
+                        ):
+                            member.mode = 0o640
+                        if case == 'symlink' and member.name.endswith('/shares.json'):
+                            member.type = tarfile.SYMTYPE
+                            member.linkname = 'metadata.json'
+                            member.size = 0
+                            payload = None
+                        if case in (
+                            'mixed-schema', 'duplicate-json-field'
+                        ) and member.name.endswith('/metadata.json'):
+                            if case == 'mixed-schema':
+                                document = json.loads(payload)
+                                document['schema'] = (
+                                    'engineering-platform/openbao-recovery/v2'
+                                )
+                                payload = json.dumps(
+                                    document,
+                                    separators=(',', ':'),
+                                    sort_keys=True,
+                                ).encode('utf-8') + b'\n'
+                            else:
+                                payload = payload.replace(
+                                    b'"key_shares":5',
+                                    b'"key_shares":5,"key_shares":5',
+                                    1,
+                                )
+                            member.size = len(payload)
+                        if case == 'root-token-field' and member.name.endswith(
+                            '/shares.json'
+                        ):
+                            document = json.loads(payload)
+                            document['root_token'] = self.synthetic_ciphertext(
+                                'forbidden-rotated-root'
+                            )
+                            payload = json.dumps(
+                                document,
+                                separators=(',', ':'),
+                                sort_keys=True,
+                            ).encode('utf-8') + b'\n'
+                            member.size = len(payload)
+                        output.addfile(
+                            member,
+                            None if payload is None else io.BytesIO(payload),
+                        )
+                    if case == 'extra-member':
+                        root = (
+                            'openbao-recovery-rotation-candidate-'
+                            + self.CURRENT_SHA
+                        )
+                        hostile = tarfile.TarInfo(f'{root}/hostile')
+                        hostile.mode = 0o600
+                        hostile.uid = hostile.gid = 0
+                        hostile.size = 1
+                        output.addfile(hostile, io.BytesIO(b'x'))
+                mutated_archive.write_bytes(self.canonical_python_gzip(raw_archive.getvalue()))
+                mutated_archive.chmod(0o600)
+                mutated_sidecar = mutated_archive.with_name(
+                    mutated_archive.name + '.sha256'
+                )
+                mutated_digest = hashlib.sha256(
+                    mutated_archive.read_bytes()
+                ).hexdigest()
+                mutated_sidecar.write_text(
+                    f'{mutated_digest}  {mutated_archive.name}\n',
+                    encoding='ascii',
+                )
+                mutated_sidecar.chmod(0o600)
+                rejected = self.run_artifact_helper(
+                    'emit-item', '--archive', mutated_archive,
+                    '--sidecar', mutated_sidecar, '--item', 'share1',
+                )
+                if case == 'canonical-control':
+                    self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                else:
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual((rejected.stdout, rejected.stderr), ('', ''))
+                    guard_script = r'''
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location('guard_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+try:
+    module._emit_item(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), 'share1')
+except module.RecoveryValidationError as error:
+    print(str(error))
+else:
+    raise SystemExit(1)
+'''
+                    guard = self.run_command([sys.executable, '-I', '-B', '-c', guard_script,
+                        str(OPENBAO_RECOVERY_HELPER), str(mutated_archive), str(mutated_sidecar)])
+                    expected_guard = {
+                        'extra-member': 'unsafe archive members',
+                        'symlink': 'noncanonical archive extension',
+                        'member-mode': 'unsafe archive members',
+                        'mixed-schema': 'rotated metadata mismatch',
+                        'duplicate-json-field': 'duplicate json field',
+                        'root-token-field': 'unexpected shares field',
+                    }[case]
+                    self.assertEqual((guard.returncode, guard.stdout, guard.stderr),
+                        (0, expected_guard + '\n', ''))
+
+        symlink_directory = self.temporary_directory() / 'symlink-output'
+        symlink_directory.mkdir()
+        sentinel = self.temporary_directory() / 'sentinel'
+        sentinel.mkdir()
+        candidate_root = symlink_directory / (
+            'openbao-recovery-rotation-candidate-' + self.CURRENT_SHA
+        )
+        candidate_root.symlink_to(sentinel, target_is_directory=True)
+        symlink_rejected, _, _ = self.build_candidate_artifact(
+            symlink_directory
+        )
+        self.assertNotEqual(symlink_rejected.returncode, 0)
+        self.assertEqual(symlink_rejected.stdout, '')
+        self.assertEqual(list(sentinel.iterdir()), [])
+
+    def test_wizard_item_permissions_follow_bundle_schema(self) -> None:
+        source_archive, source_sidecar = self.make_source_bundle()
+        v1_schema = 'engineering-platform/openbao-recovery/v1'
+        candidate_schema = (
+            'engineering-platform/openbao-recovery-rotation-candidate/v1'
+        )
+        v2_schema = 'engineering-platform/openbao-recovery/v2'
+        verified_v1 = self.run_artifact_helper(
+            'verified-schema', '--archive', source_archive,
+            '--sidecar', source_sidecar,
+        )
+        self.assertEqual(
+            (verified_v1.returncode, verified_v1.stdout, verified_v1.stderr),
+            (0, v1_schema + '\n', ''),
+        )
+        v1_shares = [
+            self.synthetic_ciphertext(f'share-{index}') for index in range(5)
+        ]
+        v1_root = self.synthetic_ciphertext('root-token')
+        for item, expected in (
+            ('share1', v1_shares[0]),
+            ('share5', v1_shares[4]),
+            ('root', v1_root),
+        ):
+            with self.subTest(schema='v1', item=item):
+                emitted = self.run_artifact_helper(
+                    'emit-item', '--archive', source_archive,
+                    '--sidecar', source_sidecar, '--expected-schema', v1_schema,
+                    '--item', item,
+                )
+                self.assertEqual(emitted.returncode, 0, emitted.stderr)
+                self.assertEqual(emitted.stdout, expected)
+                self.assertEqual(emitted.stderr, '')
+
+        mismatched_v1 = self.run_artifact_helper(
+            'emit-item', '--archive', source_archive, '--sidecar', source_sidecar,
+            '--expected-schema', candidate_schema, '--item', 'share1',
+        )
+        self.assertNotEqual(mismatched_v1.returncode, 0)
+        self.assertEqual((mismatched_v1.stdout, mismatched_v1.stderr), ('', ''))
+
+        temporary = self.temporary_directory() / 'rotated'
+        built, candidate, candidate_sidecar = self.build_candidate_artifact(
+            temporary
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        cluster_digest = hashlib.sha256(
+            b'{"cluster_id":"12345678-1234-4abc-8def-1234567890ab",'
+            b'"cluster_name":"openbao-cluster-dev"}'
+        ).hexdigest()
+        validation_arguments: list[object] = [
+            '--current-sha', self.CURRENT_SHA,
+            '--source-sha', self.SOURCE_SHA,
+            '--source-bundle-sha256', self.SOURCE_BUNDLE_SHA256,
+            '--public-key-sha256', self.PUBLIC_KEY_SHA256,
+            '--public-key-fingerprint', self.PUBLIC_KEY_FINGERPRINT,
+            '--cluster-identity-sha256', cluster_digest,
+        ]
+        final = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_sidecar = final.with_name(final.name + '.sha256')
+        final_built = self.run_artifact_helper(
+            'build-final',
+            '--candidate-archive', candidate,
+            '--candidate-sidecar', candidate_sidecar,
+            '--archive', final,
+            '--sidecar', final_sidecar,
+            *validation_arguments,
+            '--verified-at-utc', '2026-08-31T01:02:03Z',
+        )
+        self.assertEqual(final_built.returncode, 0, final_built.stderr)
+        expected_shares = self.rotation_response()['keys_base64']
+        for schema, expected_schema, archive, sidecar in (
+            ('candidate', candidate_schema, candidate, candidate_sidecar),
+            ('v2', v2_schema, final, final_sidecar),
+        ):
+            verified = self.run_artifact_helper(
+                'verified-schema', '--archive', archive, '--sidecar', sidecar,
+            )
+            self.assertEqual(
+                (verified.returncode, verified.stdout, verified.stderr),
+                (0, expected_schema + '\n', ''),
+            )
+            for item, expected in (
+                ('share1', expected_shares[0]),
+                ('share5', expected_shares[4]),
+            ):
+                with self.subTest(schema=schema, item=item):
+                    emitted = self.run_artifact_helper(
+                        'emit-item', '--archive', archive,
+                        '--sidecar', sidecar,
+                        '--expected-schema', expected_schema, '--item', item,
+                    )
+                    self.assertEqual(emitted.returncode, 0, emitted.stderr)
+                    self.assertEqual(emitted.stdout, expected)
+                    self.assertEqual(emitted.stderr, '')
+            rejected_root = self.run_artifact_helper(
+                'emit-item', '--archive', archive, '--sidecar', sidecar,
+                '--expected-schema', expected_schema, '--item', 'root',
+            )
+            self.assertNotEqual(rejected_root.returncode, 0)
+            self.assertEqual((rejected_root.stdout, rejected_root.stderr), ('', ''))
+
+            mismatched = self.run_artifact_helper(
+                'emit-item', '--archive', archive, '--sidecar', sidecar,
+                '--expected-schema', v1_schema, '--item', 'share1',
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertEqual((mismatched.stdout, mismatched.stderr), ('', ''))
+
+        for item in ('share0', 'share6', 'metadata', '../share1'):
+            with self.subTest(item=item):
+                rejected = self.run_artifact_helper(
+                    'emit-item', '--archive', candidate,
+                    '--sidecar', candidate_sidecar, '--item', item,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual((rejected.stdout, rejected.stderr), ('', ''))
+
+    def test_rotated_artifact_paths_and_marker_only_state_fail_closed(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        marker = temporary / f'openbao-rotation-{self.CURRENT_SHA}.verified.json'
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            openbao_rotation_artifact_paths
+            printf 'CANDIDATE=%s\nFINAL=%s\nMARKER=%s\nSTATE=%s\n' \
+              "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+              "$OPENBAO_RECOVERY_ARCHIVE" \
+              "$OPENBAO_ROTATION_VERIFIED_MARKER" \
+              "$(openbao_rotation_artifact_presence_state)"
+            '''
+        )
+        marker.write_text('{}\n', encoding='utf-8')
+        marker.chmod(0o600)
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'rotated-paths',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                self.CURRENT_SHA, self.SOURCE_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'CANDIDATE='
+            f'{temporary}/openbao-recovery-rotation-candidate-'
+            f'{self.CURRENT_SHA}.tar.gz\n'
+            f'FINAL={temporary}/openbao-recovery-{self.CURRENT_SHA}.tar.gz\n'
+            f'MARKER={marker}\nSTATE=UNSAFE\n',
+        )
+        marker.unlink()
+        partial_directory = temporary / (
+            'openbao-recovery-rotation-candidate-' + self.CURRENT_SHA
+        )
+        partial_directory.mkdir(mode=0o700)
+        partial = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'rotated-partial',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                self.CURRENT_SHA, self.SOURCE_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        self.assertIn('STATE=UNSAFE\n', partial.stdout)
+
+    def test_recover_start_orders_unseal_config_rotation_and_candidate(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_start(
+            state='true|true',
+            rotation_progress=-1,
+            verification_progress=-1,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RESULT=PASS_OPENBAO_RECOVERY_STARTED\n'
+            'REASON=openbao-key-rotation-verification-required\n'
+            'EXIT_CODE=0\n'
+            'NEXT=download and verify '
+            '/root/openbao-recovery/candidate.tar.gz and '
+            '/root/openbao-recovery/candidate.tar.gz.sha256; then run '
+            'stages/180-openbao-initialize/run.sh --recover-verify '
+            f'--source-recovery-sha={self.SOURCE_SHA}\n',
+        )
+        self.assertEqual(calls, [
+            'preflight',
+            'source-validate',
+            'tty-check',
+            'legacy-stage180-process-check',
+            'legacy-token-helper-cleanup',
+            'unseal',
+            'root-login',
+            'configure',
+            'rotation-init-5-3-pgp-verify-backup',
+            'old-share-1',
+            'old-share-2',
+            'old-share-3',
+            'candidate-write',
+            'candidate-validate',
+            'root-helper-cleanup',
+        ])
+        self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
+    def test_recover_start_resumes_same_rotation_nonce(self) -> None:
+        result, calls = self.run_recover_start(
+            state='true|false',
+            rotation_progress=1,
+            verification_progress=-1,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('rotation-init-5-3-pgp-verify-backup', calls)
+        self.assertNotIn('unseal', calls)
+        self.assertEqual(
+            [call for call in calls if call.startswith('old-share-')],
+            ['old-share-2', 'old-share-3'],
+        )
+        self.assertLess(calls.index('configure'), calls.index('old-share-2'))
+        self.assertLess(calls.index('old-share-3'), calls.index('candidate-write'))
+        self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
+    def test_recover_start_replays_real_status_through_quorum_and_resume(self) -> None:
+        for progress in (-1, 1, 3):
+            with self.subTest(progress=progress):
+                result, calls = self.run_recover_start(
+                    state='true|false', rotation_progress=progress,
+                    verification_progress=0 if progress == 3 else -1,
+                    real_status=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('RESULT=PASS_OPENBAO_RECOVERY_STARTED', result.stdout)
+                self.assertEqual(
+                    [call for call in calls if call.startswith('old-share-')],
+                    [f'old-share-{n}' for n in range(max(0, progress) + 1, 4)],
+                )
+                self.assertEqual(calls.count('rotation-init-5-3-pgp-verify-backup'), int(progress == -1))
+                self.assertEqual(calls.count('backup-retrieve'), int(progress == 3))
+                if progress < 3:
+                    self.assertIn('[旧份额轮换授权] 3/3 已由服务器回读确认', result.stderr)
+                self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
+    def test_recover_start_rejects_rotation_nonce_drift_before_next_share(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_start(
+            state='true|false',
+            rotation_progress=0,
+            verification_progress=-1,
+            failure='rotation-nonce-drift',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            'REASON=openbao-rotation-state-unsafe\n', result.stdout,
+        )
+        self.assertEqual(
+            [call for call in calls if call.startswith('old-share-')],
+            ['old-share-1'],
+        )
+        self.assertEqual(calls[-1], 'root-helper-cleanup')
+
+    def test_final_share_response_survives_status_reads_until_normalization(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_start(
+            state='true|false',
+            rotation_progress=0,
+            verification_progress=-1,
+            preserve_final_response=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(
+            calls.index('old-share-3'),
+            calls.index('normal-status-after-final-response'),
+        )
+        self.assertLess(
+            calls.index('normal-status-after-final-response'),
+            calls.index('verification-status-after-final-response'),
+        )
+        self.assertLess(
+            calls.index('verification-status-after-final-response'),
+            calls.index('exact-final-response-normalized'),
+        )
+
+    def test_recover_start_reuses_candidate_or_encrypted_backup(self) -> None:
+        candidate_result, candidate_calls = self.run_recover_start(
+            state='true|false',
+            rotation_progress=3,
+            verification_progress=0,
+            artifact_state='CANDIDATE',
+        )
+        self.assertEqual(candidate_result.returncode, 0, candidate_result.stderr)
+        self.assertIn('candidate-validate', candidate_calls)
+        self.assertNotIn('candidate-write', candidate_calls)
+        self.assertNotIn('backup-retrieve', candidate_calls)
+        self.assertFalse(any(
+            call.startswith('old-share-') for call in candidate_calls
+        ))
+        self.assertFalse(any(
+            call.startswith('FORBIDDEN-') for call in candidate_calls
+        ))
+
+        backup_result, backup_calls = self.run_recover_start(
+            state='true|false',
+            rotation_progress=3,
+            verification_progress=0,
+            artifact_state='MISSING',
+        )
+        self.assertEqual(backup_result.returncode, 0, backup_result.stderr)
+        self.assertLess(
+            backup_calls.index('backup-retrieve'),
+            backup_calls.index('candidate-write'),
+        )
+        self.assertLess(
+            backup_calls.index('candidate-write'),
+            backup_calls.index('candidate-validate'),
+        )
+        self.assertNotIn('rotation-init-5-3-pgp-verify-backup', backup_calls)
+        self.assertFalse(any(
+            call.startswith('old-share-') for call in backup_calls
+        ))
+        self.assertFalse(any(
+            call.startswith('FORBIDDEN-') for call in backup_calls
+        ))
+
+        partial_result, partial_calls = self.run_recover_start(
+            state='true|false', rotation_progress=3, verification_progress=0,
+            artifact_state='PARTIAL_CANDIDATE')
+        self.assertEqual(partial_result.returncode, 0, partial_result.stderr)
+        self.assertLess(partial_calls.index('backup-retrieve'), partial_calls.index('candidate-write'))
+        self.assertNotIn('rotation-init-5-3-pgp-verify-backup', partial_calls)
+        self.assertFalse(any(call.startswith(('old-share-', 'FORBIDDEN-')) for call in partial_calls))
+
+    def test_recover_start_failures_clean_root_helper_and_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            ('configure', 'openbao-configuration-failed'),
+            ('candidate-write', 'rotation-candidate-write-failed'),
+            ('candidate-validate', 'rotation-candidate-state-unsafe'),
+            ('nonce-drift', 'rotation-candidate-state-unsafe'),
+            ('legacy-stage180-process', 'legacy-stage180-session-active'),
+            ('legacy-cleanup', 'remote-session-cleanup-failed'),
+            ('temp-cleanup', 'remote-session-cleanup-failed'),
+            ('cleanup', 'remote-session-cleanup-failed'),
+        )
+        for failure, reason in cases:
+            with self.subTest(failure=failure):
+                result, calls = self.run_recover_start(
+                    state='true|false',
+                    rotation_progress=(
+                        3 if failure in ('candidate-validate', 'nonce-drift')
+                        else -1
+                    ),
+                    verification_progress=(
+                        0 if failure in ('candidate-validate', 'nonce-drift')
+                        else -1
+                    ),
+                    artifact_state=(
+                        'CANDIDATE'
+                        if failure in ('candidate-validate', 'nonce-drift')
+                        else 'MISSING'
+                    ),
+                    failure=failure,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'REASON={reason}\n', result.stdout)
+                self.assertEqual(calls[-1], 'root-helper-cleanup')
+                self.assertFalse(any(
+                    call.startswith('FORBIDDEN-') for call in calls
+                ))
+
+    def test_recover_start_rejects_unsafe_status_and_artifact_states(
+        self,
+    ) -> None:
+        unsafe_artifact, artifact_calls = self.run_recover_start(
+            state='true|false', artifact_state='UNSAFE',
+        )
+        self.assertNotEqual(unsafe_artifact.returncode, 0)
+        self.assertIn(
+            'REASON=rotation-candidate-state-unsafe\n',
+            unsafe_artifact.stdout,
+        )
+        self.assertNotIn('rotation-init-5-3-pgp-verify-backup', artifact_calls)
+        self.assertEqual(artifact_calls[-1], 'root-helper-cleanup')
+
+        unsafe_rotation, rotation_calls = self.run_recover_start(
+            state='true|false',
+            rotation_progress=2,
+            verification_progress=0,
+        )
+        self.assertNotEqual(unsafe_rotation.returncode, 0)
+        self.assertIn(
+            'REASON=openbao-rotation-state-unsafe\n',
+            unsafe_rotation.stdout,
+        )
+        self.assertNotIn('rotation-init-5-3-pgp-verify-backup', rotation_calls)
+        self.assertEqual(rotation_calls[-1], 'root-helper-cleanup')
+
+    def test_recover_start_rejects_partial_verification_progress(self) -> None:
+        for progress in (1, 2):
+            for artifact_state in ('MISSING', 'CANDIDATE'):
+                with self.subTest(
+                    progress=progress, artifact_state=artifact_state,
+                ):
+                    result, calls = self.run_recover_start(
+                        state='true|false',
+                        rotation_progress=3,
+                        verification_progress=progress,
+                        artifact_state=artifact_state,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        'REASON=openbao-rotation-state-unsafe\n',
+                        result.stdout,
+                    )
+                    self.assertNotIn('backup-retrieve', calls)
+                    self.assertNotIn('candidate-write', calls)
+                    self.assertEqual(calls[-1], 'root-helper-cleanup')
+
+    def test_recover_verify_revokes_root_only_after_all_readbacks(self) -> None:
+        result, calls = self.run_recover_verify(verification_progress=0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RESULT=PASS_OPENBAO_RECOVERED\n'
+            'REASON=openbao-key-rotation-verified\n'
+            'EXIT_CODE=0\n'
+            'NEXT=stages/180-openbao-initialize/run.sh --accept\n',
+        )
+        for before, after in (
+            ('source-validate', 'live-cluster'),
+            ('live-cluster', 'candidate-validate-pre'),
+            ('candidate-validate-pre', 'root-login'),
+            ('backup-delete', 'runtime-readback'),
+            ('runtime-readback', 'root-revoke-self'),
+            ('root-revoke-self', 'root-lookup-denied'),
+            ('root-lookup-denied', 'root-helper-cleanup'),
+            ('root-helper-cleanup', 'final-v2-build'),
+            ('final-v2-build', 'final-bundle-validate'),
+            ('final-bundle-validate', 'verified-marker'),
+        ):
+            self.assertLess(calls.index(before), calls.index(after))
+        final_revalidation = max(
+            index for index, call in enumerate(calls)
+            if call == 'candidate-revalidate'
+        )
+        self.assertLess(calls.index('new-share-3'), final_revalidation)
+        self.assertLess(final_revalidation, calls.index('backup-delete'))
+        self.assertEqual(
+            [call for call in calls if call.startswith('new-share-')],
+            ['new-share-1', 'new-share-2', 'new-share-3'],
+        )
+        self.assertLess(
+            calls.index('new-share-3'), calls.index('normal-status-idle'),
+        )
+        self.assertLess(
+            calls.index('normal-status-idle'),
+            final_revalidation,
+        )
+        self.assertLess(
+            max(
+                index for index, call in enumerate(calls)
+                if call == 'verification-status-idle'
+            ),
+            final_revalidation,
+        )
+        self.assertFalse(any(call.startswith('FORBIDDEN-') for call in calls))
+
+    def test_recover_verify_resumes_partial_verification_with_same_nonce(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_verify(verification_progress=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call for call in calls if call.startswith('new-share-')],
+            ['new-share-2', 'new-share-3'],
+        )
+        self.assertLess(calls.index('candidate-nonce'), calls.index('new-share-2'))
+        self.assertLess(calls.index('new-share-3'), calls.index('backup-delete'))
+
+    def test_recover_verify_resumes_after_live_verification_completed(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_verify(verification_progress=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call.startswith('new-share-') for call in calls))
+        self.assertNotIn('candidate-nonce', calls)
+        self.assertLess(
+            calls.index('normal-status-idle'),
+            calls.index('candidate-revalidate'),
+        )
+        self.assertLess(
+            calls.index('candidate-revalidate'), calls.index('backup-delete'),
+        )
+
+    def test_recover_verify_reentry_requires_durable_ready_before_revoke(
+        self,
+    ) -> None:
+        for reentry_failure in ('ready-fsync', ''):
+            with self.subTest(reentry_failure=reentry_failure):
+                recovery_root = self.temporary_directory()
+                preserved = {
+                    recovery_root / 'source.tar.gz': b'public-source\n',
+                    recovery_root / 'candidate.tar.gz': b'public-candidate\n',
+                }
+                for path, content in preserved.items():
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+                first, first_calls = self.run_recover_verify(
+                    verification_progress=3,
+                    failure='ready-fsync',
+                    recovery_root=recovery_root,
+                )
+                self.assertNotEqual(first.returncode, 0)
+                self.assertEqual(first.stderr, '')
+                self.assertIn('recovery-verification-marker-unsafe', first.stdout)
+                self.assertEqual(first_calls.count('recovery-root-fsync'), 1)
+                self.assertNotIn('root-revoke-self', first_calls)
+                ready = recovery_root / 'ready.json'
+                self.assertTrue(ready.is_file())
+                ready_digest = hashlib.sha256(ready.read_bytes()).digest()
+
+                # A fresh Bash process must not infer durability from visibility.
+                resumed, calls = self.run_recover_verify(
+                    verification_progress=3,
+                    failure=reentry_failure,
+                    recovery_root=recovery_root,
+                )
+                self.assertEqual(resumed.stderr, '')
+                if reentry_failure:
+                    for forbidden in (
+                        'root-revoke-self', 'root-resume-proof',
+                        'revoked-checkpoint', 'final-v2-build', 'verified-marker',
+                    ):
+                        self.assertNotIn(forbidden, calls)
+                    self.assertNotEqual(resumed.returncode, 0)
+                    self.assertIn(
+                        'recovery-verification-marker-unsafe', resumed.stdout
+                    )
+                    self.assertNotIn('recovery-root-durable', calls)
+                    self.assertEqual(
+                        hashlib.sha256(ready.read_bytes()).digest(), ready_digest
+                    )
+                else:
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                    self.assertIn('recovery-root-durable', calls)
+                    self.assertLess(
+                        calls.index('recovery-root-durable'),
+                        calls.index('root-resume-proof'),
+                    )
+                    self.assertLess(
+                        calls.index('recovery-root-durable'),
+                        calls.index('root-revoke-self'),
+                    )
+                self.assertEqual(calls.count('recovery-root-fsync'), 1)
+                for path, content in preserved.items():
+                    self.assertEqual(path.read_bytes(), content)
+                self.assertNotIn('root-login', calls)
+
+    def test_recover_verify_resumes_every_post_revoke_crash_window(self) -> None:
+        cases = (
+            ('proof-before-checkpoint', 'READY', 'CANDIDATE'),
+            ('proof-after-checkpoint', 'REVOKED', 'CANDIDATE'),
+            ('helper-cleanup', 'REVOKED', 'CANDIDATE'),
+            ('timestamp', 'REVOKED', 'CANDIDATE'),
+            ('final-build-before-output', 'REVOKED', 'CANDIDATE'),
+            ('final-build-partial-output', 'REVOKED', 'PARTIAL_FINAL'),
+            ('final-validate', 'REVOKED', 'FINAL'),
+            ('marker', 'REVOKED', 'FINAL'),
+            ('marker-before-cleanup', 'REVOKED', 'VERIFIED'),
+            ('half-cleaned-checkpoint', 'READY', 'VERIFIED'),
+        )
+        for crash_window, checkpoint_state, artifact_state in cases:
+            with self.subTest(crash_window=crash_window):
+                result, calls = self.run_recover_verify(
+                    verification_progress=3,
+                    artifact_state=artifact_state,
+                    checkpoint_state=checkpoint_state,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('root-login', calls)
+                self.assertNotIn('root-revoke-self', calls)
+                if checkpoint_state == 'READY' and artifact_state == 'CANDIDATE':
+                    self.assertIn('root-resume-proof', calls)
+                    self.assertIn('revoked-checkpoint', calls)
+                else:
+                    self.assertNotIn('root-resume-proof', calls)
+                if artifact_state == 'CANDIDATE':
+                    self.assertIn('final-v2-build', calls)
+                elif artifact_state == 'PARTIAL_FINAL':
+                    self.assertIn('partial-final-cleanup', calls)
+                    self.assertIn('final-v2-build', calls)
+                else:
+                    self.assertNotIn('final-v2-build', calls)
+                if artifact_state != 'VERIFIED':
+                    self.assertIn('verified-marker', calls)
+                self.assertEqual(calls[-1], 'checkpoint-cleanup')
+
+    def test_recover_verify_rejects_unsafe_checkpoint_artifact_pairs(self) -> None:
+        cases = (
+            ('UNSAFE', 'CANDIDATE'),
+            ('NONE', 'FINAL'),
+            ('READY', 'FINAL'),
+            ('UNSAFE', 'VERIFIED'),
+            ('REVOKED', 'UNSAFE'),
+            ('READY', 'PARTIAL_FINAL'),
+        )
+        for checkpoint_state, artifact_state in cases:
+            with self.subTest(
+                checkpoint_state=checkpoint_state,
+                artifact_state=artifact_state,
+            ):
+                result, calls = self.run_recover_verify(
+                    verification_progress=3,
+                    artifact_state=artifact_state,
+                    checkpoint_state=checkpoint_state,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('root-login', calls)
+                self.assertNotIn('root-resume-proof', calls)
+                self.assertNotIn('final-v2-build', calls)
+                self.assertNotIn('verified-marker', calls)
+
+    def test_recover_verify_rejects_nonce_drift_before_next_new_share(
+        self,
+    ) -> None:
+        result, calls = self.run_recover_verify(
+            verification_progress=0,
+            failure='verification-nonce-drift',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('REASON=openbao-rotation-state-unsafe\n', result.stdout)
+        self.assertEqual(
+            [call for call in calls if call.startswith('new-share-')],
+            ['new-share-1'],
+        )
+        self.assertNotIn('root-revoke-self', calls)
+        self.assertNotIn('final-v2-build', calls)
+
+    def test_recover_verify_pre_revoke_failures_never_revoke_root(self) -> None:
+        cases = (
+            ('source', 'source-recovery-bundle-unsafe'),
+            ('tty', 'interactive-tty-required'),
+            ('root-login', 'openbao-root-login-failed'),
+            ('candidate-pre', 'rotation-candidate-state-unsafe'),
+            ('candidate-nonce', 'rotation-candidate-state-unsafe'),
+            ('share-1', 'rotation-verification-failed'),
+            ('status-read', 'openbao-rotation-state-unsafe'),
+            ('candidate-revalidate', 'rotation-candidate-state-unsafe'),
+            ('backup-delete', 'rotation-backup-delete-failed'),
+            ('runtime-readback', 'openbao-auth-probe-failed'),
+        )
+        for failure, reason in cases:
+            with self.subTest(failure=failure):
+                result, calls = self.run_recover_verify(failure=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'REASON={reason}\n', result.stdout)
+                self.assertNotIn('root-revoke-self', calls)
+                self.assertNotIn('final-v2-build', calls)
+                self.assertNotIn('verified-marker', calls)
+
+    def test_recover_verify_post_verification_failures_fail_closed(self) -> None:
+        cases = (
+            ('root-revoke', 'initial-root-token-revoke-failed'),
+            ('lookup-transport', 'initial-root-token-still-valid'),
+            ('lookup-still-valid', 'initial-root-token-still-valid'),
+            ('helper-cleanup', 'remote-session-cleanup-failed'),
+            ('timestamp', 'recovery-final-bundle-state-unsafe'),
+            ('final-build', 'recovery-final-bundle-write-failed'),
+            ('final-validate', 'recovery-final-bundle-state-unsafe'),
+            ('marker', 'recovery-verification-marker-unsafe'),
+        )
+        for failure, reason in cases:
+            with self.subTest(failure=failure):
+                result, calls = self.run_recover_verify(failure=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'REASON={reason}\n', result.stdout)
+                if failure != 'marker':
+                    self.assertNotIn('verified-marker', calls)
+                if failure in ('root-revoke', 'lookup-transport',
+                               'lookup-still-valid', 'helper-cleanup'):
+                    self.assertNotIn('final-v2-build', calls)
+
+        staging_failure, staging_calls = self.run_recover_verify(
+            verification_progress=3,
+            artifact_state='FINAL',
+            checkpoint_state='REVOKED',
+            failure='staging-cleanup',
+        )
+        self.assertNotEqual(staging_failure.returncode, 0)
+        self.assertIn(
+            'REASON=recovery-final-bundle-state-unsafe\n',
+            staging_failure.stdout,
+        )
+        self.assertIn('final-staging-cleanup', staging_calls)
+        self.assertNotIn('verified-marker', staging_calls)
+        self.assertNotIn('checkpoint-cleanup', staging_calls)
+
+    def test_accept_rejects_candidate_marker_or_live_pending_state(self) -> None:
+        accepted, accepted_calls = self.run_incident_accept('verified')
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn('evidence-created', accepted_calls)
+        self.assertLess(
+            accepted_calls.index('incident-artifacts'),
+            accepted_calls.index('live-no-pending'),
+        )
+        self.assertLess(
+            accepted_calls.index('live-no-pending'),
+            accepted_calls.index('evidence-created'),
+        )
+
+        for state in (
+            'candidate-only', 'marker-only', 'checksum-drift', 'live-pending',
+        ):
+            with self.subTest(state=state):
+                result, calls = self.run_incident_accept(state)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('evidence-created', calls)
+
+    def test_accept_keeps_normal_v1_path_compatible(self) -> None:
+        result, calls = self.run_incident_accept('normal-v1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('evidence-created', calls)
+        self.assertNotIn('incident-artifacts', calls)
+        self.assertNotIn('live-no-pending', calls)
+
+    def test_incident_acceptance_classifier_is_fail_closed(self) -> None:
+        temporary = self.temporary_directory()
+        candidate = temporary / 'candidate.tar.gz'
+        marker = temporary / 'verified.json'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_CASE=$2
+            OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$3/candidate
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$3/candidate.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=$3/candidate.tar.gz.sha256
+            OPENBAO_ROTATION_VERIFIED_MARKER=$3/verified.json
+            OPENBAO_RECOVERY_DIRECTORY=$3/final
+            OPENBAO_RECOVERY_ARCHIVE=$3/final.tar.gz
+            OPENBAO_RECOVERY_SIDECAR=$3/final.tar.gz.sha256
+            OPENBAO_ROTATION_READY_CHECKPOINT=$3/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$3/revoked.json
+            openbao_recovery_bundle_is_valid() {
+              [[ "$TEST_CASE" == normal-v1 ]]
+            }
+            openbao_incident_acceptance_state
+            '''
+        )
+        cases = (
+            ('normal-v1', 'NORMAL_V1\n'),
+            ('none', 'AMBIGUOUS\n'),
+            ('candidate', 'AMBIGUOUS\n'),
+            ('marker', 'AMBIGUOUS\n'),
+            ('checkpoint', 'AMBIGUOUS\n'),
+            ('verified', 'INCIDENT_V2\n'),
+        )
+        for case, expected in cases:
+            for path in (
+                temporary / 'candidate',
+                temporary / 'candidate.tar.gz',
+                temporary / 'candidate.tar.gz.sha256',
+                temporary / 'final',
+                temporary / 'final.tar.gz',
+                temporary / 'final.tar.gz.sha256',
+                marker,
+                temporary / 'ready.json',
+                temporary / 'revoked.json',
+            ):
+                if path.is_dir():
+                    path.rmdir()
+                else:
+                    path.unlink(missing_ok=True)
+            if case == 'candidate':
+                candidate.write_text('public-candidate\n', encoding='ascii')
+            elif case == 'marker':
+                marker.write_text('{}\n', encoding='ascii')
+            elif case == 'verified':
+                (temporary / 'candidate').mkdir()
+                (temporary / 'final').mkdir()
+                for path in (
+                    temporary / 'candidate.tar.gz',
+                    temporary / 'candidate.tar.gz.sha256',
+                    temporary / 'final.tar.gz',
+                    temporary / 'final.tar.gz.sha256',
+                    marker,
+                ):
+                    path.write_text('public-artifact\n', encoding='ascii')
+            elif case == 'checkpoint':
+                (temporary / 'ready.json').write_text(
+                    '{}\n', encoding='ascii',
+                )
+            with self.subTest(case=case):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'incident-classifier',
+                        str(OPENBAO_INITIALIZE_LIB), case, str(temporary),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_probe_policy_readback_requires_the_exact_complete_policy(self) -> None:
+        temporary = self.temporary_directory()
+        policy = temporary / 'policy.hcl'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_POLICY=$2
+            PYTHON_BINARY=/usr/bin/python3
+            openbao_bao() {
+              case "$*" in
+                'read -format=json auth/kubernetes/config')
+                  printf '%s\n' '{"data":{"kubernetes_host":"https://kubernetes.default.svc:443","disable_iss_validation":true}}'
+                  ;;
+                'read -format=json auth/kubernetes/role/openbao-runtime-probe')
+                  printf '%s\n' '{"data":{"bound_service_account_names":["openbao-runtime-probe"],"bound_service_account_namespaces":["openbao"],"audience":"openbao","token_policies":["openbao-runtime-probe"],"token_no_default_policy":true,"token_ttl":600,"token_max_ttl":600}}'
+                  ;;
+                'policy read openbao-runtime-probe') cat "$TEST_POLICY" ;;
+                *) return 1 ;;
+              esac
+            }
+            openbao_audit_api_is_exact() { :; }
+            openbao_configuration_readback_is_exact
+            '''
+        )
+        exact = textwrap.dedent(
+            '''\
+            path "openbao-probe/data/runtime-check" {
+              capabilities = ["create", "update", "read", "delete"]
+            }
+
+            path "sys/storage/raft/configuration" {
+              capabilities = ["read"]
+            }
+
+            path "sys/rotate/root/init" {
+              capabilities = ["read"]
+            }
+
+            path "sys/rotate/root/verify" {
+              capabilities = ["read"]
+            }
+            '''
+        )
+        variants = {
+            'exact': exact,
+            'root-write': exact.replace(
+                'path "sys/rotate/root/init" {\n  capabilities = ["read"]',
+                'path "sys/rotate/root/init" {\n  capabilities = ["read", "update"]',
+            ),
+            'verification-sudo': exact.replace(
+                'path "sys/rotate/root/verify" {\n  capabilities = ["read"]',
+                'path "sys/rotate/root/verify" {\n  capabilities = ["read", "sudo"]',
+            ),
+            'runtime-extra': exact.replace(
+                '["create", "update", "read", "delete"]',
+                '["create", "update", "read", "delete", "sudo"]',
+            ),
+            'extra-path': exact + 'path "sys/auth" {\n  capabilities = ["read"]\n}\n',
+        }
+        for name, contents in variants.items():
+            policy.write_text(contents, encoding='ascii')
+            with self.subTest(name=name):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'policy-readback',
+                        str(OPENBAO_INITIALIZE_LIB), str(policy),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                if name == 'exact':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_rotation_verification_share_uses_hidden_key_dash_stdin(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        response = temporary / 'verification-response.json'
+        command_log = temporary / 'verification-command.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            OPENBAO_ROTATION_RESPONSE=$3
+            export OPENBAO_SECRET_INPUT=preexisting-exported-value
+            openbao_prompt_secret() {
+              printf '%s' "$1" >"${TEST_COMMAND_LOG}.prompt"
+              OPENBAO_SECRET_INPUT=synthetic-new-share
+            }
+            openbao_bao_stdin() {
+              local input
+              /usr/bin/printenv OPENBAO_SECRET_INPUT >/dev/null && return 1
+              IFS= read -r input
+              [[ "$input" == synthetic-new-share ]] || return 1
+              printf '%s\n' "$*" >"$TEST_COMMAND_LOG"
+              printf '{}\n'
+            }
+            openbao_rotation_response_file_prepare "$OPENBAO_ROTATION_RESPONSE"
+            openbao_rotation_verification_submit_share \
+              synthetic-verification-nonce "$OPENBAO_ROTATION_RESPONSE" 2
+            [[ -z ${OPENBAO_SECRET_INPUT+x} ]]
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'verification-share',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log), str(response),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('[新份额验证 · 第 2/3 份]', Path(str(command_log) + '.prompt').read_text())
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8'),
+            'operator rotate-keys -format=json -verify '
+            '-nonce=synthetic-verification-nonce -\n',
+        )
+
+    def test_rotation_share_rejects_invalid_attempt_before_input_or_write(self) -> None:
+        script = textwrap.dedent(r'''
+            source "$1"
+            openbao_rotation_response_file_prepare() { echo FORBIDDEN-write; }
+            openbao_prompt_secret() { echo FORBIDDEN-input; }
+            openbao_bao_stdin() { echo FORBIDDEN-submit; }
+            "$2" synthetic-rotation-nonce unused-response "$3"
+            ''')
+        for function in ('openbao_rotation_submit_share',
+                         'openbao_rotation_verification_submit_share'):
+            for attempt in ('', '0', '4', '1x', '01'):
+                with self.subTest(function=function, attempt=attempt):
+                    result = self.run_command(
+                        ['/bin/bash', '-c', script, 'invalid-attempt',
+                         str(OPENBAO_INITIALIZE_LIB), function, attempt],
+                        env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout + result.stderr, '')
+
+    def test_rotation_backup_delete_uses_the_authenticated_session(self) -> None:
+        command_log = self.temporary_directory() / 'backup-delete.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            openbao_bao() { printf '%s\n' "$*" >"$TEST_COMMAND_LOG"; }
+            openbao_rotation_backup_delete
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'backup-delete',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8'),
+            'operator rotate-keys -backup-delete\n',
+        )
+
+    def test_finalization_checkpoints_are_private_bound_and_removed_after_marker(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        source = temporary / 'source.tar.gz'
+        candidate = temporary / 'candidate.tar.gz'
+        source.write_text('public-source-bundle\n', encoding='ascii')
+        candidate.write_text('public-candidate-bundle\n', encoding='ascii')
+        source.chmod(0o600)
+        candidate.chmod(0o600)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_READY_CHECKPOINT=$2/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$2/revoked.json
+            openbao_rotation_artifact_paths() { :; }
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            cluster_digest=$(printf cluster | sha256sum | awk '{print $1}')
+            token_digest=$(printf root-token | sha256sum | awk '{print $1}')
+            binding=$(openbao_finalization_transaction_binding "$cluster_digest")
+            openbao_finalization_ready_checkpoint_create \
+              "$cluster_digest" "$token_digest" \
+              /tmp/openbao-stage180.ABC123 "$binding"
+            printf 'READY_MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_READY_CHECKPOINT")"
+            [[ "$(stat -c %u "$OPENBAO_ROTATION_READY_CHECKPOINT")" == \
+               "$(stat -c %u "$OPENBAO_RECOVERY_ROOT")" ]]
+            "$PYTHON_BINARY" -I -B - "$OPENBAO_ROTATION_READY_CHECKPOINT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as stream:
+    document = json.load(stream)
+assert set(document) == {
+    'schema', 'state', 'git_commit', 'source_recovery_sha',
+    'source_bundle_sha256', 'candidate_bundle_sha256',
+    'cluster_identity_sha256', 'live_rotation_state', 'root_token_sha256',
+    'remote_home', 'remote_session_binding',
+}
+assert not any(name in document for name in ('token', 'share', 'nonce'))
+PY
+            printf 'STATE_1=%s\n' "$(openbao_finalization_checkpoint_state "$cluster_digest")"
+            openbao_finalization_revoked_checkpoint_create "$cluster_digest"
+            printf 'REVOKED_MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_REVOKED_CHECKPOINT")"
+            [[ "$(stat -c %u "$OPENBAO_ROTATION_REVOKED_CHECKPOINT")" == \
+               "$(stat -c %u "$OPENBAO_RECOVERY_ROOT")" ]]
+            "$PYTHON_BINARY" -I -B - "$OPENBAO_ROTATION_REVOKED_CHECKPOINT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as stream:
+    document = json.load(stream)
+assert set(document) == {
+    'schema', 'state', 'ready_checkpoint_sha256', 'root_token_sha256'
+}
+assert not any(name in document for name in ('token', 'share', 'nonce'))
+PY
+            printf 'STATE_2=%s\n' "$(openbao_finalization_checkpoint_state "$cluster_digest")"
+            openbao_finalization_checkpoint_cleanup "$cluster_digest"
+            printf 'STATE_3=%s\n' "$(openbao_finalization_checkpoint_state "$cluster_digest")"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'finalization-checkpoints',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary), self.CURRENT_SHA,
+                self.SOURCE_SHA, str(source), str(candidate),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'READY_MODE=600\nSTATE_1=READY\n'
+            'REVOKED_MODE=600\nSTATE_2=REVOKED\nSTATE_3=NONE\n',
+        )
+        self.assertNotIn('root-token', result.stdout + result.stderr)
+
+    def test_finalization_checkpoints_reject_tamper_and_noclobber(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_READY_CHECKPOINT=$2/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$2/revoked.json
+            TEST_MUTATION=$7
+            openbao_rotation_artifact_paths() { :; }
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            cluster_digest=$(printf cluster | sha256sum | awk '{print $1}')
+            token_digest=$(printf root-token | sha256sum | awk '{print $1}')
+            binding=$(openbao_finalization_transaction_binding "$cluster_digest")
+            openbao_finalization_ready_checkpoint_create \
+              "$cluster_digest" "$token_digest" \
+              /tmp/openbao-stage180.ABC123 "$binding"
+            before=$(sha256sum "$OPENBAO_ROTATION_READY_CHECKPOINT" | awk '{print $1}')
+            if openbao_finalization_ready_checkpoint_create \
+                "$cluster_digest" "$token_digest" \
+                /tmp/openbao-stage180.ABC123 "$binding"; then
+              exit 80
+            fi
+            [[ "$before" == \
+               "$(sha256sum "$OPENBAO_ROTATION_READY_CHECKPOINT" | awk '{print $1}')" ]]
+            if [[ "$TEST_MUTATION" == revoked-* ]]; then
+              openbao_finalization_revoked_checkpoint_create "$cluster_digest"
+              target=$OPENBAO_ROTATION_REVOKED_CHECKPOINT
+              key=${TEST_MUTATION#revoked-}
+            else
+              target=$OPENBAO_ROTATION_READY_CHECKPOINT
+              key=$TEST_MUTATION
+            fi
+            "$PYTHON_BINARY" -I -B - "$target" "$key" <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1:]
+with open(path, encoding='utf-8') as stream:
+    document = json.load(stream)
+if key == 'extra':
+    document['unexpected'] = 'public-value'
+elif key == 'mode':
+    pass
+else:
+    document[key] = '0' * 64
+with open(path, 'w', encoding='utf-8') as stream:
+    json.dump(document, stream, separators=(',', ':'), sort_keys=True)
+    stream.write('\n')
+PY
+            if [[ "$key" == mode ]]; then chmod 644 "$target"; fi
+            [[ "$(openbao_finalization_checkpoint_state "$cluster_digest")" == UNSAFE ]]
+            '''
+        )
+        mutations = (
+            'schema', 'state', 'git_commit', 'source_recovery_sha',
+            'source_bundle_sha256', 'candidate_bundle_sha256',
+            'cluster_identity_sha256', 'live_rotation_state',
+            'remote_home', 'remote_session_binding',
+            'extra', 'mode', 'revoked-state',
+            'revoked-ready_checkpoint_sha256', 'revoked-root_token_sha256',
+            'revoked-extra', 'revoked-mode',
+        )
+        for mutation in mutations:
+            temporary = self.temporary_directory()
+            source = temporary / 'source.tar.gz'
+            candidate = temporary / 'candidate.tar.gz'
+            source.write_text('public-source-bundle\n', encoding='ascii')
+            candidate.write_text('public-candidate-bundle\n', encoding='ascii')
+            source.chmod(0o600)
+            candidate.chmod(0o600)
+            with self.subTest(mutation=mutation):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'checkpoint-tamper',
+                        str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                        self.CURRENT_SHA, self.SOURCE_SHA, str(source),
+                        str(candidate), mutation,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, '')
+
+    def test_checkpoint_and_marker_parent_fsync_failures_are_fail_closed(
+        self,
+    ) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$6
+            OPENBAO_ROTATION_READY_CHECKPOINT=$2/ready.json
+            OPENBAO_ROTATION_REVOKED_CHECKPOINT=$2/revoked.json
+            OPENBAO_RECOVERY_ARCHIVE=$2/final.tar.gz
+            OPENBAO_ROTATION_VERIFIED_MARKER=$2/verified.json
+            TEST_OPERATION=$7
+            TEST_FSYNC_LOG=$8
+            TEST_FAIL_FSYNC_AT=$9
+            TEST_FSYNC_COUNT=0
+            openbao_rotation_artifact_paths() { :; }
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            openbao_fsync_directory() {
+              TEST_FSYNC_COUNT=$((TEST_FSYNC_COUNT + 1))
+              printf '%s\n' "$1" >>"$TEST_FSYNC_LOG"
+              (( TEST_FSYNC_COUNT != TEST_FAIL_FSYNC_AT ))
+            }
+            openbao_rotation_final_is_valid() { :; }
+            cluster_digest=$(printf cluster | sha256sum | awk '{print $1}')
+            token_digest=$(printf root-token | sha256sum | awk '{print $1}')
+            binding=$(openbao_finalization_transaction_binding "$cluster_digest")
+            case "$TEST_OPERATION" in
+              ready) ;;
+              revoked|cleanup)
+                openbao_finalization_ready_checkpoint_create \
+                  "$cluster_digest" "$token_digest" \
+                  /tmp/openbao-stage180.ABC123 "$binding"
+                if [[ "$TEST_OPERATION" == cleanup ]]; then
+                  openbao_finalization_revoked_checkpoint_create \
+                    "$cluster_digest"
+                fi
+                ;;
+              marker) ;;
+              *) exit 90 ;;
+            esac
+            : >"$TEST_FSYNC_LOG"
+            TEST_FSYNC_COUNT=0
+            set +e
+            case "$TEST_OPERATION" in
+              ready)
+                openbao_finalization_ready_checkpoint_create \
+                  "$cluster_digest" "$token_digest" \
+                  /tmp/openbao-stage180.ABC123 "$binding"
+                ;;
+              revoked)
+                openbao_finalization_revoked_checkpoint_create \
+                  "$cluster_digest"
+                ;;
+              cleanup)
+                openbao_finalization_checkpoint_cleanup "$cluster_digest"
+                ;;
+              marker)
+                openbao_rotation_verified_marker_create "$cluster_digest"
+                ;;
+            esac
+            rc=$?
+            set -e
+            printf 'RC=%s\n' "$rc"
+            '''
+        )
+        for operation in ('ready', 'revoked', 'cleanup', 'marker'):
+            for fail_at in (1, 2):
+                temporary = self.temporary_directory()
+                source = temporary / 'source.tar.gz'
+                candidate = temporary / 'candidate.tar.gz'
+                final = temporary / 'final.tar.gz'
+                for path, content in (
+                    (source, 'public-source'),
+                    (candidate, 'public-candidate'),
+                    (final, 'public-final'),
+                ):
+                    path.write_text(content + '\n', encoding='ascii')
+                    path.chmod(0o600)
+                fsync_log = temporary / 'fsync.log'
+                with self.subTest(operation=operation, fail_at=fail_at):
+                    result = self.run_command(
+                        [
+                            '/bin/bash', '-c', script, 'durable-state',
+                            str(OPENBAO_INITIALIZE_LIB), str(temporary),
+                            self.CURRENT_SHA, self.SOURCE_SHA, str(source),
+                            str(candidate), operation, str(fsync_log),
+                            str(fail_at),
+                        ],
+                        env=self.sanitized_environment(
+                            BOOTSTRAP_TEST_MODE='1'
+                        ),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, 'RC=1\n')
+                    self.assertEqual(
+                        fsync_log.read_text(
+                            encoding='utf-8'
+                        ).splitlines(),
+                        [str(temporary)] * fail_at,
+                    )
+
+    def test_partial_final_crash_cleanup_is_scoped_and_fail_closed(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_ROTATION_CANDIDATE_DIRECTORY=$2/candidate
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=$2/candidate.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=$2/candidate.tar.gz.sha256
+            OPENBAO_RECOVERY_DIRECTORY=$2/final
+            OPENBAO_RECOVERY_ARCHIVE=$2/final.tar.gz
+            OPENBAO_RECOVERY_SIDECAR=$2/final.tar.gz.sha256
+            OPENBAO_ROTATION_VERIFIED_MARKER=$2/verified.json
+            safe_owned_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+            safe_file() {
+              [[ -f "$1" && ! -L "$1" && "$(stat -c %a "$1")" == "$2" ]]
+            }
+            if [[ "$3" == fsync-fail ]]; then
+              openbao_fsync_directory() { return 1; }
+            fi
+            mkdir "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY"
+            chmod 700 "$OPENBAO_ROTATION_CANDIDATE_DIRECTORY"
+            printf candidate >"$OPENBAO_ROTATION_CANDIDATE_ARCHIVE"
+            printf sidecar >"$OPENBAO_ROTATION_CANDIDATE_SIDECAR"
+            chmod 600 "$OPENBAO_ROTATION_CANDIDATE_ARCHIVE" \
+              "$OPENBAO_ROTATION_CANDIDATE_SIDECAR"
+            mkdir "$OPENBAO_RECOVERY_DIRECTORY"
+            chmod 700 "$OPENBAO_RECOVERY_DIRECTORY"
+            printf metadata >"$OPENBAO_RECOVERY_DIRECTORY/metadata.json"
+            chmod 600 "$OPENBAO_RECOVERY_DIRECTORY/metadata.json"
+            printf archive >"$OPENBAO_RECOVERY_ARCHIVE"
+            chmod 600 "$OPENBAO_RECOVERY_ARCHIVE"
+            if [[ "$3" == hostile ]]; then
+              printf unknown >"$OPENBAO_RECOVERY_DIRECTORY/unexpected"
+              chmod 600 "$OPENBAO_RECOVERY_DIRECTORY/unexpected"
+            fi
+            set +e
+            openbao_rotation_partial_final_cleanup
+            rc=$?
+            set -e
+            printf 'RC=%s\nSTATE=%s\n' \
+              "$rc" "$(openbao_rotation_artifact_presence_state)"
+            '''
+        )
+        for case, expected in (
+            ('safe', 'RC=0\nSTATE=CANDIDATE\n'),
+            ('hostile', 'RC=1\nSTATE=PARTIAL_FINAL\n'),
+            ('fsync-fail', 'RC=1\nSTATE=PARTIAL_FINAL\n'),
+        ):
+            temporary = self.temporary_directory()
+            with self.subTest(case=case):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'partial-final-cleanup',
+                        str(OPENBAO_INITIALIZE_LIB), str(temporary), case,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_resume_revocation_uses_cli_tty_not_outer_secret_capture(self) -> None:
+        command_log = self.temporary_directory() / 'resume-proof.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_COMMAND_LOG=$2
+            openbao_require_interactive_tty() { :; }
+            openbao_prompt_secret() { echo FORBIDDEN-shell-prompt >&2; return 1; }
+            kubectl_run() {
+              [[ "$*" == *' exec --stdin --tty '* ]] || return 1
+              printf '%s\n' "$*" >"$TEST_COMMAND_LOG"
+            }
+            openbao_finalization_resume_root_revocation \
+              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            [[ -z ${OPENBAO_SECRET_INPUT:-} ]]
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'resume-root-revocation',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr, '')
+        self.assertIn('bao login -no-print lookup=false', command_log.read_text())
+        self.assertNotIn(
+            'synthetic-root-secret',
+            command_log.read_text(encoding='utf-8'),
+        )
+
+    def test_resume_revocation_proves_the_same_committed_token_exactly(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        fake_bin = temporary / 'bin'
+        fake_bin.mkdir()
+        fake_bao = fake_bin / 'bao'
+        fake_bao.write_text(
+            textwrap.dedent(
+                r'''#!/bin/sh
+                set -eu
+                env | grep -F 'synthetic-root-secret' >/dev/null && exit 90
+                printf '%s\n' "$*" >>"$TEST_BAO_LOG"
+                case "$*" in
+                  'login -no-print lookup=false')
+                    [ -t 0 ] && [ -t 2 ] || exit 91
+                    printf 'Synthetic hidden: ' >&2
+                    IFS= read -r value
+                    [ "$value" = synthetic-root-secret ] || exit 92
+                    printf %s "$value" >"$HOME/.bao-token"
+                    printf '%s\n' "$HOME" >"$TEST_HELPER_PATH"
+                    if [ "${TEST_REVOKE_MODE:-normal}" = cleanup-fail ]; then
+                      : >"$HOME/foreign"
+                    fi
+                    if [ "${TEST_REVOKE_MODE:-normal}" = store-fail ]; then
+                      printf '%s\n' "$value"
+                      exit 2
+                    fi
+                    ;;
+                  'token lookup -format=json')
+                    case "$(cat "$TEST_TOKEN_STATE")" in
+                      valid) exit 0 ;;
+                      revoked)
+                        printf '%s\n' 'Error making API request.' \
+                          'Code: 403. Errors:' '' '* permission denied' >&2
+                        exit 2
+                        ;;
+                      transport)
+                        printf '%s\n' 'connection refused' >&2
+                        exit 2
+                        ;;
+                      *) exit 3 ;;
+                    esac
+                    ;;
+                  'token revoke -self')
+                    case "${TEST_REVOKE_MODE:-normal}" in
+                      normal|cleanup-fail) printf '%s\n' revoked >"$TEST_TOKEN_STATE" ;;
+                      noop) : ;;
+                      fail) exit 4 ;;
+                    esac
+                    ;;
+                  *) exit 5 ;;
+                esac
+                '''
+            ),
+            encoding='ascii',
+        )
+        fake_bao.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_TOKEN_STATE=$2
+            TEST_BAO_LOG=$3
+            export TEST_TOKEN_STATE TEST_BAO_LOG TEST_REVOKE_MODE
+            openbao_prompt_secret() { echo FORBIDDEN-shell-prompt >&2; return 1; }
+            kubectl_run() {
+              while [[ "$1" != -- ]]; do shift; done
+              shift
+              "$@"
+            }
+            set +e
+            openbao_finalization_resume_root_revocation "$4"
+            rc=$?
+            set -e
+            [[ -z ${OPENBAO_SECRET_INPUT:-} ]]
+            exit "$rc"
+            '''
+        )
+        token_digest = hashlib.sha256(b'synthetic-root-secret').hexdigest()
+        cases = (
+            ('valid', 'normal', token_digest, True, True),
+            ('revoked', 'normal', token_digest, True, False),
+            ('valid', 'normal', '0' * 64, False, False),
+            ('transport', 'normal', token_digest, False, False),
+            ('valid', 'noop', token_digest, False, True),
+            ('valid', 'fail', token_digest, False, True),
+            ('valid', 'store-fail', token_digest, False, False),
+            ('valid', 'cleanup-fail', token_digest, False, True),
+        )
+        for index, (
+            initial_state, revoke_mode, commitment, succeeds, revoke_called,
+        ) in enumerate(cases):
+            state = temporary / f'state-{index}'
+            log = temporary / f'bao-{index}.log'
+            helper_path = temporary / f'helper-{index}.path'
+            state.write_text(initial_state + '\n', encoding='ascii')
+            log.write_text('', encoding='ascii')
+            with self.subTest(
+                initial_state=initial_state,
+                revoke_mode=revoke_mode,
+                commitment_matches=commitment == token_digest,
+            ):
+                result = self.run_synthetic_hidden_cli(
+                    [
+                        '/bin/bash', '-c', script, 'exact-root-proof',
+                        str(OPENBAO_INITIALIZE_LIB), str(state), str(log),
+                        commitment,
+                    ],
+                    env=self.sanitized_environment(
+                        BOOTSTRAP_TEST_MODE='1',
+                        PATH=f'{fake_bin}:/usr/bin:/bin',
+                        TEST_REVOKE_MODE=revoke_mode,
+                        TEST_HELPER_PATH=str(helper_path),
+                    ),
+                )
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                self.assertEqual(result.stdout, '')
+                calls = log.read_text(encoding='ascii').splitlines()
+                self.assertEqual('token revoke -self' in calls, revoke_called)
+                self.assertNotIn('synthetic-root-secret', result.stderr)
+                self.assertNotIn('synthetic-root-secret', '\n'.join(calls))
+                home = Path(helper_path.read_text().strip())
+                self.assertFalse((home / '.bao-token').exists())
+                if revoke_mode == 'cleanup-fail':
+                    self.assertTrue((home / 'foreign').exists())
+                    (home / 'foreign').unlink()  # synthetic test-only cleanup
+                    home.rmdir()
+                else:
+                    self.assertFalse(home.exists())
+
+    def test_normal_login_store_failure_is_hidden_before_tty_multiplexing(self) -> None:
+        temporary = self.temporary_directory()
+        fake_bao = temporary / 'bao'
+        fake_bao.write_text('''#!/bin/sh
+[ "$*" = 'login -no-print' ] || exit 91
+[ -t 0 ] && [ -t 2 ] || exit 92
+printf 'Synthetic hidden: ' >&2
+IFS= read -r value
+printf '%s\\n' "$value"
+exit 2
+''')
+        fake_bao.chmod(0o755)
+        script = r'''
+source "$1"
+TEST_REMOTE_PATH=$2
+openbao_remote_home_create() { OPENBAO_REMOTE_HOME=$TEST_REMOTE_PATH; }
+openbao_apply_configuration() { echo FORBIDDEN-configuration; }
+openbao_root_session_revoke() { echo FORBIDDEN-revoke; }
+openbao_remote_session_cleanup() { :; }
+TEST_KUBECTL_PID=
+kubectl_isolated_start() {
+  while [[ "$1" != -- ]]; do shift; done
+  shift
+  "$@" <&0 >&1 2>&2 &
+  TEST_KUBECTL_PID=$!
+  KUBE_RUNNER_ACTIVE=1
+}
+kubectl_isolated_wait_interruptibly() {
+  local rc=0
+  wait "$TEST_KUBECTL_PID" || rc=$?
+  KUBE_RUNNER_ACTIVE=0
+  return "$rc"
+}
+openbao_apply_configuration_with_root
+'''
+        result = self.run_synthetic_hidden_cli(['/bin/bash', '-c', script,
+            'normal-store-error', str(OPENBAO_INITIALIZE_LIB), str(temporary)],
+            env=self.sanitized_environment(PATH=f'{temporary}:/usr/bin:/bin'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            result.stderr,
+            'OPENBAO_HIDDEN_INPUT_READY=root-token\r\n'
+            '[root 登录] 等待下一行 Token 隐藏提示；粘贴旧恢复包中 root 的解密值，'
+            '不是份额，也不是 GPG 口令。\r\nSynthetic hidden: ',
+        )
+
+    def run_synthetic_hidden_cli(self, arguments, *, env):
+        master, slave = pty.openpty()
+        attributes = termios.tcgetattr(slave)
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        process = subprocess.Popen(arguments, stdin=slave, stdout=slave,
+            stderr=slave, env=env, close_fds=True)
+        os.close(slave)
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        sent = False
+        try:
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if b'Synthetic hidden: ' in output and not sent:
+                        os.write(master, b'synthetic-root-secret\n')
+                        sent = True
+                if process.poll() is not None:
+                    break
+            returncode = process.wait(timeout=2)
+        finally:
+            os.close(master)
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        rendered = output.decode('utf-8', errors='replace')
+        self.assertNotIn('synthetic-root-secret', rendered)
+        self.assertNotIn('FORBIDDEN-shell-prompt', rendered)
+        return subprocess.CompletedProcess(arguments, returncode, '', rendered)
+
+    def test_bound_remote_helper_cleanup_rejects_reused_or_unsafe_path(
+        self,
+    ) -> None:
+        binding = 'b' * 64
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_REMOTE_PATH=$2
+            OPENBAO_FINALIZATION_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_FINALIZATION_REMOTE_BINDING=$3
+            kubectl_run() {
+              [[ "$1" == --namespace=openbao && "$2" == exec &&
+                 "$3" == pod/openbao-0 && "$4" == -- &&
+                 "$5" == /bin/sh && "$6" == -c ]] || return 97
+              /bin/sh -c "$7" "$8" "$TEST_REMOTE_PATH" "${10}"
+            }
+            openbao_finalization_remote_helper_cleanup
+            '''
+        )
+        for case in (
+            'missing', 'valid', 'broken-path-symlink', 'directory-mode',
+            'binding-mode', 'binding-drift', 'binding-symlink',
+            'token-mode', 'token-symlink',
+        ):
+            with self.subTest(case=case):
+                temporary = self.temporary_directory()
+                remote = temporary / 'remote-helper'
+                if case == 'broken-path-symlink':
+                    remote.symlink_to(
+                        temporary / 'missing-target', target_is_directory=True
+                    )
+                elif case != 'missing':
+                    remote.mkdir(mode=0o700)
+                    sentinel = remote / '.openbao-session-binding'
+                    if case == 'binding-symlink':
+                        target = temporary / 'binding-target'
+                        target.write_text(binding + '\n', encoding='ascii')
+                        target.chmod(0o600)
+                        sentinel.symlink_to(target)
+                    else:
+                        sentinel.write_text(
+                            ('f' * 64 if case == 'binding-drift' else binding)
+                            + '\n',
+                            encoding='ascii',
+                        )
+                        sentinel.chmod(
+                            0o644 if case == 'binding-mode' else 0o600
+                        )
+                    token = remote / '.bao-token'
+                    if case == 'token-symlink':
+                        target = temporary / 'token-target'
+                        target.write_text('opaque\n', encoding='ascii')
+                        target.chmod(0o600)
+                        token.symlink_to(target)
+                    else:
+                        token.write_text('opaque\n', encoding='ascii')
+                        token.chmod(
+                            0o644 if case == 'token-mode' else 0o600
+                        )
+                    if case == 'directory-mode':
+                        remote.chmod(0o755)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'bound-helper-cleanup',
+                        str(OPENBAO_INITIALIZE_LIB), str(remote), binding,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                if case in ('missing', 'valid'):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(remote.exists() or remote.is_symlink())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(remote.exists() or remote.is_symlink())
+
+    def test_verified_marker_binds_final_digest_and_cluster_identity(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        final_bundle = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_bundle.write_text('public-final-bundle\n', encoding='ascii')
+        final_bundle.chmod(0o600)
+        marker = temporary / (
+            f'openbao-rotation-{self.CURRENT_SHA}.verified.json'
+        )
+        cluster_digest = 'd' * 64
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_VERIFIED_MARKER=$6
+            openbao_rotation_artifact_paths() { :; }
+            openbao_rotation_final_is_valid() { :; }
+            openbao_rotation_verified_marker_create "$7" || exit 90
+            printf 'MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_VERIFIED_MARKER")"
+            openbao_rotation_verified_marker_is_valid "$7" || exit 91
+            printf 'VALID=true\n'
+            printf 'changed\n' >>"$OPENBAO_RECOVERY_ARCHIVE"
+            if openbao_rotation_verified_marker_is_valid "$7"; then
+              printf 'DRIFT_REJECTED=false\n'
+            else
+              printf 'DRIFT_REJECTED=true\n'
+            fi
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'verified-marker',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary), self.CURRENT_SHA,
+                self.SOURCE_SHA, str(final_bundle), str(marker), cluster_digest,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'MODE=600\nVALID=true\nDRIFT_REJECTED=true\n',
+        )
+        marker_document = json.loads(marker.read_text(encoding='utf-8'))
+        self.assertEqual(
+            set(marker_document),
+            {
+                'schema', 'git_commit', 'source_recovery_sha',
+                'final_bundle_sha256', 'cluster_identity_sha256',
+                'rotation_state', 'initial_root_token',
+            },
+        )
+
+    def test_verified_marker_create_fails_closed_on_atomic_noclobber_race(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        final_bundle = temporary / f'openbao-recovery-{self.CURRENT_SHA}.tar.gz'
+        final_bundle.write_text('public-final-bundle\n', encoding='ascii')
+        final_bundle.chmod(0o600)
+        marker = temporary / (
+            f'openbao-rotation-{self.CURRENT_SHA}.verified.json'
+        )
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_RECOVERY_ID=$3
+            OPENBAO_SOURCE_RECOVERY_SHA=$4
+            OPENBAO_RECOVERY_ARCHIVE=$5
+            OPENBAO_ROTATION_VERIFIED_MARKER=$6
+            openbao_rotation_artifact_paths() { :; }
+            openbao_rotation_final_is_valid() { :; }
+            mv() {
+              command cp "${@: -2:1}" "${@: -1}"
+              return 0
+            }
+            ln() {
+              command cp "${@: -2:1}" "${@: -1}"
+              return 1
+            }
+            set +e
+            openbao_rotation_verified_marker_create "$7"
+            rc=$?
+            set -e
+            shopt -s nullglob
+            temps=("$OPENBAO_RECOVERY_ROOT"/.openbao-rotation-marker.*)
+            marker_exists=false
+            [[ -f "$OPENBAO_ROTATION_VERIFIED_MARKER" ]] && marker_exists=true
+            printf 'RC=%s\nTEMP_COUNT=%s\nMARKER_EXISTS=%s\n' \
+              "$rc" "${#temps[@]}" "$marker_exists"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'verified-marker-race',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary), self.CURRENT_SHA,
+                self.SOURCE_SHA, str(final_bundle), str(marker), 'd' * 64,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RC=1\nTEMP_COUNT=0\nMARKER_EXISTS=true\n',
+        )
+
+    def test_incident_evidence_requires_exact_public_fields_and_rejects_shapes(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        archive = temporary / 'final.tar.gz'
+        fingerprint = temporary / 'fingerprint'
+        archive.write_text('public-final-bundle\n', encoding='ascii')
+        fingerprint.write_text(
+            self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii'
+        )
+        archive.chmod(0o600)
+        fingerprint.chmod(0o600)
+        payload = temporary / 'evidence.txt'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_RECOVERY_ARCHIVE=$2
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$3
+            OPENBAO_RECOVERY_ID=2222222222222222222222222222222222222222
+            openbao_platform_secret_fingerprint() { printf '%064d\n' 0; }
+            openbao_status_evidence() {
+              printf '%s\n' OPENBAO_VERSION=2.6.1 \
+                OPENBAO_INITIALIZED=true OPENBAO_SEALED=false
+            }
+            openbao_resource_fact() {
+              printf '%s_UID=public-uid\n%s_GENERATION=1\n' "$4" "$4"
+            }
+            openbao_write_acceptance_payload "$4" INCIDENT_V2
+            openbao_incident_evidence_is_exact "$4"
+            openbao_evidence_is_secret_free "$4"
+            '''
+        )
+        accepted = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'incident-evidence',
+                str(OPENBAO_INITIALIZE_LIB), str(archive), str(fingerprint),
+                str(payload),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        evidence = payload.read_text(encoding='utf-8')
+        for required in (
+            'UNSEAL_KEY_ROTATION=PASS\n',
+            'COMPROMISED_SHARE_INVALIDATED=true\n',
+            'INITIAL_ROOT_TOKEN=REVOKED\n',
+            'RECOVERY_BUNDLE_SCHEMA=engineering-platform/openbao-recovery/v2\n',
+            'MINIO=NOT_EXECUTED\n',
+            'SNAPSHOT=NOT_EXECUTED\n',
+            'BACKUP=NOT_EXECUTED\n',
+            'RESTORE=NOT_EXECUTED\n',
+            'APP_SECRET_MIGRATION=NOT_EXECUTED\n',
+        ):
+            self.assertEqual(evidence.count(required), 1)
+        self.assertIn(self.PUBLIC_KEY_FINGERPRINT, evidence)
+        self.assertRegex(evidence, r'RECOVERY_BUNDLE_SHA256=[0-9a-f]{64}\n')
+
+        old_format = temporary / 'old-evidence.txt'
+        old_format.write_text(
+            ''.join(
+                line for line in evidence.splitlines(keepends=True)
+                if not line.startswith((
+                    'UNSEAL_KEY_ROTATION=',
+                    'COMPROMISED_SHARE_INVALIDATED=',
+                    'RECOVERY_BUNDLE_SCHEMA=',
+                ))
+            ),
+            encoding='utf-8',
+        )
+        old_format.chmod(0o600)
+        old_rejected = self.run_command(
+            [
+                '/bin/bash', '-c',
+                'source "$1"; openbao_incident_evidence_is_exact "$2"',
+                'old-incident-evidence', str(OPENBAO_INITIALIZE_LIB),
+                str(old_format),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(old_rejected.returncode, 0)
+
+        for index, duplicate in enumerate((
+            'INITIAL_ROOT_TOKEN=REVOKED',
+            'INITIAL_ROOT_TOKEN=ACTIVE',
+            'UNSEAL_KEY_ROTATION=FAIL',
+        )):
+            with self.subTest(duplicate_key=index):
+                duplicate_payload = temporary / f'duplicate-{index}.txt'
+                duplicate_payload.write_text(
+                    evidence + duplicate + '\n', encoding='utf-8',
+                )
+                duplicate_payload.chmod(0o600)
+                duplicate_rejected = self.run_command(
+                    [
+                        '/bin/bash', '-c',
+                        'source "$1"; openbao_incident_evidence_is_exact "$2"',
+                        'duplicate-incident-evidence',
+                        str(OPENBAO_INITIALIZE_LIB), str(duplicate_payload),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertNotEqual(duplicate_rejected.returncode, 0)
+
+        forbidden_lines = (
+            'verification_nonce=synthetic-public-value',
+            'keys_base64=[]',
+            'raw_rotation_response={}',
+            'ciphertext=' + 'A' * 96,
+            'value=hvs.abcdefgh',
+        )
+        for index, forbidden in enumerate(forbidden_lines):
+            with self.subTest(index=index):
+                hostile = temporary / f'hostile-{index}.txt'
+                hostile.write_text(evidence + forbidden + '\n', encoding='utf-8')
+                hostile.chmod(0o600)
+                rejected = self.run_command(
+                    [
+                        '/bin/bash', '-c',
+                        'source "$1"; openbao_evidence_is_secret_free "$2"',
+                        'hostile-incident-evidence',
+                        str(OPENBAO_INITIALIZE_LIB), str(hostile),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+
+    def test_incident_existing_evidence_rejects_old_format(self) -> None:
+        evidence_directory = self.temporary_directory() / 'evidence'
+        evidence_directory.mkdir(mode=0o700)
+        evidence = evidence_directory / '17-openbao-runtime-old.txt'
+        evidence.write_text(
+            f'GIT_COMMIT={self.CURRENT_SHA}\nMINIO=NOT_EXECUTED\n',
+            encoding='ascii',
+        )
+        evidence.chmod(0o600)
+        sidecar = evidence.with_name(evidence.name + '.sha256')
+        sidecar.write_text(
+            f'{hashlib.sha256(evidence.read_bytes()).hexdigest()}  '
+            f'{evidence.name}\n',
+            encoding='ascii',
+        )
+        sidecar.chmod(0o600)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            TEST_EVIDENCE_DIRECTORY=$2
+            OPENBAO_RECOVERY_ID=$3
+            host_path() { printf '%s\n' "$TEST_EVIDENCE_DIRECTORY"; }
+            normal=$(openbao_existing_evidence NORMAL_V1)
+            set +e
+            incident=$(openbao_existing_evidence INCIDENT_V2)
+            incident_rc=$?
+            set -e
+            printf 'NORMAL=%s\nINCIDENT_RC=%s\nINCIDENT=%s\n' \
+              "$normal" "$incident_rc" "$incident"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'incident-existing-evidence',
+                str(OPENBAO_INITIALIZE_LIB), str(evidence_directory),
+                self.CURRENT_SHA,
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f'NORMAL={evidence}\nINCIDENT_RC=1\nINCIDENT=\n',
+        )
+
+    def test_rotation_share_uses_hidden_input_key_dash_and_private_response(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        response = temporary / 'response.json'
+        command_log = temporary / 'command.log'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_ROTATION_RESPONSE=$2
+            TEST_COMMAND_LOG=$3
+            export OPENBAO_SECRET_INPUT=preexisting-exported-value
+            openbao_prompt_secret() {
+              printf '%s' "$1" >"${TEST_COMMAND_LOG}.prompt"
+              OPENBAO_SECRET_INPUT=synthetic-test-share
+            }
+            openbao_bao_stdin() {
+              local input
+              if env | grep -Fq 'OPENBAO_SECRET_INPUT=synthetic-test-share'; then
+                return 1
+              fi
+              IFS= read -r input
+              [[ "$input" == synthetic-test-share ]] || return 1
+              printf '%s\n' "$*" >"$TEST_COMMAND_LOG"
+              printf '{}\n'
+            }
+            openbao_rotation_response_file_prepare "$OPENBAO_ROTATION_RESPONSE"
+            openbao_rotation_submit_share synthetic-rotation-nonce \
+              "$OPENBAO_ROTATION_RESPONSE" 1
+            if [[ ${OPENBAO_SECRET_INPUT+x} == x ]]; then
+              printf 'SECRET_VARIABLE_PRESENT=true\n'
+            else
+              printf 'SECRET_VARIABLE_PRESENT=false\n'
+            fi
+            printf 'RESPONSE_MODE=%s\n' "$(stat -c %a "$OPENBAO_ROTATION_RESPONSE")"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'rotation-share',
+                str(OPENBAO_INITIALIZE_LIB), str(response), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('[旧份额轮换授权 · 第 1/3 份]', Path(str(command_log) + '.prompt').read_text())
+        self.assertEqual(
+            result.stdout,
+            'SECRET_VARIABLE_PRESENT=false\nRESPONSE_MODE=600\n',
+        )
+        self.assertEqual(
+            command_log.read_text(encoding='utf-8'),
+            'operator rotate-keys -format=json '
+            '-nonce=synthetic-rotation-nonce -\n',
+        )
+        combined = result.stdout + result.stderr
+        self.assertNotIn('synthetic-test-share', combined)
+
+    def test_rotation_backup_nonce_uses_stdin_not_argv_or_environment(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        response = temporary / 'backup-response.json'
+        response.write_text('{}\n', encoding='utf-8')
+        response.chmod(0o600)
+        audit_log = temporary / 'audit.log'
+        fake_python = temporary / 'python3'
+        fake_python.write_text(
+            textwrap.dedent(
+                r'''#!/bin/bash
+                set -euo pipefail
+                IFS= read -r private_value
+                [[ -n "$private_value" ]]
+                for argument in "$@"; do
+                  [[ "$argument" != "$private_value" ]] || exit 91
+                done
+                while IFS='=' read -r _ value; do
+                  [[ "$value" != "$private_value" ]] || exit 92
+                done < <(env)
+                printf 'STDIN_PRESENT=true\nARGV_LEAK=false\nENV_LEAK=false\n' \
+                  >"$TEST_AUDIT_LOG"
+                '''
+            ),
+            encoding='utf-8',
+        )
+        fake_python.chmod(0o700)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            PYTHON_BINARY=$2
+            OPENBAO_RECOVERY_ID=1111111111111111111111111111111111111111
+            OPENBAO_SOURCE_RECOVERY_SHA=2222222222222222222222222222222222222222
+            OPENBAO_SOURCE_RECOVERY_ARCHIVE=/public/source.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_ARCHIVE=/public/candidate.tar.gz
+            OPENBAO_ROTATION_CANDIDATE_SIDECAR=/public/candidate.tar.gz.sha256
+            OPENBAO_PUBLIC_KEY=/public/recovery-key.asc
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=/public/recovery-key.fingerprint
+            openbao_rotation_artifact_paths() { :; }
+            openbao_source_recovery_bundle_is_valid() { :; }
+            safe_file() { :; }
+            openbao_cluster_identity_sha256() { printf '%064d\n' 0; }
+            sha256_file() { printf '%064d\n' 0; }
+            openbao_rotation_candidate_is_valid() { :; }
+            openbao_build_rotation_candidate "$3" backup \
+              public-cluster-id public-cluster-name \
+              synthetic-private-verification-value
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'backup-nonce-audit',
+                str(OPENBAO_INITIALIZE_LIB), str(fake_python), str(response),
+            ],
+            env=self.sanitized_environment(
+                BOOTSTRAP_TEST_MODE='1', TEST_AUDIT_LOG=str(audit_log),
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr, '')
+        self.assertEqual(
+            audit_log.read_text(encoding='utf-8'),
+            'STDIN_PRESENT=true\nARGV_LEAK=false\nENV_LEAK=false\n',
+        )
+
+    def test_rotation_status_accepts_only_exact_typed_openbao_shapes(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        response = temporary / 'status.json'
+        state_file = temporary / 'state.txt'
+        fingerprint = self.PUBLIC_KEY_FINGERPRINT
+        fingerprint_path = temporary / 'fingerprint'
+        fingerprint_path.write_text(fingerprint + '\n', encoding='ascii')
+        fingerprint_path.chmod(0o600)
+        valid = {
+            'nonce': 'synthetic-old-rotation-nonce',
+            'started': True,
+            't': 3,
+            'n': 5,
+            'progress': 2,
+            'required': 3,
+            'pgp_fingerprints': [fingerprint.lower()] * 5,
+            'backup': True,
+            'verification_required': True,
+            'verification_nonce': '',
+        }
+        complete = {
+            **valid,
+            'progress': 0,
+            'verification_nonce': 'synthetic-verification-nonce',
+        }
+        idle = {
+            'nonce': '', 'started': False, 't': 0, 'n': 0,
+            'progress': 0, 'required': 3, 'pgp_fingerprints': None,
+            'backup': False, 'verification_required': False,
+            'verification_nonce': '',
+        }
+        verification = {
+            'nonce': 'synthetic-verification-nonce',
+            'started': True,
+            't': 3,
+            'n': 5,
+            'progress': 0,
+        }
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_ROTATION_STATUS_RESPONSE=$2
+            OPENBAO_ROTATION_STATUS_STATE=$3
+            OPENBAO_ROTATION_VERIFICATION_RESPONSE=$2
+            OPENBAO_ROTATION_VERIFICATION_STATE=$3
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$4
+            PYTHON_BINARY=/usr/bin/python3
+            TEST_STATUS_PAYLOAD=$5
+            openbao_bao() { cat "$TEST_STATUS_PAYLOAD"; }
+            openbao_rotation_status "$6" || exit "$?"
+            case "$6" in
+              normal)
+                printf 'PHASE=%s\nPROGRESS=%s\nNONCE_SET=%s\n' \
+                  "$OPENBAO_ROTATION_PHASE" "$OPENBAO_ROTATION_PROGRESS" \
+                  "$([[ -n $OPENBAO_ROTATION_NONCE ]] && printf true || printf false)"
+                ;;
+              verification)
+                printf 'PHASE=%s\nPROGRESS=%s\nNONCE_SET=%s\n' \
+                  "$OPENBAO_ROTATION_VERIFICATION_PHASE" \
+                  "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" \
+                  "$([[ -n $OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE ]] && printf true || printf false)"
+                ;;
+            esac
+            '''
+        )
+
+        cases = (
+            ('normal', idle, 0, 'PHASE=IDLE\nPROGRESS=0\nNONCE_SET=false\n'),
+            ('normal', {**idle, 'required': 0}, 1, ''),
+            ('normal', {**idle, 'required': True}, 1, ''),
+            ('normal', valid, 0, 'PHASE=OLD_QUORUM_PENDING\nPROGRESS=2\nNONCE_SET=true\n'),
+            ('normal', complete, 0, 'PHASE=OLD_QUORUM_COMPLETE\nPROGRESS=0\nNONCE_SET=true\n'),
+            ('normal', {**complete, 'progress': 1}, 1, ''),
+            ('normal', {**complete, 'progress': 3}, 1, ''),
+            ('normal', {**valid, 'progress': 3}, 1, ''),
+            ('verification', verification, 0, 'PHASE=PENDING\nPROGRESS=0\nNONCE_SET=true\n'),
+            ('normal', {
+                key: value for key, value in valid.items()
+                if key != 'verification_nonce'
+            }, 1, ''),
+            ('normal', {**valid, 'unexpected': False}, 1, ''),
+            ('normal', {**valid, 'progress': True}, 1, ''),
+            ('normal', {**valid, 'backup': False}, 1, ''),
+            ('normal', {**complete, 'verification_nonce': 'unsafe value'}, 1, ''),
+            ('verification', {**verification, 'n': 4}, 1, ''),
+        )
+        for index, (kind, document, expected_rc, expected_stdout) in enumerate(cases):
+            with self.subTest(kind=kind, index=index):
+                payload = temporary / f'payload-{index}.json'
+                payload.write_text(
+                    json.dumps(document, separators=(',', ':')) + '\n',
+                    encoding='utf-8',
+                )
+                payload.chmod(0o600)
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'rotation-status',
+                        str(OPENBAO_INITIALIZE_LIB), str(response),
+                        str(state_file), str(fingerprint_path),
+                        str(payload), kind,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stderr)
+                self.assertEqual(result.stdout, expected_stdout)
+                self.assertEqual(result.stderr, '')
+
+    def test_rotation_verification_idle_uses_exact_cli_and_fresh_normal_status(
+        self,
+    ) -> None:
+        # OpenBao v2.6.1 logical_system_rotate.go + CLI JSON serialization:
+        # no configuration is HTTP 400, not a successful all-zero status;
+        # before old-share quorum, verification is not started but has n=5/t=3.
+        temporary = self.temporary_directory()
+        fingerprint = temporary / 'fingerprint'
+        fingerprint.write_text(self.PUBLIC_KEY_FINGERPRINT + '\n', encoding='ascii')
+        fingerprint.chmod(0o600)
+        idle = {
+            'nonce': '', 'started': False, 't': 0, 'n': 0,
+            'progress': 0, 'required': 3, 'pgp_fingerprints': None,
+            'backup': False, 'verification_required': False,
+            'verification_nonce': '',
+        }
+        active = {
+            **idle, 'nonce': 'synthetic-old-rotation-nonce', 'started': True,
+            't': 3, 'n': 5, 'pgp_fingerprints': [self.PUBLIC_KEY_FINGERPRINT] * 5,
+            'backup': True, 'verification_required': True,
+        }
+        waiting = {'nonce': '', 'started': False, 't': 3, 'n': 5, 'progress': 0}
+        absent = (
+            'Error reading rotate status: Error making API request.\n\n'
+            'URL: GET https://openbao.openbao.svc:8200/v1/sys/rotate/root/verify\n'
+            'Code: 400. Errors:\n\n* no rotation configuration found\n'
+        )
+        transport_suffix = 'command terminated with exit code 2\n'
+        cases = [
+            ('absent', 2, '', absent, idle, 0),
+            ('absent-kubectl', 2, '', absent + transport_suffix, idle, 0),
+            ('waiting', 0, json.dumps(waiting), '', active, 0),
+            ('absent-active', 2, '', absent, active, 1),
+            ('absent-bad-normal', 2, '', absent, {**idle, 'required': 0}, 1),
+            ('waiting-without-config', 0, json.dumps(waiting), '', idle, 1),
+            ('waiting-complete', 0, json.dumps(waiting), '', {**active, 'progress': 3}, 1),
+            ('zero-status', 0, json.dumps({**waiting, 't': 0, 'n': 0}), '', idle, 1),
+            ('wrong-exit', 1, '', absent, idle, 1),
+            ('unexpected-stdout', 2, '{}', absent, idle, 1),
+            ('forbidden', 2, '', absent.replace('400', '403'), idle, 1),
+            ('server-error', 2, '', absent.replace('400', '500'), idle, 1),
+            ('different-error', 2, '', absent.replace('no rotation configuration found', 'permission denied'), idle, 1),
+            ('different-path', 2, '', absent.replace('/root/verify', '/root/init'), idle, 1),
+            ('extra-error', 2, '', absent + '* another failure\n', idle, 1),
+            ('transport-error', 2, '', absent + 'error: connection closed\n', idle, 1),
+            ('timeout', 2, '', 'error: timeout\n', idle, 1),
+        ]
+        script = textwrap.dedent(r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            OPENBAO_PUBLIC_KEY_FINGERPRINT=$2/fingerprint
+            PYTHON_BINARY=/usr/bin/python3
+            openbao_rotation_temp_create || exit 90
+            # Simulate cached completion from immediately before the final
+            # verification submission. Only a NEW live normal read can win.
+            OPENBAO_ROTATION_PHASE=OLD_QUORUM_COMPLETE
+            OPENBAO_ROTATION_REQUIRED=3
+            TEST_DIRECTORY=$2
+            TEST_VERIFY_EXIT=$3
+            openbao_bao() {
+              if [[ " $* " == *' -verify '* ]]; then
+                cat "$TEST_DIRECTORY/stdout"
+                cat "$TEST_DIRECTORY/stderr" >&2
+                return "$TEST_VERIFY_EXIT"
+              fi
+              printf 'normal-read\n' >>"$TEST_DIRECTORY/calls"
+              cat "$TEST_DIRECTORY/normal.json"
+            }
+            rc=0
+            openbao_rotation_status verification || rc=$?
+            if (( rc == 0 )); then
+              [[ "$OPENBAO_ROTATION_VERIFICATION_PHASE" == IDLE &&
+                 "$OPENBAO_ROTATION_VERIFICATION_PROGRESS" == 0 &&
+                 -z "$OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE" ]] || exit 91
+              if [[ "$OPENBAO_ROTATION_PHASE" == IDLE ]]; then
+                openbao_rotation_live_fields_are_idle || exit 92
+                # The incident preflight must share the same idle contract.
+                openbao_rotation_temp_cleanup || exit 93
+                openbao_probe_session_start() { :; }
+                openbao_remote_session_cleanup() { :; }
+                openbao_incident_live_rotation_is_idle || exit 94
+              fi
+              printf 'VERIFICATION_IDLE=true\n'
+            fi
+            openbao_rotation_temp_cleanup || exit 95
+            exit "$rc"
+        ''')
+        for name, status, stdout, stderr, normal, expected in cases:
+            with self.subTest(name=name):
+                for leaf, content in (
+                    ('stdout', stdout), ('stderr', stderr),
+                    ('normal.json', json.dumps(normal)), ('calls', ''),
+                ):
+                    (temporary / leaf).write_text(content, encoding='utf-8')
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'verification-status',
+                     str(OPENBAO_INITIALIZE_LIB), str(temporary), str(status)],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertEqual(result.stdout, 'VERIFICATION_IDLE=true\n' if expected == 0 else '')
+                if expected == 0:
+                    self.assertIn('normal-read\n', (temporary / 'calls').read_text())
+                self.assertEqual(list(temporary.glob('.openbao-rotation.*')), [])
+
+    def test_rotation_nonce_globals_never_retain_inherited_export_attributes(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_ROTATION_STATUS_RESPONSE=$2/status.json
+            OPENBAO_ROTATION_STATUS_STATE=$2/status.state
+            OPENBAO_ROTATION_VERIFICATION_RESPONSE=$2/verification.json
+            OPENBAO_ROTATION_VERIFICATION_STATE=$2/verification.state
+            openbao_bao() { :; }
+            openbao_rotation_status_parse() {
+              case "$1" in
+                normal)
+                  printf '%s\n' OLD_QUORUM_PENDING public-live-nonce 1 3 '' \
+                    >"$3"
+                  ;;
+                verification)
+                  printf '%s\n' PENDING public-verification-nonce 0 >"$3"
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            openbao_rotation_status normal
+            openbao_rotation_status verification
+            for name in OPENBAO_ROTATION_NONCE \
+                OPENBAO_ROTATION_VERIFICATION_NONCE \
+                OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE; do
+              export -p | /usr/bin/grep -q "declare -x ${name}=" && exit 1
+            done
+            /bin/bash -c '
+              for name in OPENBAO_ROTATION_NONCE \
+                  OPENBAO_ROTATION_VERIFICATION_NONCE \
+                  OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE; do
+                if /usr/bin/printenv "$name" >/dev/null; then
+                  exit 1
+                fi
+              done
+              exit 0
+            ' || exit 1
+            printf 'CHILD_ENV_CLEAN=true\n'
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'nonce-export-audit',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+            ],
+            env=self.sanitized_environment(
+                BOOTSTRAP_TEST_MODE='1',
+                OPENBAO_ROTATION_NONCE='inherited-test-value',
+                OPENBAO_ROTATION_VERIFICATION_NONCE='inherited-test-value',
+                OPENBAO_ROTATION_VERIFICATION_LIVE_NONCE=(
+                    'inherited-test-value'
+                ),
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'CHILD_ENV_CLEAN=true\n')
+        self.assertEqual(result.stderr, '')
+
+    def test_recover_start_dispatcher_routes_exact_operation(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            business_initialize() { :; }
+            require_command() { :; }
+            path_owner() { printf '0:0\n'; }
+            openbao_initialize_paths() { :; }
+            openbao_initialize_ceremony_paths() { :; }
+            openbao_stage_180_recover_start() {
+              printf 'dispatch-recover-start\n'
+            }
+            complete() {
+              printf 'dispatch-failed:%s\n' "$2"
+              exit "$3"
+            }
+            openbao_initialize_main --recover-start \
+              --source-recovery-sha=1111111111111111111111111111111111111111
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-start-dispatch',
+                str(OPENBAO_INITIALIZE_LIB),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'dispatch-recover-start\n')
+
+    def test_recover_verify_dispatcher_routes_exact_operation(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            business_initialize() { :; }
+            require_command() { :; }
+            path_owner() { printf '0:0\n'; }
+            openbao_initialize_paths() { :; }
+            openbao_initialize_ceremony_paths() { :; }
+            openbao_stage_180_recover_verify() {
+              printf 'dispatch-recover-verify\n'
+            }
+            complete() {
+              printf 'dispatch-failed:%s\n' "$2"
+              exit "$3"
+            }
+            openbao_initialize_main --recover-verify \
+              --source-recovery-sha=1111111111111111111111111111111111111111
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-verify-dispatch',
+                str(OPENBAO_INITIALIZE_LIB),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'dispatch-recover-verify\n')
+
+    def test_rotation_temp_files_are_private_and_trap_cleanup_is_bounded(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        recovery_root = temporary / 'recovery'
+        recovery_root.mkdir(mode=0o700)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            set +e
+            openbao_rotation_temp_create
+            create_rc=$?
+            set -e
+            printf 'CREATE_RC=%s\nDIRECTORY_MODE=%s\n' "$create_rc" \
+              "$(stat -c %a "$OPENBAO_ROTATION_TEMP_DIRECTORY")"
+            for path in "$OPENBAO_ROTATION_RESPONSE" \
+                "$OPENBAO_ROTATION_STATUS_RESPONSE" \
+                "$OPENBAO_ROTATION_STATUS_STATE" \
+                "$OPENBAO_ROTATION_VERIFICATION_RESPONSE" \
+                "$OPENBAO_ROTATION_VERIFICATION_STATE"; do
+              printf 'FILE_MODE=%s\n' "$(stat -c %a "$path")"
+            done
+            openbao_rotation_temp_cleanup
+            shopt -s nullglob
+            remaining=("$OPENBAO_RECOVERY_ROOT"/.openbao-rotation.*)
+            printf 'REMAINING=%s\n' "${#remaining[@]}"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'rotation-temp',
+                str(OPENBAO_INITIALIZE_LIB), str(recovery_root),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'CREATE_RC=0\nDIRECTORY_MODE=700\n'
+            + 'FILE_MODE=600\n' * 5
+            + 'REMAINING=0\n',
+        )
+
+        failed_root = temporary / 'failed-recovery'
+        failed_root.mkdir(mode=0o700)
+        failed_script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_RECOVERY_ROOT=$2
+            safe_owned_directory() { return 1; }
+            set +e
+            openbao_rotation_temp_create
+            create_rc=$?
+            openbao_rotation_temp_cleanup
+            cleanup_rc=$?
+            set -e
+            shopt -s nullglob
+            remaining=("$OPENBAO_RECOVERY_ROOT"/.openbao-rotation.*)
+            printf 'CREATE_RC=%s\nCLEANUP_RC=%s\nREMAINING=%s\n' \
+              "$create_rc" "$cleanup_rc" "${#remaining[@]}"
+            '''
+        )
+        failed = self.run_command(
+            [
+                '/bin/bash', '-c', failed_script, 'rotation-temp-failure',
+                str(OPENBAO_INITIALIZE_LIB), str(failed_root),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        self.assertEqual(
+            failed.stdout,
+            'CREATE_RC=1\nCLEANUP_RC=0\nREMAINING=0\n',
+        )
+
+    def test_initialize_exit_preserves_status_with_real_empty_cleanup(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            kubectl_run() { printf 'FORBIDDEN_KUBECTL_CALL\n' >&2; return 99; }
+            finish_phase() { printf 'UNEXPECTED_CLEANUP_FAILURE\n'; }
+            openbao_initialize_traps_install
+            exit "$2"
+            '''
+        )
+        for status in (0, 10, 20, 30, 40, 50):
+            with self.subTest(status=status):
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'real-empty-cleanup',
+                     str(OPENBAO_INITIALIZE_LIB), str(status)],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, '')
+
+    def test_empty_cleanup_rejects_orphaned_session_kind(self) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            kubectl_run() { printf 'FORBIDDEN_KUBECTL_CALL\n' >&2; return 99; }
+            printf -v "$3" '%s' orphaned
+            "$2"
+            '''
+        )
+        for function, kind in (
+            ('openbao_remote_session_cleanup', 'OPENBAO_REMOTE_SESSION_KIND'),
+            ('openbao_recover_probe_cleanup', 'OPENBAO_RECOVER_PROBE_SESSION_KIND'),
+        ):
+            with self.subTest(function=function):
+                result = self.run_command(
+                    ['/bin/bash', '-c', script, 'orphaned-cleanup',
+                     str(OPENBAO_INITIALIZE_LIB), function, kind],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, '')
+
+    def test_initialize_traps_surface_cleanup_failures_and_terminate_signals(
+        self,
+    ) -> None:
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            TEST_CALL_LOG=$2
+            TEST_EVENT=$3
+            TEST_FAILURE=$4
+            OPENBAO_SECRET_INPUT=synthetic-hidden-input
+            openbao_rotation_temp_cleanup() {
+              [[ -z ${OPENBAO_SECRET_INPUT+x} ]] || return 1
+              printf 'temp-cleanup\n' >>"$TEST_CALL_LOG"
+              [[ "$TEST_FAILURE" != temp ]]
+            }
+            openbao_remote_session_cleanup() {
+              [[ -z ${OPENBAO_SECRET_INPUT+x} ]] || return 1
+              printf 'remote-cleanup\n' >>"$TEST_CALL_LOG"
+              [[ "$TEST_FAILURE" != remote ]]
+            }
+            finish_phase() {
+              printf 'RESULT=%s\nREASON=%s\nEXIT_CODE=%s\nNEXT=%s\n' \
+                "$1" "$2" "$3" "$4"
+            }
+            openbao_initialize_traps_install
+            case "$TEST_EVENT" in
+              HUP) kill -HUP "$$" ;;
+              INT) kill -INT "$$" ;;
+              TERM) kill -TERM "$$" ;;
+              EXIT) exit 0 ;;
+              *) exit 91 ;;
+            esac
+            printf 'FORBIDDEN_CONTINUATION=true\n'
+            '''
+        )
+        cases = (
+            ('HUP', 'none', 129, ''),
+            ('INT', 'none', 130, ''),
+            ('TERM', 'none', 143, ''),
+            (
+                'TERM', 'temp', 30,
+                'RESULT=STOP_UNKNOWN_STATE\n'
+                'REASON=remote-session-cleanup-failed\n'
+                'EXIT_CODE=30\nNEXT=NONE\n',
+            ),
+            (
+                'EXIT', 'remote', 30,
+                'RESULT=STOP_UNKNOWN_STATE\n'
+                'REASON=remote-session-cleanup-failed\n'
+                'EXIT_CODE=30\nNEXT=NONE\n',
+            ),
+        )
+        for index, (event, failure, expected_rc, expected_stdout) in enumerate(
+            cases
+        ):
+            with self.subTest(event=event, failure=failure):
+                call_log = self.temporary_directory() / f'calls-{index}.log'
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'cleanup-trap',
+                        str(OPENBAO_INITIALIZE_LIB), str(call_log),
+                        event, failure,
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stderr)
+                self.assertEqual(result.stdout, expected_stdout)
+                self.assertEqual(result.stderr, '')
+                self.assertEqual(
+                    call_log.read_text(encoding='utf-8').splitlines(),
+                    ['temp-cleanup', 'remote-cleanup'],
+                )
+
+    def test_supervisor_completion_survives_control_timeout_boundary(self) -> None:
+        for binary, expected_exit in (('/bin/true', 0), ('/bin/false', 1)):
+            with self.subTest(expected_exit=expected_exit):
+                script = f'kubectl_binary={binary}\n' + textwrap.dedent(r'''
+                    read() {
+                      local boundary_status=0 boundary_target=${!#}
+                      builtin read "$@" || boundary_status=$?
+                      [[ "${!boundary_target}" == DONE\|* ]] && return 142
+                      return "$boundary_status"
+                    }
+                    ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                    admin_conf_is_safe() { :; }
+                    kubectl_isolated_start --synthetic || exit 97
+                    printf 'PID=%s\nPID=%s\n' \
+                      "$KUBE_RUNNER_PID" "$KUBE_RUNNER_GROUP" >>"$TEST_COMMAND_LOG"
+                    kubectl_isolated_wait_interruptibly
+                    ''')
+                result, logged = self.run_stage180_function_in_pty(
+                    script, pty_input=None,
+                )
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertEqual(result.stdout, '')
+                self.assert_hidden_tty_fixture_pids_are_gone(
+                    logged, minimum=2, require_late=False,
+                )
+
+    def test_stage180_pty_waits_for_exit_after_terminal_closes(self) -> None:
+        # The terminal closing is not process completion or a timeout.
+        # Preserve the delayed child's real nonzero exit status.
+        result, _ = self.run_stage180_function_in_pty(
+            'exec 0<&- 1>&- 2>&-; /bin/sleep 0.1; exit 23',
+            pty_input=None,
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, '')
+
+    def test_stage180_pty_closed_terminal_still_enforces_deadline(self) -> None:
+        descriptor_count = len(os.listdir('/proc/self/fd'))
+        started = time.monotonic()
+        with self.assertRaisesRegex(AssertionError, 'PTY harness timed out'):
+            self.run_stage180_function_in_pty(
+                'exec 0<&- 1>&- 2>&-; exec /bin/sleep 30',
+                pty_input=None,
+                timeout=0.2,
+            )
+        self.assertGreaterEqual(time.monotonic() - started, 0.2)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(os.listdir('/proc/self/fd')), descriptor_count)
+
+    def test_stage180_pty_timeout_diagnostics_exclude_terminal_contents(self) -> None:
+        with self.assertRaisesRegex(AssertionError, 'PTY harness timed out') as raised:
+            self.run_stage180_function_in_pty(
+                "printf 'synthetic-private-output\\n'; exec /bin/sleep 30",
+                pty_input=None,
+                timeout=0.2,
+            )
+        message = str(raised.exception)
+        self.assertIn('terminal_closed=False', message)
+        self.assertRegex(message, r'output_bytes=[1-9][0-9]*; processes=\[\(')
+        self.assertNotIn('synthetic-private-output', message)
+        self.assertNotIn('/bin/sleep', message)
+
+    def test_unseal_and_root_login_use_true_tty_without_outer_capture(
+        self,
+    ) -> None:
+        result, command_log = self.run_stage180_function_in_pty(
+            textwrap.dedent(r'''
+                kubectl_isolated_start() {
+                  {
+                    printf '%s' "$1"
+                    shift
+                    printf ' %s' "$@"
+                    printf '\n'
+                  } >>"$TEST_COMMAND_LOG"
+                  KUBE_RUNNER_ACTIVE=1
+                }
+                kubectl_isolated_wait_interruptibly() {
+                  KUBE_RUNNER_ACTIVE=0
+                }
+                openbao_unseal_interactively
+                openbao_root_session_start
+                ''')
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('exec --stdin --tty pod/openbao-0', command_log)
+        self.assertIn('bao operator unseal -format=json', command_log)
+        self.assertIn('bao login -no-print', command_log)
+        unseal = self.openbao_function_source('openbao_unseal_interactively')
+        root_start = self.openbao_function_source('openbao_root_session_start')
+        progress_notice = (
+            "    printf '[解封 OpenBao] %s/3 已由服务器回读确认。\\n' "
+            '\"$attempt\" >&2'
+        )
+        self.assertEqual(unseal.count(progress_notice), 1)
+        unseal_without_notice = unseal.replace(progress_notice, '')
+        for forbidden in ('OPENBAO_SECRET_INPUT', 'read ', 'printf'):
+            self.assertNotIn(forbidden, unseal_without_notice)
+            self.assertNotIn(forbidden, root_start)
+        for forbidden in ('>/dev/null', '2>&1'):
+            self.assertNotIn(forbidden, root_start)
+        self.assertLess(
+            unseal.index('openbao_require_interactive_tty'),
+            unseal.index('operator unseal -reset'),
+        )
+        self.assertLess(
+            root_start.index('openbao_require_interactive_tty'),
+            root_start.index('openbao_remote_home_create root'),
+        )
+
+    def test_unseal_prompts_survive_remote_pty_without_status_output(self) -> None:
+        # An outer redirect must fail this test: kubectl's remote PTY merges
+        # stderr prompts into stdout before returning to the real caller.
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        bao = binary_directory / 'bao'
+        bao.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            [[ "$*" == 'operator unseal -format=json' ]] || exit 98
+            [[ -t 0 && -t 2 ]] || exit 97
+            printf 'synthetic-unseal-hidden-prompt\\n' >&2
+            printf 'synthetic-unseal-status\\n'
+            exit "$FIXTURE_UNSEAL_EXIT_CODE"
+            '''), encoding='utf-8')
+        bao.chmod(0o755)
+        bridge = temporary / 'remote-pty.py'
+        bridge.write_text(textwrap.dedent('''\
+            #!/usr/bin/python3
+            import errno
+            import os
+            import pty
+            import sys
+
+            arguments = sys.argv[1:]
+            assert arguments[0] == '--kubeconfig'
+            assert arguments[1].startswith('/dev/fd/')
+            assert arguments[2] == '--cache-dir=/dev/null'
+            arguments = arguments[3:]
+            assert arguments[:6] == [
+                '--namespace=openbao', 'exec', '--stdin', '--tty',
+                'pod/openbao-0', '--',
+            ]
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execvp(arguments[6], arguments[6:])
+            try:
+                while True:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    os.write(1, data)
+            finally:
+                os.close(master)
+                _, status = os.waitpid(pid, 0)
+            raise SystemExit(os.waitstatus_to_exitcode(status))
+            ''').lstrip(), encoding='utf-8')
+        bridge.chmod(0o755)
+        for cli_exit, expected_prompts, expected_exit in ((0, 3, 0), (23, 1, 1)):
+            with self.subTest(cli_exit=cli_exit):
+                script = (
+                    f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
+                    f'export FIXTURE_UNSEAL_EXIT_CODE={cli_exit}\n'
+                    f'kubectl_binary={shlex.quote(str(bridge))}\n'
+                    + textwrap.dedent(r'''
+                        ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                        admin_conf_is_safe() { :; }
+                        kubectl_run() {
+                          if [[ "$*" == '--namespace=openbao exec pod/openbao-0 -- env BAO_ADDR=https://openbao.openbao.svc:8200 BAO_CACERT=/openbao/userconfig/openbao-server-tls/ca.crt bao operator unseal -reset -format=json' ]]; then
+                            return 0
+                          fi
+                          return 99
+                        }
+                        openbao_unseal_interactively
+                        ''')
+                )
+                result, _ = self.run_stage180_function_in_pty(script)
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertEqual(
+                    result.stdout.count('synthetic-unseal-hidden-prompt'),
+                    expected_prompts,
+                    result.stdout,
+                )
+                self.assertNotIn('synthetic-unseal-status', result.stdout)
+                self.assertNotIn('synthetic-share-', result.stdout)
+                for attempt in range(1, expected_prompts + 1):
+                    self.assertIn(
+                        f'[解封 OpenBao · 第 {attempt}/3 份旧份额]',
+                        result.stdout,
+                    )
+                self.assertEqual(
+                    result.stdout.count('已由服务器回读确认。'),
+                    3 if cli_exit == 0 else 0,
+                )
+
+    def test_hidden_tty_is_noecho_before_ready_marker_and_restored(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        bao = binary_directory / 'bao'
+        bao.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            [[ "$*" == "$FIXTURE_EXPECTED_BAO_COMMAND" ]] || exit 98
+            [[ -t 0 && -t 2 ]] || exit 97
+            terminal_flags=" $(stty -a | tr ';\\n' '  ') "
+            [[ "$terminal_flags" == *' -echo '* ]] || exit 96
+            if [[ "$*" == 'login -no-print' ]]; then
+              [[ "${BAO_TOKEN_PATH:-}" == "$HOME/.bao-token" ]] || exit 95
+            fi
+            exit "$FIXTURE_BAO_EXIT_CODE"
+            '''), encoding='utf-8')
+        bao.chmod(0o755)
+        bridge = temporary / 'remote-pty.py'
+        bridge.write_text(textwrap.dedent('''\
+            #!/usr/bin/python3
+            import errno
+            import os
+            import pty
+            import sys
+            import termios
+
+            arguments = sys.argv[1:]
+            assert not termios.tcgetattr(0)[3] & termios.ECHO
+            assert arguments[0] == '--kubeconfig'
+            assert arguments[1].startswith('/dev/fd/')
+            assert arguments[2] == '--cache-dir=/dev/null'
+            arguments = arguments[3:]
+            assert arguments[:6] == [
+                '--namespace=openbao', 'exec', '--stdin', '--tty',
+                'pod/openbao-0', '--',
+            ]
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execvp(arguments[6], arguments[6:])
+            try:
+                while True:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    os.write(1, data)
+            finally:
+                os.close(master)
+                _, status = os.waitpid(pid, 0)
+            raise SystemExit(os.waitstatus_to_exitcode(status))
+            ''').lstrip(), encoding='utf-8')
+        bridge.chmod(0o755)
+        cases = (
+            (
+                'openbao_bao_tty_public unseal-share-1 operator unseal '
+                '-format=json',
+                'operator unseal -format=json',
+                'OPENBAO_HIDDEN_INPUT_READY=unseal-share-1',
+            ),
+            (
+                'OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123; '
+                'openbao_bao_tty root-token login -no-print',
+                'login -no-print',
+                'OPENBAO_HIDDEN_INPUT_READY=root-token',
+            ),
+        )
+        for function_call, expected_command, ready_marker in cases:
+            for cli_exit in (0, 23):
+                with self.subTest(
+                    function_call=function_call,
+                    cli_exit=cli_exit,
+                ):
+                    script = (
+                        f'export PATH={shlex.quote(str(binary_directory))}:"$PATH"\n'
+                        f'export FIXTURE_EXPECTED_BAO_COMMAND='
+                        f'{shlex.quote(expected_command)}\n'
+                        f'export FIXTURE_BAO_EXIT_CODE={cli_exit}\n'
+                        f'kubectl_binary={shlex.quote(str(bridge))}\n'
+                        + textwrap.dedent(r'''
+                            ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                            admin_conf_is_safe() { :; }
+                            openbao_initialize_traps_install
+                            '''
+                        )
+                        + function_call
+                        + textwrap.dedent(r'''
+                            rc=$?
+                            OPENBAO_REMOTE_HOME=
+                            terminal_flags=" $(stty -a | tr ';\n' '  ') "
+                            [[ "$terminal_flags" == *' -echo '* ]] && exit 94
+                            [[ "$(trap -p HUP)" == *'openbao_initialize_trap HUP 129'* ]] || exit 93
+                            [[ "$(trap -p INT)" == *'openbao_initialize_trap INT 130'* ]] || exit 92
+                            [[ "$(trap -p TERM)" == *'openbao_initialize_trap TERM 143'* ]] || exit 91
+                            printf 'HOST_ECHO_RESTORED=true\n'
+                            exit "$rc"
+                            ''')
+                    )
+                    result, _ = self.run_stage180_function_in_pty(
+                        script,
+                        initial_echo=True,
+                        pty_input=None,
+                    )
+                    self.assertEqual(result.returncode, cli_exit, result.stdout)
+                    self.assertIn(ready_marker, result.stdout)
+                    self.assertIn('HOST_ECHO_RESTORED=true', result.stdout)
+                    self.assertNotIn('synthetic-share-', result.stdout)
+
+    def hidden_tty_signal_fixture(self) -> Path:
+        fixture = self.temporary_directory() / 'signal-kubectl'
+        fixture.write_text(textwrap.dedent('''\
+            #!/bin/bash
+            printf 'PID=%s\n' "$BASHPID" >>"$TEST_COMMAND_LOG"
+            spawn_late_descendant() {
+              /bin/sleep 30 &
+              printf 'LATE_PID=%s\n' "$!" >>"$TEST_COMMAND_LOG"
+              exit 0
+            }
+            trap spawn_late_descendant HUP INT TERM
+            (
+              printf 'PID=%s\n' "$BASHPID" >>"$TEST_COMMAND_LOG"
+              /bin/sleep 30 &
+              printf 'PID=%s\n' "$!" >>"$TEST_COMMAND_LOG"
+              wait
+            ) &
+            for _ in {1..100}; do
+              pid_count=0
+              while IFS= read -r logged_line; do
+                [[ "$logged_line" == PID=* ]] && pid_count=$((pid_count + 1))
+              done <"$TEST_COMMAND_LOG"
+              ((pid_count >= 3)) && break
+              /bin/sleep 0.01
+            done
+            ((pid_count >= 3)) || exit 98
+            if [[ "${TEST_STARTUP_SIGNAL:-false}" == self-hup ]]; then
+              printf 'STARTUP_SIGNAL_FIXTURE_READY\n'
+              kill -STOP "$TEST_PARENT_PID"
+              kill -HUP "$TEST_PARENT_PID"
+              kill -CONT "$TEST_PARENT_PID"
+            elif [[ "${TEST_STARTUP_SIGNAL:-false}" == marker ]]; then
+              printf 'STARTUP_SIGNAL_FIXTURE_READY\n'
+            else
+              printf 'SIGNAL_FIXTURE_READY\n'
+            fi
+            wait
+            ''').lstrip(), encoding='utf-8')
+        fixture.chmod(0o755)
+        return fixture
+
+    def test_hidden_tty_restores_echo_when_runner_teardown_fails(self) -> None:
+        script = textwrap.dedent(r'''
+            kubectl_isolated_start() {
+              KUBE_RUNNER_ACTIVE=1
+            }
+            kubectl_isolated_wait_interruptibly() {
+              return 1
+            }
+            kubectl_isolated_terminate() {
+              return 1
+            }
+            rc=0
+            openbao_run_hidden_tty unseal-share-1 --fixture || rc=$?
+            terminal_flags=" $(stty -a | tr ';\n' '  ') "
+            [[ "$terminal_flags" != *' -echo '* ]] || exit 91
+            [[ -z "$(trap -p HUP)$(trap -p INT)$(trap -p TERM)" ]] || exit 92
+            printf 'RC=%s\nACTIVE_AFTER=%s\nECHO_RESTORED=true\n' \
+              "$rc" "$KUBE_RUNNER_ACTIVE"
+            ''')
+        result, _ = self.run_stage180_function_in_pty(
+            script,
+            initial_echo=True,
+            pty_input=None,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            'RC=1\nACTIVE_AFTER=1\nECHO_RESTORED=true\n',
+            result.stdout,
+        )
+
+    def assert_hidden_tty_fixture_pids_are_gone(
+        self,
+        logged: str,
+        *,
+        minimum: int = 4,
+        require_late: bool = True,
+    ) -> None:
+        pid_lines = re.findall(r'^(?:PID|LATE_PID)=(\d+)$', logged, re.MULTILINE)
+        self.assertGreaterEqual(len(pid_lines), minimum, logged)
+        if require_late:
+            self.assertIsNotNone(
+                re.search(r'^LATE_PID=\d+$', logged, re.MULTILINE),
+            )
+        for process_id_text in pid_lines:
+            process_id = int(process_id_text)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(process_id, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                try:
+                    os.kill(process_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail(f'hidden TTY descendant survived: {process_id}')
+
+    def test_hidden_tty_supervises_signals_and_restores_echo(self) -> None:
+        fake_kubectl = self.hidden_tty_signal_fixture()
+        cases = (
+            ('HUP', signal.SIGHUP, 129, False, 'none', None),
+            ('INT', signal.SIGINT, 130, False, 'none', None),
+            ('TERM', signal.SIGTERM, 143, False, 'none', None),
+            ('INT-process-group', signal.SIGINT, 130, True, 'none', None),
+            (
+                'TERM-then-INT', signal.SIGTERM, 143, True, 'none',
+                signal.SIGINT,
+            ),
+            (
+                'TERM-cleanup-failure', signal.SIGTERM, 30, False, 'remote',
+                None,
+            ),
+        )
+        for (
+            name, signal_number, expected_exit, process_group, failure,
+            second_signal,
+        ) in cases:
+            with self.subTest(signal=name):
+                script = (
+                    f'kubectl_binary={shlex.quote(str(fake_kubectl))}\n'
+                    f'TEST_CLEANUP_FAILURE={failure}\n'
+                    f'TEST_SECOND_SIGNAL={str(second_signal is not None).lower()}\n'
+                    + textwrap.dedent(r'''
+                        ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                        export TEST_COMMAND_LOG
+                        admin_conf_is_safe() { :; }
+                        openbao_rotation_temp_cleanup() {
+                          [[ -z ${OPENBAO_SECRET_INPUT+x} ]] || return 1
+                          if [[ "$TEST_SECOND_SIGNAL" == true ]]; then
+                            printf 'CLEANUP_WINDOW_READY\n'
+                            /bin/sleep 0.3
+                          fi
+                          printf 'CLEANUP=rotation\n' >>"$TEST_COMMAND_LOG"
+                          [[ "$TEST_CLEANUP_FAILURE" != rotation ]]
+                        }
+                        openbao_recover_probe_cleanup() {
+                          printf 'CLEANUP=probe\n' >>"$TEST_COMMAND_LOG"
+                          [[ "$TEST_CLEANUP_FAILURE" != probe ]]
+                        }
+                        openbao_remote_session_cleanup() {
+                          printf 'CLEANUP=remote\n' >>"$TEST_COMMAND_LOG"
+                          [[ "$TEST_CLEANUP_FAILURE" != remote ]]
+                        }
+                        finish_phase() {
+                          printf 'UNKNOWN_STATE=%s|%s|%s|%s\n' \
+                            "$1" "$2" "$3" "$4"
+                        }
+                        OPENBAO_SECRET_INPUT=synthetic-hidden-input
+                        openbao_initialize_traps_install
+                        openbao_run_hidden_tty unseal-share-1 --fixture
+                        printf 'FORBIDDEN_CONTINUATION=true\n'
+                        ''')
+                )
+                result, logged = self.run_stage180_function_in_pty(
+                    script,
+                    initial_echo=True,
+                    pty_input=None,
+                    signal_after_output=(
+                        b'SIGNAL_FIXTURE_READY', signal_number, process_group,
+                    ),
+                    second_signal=second_signal,
+                    second_signal_after_output=(
+                        b'CLEANUP_WINDOW_READY'
+                        if second_signal is not None
+                        else None
+                    ),
+                    report_echo_after=True,
+                )
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertIn('PTY_ECHO_AFTER_PROCESS=true', result.stdout)
+                self.assertNotIn('FORBIDDEN_CONTINUATION', result.stdout)
+                cleanup_calls = re.findall(r'^CLEANUP=(\w+)$', logged, re.MULTILINE)
+                self.assertEqual(cleanup_calls, ['rotation', 'probe', 'remote'])
+                if failure == 'none':
+                    self.assertNotIn('UNKNOWN_STATE=', result.stdout)
+                else:
+                    self.assertIn(
+                        'UNKNOWN_STATE=STOP_UNKNOWN_STATE|'
+                        'remote-session-cleanup-failed|30|NONE',
+                        result.stdout,
+                    )
+                self.assert_hidden_tty_fixture_pids_are_gone(logged)
+
+    def test_hidden_tty_defers_startup_signal_until_group_is_registered(
+        self,
+    ) -> None:
+        fake_kubectl = self.hidden_tty_signal_fixture()
+        cases = (
+            ('HUP', 129, False),
+            ('INT', 130, True),
+        )
+        for signal_name, expected_exit, process_group in cases:
+            with self.subTest(signal_name=signal_name):
+                script = (
+                    f'kubectl_binary={shlex.quote(str(fake_kubectl))}\n'
+                    f'TEST_STARTUP_SIGNAL={signal_name}\n'
+                    + textwrap.dedent(r'''
+                        ADMIN_CONF_CONTENT=synthetic-kubeconfig
+                        export TEST_COMMAND_LOG
+                        admin_conf_is_safe() { :; }
+                        openbao_rotation_temp_cleanup() {
+                          printf 'CLEANUP=rotation\n' >>"$TEST_COMMAND_LOG"
+                        }
+                        openbao_recover_probe_cleanup() {
+                          printf 'CLEANUP=probe\n' >>"$TEST_COMMAND_LOG"
+                        }
+                        openbao_remote_session_cleanup() {
+                          printf 'CLEANUP=remote\n' >>"$TEST_COMMAND_LOG"
+                        }
+                        OPENBAO_SECRET_INPUT=synthetic-hidden-input
+                        openbao_initialize_traps_install
+                        eval "$(
+                          declare -f kubectl_isolated_start |
+                            sed '1s/kubectl_isolated_start/kubectl_isolated_start_real/'
+                        )"
+                        kubectl_isolated_start() {
+                          kubectl_isolated_start_real "$@" || return
+                          printf 'PID=%s\nPID=%s\n' \
+                            "$KUBE_RUNNER_PID" "$KUBE_RUNNER_GROUP" \
+                            >>"$TEST_COMMAND_LOG"
+                          printf 'STARTUP_SIGNAL_INJECTED=%s\n' \
+                            "$TEST_STARTUP_SIGNAL"
+                          if [[ "$TEST_STARTUP_SIGNAL" == INT ]]; then
+                            kill -INT -- "-$BASHPID"
+                          else
+                            kill -HUP "$BASHPID"
+                          fi
+                        }
+                        openbao_run_hidden_tty unseal-share-1 --fixture
+                        printf 'FORBIDDEN_CONTINUATION=true\n'
+                        ''')
+                )
+                result, logged = self.run_stage180_function_in_pty(
+                    script,
+                    initial_echo=True,
+                    pty_input=None,
+                    foreground_process_group=process_group,
+                    report_echo_after=True,
+                )
+                self.assertEqual(result.returncode, expected_exit, result.stdout)
+                self.assertIn(
+                    f'STARTUP_SIGNAL_INJECTED={signal_name}', result.stdout,
+                )
+                self.assertIn('PTY_ECHO_AFTER_PROCESS=true', result.stdout)
+                self.assertNotIn('FORBIDDEN_CONTINUATION', result.stdout)
+                self.assertEqual(
+                    re.findall(r'^CLEANUP=(\w+)$', logged, re.MULTILINE),
+                    ['rotation', 'probe', 'remote'],
+                )
+                self.assert_hidden_tty_fixture_pids_are_gone(
+                    logged, minimum=2, require_late=False,
+                )
+
+    def test_unseal_tty_wrapper_rejects_unexpected_commands(self) -> None:
+        for command in (
+            'unseal-share-1 token lookup -format=json',
+            'unseal-share-1 operator unseal -format=json synthetic-share',
+            'unseal-share-1 operator unseal -reset -format=json',
+            'unseal-share-4 operator unseal -format=json',
+            'root-token operator unseal -format=json',
+        ):
+            with self.subTest(command=command):
+                result, logged = self.run_stage180_function_in_pty(
+                    f'openbao_bao_tty_public {command}',
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(logged, '')
+
+    def test_root_tty_wrapper_rejects_unexpected_commands(self) -> None:
+        for command in (
+            'unseal-share-1 login -no-print',
+            'root-token token lookup',
+            'root-token login',
+            'root-token login -no-print synthetic-root-token',
+        ):
+            with self.subTest(command=command):
+                result, logged = self.run_stage180_function_in_pty(
+                    f'openbao_bao_tty {command}',
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(logged, '')
+
+    def test_secret_operations_stop_before_read_without_tty(self) -> None:
+        for function in (
+            'openbao_unseal_interactively',
+            'openbao_root_session_start',
+            'openbao_finalization_resume_root_revocation ' + 'a' * 64,
+        ):
+            for descriptor in (0, 1, 2):
+                with self.subTest(function=function, descriptor=descriptor):
+                    result, command_log = self.run_stage180_function_in_pty(
+                        function, non_tty_fd=descriptor,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        result.stdout.strip(), 'interactive-tty-required',
+                    )
+                    self.assertEqual(command_log, '')
+
+    def test_normal_root_session_revokes_then_cleans_up(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            openbao_root_session_start() { printf 'start\n'; }
+            openbao_apply_configuration() { printf 'configure\n'; }
+            openbao_root_session_revoke() { printf 'revoke\n'; }
+            openbao_remote_session_cleanup() { printf 'cleanup\n'; }
+            openbao_apply_configuration_with_root
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'root-lifecycle', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'start', 'configure', 'revoke', 'cleanup',
+        ])
+
+    def test_root_revoke_requires_exact_silent_auth_denial(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        fake_bao = binary_directory / 'bao'
+        fake_bao.write_text(textwrap.dedent(
+            '''
+            #!/bin/sh
+            case "$*" in
+              'token revoke -self') exit 0 ;;
+              'token lookup -format=json')
+                cat "$OPENBAO_TEST_LOOKUP_ERROR_FILE" >&2
+                exit 2
+                ;;
+              *) exit 1 ;;
+            esac
+            '''
+        ).lstrip(), encoding='utf-8')
+        fake_bao.chmod(0o755)
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            export PATH=$2:$PATH
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            kubectl_run() {
+              while (($#)); do
+                if [[ "$1" == -- ]]; then
+                  shift
+                  break
+                fi
+                shift
+              done
+              "$@"
+            }
+            set +e
+            openbao_root_session_revoke
+            rc=$?
+            set -e
+            printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+            '''
+        )
+        cases = (
+            (
+                'denied',
+                'Error looking up token: Error making API request.\n\n'
+                'URL: GET https://openbao.example.invalid/v1/auth/token/lookup-self\n'
+                'Code: 403. Errors:\n\n* permission denied\n',
+                'RC=0\nHOME=/tmp/openbao-stage180.ABC123\nKIND=\n',
+            ),
+            (
+                'transport',
+                'Error looking up token: Get "https://openbao.example.invalid": '
+                'connection refused\n',
+                'RC=1\nHOME=/tmp/openbao-stage180.ABC123\nKIND=root\n',
+            ),
+        )
+        for name, lookup_error, expected_state in cases:
+            with self.subTest(name=name):
+                error_file = temporary / f'{name}.txt'
+                error_file.write_text(lookup_error, encoding='utf-8')
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'root-revoke',
+                        str(OPENBAO_INITIALIZE_LIB), str(binary_directory),
+                    ],
+                    env=self.sanitized_environment(
+                        BOOTSTRAP_TEST_MODE='1',
+                        OPENBAO_TEST_LOOKUP_ERROR_FILE=str(error_file),
+                    ),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected_state)
+                self.assertEqual(result.stderr, '')
+                self.assertNotIn('Code:', result.stdout)
+                self.assertNotIn('permission denied', result.stdout)
+                self.assertNotIn('connection refused', result.stdout)
+
+    def test_probe_start_failures_cleanup_pending_home_without_revoke(
+        self,
+    ) -> None:
+        for failed_stage in ('token-create', 'exchange', 'login'):
+            with self.subTest(failed_stage=failed_stage):
+                command_log = self.temporary_directory() / 'probe.log'
+                script = textwrap.dedent(
+                    '''
+                    set -o pipefail
+                    source "$1"
+                    OPENBAO_TEST_FAILED_STAGE=$2
+                    OPENBAO_TEST_COMMAND_LOG=$3
+                    kubectl_run() {
+                      case " $* " in
+                        *' mktemp -d /tmp/openbao-stage180.XXXXXX '*)
+                          printf 'home-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          printf '/tmp/openbao-stage180.ABC123\n'
+                          ;;
+                        *' create token openbao-runtime-probe '*)
+                          printf 'token-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          [[ "$OPENBAO_TEST_FAILED_STAGE" != token-create ]] ||
+                            return 1
+                          printf 'synthetic-jwt\n'
+                          ;;
+                        *' bao write -field=token auth/kubernetes/login '*)
+                          cat >/dev/null
+                          printf 'exchange\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          [[ "$OPENBAO_TEST_FAILED_STAGE" != exchange ]] ||
+                            return 1
+                          printf 'synthetic-session-token\n'
+                          ;;
+                        *' bao login -no-print '*)
+                          cat >/dev/null
+                          printf 'login\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          [[ "$OPENBAO_TEST_FAILED_STAGE" != login ]] ||
+                            return 1
+                          ;;
+                        *' bao token revoke -self '*)
+                          printf 'revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          return 1
+                          ;;
+                        *' rm -f -- "$1/.bao-token" "$1/.openbao-session-binding"; rmdir -- "$1" '*)
+                          printf 'cleanup-remove\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                          ;;
+                        *) return 1 ;;
+                      esac
+                    }
+                    set +e
+                    openbao_auth_probe
+                    rc=$?
+                    set -e
+                    printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+                      "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+                    '''
+                )
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'probe-start-failure',
+                        str(OPENBAO_INITIALIZE_LIB), failed_stage,
+                        str(command_log),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'RC=1\nHOME=\nKIND=\n')
+                logged = command_log.read_text(encoding='utf-8')
+                self.assertIn('cleanup-remove\n', logged)
+                self.assertNotIn('revoke\n', logged)
+
+    def test_authenticated_probe_revoke_failure_retains_cleanup_handle(
+        self,
+    ) -> None:
+        command_log = self.temporary_directory() / 'probe-cleanup.log'
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_TEST_COMMAND_LOG=$2
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=probe
+            kubectl_run() {
+              case " $* " in
+                *' bao token revoke -self '*)
+                  printf 'revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  return 1
+                  ;;
+                *' rm -f -- "$1/.bao-token" "$1/.openbao-session-binding"; rmdir -- "$1" '*)
+                  printf 'cleanup-remove\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            set +e
+            openbao_remote_session_cleanup
+            rc=$?
+            set -e
+            printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'probe-cleanup-retain',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RC=1\nHOME=/tmp/openbao-stage180.ABC123\nKIND=probe\n',
+        )
+        self.assertEqual(command_log.read_text(encoding='utf-8'), 'revoke\n')
+
+    def test_remote_home_create_refuses_to_overwrite_cleanup_handle(self) -> None:
+        command_log = self.temporary_directory() / 'home-create.log'
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_TEST_COMMAND_LOG=$2
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.RETAIN
+            OPENBAO_REMOTE_SESSION_KIND=probe
+            kubectl_run() {
+              printf 'unexpected-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+              printf '/tmp/openbao-stage180.NEW123\n'
+            }
+            set +e
+            openbao_remote_home_create probe-pending
+            rc=$?
+            set -e
+            printf 'RC=%s\nHOME=%s\nKIND=%s\n' "$rc" \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'home-create-retain',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'RC=1\nHOME=/tmp/openbao-stage180.RETAIN\nKIND=probe\n',
+        )
+        self.assertFalse(command_log.exists())
+
+    def test_remote_session_cleanup_failure_blocks_success(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            kubectl_run() { return 1; }
+            openbao_remote_session_cleanup
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'cleanup-failure', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+        lifecycle = textwrap.dedent(
+            '''
+            source "$1"
+            openbao_root_session_start() { :; }
+            openbao_apply_configuration() { :; }
+            openbao_root_session_revoke() { :; }
+            openbao_remote_session_cleanup() { return 1; }
+            openbao_apply_configuration_with_root
+            '''
+        )
+        blocked = self.run_command(
+            ['/bin/bash', '-c', lifecycle, 'cleanup-blocks-success',
+             str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+
+    def test_authenticated_cli_sessions_pin_the_cleanup_token_path(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        fake_bao = binary_directory / 'bao'
+        fake_bao.write_text(textwrap.dedent(
+            '''
+            #!/bin/bash
+            [[ "${BAO_TOKEN_PATH:-}" == "$HOME/.bao-token" ]] || exit 95
+            [[ "$*" == 'token lookup -format=json' ]] || exit 94
+            '''
+        ).lstrip(), encoding='utf-8')
+        fake_bao.chmod(0o755)
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            export PATH="$2:$PATH"
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ABC123
+            OPENBAO_REMOTE_SESSION_KIND=root
+            OPENBAO_RECOVER_PROBE_HOME=/tmp/openbao-stage180-probe.ABC123
+            OPENBAO_RECOVER_PROBE_SESSION_KIND=authenticated
+            openbao_bao token lookup -format=json
+            openbao_bao_recover_probe token lookup -format=json
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'pinned-token-path',
+                str(OPENBAO_INITIALIZE_LIB), str(binary_directory),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_every_authenticated_home_pins_the_cleanup_token_path(self) -> None:
+        lines = self.implementation().splitlines()
+        bindings: list[tuple[str, str]] = []
+        for index, line in enumerate(lines[:-1]):
+            matched = re.match(r'^\s*(?:env )?HOME="(\$[^"/]+)" \\$', line)
+            if matched is not None:
+                bindings.append((matched.group(1), lines[index + 1].strip()))
+        self.assertEqual(len(bindings), 10)
+        for home, token_binding in bindings:
+            with self.subTest(home=home):
+                self.assertEqual(
+                    token_binding,
+                    f'BAO_TOKEN_PATH="{home}/.bao-token" \\',
+                )
+        self.assertIn(
+            'env HOME="$path" \\\n'
+            '      BAO_TOKEN_PATH="$path/.bao-token" \\',
+            self.implementation(),
+        )
+
+    def test_legacy_default_token_helper_cleanup_removes_valid_orphan(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            helper_root=$2
+            chmod 700 "$helper_root"
+            path=$(mktemp -d "$helper_root/openbao-stage180.XXXXXX")
+            trap 'rm -f -- "$path/.vault-token"; rmdir -- "$path" 2>/dev/null || true' EXIT
+            printf 'synthetic-token\n' >"$path/.vault-token"
+            chmod 600 "$path/.vault-token"
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            set +e
+            openbao_legacy_default_token_helpers_cleanup "$helper_root"
+            rc=$?
+            set -e
+            if [[ -e "$path" || -L "$path" ]]; then present=true; else present=false; fi
+            printf 'RC=%s\nPRESENT=%s\n' "$rc" "$present"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'legacy-helper-cleanup',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=0\nPRESENT=false\n')
+
+    def test_legacy_stage180_process_check_rejects_an_old_runner(self) -> None:
+        temporary = self.temporary_directory()
+        proc_root = temporary / 'proc'
+        proc_root.mkdir(mode=0o700)
+        old_process = proc_root / '4242'
+        old_process.mkdir(mode=0o700)
+        repo_root = '/opt/uni-code/engineering-platform-gitops'
+        stage_entrypoint = (
+            f'{repo_root}/scripts/bootstrap/stages/'
+            '180-openbao-initialize/run.sh'
+        )
+        (old_process / 'cmdline').write_bytes(
+            b'/bin/bash\0' + stage_entrypoint.encode('ascii') +
+            b'\0--recover-start\0'
+        )
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            OPENBAO_REPO_ROOT=$2
+            proc_root=$3
+            set +e
+            openbao_legacy_stage180_processes_absent "$proc_root"
+            active_rc=$?
+            rm -f -- "$proc_root/4242/cmdline"
+            rmdir -- "$proc_root/4242"
+            openbao_legacy_stage180_processes_absent "$proc_root"
+            empty_rc=$?
+            set -e
+            printf 'ACTIVE_RC=%s\nEMPTY_RC=%s\n' "$active_rc" "$empty_rc"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'legacy-process-check',
+                str(OPENBAO_INITIALIZE_LIB), repo_root, str(proc_root),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'ACTIVE_RC=1\nEMPTY_RC=0\n')
+
+    def test_legacy_default_token_helper_cleanup_rejects_unsafe_batch(
+        self,
+    ) -> None:
+        temporary = self.temporary_directory()
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            helper_root=$2
+            chmod 700 "$helper_root"
+            safe=$(mktemp -d "$helper_root/openbao-stage180.XXXXXX")
+            unsafe=$(mktemp -d "$helper_root/openbao-stage180.XXXXXX")
+            cleanup_fixture() {
+              rm -f -- "$safe/.vault-token" "$unsafe/.vault-token" "$unsafe/extra"
+              rmdir -- "$safe" "$unsafe" 2>/dev/null || true
+            }
+            trap cleanup_fixture EXIT
+            printf 'synthetic-token\n' >"$safe/.vault-token"
+            printf 'synthetic-token\n' >"$unsafe/.vault-token"
+            printf 'unexpected\n' >"$unsafe/extra"
+            chmod 600 "$safe/.vault-token" "$unsafe/.vault-token" "$unsafe/extra"
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            set +e
+            openbao_legacy_default_token_helpers_cleanup "$helper_root"
+            rc=$?
+            set -e
+            if [[ -f "$safe/.vault-token" && -f "$unsafe/.vault-token" &&
+                  -f "$unsafe/extra" ]]; then
+              preserved=true
+            else
+              preserved=false
+            fi
+            printf 'RC=%s\nPRESERVED=%s\n' "$rc" "$preserved"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'unsafe-legacy-helper-cleanup',
+                str(OPENBAO_INITIALIZE_LIB), str(temporary),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=1\nPRESERVED=true\n')
+
+    def test_legacy_cleanup_second_pass_drift_deletes_nothing(self) -> None:
+        temporary = self.temporary_directory()
+        binary_directory = temporary / 'bin'
+        binary_directory.mkdir()
+        fake_stat = binary_directory / 'stat'
+        fake_stat.write_text(textwrap.dedent(
+            r'''
+            #!/bin/bash
+            set -eu
+            last=${!#}
+            if [[ "$last" == "$TEST_MUTATE_PATH" ]]; then
+              count=0
+              [[ ! -e "$TEST_STAT_COUNT" ]] || read -r count <"$TEST_STAT_COUNT"
+              count=$((count + 1))
+              printf '%s\n' "$count" >"$TEST_STAT_COUNT"
+              if (( count == 3 )); then
+                printf 'unexpected\n' >"$TEST_MUTATE_PATH/extra"
+                chmod 600 "$TEST_MUTATE_PATH/extra"
+              fi
+            fi
+            exec /usr/bin/stat "$@"
+            '''
+        ).lstrip(), encoding='utf-8')
+        fake_stat.chmod(0o755)
+        helper_root = temporary / 'helpers'
+        helper_root.mkdir(mode=0o700)
+        first = helper_root / 'openbao-stage180.ABC123'
+        second = helper_root / 'openbao-stage180.XYZ789'
+        first.mkdir(mode=0o700)
+        second.mkdir(mode=0o700)
+        for directory in (first, second):
+            token = directory / '.vault-token'
+            token.write_text('synthetic-token\n', encoding='ascii')
+            token.chmod(0o600)
+        count_file = temporary / 'stat-count'
+        script = textwrap.dedent(
+            r'''
+            source "$1"
+            export PATH="$2:$PATH"
+            export TEST_MUTATE_PATH=$3
+            export TEST_STAT_COUNT=$4
+            helper_root=$5
+            kubectl_run() {
+              while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+              [[ "$1" == -- ]] || return 93
+              shift
+              "$@"
+            }
+            set +e
+            openbao_legacy_default_token_helpers_cleanup "$helper_root"
+            rc=$?
+            set -e
+            if [[ -f "$helper_root/openbao-stage180.ABC123/.vault-token" &&
+                  -f "$helper_root/openbao-stage180.XYZ789/.vault-token" &&
+                  -f "$helper_root/openbao-stage180.XYZ789/extra" ]]; then
+              preserved=true
+            else
+              preserved=false
+            fi
+            printf 'RC=%s\nPRESERVED=%s\n' "$rc" "$preserved"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'legacy-second-pass-drift',
+                str(OPENBAO_INITIALIZE_LIB), str(binary_directory),
+                str(second), str(count_file), str(helper_root),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'RC=1\nPRESERVED=true\n')
+
+    def test_unseal_progress_uses_independent_public_readback(self) -> None:
+        script = textwrap.dedent(
+            '''
+            set -o pipefail
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_TEST_STATUS=$2
+            cli_rc=$4
+            kubectl_run() { printf '%s\n' "$OPENBAO_TEST_STATUS"; return "$cli_rc"; }
+            openbao_unseal_progress_is_safe "$3"
+            '''
+        )
+        cases = (
+            (1, '{"initialized":true,"sealed":true,"progress":1}', 2, 0),
+            (2, '{"initialized":true,"sealed":true,"progress":2}', 2, 0),
+            (3, '{"initialized":true,"sealed":false,"progress":0}', 0, 0),
+            (2, '{"initialized":true,"sealed":false,"progress":0}', 0, 1),
+            (1, '{"initialized":true,"sealed":true,"progress":1}', 1, 1),
+            (1, '{}', 2, 1),
+            (1, '{"initialized":true,"sealed":true,"progress":true}', 2, 1),
+        )
+        for attempt, status, cli_rc, expected_returncode in cases:
+            with self.subTest(attempt=attempt, status=status):
+                result = self.run_command(
+                    [
+                        '/bin/bash', '-c', script, 'unseal-progress',
+                        str(OPENBAO_INITIALIZE_LIB), status, str(attempt), str(cli_rc),
+                    ],
+                    env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+                )
+                self.assertEqual(
+                    result.returncode, expected_returncode, result.stderr,
+                )
+                self.assertEqual(result.stdout, '')
+
+    def test_probe_cleanup_failure_blocks_probe_success(self) -> None:
+        script = textwrap.dedent(
+            '''
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            openbao_probe_session_start() { :; }
+            openbao_bao() {
+              case "$*" in
+                'kv get -field=value openbao-probe/runtime-check')
+                  printf 'stage180-probe\n'
+                  ;;
+                'read sys/auth') return 1 ;;
+                'operator raft list-peers -format=json')
+                  printf '%s\n' '{"data":{"config":{"servers":[{"node_id":"openbao-0","leader":true}]}}}'
+                  ;;
+              esac
+            }
+            openbao_remote_session_cleanup() { return 1; }
+            openbao_auth_probe
+            '''
+        )
+        result = self.run_command(
+            ['/bin/bash', '-c', script, 'probe-cleanup', str(OPENBAO_INITIALIZE_LIB)],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_recover_auth_probe_preserves_root_session_and_cleans_own_helper(
+        self,
+    ) -> None:
+        command_log = self.temporary_directory() / 'recover-probe.log'
+        script = textwrap.dedent(
+            r'''
+            set -o pipefail
+            source "$1"
+            PYTHON_BINARY=/usr/bin/python3
+            OPENBAO_TEST_COMMAND_LOG=$2
+            OPENBAO_REMOTE_HOME=/tmp/openbao-stage180.ROOT12
+            OPENBAO_REMOTE_SESSION_KIND=root
+            kubectl_run() {
+              if [[ " $* " == *' bao '* ]]; then
+                [[ " $* " == *' HOME=/tmp/openbao-stage180-probe.ABC123 '* ]] ||
+                  return 97
+              fi
+              case " $* " in
+                *' mktemp -d /tmp/openbao-stage180-probe.XXXXXX '*)
+                  printf 'probe-home-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf '/tmp/openbao-stage180-probe.ABC123\n'
+                  ;;
+                *' create token openbao-runtime-probe '*)
+                  printf 'token-create\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf 'synthetic-jwt\n'
+                  ;;
+                *' bao write -field=token auth/kubernetes/login '*)
+                  cat >/dev/null
+                  printf 'exchange\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf 'synthetic-session-token\n'
+                  ;;
+                *' bao login -no-print '*)
+                  cat >/dev/null
+                  printf 'login\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' bao kv put openbao-probe/runtime-check '*)
+                  printf 'put\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' bao kv get -field=value openbao-probe/runtime-check '*)
+                  printf 'get\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf 'stage180-probe\n'
+                  ;;
+                *' bao read sys/auth '*)
+                  printf 'negative-auth\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  return 2
+                  ;;
+                *' bao operator raft list-peers -format=json '*)
+                  printf 'raft\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  printf '%s\n' '{"data":{"config":{"servers":[{"node_id":"openbao-0","leader":true}]}}}'
+                  ;;
+                *' bao kv delete openbao-probe/runtime-check '*)
+                  printf 'delete\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' bao token revoke -self '*)
+                  printf 'probe-revoke\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *' rm -f -- "$1/.bao-token"; rmdir -- "$1" '*)
+                  printf 'probe-cleanup\n' >>"$OPENBAO_TEST_COMMAND_LOG"
+                  ;;
+                *) return 98 ;;
+              esac
+            }
+            openbao_recover_auth_probe
+            printf 'ROOT_HOME=%s\nROOT_KIND=%s\nPROBE_HOME=%s\nPROBE_KIND=%s\n' \
+              "$OPENBAO_REMOTE_HOME" "$OPENBAO_REMOTE_SESSION_KIND" \
+              "$OPENBAO_RECOVER_PROBE_HOME" \
+              "$OPENBAO_RECOVER_PROBE_SESSION_KIND"
+            '''
+        )
+        result = self.run_command(
+            [
+                '/bin/bash', '-c', script, 'recover-auth-probe',
+                str(OPENBAO_INITIALIZE_LIB), str(command_log),
+            ],
+            env=self.sanitized_environment(BOOTSTRAP_TEST_MODE='1'),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'ROOT_HOME=/tmp/openbao-stage180.ROOT12\n'
+            'ROOT_KIND=root\nPROBE_HOME=\nPROBE_KIND=\n',
+        )
+        calls = command_log.read_text(encoding='utf-8').splitlines()
+        for required in (
+            'probe-home-create', 'token-create', 'exchange', 'login', 'put',
+            'get', 'negative-auth', 'raft', 'delete', 'probe-revoke',
+            'probe-cleanup',
+        ):
+            self.assertEqual(calls.count(required), 1)
+        for before, after in (
+            ('login', 'put'), ('put', 'get'), ('get', 'negative-auth'),
+            ('negative-auth', 'raft'), ('raft', 'delete'),
+            ('delete', 'probe-revoke'), ('probe-revoke', 'probe-cleanup'),
+        ):
+            self.assertLess(calls.index(before), calls.index(after))
+
+    def test_secret_lifecycle_source_has_no_capture_argv_env_or_logging(
+        self,
+    ) -> None:
+        names = (
+            'openbao_hidden_input_label_is_valid',
+            'openbao_run_hidden_tty',
+            'openbao_bao_tty_public',
+            'openbao_bao_tty',
+            'openbao_unseal_interactively',
+            'openbao_root_session_start',
+            'openbao_root_session_revoke',
+            'openbao_remote_session_cleanup',
+            'openbao_prompt_secret',
+        )
+        source = '\n'.join(self.openbao_function_source(name) for name in names)
+        for forbidden in (
+            'set -x',
+            'BAO_TOKEN=',
+            'VAULT_TOKEN=',
+            'operator unseal "$OPENBAO_SECRET_INPUT"',
+            'login "$OPENBAO_SECRET_INPUT"',
+            'log_evidence "$OPENBAO_SECRET_INPUT"',
+            'echo "$OPENBAO_SECRET_INPUT"',
+        ):
+            self.assertNotIn(forbidden, source)
+        prompt = self.openbao_function_source('openbao_prompt_secret')
+        self.assertIn('read -r -s -p', prompt)
+        self.assertNotIn('operator unseal', prompt)
+        self.assertNotIn('login ', prompt)
+
+    def test_configuration_and_probe_contract_are_exact(self) -> None:
+        body = self.implementation()
+        for expected in (
+            'openbao-runtime-probe',
+            'openbao-probe',
+            '"audience":"openbao"',
+            'sys/storage/raft/configuration',
+            'to-file/',
+            'to-stdout/',
+            'kubectl_run --namespace=openbao create token',
+            'bao kv delete openbao-probe/runtime-check',
+            'bao read sys/auth',
+            'bao token revoke -self',
+        ):
+            self.assertIn(expected, body)
+
+    def test_acceptance_evidence_is_secret_free_and_scope_exact(self) -> None:
+        body = self.implementation()
+        accept = body.split('openbao_stage_180_accept() {', 1)[1]
+        for expected in (
+            '17-openbao-runtime',
+            'OPENBAO_INITIALIZED=true',
+            'OPENBAO_SEALED=false',
+            'OPENBAO_RAFT_PEERS=1',
+            'OPENBAO_HA_CLASS=NON_HA',
+            'KUBERNETES_AUTH=PASS',
+            'MINIO=NOT_EXECUTED',
+            'SNAPSHOT=NOT_EXECUTED',
+            'BACKUP=NOT_EXECUTED',
+            'RESTORE=NOT_EXECUTED',
+            'APP_SECRET_MIGRATION=NOT_EXECUTED',
+            'openbao_platform_secret_fingerprint',
+            'openbao_evidence_is_secret_free',
+        ):
+            self.assertIn(expected, body)
+        self.assertIn('openbao_write_acceptance_payload', accept)
+        self.assertIn('openbao_evidence_is_secret_free', accept)
+        self.assertNotIn('unseal_keys_b64', accept)
+        self.assertNotIn('root_token', accept)
+
+    def test_recovery_wizard_has_exactly_five_human_stages(self) -> None:
+        self.assertTrue(OPENBAO_RECOVERY_WIZARD.is_file())
+        wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
+        stages = re.findall(r'^stage "', wizard, re.MULTILINE)
+        self.assertEqual(len(stages), 5)
+        self.assertIn('TOTAL_STAGES=5', wizard)
+        for expected in (
+            'Gpg4win',
+            'gpg --full-generate-key',
+            'openbao-recovery-public-key.b64',
+            'Set-Clipboard',
+            '受控云存储',
+            'Clear-Clipboard',
+        ):
+            self.assertIn(expected, wizard)
+        for forbidden in ('write_env ', 'set_secret ', 'set_var '):
+            stages_source = wizard.split('# STAGES', 1)[1]
+            self.assertNotIn(forbidden, stages_source)
+
+    def test_recovery_wizard_v1_guides_distinct_valid_old_shares(self) -> None:
+        # Exercise only the schema-routed instructions, never GPG or clipboard.
+        wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
+        instructions = wizard.split(
+            'stage "隐藏提示、服务器仪式与清理"', 1,
+        )[1].rsplit('\nfinish', 1)[0]
+        result = subprocess.run(
+            ['bash', '-euo', 'pipefail', '-c', textwrap.dedent('''\
+                step() { printf '%s\\n' "$*"; }
+                say() { printf '%s\\n' "$*"; }
+                RECOVERY_SCHEMA=engineering-platform/openbao-recovery/v1
+            ''') + instructions],
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8'},
+            timeout=10,
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for required in (
+            '三份不同的有效旧 share',
+            '无需识别泄露编号',
+            '旧 share 轮换授权',
+            'verification 成功前不能宣称旧份额失效',
+            '保留旧恢复包和 GPG 私钥',
+            '隐藏 root-token prompt',
+            'recover-start',
+        ):
+            self.assertIn(required, result.stdout)
+        self.assertNotIn('未暴露', result.stdout)
+        self.assertNotIn('初始 root token 已撤销', result.stdout)
+
+    def test_recovery_wizard_routes_all_three_bundle_schemas(self) -> None:
+        wizard = OPENBAO_RECOVERY_WIZARD.read_text(encoding='utf-8')
+        for schema in (
+            'engineering-platform/openbao-recovery/v1',
+            'engineering-platform/openbao-recovery-rotation-candidate/v1',
+            'engineering-platform/openbao-recovery/v2',
+        ):
+            self.assertIn(schema, wizard)
+        self.assertIn('候选恢复包尚未完成验证', wizard)
+        self.assertIn('初始 root token 已撤销', wizard)
+        self.assertIn('verified-schema', wizard)
+        self.assertIn('--expected-schema "$expected_schema"', wizard)
+        self.assertIn(
+            '"$RECOVERY_ARCHIVE" "$RECOVERY_SCHEMA" "$RECOVERY_ITEM"',
+            wizard,
+        )
+        self.assertNotIn('ask RECOVERY_SCHEMA', wizard)
+        self.assertIn('不是正常 v1 configure 路径', wizard)
+
+    def test_manual_stage_readme_stop_reasons_match_implementation(self) -> None:
+        source = OPENBAO_INITIALIZE_LIB.read_text(encoding='utf-8')
+        reason_constants = dict(re.findall(
+            r'^readonly (OPENBAO_REASON_[A-Z_]+)=([a-z0-9-]+)$', source,
+            re.MULTILINE,
+        ))
+        emitted = re.findall(
+            r'(?:complete|openbao_recover_start_fail|openbao_recover_verify_fail)'
+            r'\s+STOP_[A-Z_]+\s+(?:\\\s*)?["\']?(\$?[A-Za-z0-9_-]+)',
+            source,
+        )
+        implemented = {
+            reason_constants.get(reason.removeprefix('$'), reason)
+            for reason in emitted
+        }
+        loop = re.search(
+            r'for required in ([a-z ]+); do\s+'
+            r'require_command "\$required" \|\|\s+'
+            r'complete STOP_PRECONDITION "missing-command-\$\{required\}"',
+            source,
+        )
+        self.assertIsNotNone(loop)
+        assert loop is not None
+        implemented.discard('missing-command-')
+        implemented.update(
+            f'missing-command-{command}' for command in loop.group(1).split()
+        )
+        listed = sorted(re.findall(
+            r'^- `([a-z0-9-]+)`$',
+            OPENBAO_INITIALIZE.with_name('README.md').read_text(encoding='utf-8'),
+            re.MULTILINE,
+        ))
+        self.assertTrue(implemented)
+        self.assertEqual(listed, sorted(implemented))
 
 
 class ArtifactStageTest(BootstrapTestCase):

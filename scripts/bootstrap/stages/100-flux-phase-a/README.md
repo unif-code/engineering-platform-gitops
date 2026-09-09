@@ -1,8 +1,8 @@
 # 100-flux-phase-a
 
-Flux Phase A 的一键部署与验收，只允许安装 source、kustomize、helm、notification
-四个 Controller。禁止 Secret、sync CR、第五个 Controller、下游 Namespace、OpenBao、
-备份与业务应用。
+Flux Phase A 的一键部署与验收，`--apply` 只允许安装 source、kustomize、helm、
+notification 四个 Controller。禁止由 Stage 100 创建 Secret、sync CR、第五个
+Controller、下游 Namespace、OpenBao、备份与业务应用。
 
 | 项 | 值 |
 | --- | --- |
@@ -14,9 +14,12 @@ Flux Phase A 的一键部署与验收，只允许安装 source、kustomize、hel
 
 `--check` 只读识别 `ABSENT`、精确 `NAMESPACE_ONLY`、完整 `COMPLIANT`，或 inventory
 边界仍精确但批准清单存在 SSA diff 的 `UPGRADE_REQUIRED` 状态。Phase A 基线完整后，允许
-Stage `110`～`160` 已批准 sync CR 与下游 Namespace 清单的任意无重复子集作为合法续跑
-检查点；sync CR 按 `resource/namespace/name` 身份核对，错误 Namespace、未批准名称或
-`kubectl diff` 执行错误都 fail-closed，并由后续所属 stage 负责精确收敛。`--apply` 固定
+Stage `110`～`170` 已批准 sync CR 与下游 Namespace 清单的任意无重复子集作为合法续跑
+检查点。Stage 170 只增加 `namespace/openbao`、`flux-system/openbao-runtime` Kustomization、
+`flux-system/openbao` HelmRelease 与派生的 `flux-system/flux-system-openbao` HelmChart；
+MinIO、监控、Backup/Snapshot/Restore 及其他未知身份仍 fail-closed。sync CR 按
+`resource/namespace/name` 身份核对，错误 Namespace、未批准名称或 `kubectl diff` 执行错误
+都 fail-closed，并由后续所属 stage 负责精确收敛。`--apply` 固定
 Flux CLI 版本与摘要；CLI 归档成员只流式写入 root 新建的私有文件，再显式规范化为
 `root:root 0755`，不继承归档 owner。首次安装先单独处理 Namespace 依赖，升级不重建
 Namespace；两条路径都只对同一份已验摘要的私有 `rendered.yaml` 依次执行完整 bundle 的
